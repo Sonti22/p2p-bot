@@ -143,6 +143,18 @@ def test_due_volume_condition_ignores_ads_below_rate(tmp_path):
     assert alerts.due(snap(best, groups=groups), cfg(), path=db) == []
 
 
+def test_due_volume_condition_counts_exchanger_network_only(tmp_path):
+    db = str(tmp_path / "alerts.db")
+    alerts.add("1", "USDT", "sell", 92.0, time.time() + 86400, path=db, min_volume=100_000)
+    trc = make_ad("BestChange", "sell", 95.0, net="TRC20", max_amt=60_000)
+    erc = make_ad("BestChange", "sell", 94.0, net="ERC20", max_amt=60_000)
+    best = {("BestChange", "sell", "USDT"): trc}
+    groups = {("BestChange", "sell", "USDT"): [trc, erc]}   # 120 000 ₽ только в сумме разных сетей
+    assert alerts.due(snap(best, groups=groups), cfg(), path=db) == []
+    groups[("BestChange", "sell", "USDT")].append(make_ad("BestChange", "sell", 93.0, net="TRC20", max_amt=60_000))
+    assert len(alerts.due(snap(best, groups=groups), cfg(), path=db)) == 1   # в TRC20 набирается 120 000
+
+
 def test_due_reliable_condition_blocks_trap_deal(tmp_path):
     db = str(tmp_path / "alerts.db")
     alerts.add("1", "USDT", "sell", 92.0, time.time() + 86400, path=db, require_reliable=True)

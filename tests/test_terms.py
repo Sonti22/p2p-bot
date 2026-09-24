@@ -60,3 +60,38 @@ def test_reliability_mentions_risky_terms():
     snap = p2p.Snapshot(88.0, "t", {"USDT": 88.0}, {}, [d], {}, {}, {})
     label, reasons = p2p.reliability(d, p2p.Config(), snap)
     assert any("условия" in r and "реквизиты в чате" in r and "ИП" in r for r in reasons)
+
+
+RISKY_TERMS = "Оплата на счёт ИП, реквизиты в чате"
+
+
+def test_stack_keeps_terms_of_single_ad():
+    stacked = p2p._stack([make_ad(terms=RISKY_TERMS)], 50000)
+    assert stacked.nick == "nick" and stacked.terms == RISKY_TERMS
+    assert p2p._stack([make_ad()], 50000).terms == ""
+
+
+def test_stack_merges_terms_of_used_ads_only():
+    ads = [make_ad(price=85.0, max_amt=20000, avail=20000 / 85.0, terms="Реквизиты в чате"),
+           make_ad(price=86.0, max_amt=40000, avail=40000 / 86.0, terms="Оплата на счёт ИП"),
+           make_ad(price=87.0, terms="Звоните +7 (999) 123-45-67")]   # сумма набрана раньше — не используется
+    stacked = p2p._stack(ads, 50000)
+    assert stacked.nick == "2 объявл."
+    notes = p2p.terms_flags(stacked.terms)[1]
+    assert "реквизиты в чате" in notes and "оплата на счёт ИП/юрлица" in notes
+    assert "в условиях указан телефон" not in notes
+
+
+def test_scan_keeps_risky_terms_after_stacking(offline, monkeypatch):
+    async def fake_r(s, cfg, side, asset):
+        return [make_ad("R", side, 88.15 if side == "buy" else 89.5, orders=500, rate=100.0, terms=RISKY_TERMS)]
+
+    monkeypatch.setitem(p2p.FETCHERS, "r", fake_r)
+    c = p2p.Config(exchanges=["r"], assets=["USDT"], min_orders=0, min_rate=0)
+    snap = asyncio.run(p2p.scan(None, c))
+    d = snap.deals[0]
+    assert d[1].terms == RISKY_TERMS and d[2].terms == RISKY_TERMS
+    label, reasons = p2p.reliability(d, c, snap)
+    assert label == p2p.RISKY and sum("условия" in r for r in reasons) == 2   # покупка + продажа
+    text = p2p.fmt_deal(d, c, snap)
+    assert "⚠" in text and "реквизиты в чате" in text

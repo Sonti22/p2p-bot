@@ -172,6 +172,11 @@ def open_nets(venue, asset):
     return [n for n, r in (STATUS.get((venue, asset)) or {}).items() if r.get("wd")]
 
 
+def known_nets(venue, asset):
+    """Все сети площадки из живого справочника; пусто — сведений нет."""
+    return list(STATUS.get((venue, asset)) or {})
+
+
 def pop_changes():
     c = CHANGES[:]
     CHANGES.clear()

@@ -464,15 +464,16 @@ def usable(a, cfg, blocked=frozenset()):
 
 def _signal_ok(a, cfg, blocked=frozenset()):
     """Фильтр объявления для стакана глубины: мерчант/способ оплаты/условия, без требования, что объём
-    покрывает всю сумму в одиночку — это делает _stack, складывая несколько объявлений."""
+    покрывает всю сумму в одиночку — это делают _stack (покупка) и _stack_qty (продажа, под фактический
+    выход монеты маршрута), складывая несколько объявлений."""
     return bool(_pays(a, cfg)) and a.orders >= cfg.min_orders and a.rate >= cfg.min_rate \
         and (a.ex, a.nick) not in blocked and not terms_flags(a.terms)[0]
 
 
 def _stack(ads, amount):
     """Сложить объявления по цене (ads отсортированы: лучшая цена первой), пока не наберётся amount
-    в фиате — не только верхнее объявление. Возвращает синтетическое Ad со средневзвешенной ценой,
-    None — если суммарной глубины меньше amount."""
+    в фиате — не только верхнее объявление. Возвращает синтетическое Ad со средневзвешенной ценой
+    и объединёнными условиями использованных объявлений, None — если суммарной глубины меньше amount."""
     remaining, qty, used = amount, 0.0, []
     for a in ads:
         if remaining <= 0:
@@ -485,25 +486,78 @@ def _stack(ads, amount):
         used.append(a)
     if remaining > 0.01 or not used:
         return None
+    return _combined(used, amount / qty, amount, qty)
+
+
+def _stack_qty(ads, qty):
+    """Сложить объявления продажи (лучшая цена первой), пока они не примут qty монеты — фактический
+    выход маршрута, а не сумму круга в фиате: при прибыли монеты на выходе больше, чем сумма / цена.
+    Синтетическое Ad: цена — средневзвешенная по проданному объёму, min_amt — выручка в фиате;
+    None — если глубины не хватает."""
+    if qty is None or qty <= 0:
+        return None
+    remaining, fiat, used = qty, 0.0, []
+    for a in ads:
+        if remaining <= 0:
+            break
+        take = min(remaining, a.avail, a.max_amt / a.price)
+        if take * a.price < a.min_amt:
+            continue   # меньше минимума этого объявления — пропускаем, берём из следующего
+        remaining -= take
+        fiat += take * a.price
+        used.append(a)
+    if remaining > qty * 1e-9 or not used:
+        return None
+    return _combined(used, fiat / qty, fiat, qty)
+
+
+def _combined(used, price, total, qty):
+    """Синтетическое Ad из использованных объявлений стакана: total — объём в фиате, qty — в монете;
+    сеть сохраняем, если она у всех объявлений одна, условия мерчантов объединяем."""
     one = len(used) == 1
-    return Ad(used[0].ex, used[0].side, amount / qty, amount, sum(a.max_amt for a in used), qty,
+    nets = {a.net for a in used}
+    terms = "; ".join(dict.fromkeys(a.terms.strip() for a in used if a.terms and a.terms.strip()))
+    return Ad(used[0].ex, used[0].side, price, total, sum(a.max_amt for a in used), qty,
               sorted(set(p for a in used for p in a.pays)), used[0].nick if one else f"{len(used)} объявл.",
               min(a.orders for a in used), min(a.rate for a in used), used[0].url if one else "",
-              used[0].asset, used[0].net if one else "")
+              used[0].asset, nets.pop() if len(nets) == 1 else "", terms=terms)
+
+
+def _net_parts(grp):
+    """Части стакана, которые можно складывать вместе: у обменников — по сетям (монету шлют в сеть
+    конкретного обменника), у бирж — весь стакан."""
+    if not grp or grp[0].ex != "BestChange":
+        return [grp]
+    return [[a for a in grp if a.net == n] for n in dict.fromkeys(a.net for a in grp)]
+
+
+def _same_net(grp, ad):
+    """Объявления стакана, которые можно складывать с ad: у обменника — только той же сети."""
+    return [a for a in grp if a.net == ad.net] if ad.ex == "BestChange" else grp
 
 
 def _same_venue(b, s):
     return b.ex == s.ex and b.ex != "BestChange"   # обменники всегда внешние: нужен перевод
 
 
+def _receive_nets(to, asset):
+    """Сети, в которых получатель точно примет asset (RECEIVE_NETS); None — ограничения нет. Ограничение
+    касается монет, которые вообще ходят в этих сетях (USDT/USDC в TRC20 — по BC_COINS): BTC или ETH
+    в TRC20 не бывает, сети получателя для них не подтверждены — не мешаем."""
+    nets = RECEIVE_NETS.get(to)
+    return nets if nets and any((asset, n) in BC_COINS.values() for n in nets) else None
+
+
 def _withdraw(cfg, sender, asset, net="", receiver=""):
     """Комиссия вывода монеты с биржи и сеть. Сеть задана (её требует обменник) — берём её,
     иначе самую дешёвую из тех, что принимает получатель. None — открытой сети нет: у отправителя
-    закрыт вывод или у получателя ввод (по живому справочнику netstatus; неизвестно = не мешаем)."""
+    закрыт вывод или у получателя ввод (по живому справочнику netstatus; неизвестно = не мешаем),
+    либо справочник отправителя известен и все его сети закрыты (или нет сети, которую принимает
+    получатель). Нет сведений — запасная комиссия."""
     table = dict(WITHDRAW.get((sender, asset), {}))
-    for n in netstatus.open_nets(sender, asset):       # живой справочник дополняет таблицу комиссий
+    for n in netstatus.open_nets(sender, asset):       # живой справочник дополняет таблицу и переопределяет её
         fee = netstatus.live_fee(sender, asset, n)
-        if n not in table and fee is not None:
+        if fee is not None:
             table[n] = fee
 
     def ok(n):
@@ -519,6 +573,13 @@ def _withdraw(cfg, sender, asset, net="", receiver=""):
             return None
         best = min(cand, key=cand.get)
         return cand[best], best
+    listed = netstatus.known_nets(sender, asset)
+    known = [n for n in listed if n in RECEIVE_NETS.get(receiver, n)]
+    if known and not any(ok(n) for n in known):
+        return None   # справочник есть, и во всех его сетях вывод (или ввод у получателя) закрыт
+    need = _receive_nets(receiver, asset)
+    if listed and not known and need and set(need) <= set(netstatus.KNOWN_NETS):
+        return None   # справочник есть, а сети, которую принимает получатель (BitPapa — TRC20), в нём нет
     return cfg.transfer_fees.get(asset, 0), ""
 
 
@@ -528,12 +589,19 @@ def _hop(cfg, frm, frm_net, to, to_net, asset):
     if frm == to and frm != "BestChange":
         return 0.0, ""
     if frm == "BestChange" and to == "BestChange":   # обменник → твой кошелёк на бирже → другой обменник
+        if netstatus.deposit_ok("Bybit", asset, frm_net) is False:
+            return None, ""                          # на Bybit закрыт ввод в сети первого обменника
         w = _withdraw(cfg, "Bybit", asset, to_net)
         if w is None:
             return None, ""
         fee, net = w
         return fee, f"через Bybit: перевод −{fee:g} {asset} ({net})"
     if frm == "BestChange":                          # обменник сам шлёт монету, комиссия в его курсе
+        need = _receive_nets(to, asset)
+        if need and frm_net not in need:
+            return None, ""                          # получатель не принимает сеть обменника (BitPapa: USDT/USDC — только TRC20)
+        if netstatus.deposit_ok(to, asset, frm_net) is False:
+            return None, ""                          # у биржи закрыт ввод в сети обменника
         return 0.0, f"обменник шлёт {asset} ({frm_net}) на {to}"
     w = _withdraw(cfg, frm, asset, to_net if to == "BestChange" else "", to)
     if w is None:
@@ -709,6 +777,23 @@ def _route(b, s, cfg, spot, over_banks=frozenset()):
     return (qty * s.price / cfg.amount - 1) * 100, " → ".join(steps)
 
 
+def _match(b, sell_ads, cfg, spot, over_banks=frozenset()):
+    """Связка покупки b со стаканом продажи (sell_ads отсортированы: лучшая цена первой). Продажа
+    собирается под фактический выход монеты маршрута: при прибыли его больше, чем сумма круга / цена,
+    и объявления, покрывающие сумму круга впритык, весь объём не примут.
+    (прибыль %, b, s, маршрут) или None — маршрут невозможен или глубины продажи не хватает."""
+    if not sell_ads:
+        return None
+    # от цены продажи выход не зависит; запас на курс только занижает оценку прибыли, а продавать
+    # придётся всю монету — глубину сверяем с количеством без него
+    qty = _route_qty(b, sell_ads[0], cfg, spot, over_banks, disable=frozenset({"risk"}))
+    s = _stack_qty(sell_ads, qty)
+    if s is None:
+        return None
+    r = _route(b, s, cfg, spot, over_banks)
+    return (r[0], b, s, r[1]) if r else None
+
+
 def profit_breakdown(b, s, cfg, spot, over_banks=frozenset()):
     """Разложение чистой прибыли связки на составляющие: валовый спред (без издержек) → минус
     вывод → минус спот (если есть конвертация монеты) → минус запас на курс → чистыми (с учётом
@@ -827,7 +912,7 @@ class Snapshot:
     over_banks: frozenset = field(default_factory=frozenset)
 
 
-_alt = {"t": 0.0, "ads": [], "errors": {}}
+_alt = {"t": 0.0, "ads": [], "errors": {}, "key": None}   # key — (монеты, площадки, сумма круга), под которые собран кэш
 
 VENUE_BACKOFF_BASE = 30    # сек: первая пауза площадки после ошибки
 VENUE_BACKOFF_MAX = 600    # сек: потолок паузы (10 мин)
@@ -886,6 +971,9 @@ async def scan(s, cfg, force_alt=False):
     """force_alt — разовый скан под свою сумму (`/calc`, «своя сумма»): всегда опросить не-USDT монеты
     заново и не трогать общий кэш _alt, потому что лимиты объявлений зависят от cfg.amount."""
     names_all = [n for n in cfg.exchanges if n in FETCHERS]
+    key = (tuple(cfg.assets), tuple(names_all), cfg.amount)   # площадки фильтруют объявления по сумме
+    if not force_alt and _alt["key"] != key:   # сменили монеты/площадки/сумму — старый кэш не годится, опросить заново
+        _alt.update(t=0.0, ads=[], errors={}, key=key)
     paused = {n: u for n in names_all if (u := _venue_paused_until(n))}   # площадки на паузе после ошибок
     names = [n for n in names_all if n not in paused]
     alts = [a for a in cfg.assets if a != "USDT"]
@@ -964,8 +1052,9 @@ async def scan(s, cfg, force_alt=False):
         if a.net and a.asset == "USDT" and better(networks.setdefault(a.net, {}).get(a.side)):
             networks[a.net][a.side] = a
 
-    # для связок — стакан глубины: складываем объявления по цене, пока не наберётся сумма круга;
-    # связку, которую суммарный объём не покрывает, не сигналим (сюда она просто не попадёт)
+    # для связок — стакан глубины: покупку складываем по цене, пока не наберётся сумма круга, продажу —
+    # под фактический выход монеты маршрута (_match); связку, которую объём не покрывает, не сигналим;
+    # обменники складываем только в пределах одной сети
     groups = {}
     for a in ads:
         if not _signal_ok(a, cfg, blocked):
@@ -974,28 +1063,37 @@ async def scan(s, cfg, force_alt=False):
         if r and abs(a.price / r - 1) * 100 > cfg.max_dev:
             continue
         groups.setdefault((a.ex, a.side, a.asset), []).append(a)
-    depth = {}
+    buys, sells = [], []
     for key, grp in groups.items():
         grp.sort(key=lambda a: a.price, reverse=(key[1] == "sell"))
-        stacked = _stack(grp, cfg.amount)
-        if stacked:
-            depth[key] = stacked
+        for part in _net_parts(grp):
+            if key[1] == "sell":
+                sells.append(part)   # продажа собирается в _match под выход монеты конкретной связки
+                continue
+            stacked = _stack(part, cfg.amount)
+            if stacked:
+                buys.append(stacked)
 
-    buys = [a for (_, side, _), a in depth.items() if side == "buy"]
-    sells = [a for (_, side, _), a in depth.items() if side == "sell"]
     over_banks = trades.banks_over_limit({trades.sbp_bank(b.pays) for b in buys})
     deals = []
     for b in buys:
         for sl in sells:
-            if cfg.same_venue_only and not _same_venue(b, sl):
+            if cfg.same_venue_only and not _same_venue(b, sl[0]):
                 continue   # пресет «USDT без переводов»: только связки внутри одной площадки
-            r = _route(b, sl, cfg, spot, over_banks)
-            if r:
-                deals.append((r[0], b, sl, r[1]))
+            d = _match(b, sl, cfg, spot, over_banks)
+            if d:
+                deals.append(d)
     snap = Snapshot(ref or 0, ref_src, refs, best, [], networks, dropped, errors, groups, spot, over_banks)
     # сортировка «прибыль × надёжность»: каждая причина риска снимает risk_penalty п.п. с профита
     deals.sort(key=lambda d: d[0] - cfg.risk_penalty * len(reliability(d, cfg, snap)[1]), reverse=True)
-    snap.deals = deals
+    # обменники разных сетей дают по связке на одну и ту же пару площадок; бот сигналит по паре
+    # (b.ex, b.asset, s.ex, s.asset) — оставляем лучшую, чтобы дубли не вытеснили из топ-N другие площадки
+    seen = set()
+    for d in deals:
+        key = (d[1].ex, d[1].asset, d[2].ex, d[2].asset)
+        if key not in seen:
+            seen.add(key)
+            snap.deals.append(d)
     return snap
 
 
@@ -1004,18 +1102,16 @@ DEPTH_AMOUNTS = (50_000, 100_000, 300_000)   # суммы круга для ра
 
 def deal_amounts(deal, cfg, snap, amounts=DEPTH_AMOUNTS):
     """Прибыль % той же связки на другие суммы круга: пересобрать те же объявления стакана
-    (snap.groups) через _stack под каждую сумму. None для суммы, на которую не хватает глубины."""
+    (snap.groups) под каждую сумму — покупку через _stack, продажу под выход монеты (_match).
+    None для суммы, на которую не хватает глубины."""
     _, b, s, _ = deal
-    buy_ads = snap.groups.get((b.ex, "buy", b.asset), [])
-    sell_ads = snap.groups.get((s.ex, "sell", s.asset), [])
+    buy_ads = _same_net(snap.groups.get((b.ex, "buy", b.asset), []), b)
+    sell_ads = _same_net(snap.groups.get((s.ex, "sell", s.asset), []), s)
     out = {}
     for amount in amounts:
-        bb, ss = _stack(buy_ads, amount), _stack(sell_ads, amount)
-        if not bb or not ss:
-            out[amount] = None
-            continue
-        r = _route(bb, ss, dataclasses.replace(cfg, amount=amount), snap.spot, snap.over_banks)
-        out[amount] = r[0] if r else None
+        bb = _stack(buy_ads, amount)
+        d = _match(bb, sell_ads, dataclasses.replace(cfg, amount=amount), snap.spot, snap.over_banks) if bb else None
+        out[amount] = d[0] if d else None
     return out
 
 

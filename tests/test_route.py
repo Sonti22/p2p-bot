@@ -192,6 +192,171 @@ def test_stack_returns_none_when_depth_insufficient():
     assert p2p._stack(ads, 50000) is None
 
 
+def test_stack_keeps_net_only_when_all_ads_share_it():
+    trc = [make_ad("BestChange", "sell", 89.9, net="TRC20", max_amt=25000, avail=25000 / 89.9),
+           make_ad("BestChange", "sell", 89.7, net="TRC20", max_amt=25000, avail=25000 / 89.7)]
+    assert p2p._stack(trc, 50000).net == "TRC20"
+    mixed = [trc[0], make_ad("BestChange", "sell", 89.8, net="ERC20", max_amt=25000, avail=25000 / 89.8)]
+    assert p2p._stack(mixed, 50000).net == ""
+
+
+def _exchangers(*nets):
+    """Обменники BestChange на продажу по 25 000 ₽ каждый — в указанных сетях, цены по убыванию."""
+    return [make_ad("BestChange", "sell", 89.9 - i * 0.1, net=n, min_amt=500, max_amt=25000,
+                    avail=25000 / (89.9 - i * 0.1)) for i, n in enumerate(nets)]
+
+
+def test_scan_stacks_exchangers_per_network(offline, monkeypatch):
+    nets = ["TRC20", "ERC20"]
+
+    async def mexc(s, cfg, side, asset):
+        return [make_ad("MEXC", "buy", 88.0)] if side == "buy" else []
+
+    async def bc(s, cfg, side, asset):
+        return _exchangers(*nets) if side == "sell" else []
+
+    monkeypatch.setitem(p2p.FETCHERS, "fakemexc", mexc)
+    monkeypatch.setitem(p2p.FETCHERS, "bestchange", bc)
+    c = cfg(exchanges=["fakemexc", "bestchange"], assets=["USDT"], min_orders=0, min_rate=0)
+    assert not asyncio.run(p2p.scan(None, c)).deals   # 25 000 в TRC20 + 25 000 в ERC20 — ни одна сеть не покрывает круг
+    nets += ["TRC20", "TRC20"]
+    snap = asyncio.run(p2p.scan(None, c))
+    profit, b, s, route = snap.deals[0]
+    assert s.net == "TRC20" and "объявл." in s.nick
+    assert "перевод −1 USDT (TRC20) на BestChange" in route and "BEP20" not in route
+
+
+def test_scan_keeps_one_deal_per_venue_pair(offline, monkeypatch):
+    def fetcher(buys=(), sells=()):
+        async def f(s, cfg, side, asset):
+            return list(buys if side == "buy" else sells)
+        return f
+
+    # один курс обменника в четырёх сетях — это одна пара площадок; дубли не должны занять топ-3
+    bc = [make_ad("BestChange", "sell", 90.0, net=n, min_amt=500, max_amt=200_000, avail=5000)
+          for n in ("TRC20", "BEP20", "TON", "ERC20")]
+    monkeypatch.setitem(p2p.FETCHERS, "fakemexc", fetcher(buys=[make_ad("MEXC", "buy", 88.0)]))
+    monkeypatch.setitem(p2p.FETCHERS, "bestchange", fetcher(sells=bc))
+    monkeypatch.setitem(p2p.FETCHERS, "fakebybit", fetcher(sells=[make_ad("Bybit", "sell", 89.7)]))
+    monkeypatch.setitem(p2p.FETCHERS, "fakehtx", fetcher(sells=[make_ad("HTX", "sell", 89.6)]))
+    c = cfg(exchanges=["fakemexc", "bestchange", "fakebybit", "fakehtx"], assets=["USDT"], min_orders=0, min_rate=0)
+    snap = asyncio.run(p2p.scan(None, c))
+    keys = [(b.ex, b.asset, s.ex, s.asset) for _, b, s, _ in snap.deals]
+    assert len(keys) == len(set(keys)) == 3
+    assert {k[2] for k in keys[:3]} == {"BestChange", "Bybit", "HTX"}
+    profit, _, s, route = next(d for d in snap.deals if d[2].ex == "BestChange")
+    assert s.net == "BEP20" and "(BEP20)" in route   # из сетей обменника — лучшая: вывод MEXC в BEP20 дешевле всех
+    assert profit == pytest.approx(((50000 / 88 - 0.01) * 90 / 50000 - 1) * 100)
+
+
+def test_deal_amounts_respects_exchanger_network():
+    ads = _exchangers("TRC20", "ERC20", "TRC20")
+    buy_ads = [make_ad("MEXC", "buy", 88.0)]
+    snap = p2p.Snapshot(88.0, "t", {}, {}, [], {}, {}, {}, spot=SPOT,
+                        groups={("MEXC", "buy", "USDT"): buy_ads, ("BestChange", "sell", "USDT"): ads})
+    deal = (2.0, buy_ads[0], p2p._stack([ads[0], ads[2]], 50000), "перевод −1 USDT (TRC20) на BestChange")
+    out = p2p.deal_amounts(deal, cfg(), snap, amounts=(40_000, 75_000))
+    assert out[75_000] is None   # 75 000 набирается только вместе с ERC20
+    qty = 40000 / 88 - 1.0    # вывод TRC20 −1 USDT
+    first = 25000 / 89.9      # TRC20 89.9 целиком, остаток — в TRC20 89.7; ERC20 89.8 пропущен
+    assert out[40_000] == pytest.approx(((first * 89.9 + (qty - first) * 89.7) / 40000 - 1) * 100)
+
+
+def test_stack_qty_combines_ads_by_quantity():
+    ads = [make_ad("MEXC", "sell", 102.0, max_amt=30_600, avail=10_000),   # лимит 30 600 ₽ = 300 USDT
+           make_ad("MEXC", "sell", 101.0, max_amt=500_000, avail=10_000)]
+    stacked = p2p._stack_qty(ads, 500.0)
+    assert stacked.avail == pytest.approx(500.0) and stacked.nick == "2 объявл."
+    assert stacked.price == pytest.approx((300 * 102.0 + 200 * 101.0) / 500)
+    assert stacked.min_amt == pytest.approx(300 * 102.0 + 200 * 101.0)   # выручка в фиате
+
+
+def test_stack_qty_none_when_depth_short():
+    ads = [make_ad("MEXC", "sell", 102.0, max_amt=50_000, avail=10_000),
+           make_ad("MEXC", "sell", 101.0, max_amt=500_000, avail=5.0)]
+    assert p2p._stack_qty(ads, 500.0) is None   # 50 000 / 102 + 5 = 495.2 USDT < 500
+    assert p2p._stack_qty(ads, 0.0) is None and p2p._stack_qty([], 1.0) is None
+
+
+def test_stack_qty_skips_ad_below_min():
+    ads = [make_ad("MEXC", "sell", 102.0, max_amt=500_000, avail=450.0),
+           make_ad("MEXC", "sell", 101.0, min_amt=10_000, avail=10_000),   # остаток 50 USDT = 5 050 ₽ < минимума
+           make_ad("MEXC", "sell", 100.0, avail=10_000)]
+    stacked = p2p._stack_qty(ads, 500.0)
+    assert stacked.price == pytest.approx((450 * 102.0 + 50 * 100.0) / 500)
+
+
+def test_route_uses_sell_depth_for_actual_output():
+    b = make_ad("MEXC", "buy", 100.0)
+    tight = [make_ad("MEXC", "sell", 102.0, max_amt=50_000, avail=50_000 / 102.0)]   # на выходе 500 USDT, примут 490.2
+    assert p2p._match(b, tight, cfg(), SPOT) is None
+    wide = [make_ad("MEXC", "sell", 102.0, max_amt=51_000, avail=500.0)]
+    profit, _, s, route = p2p._match(b, wide, cfg(), SPOT)
+    assert profit == pytest.approx(2.0) and s.avail == pytest.approx(500.0) and route == "внутри биржи"
+
+
+def test_match_cross_asset_limits_sell_in_coin():
+    b = make_ad("MEXC", "buy", 88.0)
+    qty = 50000 / 88 / 2500.0 * (1 - 0.001)   # ETH на выходе после спота на MEXC
+    one = [make_ad("MEXC", "sell", 245000.0, asset="ETH", max_amt=50_000)]   # примет 50 000 / 245 000 = 0.204 ETH
+    assert p2p._match(b, one, cfg(), SPOT) is None
+    two = one + [make_ad("MEXC", "sell", 244000.0, asset="ETH")]
+    profit, _, s, route = p2p._match(b, two, cfg(), SPOT)
+    first = 50_000 / 245000.0
+    assert s.asset == "ETH" and "спот USDT→ETH на MEXC" in route
+    assert profit == pytest.approx(((first * 245000.0 + (qty - first) * 244000.0) / 50000 - 1) * 100)
+
+
+def test_match_checks_sell_depth_before_risk_buffer():
+    c = cfg(risk_buffer={"ETH": 0.5})
+    b = make_ad("MEXC", "buy", 200_000.0, asset="ETH", avail=100)
+    real = 50_000 / 200_000.0                  # 0.25 ETH физически на выходе
+    short = [make_ad("MEXC", "sell", 204_000.0, asset="ETH", avail=real * (1 - 0.5 / 100))]
+    assert p2p._match(b, short, c, SPOT) is None   # стакан примет только 0.24875 — 0.5% монеты не продать
+    full = [make_ad("MEXC", "sell", 204_000.0, asset="ETH", avail=real)]
+    profit, _, s, route = p2p._match(b, full, c, SPOT)
+    assert s.avail == pytest.approx(real) and "запас на курс −0.5%" in route
+    assert profit == pytest.approx((real * (1 - 0.5 / 100) * 204_000.0 / 50_000 - 1) * 100)   # запас — в оценке прибыли
+
+
+def _fake_sell_scan(monkeypatch, sell_ads):
+    async def fake_fetcher(s, cfg, side, asset):
+        return [make_ad("Fake", "buy", 87.0)] if side == "buy" else sell_ads
+
+    monkeypatch.setitem(p2p.FETCHERS, "fake", fake_fetcher)
+    c = p2p.Config(exchanges=["fake"], assets=["USDT"], min_orders=0, min_rate=0)
+    return asyncio.run(p2p.scan(None, c))
+
+
+def test_scan_drops_deal_when_sell_depth_below_output_qty(offline, monkeypatch):
+    # ориентир Rapira 88.15: покупка 87.0 и продажа 88.74 (+2%) в пределах отсева аномалий
+    snap = _fake_sell_scan(monkeypatch, [make_ad("Fake", "sell", 88.74, max_amt=50_000, avail=50_000 / 88.74)])
+    assert not snap.deals   # на выходе 574.7 USDT, а объявление примет только 563.4
+    snap = _fake_sell_scan(monkeypatch, [make_ad("Fake", "sell", 88.74, max_amt=52_000, avail=575.0)])
+    assert snap.deals and snap.deals[0][0] == pytest.approx((88.74 / 87.0 - 1) * 100)
+
+
+def test_scan_sell_side_weighted_by_output_quantity(offline, monkeypatch):
+    sells = [make_ad("Fake", "sell", 88.74, max_amt=300 * 88.74, avail=10_000),   # только 300 USDT
+             make_ad("Fake", "sell", 88.0, avail=10_000)]
+    snap = _fake_sell_scan(monkeypatch, sells)
+    profit, _, s, _ = snap.deals[0]
+    qty = 50000 / 87.0
+    assert s.avail == pytest.approx(qty)
+    assert profit == pytest.approx(((300 * 88.74 + (qty - 300) * 88.0) / 50000 - 1) * 100)
+
+
+def test_deal_amounts_none_when_sell_depth_short():
+    buy_ads = [make_ad("MEXC", "buy", 85.0)]
+    sell_ads = [make_ad("MEXC", "sell", 90.0, max_amt=50_000, avail=10_000)]
+    snap = p2p.Snapshot(88.0, "t", {}, {}, [], {}, {}, {}, spot=SPOT,
+                        groups={("MEXC", "buy", "USDT"): buy_ads, ("MEXC", "sell", "USDT"): sell_ads})
+    deal = (5.88, buy_ads[0], sell_ads[0], "внутри биржи")
+    out = p2p.deal_amounts(deal, cfg(), snap, amounts=(10_000, 50_000))
+    assert out[10_000] == pytest.approx((90.0 / 85.0 - 1) * 100)
+    assert out[50_000] is None   # на выходе 588 USDT = 52 941 ₽, а лимит продажи 50 000 ₽
+
+
 def test_scan_combines_depth_across_ads_to_form_deal(offline, monkeypatch):
     async def fake_fetcher(s, cfg, side, asset):
         if side == "buy":
