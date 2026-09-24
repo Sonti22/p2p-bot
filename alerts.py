@@ -110,13 +110,27 @@ def _matching_deal(snap, ad, side, asset):
     return None
 
 
+def _candidate_ok(snap, cfg, ad, side, asset, rate, min_volume, require_reliable):
+    """Все условия «И» для одной площадки: цена не хуже порога, объём стакана, надёжность встречной связки."""
+    if not (ad.price >= rate if side == "sell" else ad.price <= rate):
+        return False
+    if min_volume and not _volume_ok(snap, ad, side, asset, rate, min_volume):
+        return False
+    if require_reliable:
+        deal = _matching_deal(snap, ad, side, asset)
+        if deal is None or p2p.reliability(deal, cfg, snap)[0] == p2p.TRAP:
+            return False
+    return True
+
+
 def due(snap, cfg, path=DB_PATH, now=None):
     """Сработавшие алерты по текущему снимку: [(id, chat_id, asset, side, rate, price, Ad), ...].
     Цена берётся из snap.best (объявления уже прошли фильтры usable() — мин. сделок/отзывов, отсев
     аномалий, блэклист). Сами алерты здесь не меняются: после доставки сообщения бот вызывает
     mark_fired — одноразовый удаляется, у «повторно» начинается кулдаун; не доставили — алерт сработает
     снова на следующем скане. Истёкшие (expires_ts) удаляются в любом режиме. min_volume/require_reliable —
-    дополнительные условия через «И» (см. модульный docstring), проверяются только когда цена уже подошла."""
+    дополнительные условия через «И» (см. модульный docstring): все условия проверяются на каждой площадке,
+    срабатывает лучшая по цене из прошедших."""
     now = time.time() if now is None else now
     if not os.path.exists(path):
         return []
@@ -129,22 +143,18 @@ def due(snap, cfg, path=DB_PATH, now=None):
     for alert_id, chat_id, asset, side, rate, cooldown, last_fired, min_volume, require_reliable in rows:
         if cooldown is not None and last_fired is not None and now - last_fired < cooldown:
             continue   # алерт «повторно» ещё «отдыхает» после прошлого срабатывания
-        best_ad, best_price = None, None
+        # сначала отбираем площадки, прошедшие все условия, потом лучшую по цене среди них —
+        # иначе лучшая по цене, но без объёма/надёжности, заслоняет подходящую вторую
+        best_ad = None
         for (ex, ad_side, ad_asset), ad in snap.best.items():
             if ad_side != side or ad_asset != asset:
                 continue
-            if best_price is None or (ad.price > best_price if side == "sell" else ad.price < best_price):
-                best_price, best_ad = ad.price, ad
-        if best_ad is None:
-            continue
-        ok = best_price >= rate if side == "sell" else best_price <= rate
-        if ok and min_volume:
-            ok = _volume_ok(snap, best_ad, side, asset, rate, min_volume)
-        if ok and require_reliable:
-            deal = _matching_deal(snap, best_ad, side, asset)
-            ok = deal is not None and p2p.reliability(deal, cfg, snap)[0] != p2p.TRAP
-        if ok:
-            fired.append((alert_id, chat_id, asset, side, rate, best_price, best_ad))
+            if not _candidate_ok(snap, cfg, ad, side, asset, rate, min_volume, require_reliable):
+                continue
+            if best_ad is None or (ad.price > best_ad.price if side == "sell" else ad.price < best_ad.price):
+                best_ad = ad
+        if best_ad is not None:
+            fired.append((alert_id, chat_id, asset, side, rate, best_ad.price, best_ad))
     con.close()
     return fired
 
