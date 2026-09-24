@@ -8,6 +8,7 @@ import time
 
 import aiohttp
 
+import trades
 from cards import deal_card, top_chart
 from p2p import ENV_PATH, Config, _money, fmt_deal, fmt_top, load_env, scan, spot_url, venue_url
 
@@ -19,6 +20,7 @@ BUTTONS = {"🔥 Лучшая сейчас": "/best", "📊 Топ связок"
            "🛠 Разработка": "/dev", "❓ Как работать": "/help"}
 COMMANDS = [{"command": "best", "description": "Лучшая связка сейчас"},
             {"command": "top", "description": "Топ связок графиком"},
+            {"command": "stats", "description": "Журнал сделок: день/неделя/месяц"},
             {"command": "settings", "description": "Порог, сумма, пауза"},
             {"command": "dev", "description": "Как развивается бот: версия, изменения, план"},
             {"command": "help", "description": "Как работать с сигналами"}]
@@ -71,7 +73,7 @@ def save_env(key, value, path=ENV_PATH):
         f.write("\n".join(lines) + "\n")
 
 
-def deal_markup(d):
+def deal_markup(d, deal_id=None):
     _, b, s, route = d
     row = [{"text": f"{label} · {ad.ex}", "url": venue_url(ad)}
            for ad, label in ((b, "🟢 Купить"), (s, "🔴 Продать")) if venue_url(ad)]
@@ -79,6 +81,8 @@ def deal_markup(d):
     m = re.search(r"спот (\w+)→(\w+) на (\w+)", route)
     if m and spot_url(route):
         rows.append([{"text": f"🔁 Спот {m.group(1)}→{m.group(2)} · {m.group(3)}", "url": spot_url(route)}])
+    if deal_id is not None:
+        rows.append([{"text": "✅ Сделал", "callback_data": f"did:{deal_id}"}])
     rows.append([{"text": "📊 Все связки", "callback_data": "top"}, {"text": "🔄 Обновить", "callback_data": "best"}])
     return {"inline_keyboard": rows}
 
@@ -141,6 +145,8 @@ class Bot:
         self.paused = False
         self.sent = {}
         self.venue = {}   # ex -> {"streak": сканов подряд с ошибкой, "down_since": ts, "alerted_at": ts}
+        self.deals_by_id = {}   # id -> (d, сумма круга) для кнопки «✅ Сделал»; не переживает рестарт
+        self.next_deal_id = 1
 
     async def call(self, method, **params):
         async with self.s.post(f"https://api.telegram.org/bot{self.token}/{method}", json=params,
@@ -177,8 +183,43 @@ class Bot:
                 print("card error:", e)
         await self.send(caption, markup=markup)
 
+    def remember_deal(self, d):
+        """Запомнить связку под кнопкой «✅ Сделал»; хранится ограниченное число последних."""
+        deal_id, self.next_deal_id = self.next_deal_id, self.next_deal_id + 1
+        self.deals_by_id[deal_id] = (d, self.cfg.amount)
+        if len(self.deals_by_id) > 200:
+            del self.deals_by_id[min(self.deals_by_id)]
+        return deal_id
+
     async def send_deal(self, d, prefix=""):
-        await self.photo_or_text(lambda: deal_card(d, self.cfg), prefix + fmt_deal(d, self.cfg), deal_markup(d))
+        deal_id = self.remember_deal(d)
+        await self.photo_or_text(lambda: deal_card(d, self.cfg), prefix + fmt_deal(d, self.cfg), deal_markup(d, deal_id))
+
+    async def mark_done(self, cq, deal_id):
+        """Кнопка «✅ Сделал»: записать сделку в журнал (data/trades.db) и убрать кнопку."""
+        entry = self.deals_by_id.pop(deal_id, None)
+        if not entry:
+            await self.call("answerCallbackQuery", callback_query_id=cq["id"], text="Сигнал устарел, не записан")
+            return
+        d, amount = entry
+        trades.log_trade(d, amount)
+        await self.call("answerCallbackQuery", callback_query_id=cq["id"], text="Записано в журнал ✅")
+        await self.call("editMessageReplyMarkup", chat_id=self.chat_id, message_id=cq["message"]["message_id"],
+                        reply_markup=deal_markup(d))
+
+    def stats_view(self):
+        st = trades.stats()
+        labels = (("day", "За сегодня"), ("week", "За неделю"), ("month", "За месяц"))
+        lines = ["📒 <b>Журнал сделок</b>", ""]
+        for key, label in labels:
+            s = st[key]
+            if s["count"]:
+                lines.append(f"{label}: {s['count']} сделок, оборот {_money(s['amount'])} ₽, "
+                             f"средний профит {s['avg_profit']:+.2f}%")
+            else:
+                lines.append(f"{label}: сделок нет")
+        lines.append("\nОтмечай связку кнопкой «✅ Сделал» под сигналом — так она попадёт в журнал.")
+        return "\n".join(lines)
 
     async def show_best(self):
         if not self.last:
@@ -335,6 +376,8 @@ class Bot:
         elif data == "dev":
             text, kb = dev_view()
             await self.send(text, markup=kb)
+        elif data.startswith("did:"):
+            await self.mark_done(cq, int(data[4:]))
 
     async def handle(self, text):
         cmd, _, arg = BUTTONS.get(text, text).partition(" ")
@@ -345,6 +388,8 @@ class Bot:
             await self.show_best()
         elif cmd == "/top":
             await self.show_top()
+        elif cmd == "/stats":
+            await self.send(self.stats_view())
         elif cmd == "/settings":
             text, kb = self.settings_view()
             await self.send(text, markup=kb)
