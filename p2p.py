@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 
 import aiohttp
 
+import fees
 import netstatus
 
 import blacklist
@@ -35,13 +36,7 @@ DEFAULT_ASSETS = "USDT,USDC,BTC,ETH,TON"
 DEFAULT_FEES = "USDT:1,USDC:1,BTC:0.0002,ETH:0.001,TON:0.05"   # комиссия вывода по умолчанию, в единицах монеты
 # Комиссии вывода по биржам и сетям, в монете (агрегаторы Yieldo 31.07.2026 и ChainCost 01.2026 — сверять на бирже).
 # Для бирж не из таблицы берётся DEFAULT_FEES/TRANSFER_FEES.
-WITHDRAW = {
-    ("Bybit", "USDT"): {"TRC20": 1.0, "BEP20": 0.2, "ERC20": 0.8},
-    ("MEXC", "USDT"): {"TRC20": 1.0, "BEP20": 0.01, "TON": 0.023, "ERC20": 0.44},
-    ("MEXC", "USDC"): {"BEP20": 0.0},
-    ("Bybit", "ETH"): {"ERC20": 0.001},
-    ("MEXC", "ETH"): {"ERC20": 0.00003},
-}
+WITHDRAW = fees.table()   # fees.json: биржа → монета → сеть → комиссия; /fees показывает таблицу и возраст данных
 # Сети, которые точно принимает площадка-получатель (не подтверждено иное — только TRC20). Нет в списке — любые.
 RECEIVE_NETS = {"BitPapa": ("TRC20",)}
 SPOT_VENUES = ("Bybit", "MEXC", "HTX", "KuCoin")   # порядок = приоритет ориентира и спота, если монета лежит не на бирже
