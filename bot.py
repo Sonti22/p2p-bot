@@ -247,6 +247,13 @@ def plain_markup(markup):
     return {"inline_keyboard": rows}
 
 
+def delivery_final(r):
+    """Ответ Telegram закрывает отправку сигнала/алерта: доставлено или отказ, который повтор не исправит
+    (400 — чат/топик не найден, разметка; 403 — бот заблокирован). 429, 5xx и сбой сети — повторим на
+    следующем скане."""
+    return bool(r.get("ok")) or r.get("error_code") in (400, 403)
+
+
 def is_fancy(markup):
     return any("style" in b or "copy_text" in b for row in (markup or {}).get("inline_keyboard", []) for b in row)
 
@@ -880,7 +887,7 @@ class Bot:
         try:
             r = await self.call("deleteMessage", chat_id=self.chat_id, message_id=message_id)
         except Exception as e:
-            logger.warning("deleteMessage error: %s", e)
+            logger.warning("deleteMessage error: %s", accounts.api_error_text(e))   # без URL с токеном бота
             return False
         if not r.get("ok"):
             logger.warning("deleteMessage %s: %s", message_id, r.get("description"))
@@ -1061,12 +1068,12 @@ class Bot:
                 r = await self.send(f"🔔 <b>Алерт сработал:</b> {asset} можно {label} по {_price(price)} ₽ "
                                     f"({cmp}{rate:g}) — {fmt_ad(ad)}", chat_id=chat_id, topic="signals")
             except Exception as e:   # сеть/таймаут: остальные алерты этого скана тоже не дойдут
-                logger.warning("alert send error: %s", e)
+                logger.warning("alert send error: %s", accounts.api_error_text(e))   # без URL с токеном бота
                 break
-            if r.get("ok"):
-                alerts.mark_fired(alert_id)
-            else:
+            if not r.get("ok"):
                 logger.warning("alert not sent: %s", r.get("description"))
+            if delivery_final(r):
+                alerts.mark_fired(alert_id)
 
     def stats_view(self):
         st = trades.stats()
@@ -1535,10 +1542,11 @@ class Bot:
             try:
                 r = await self.send_deal(d, "🔔 " + self.held_label(d, now), snap=snap, topic="signals")
             except Exception as e:   # сеть/таймаут: остальные связки этого скана тоже не дойдут
-                logger.warning("signal send error: %s", e)
+                logger.warning("signal send error: %s", accounts.api_error_text(e))   # без URL с токеном бота
                 break
             if not r.get("ok"):
                 logger.warning("signal not sent: %s", r.get("description"))
+            if not delivery_final(r):
                 continue
             self.sent[key] = (now, profit)
             # гостям — та же карточка, без кнопок журнала и без «живого» обновления; только после доставки
@@ -1612,7 +1620,9 @@ class Bot:
                 for it in hist:
                     if hist_key(it) not in seen:
                         await self.send(hist_text(ex, it), topic="journal")
-            self.acc_seen[ex] = {hist_key(it) for it in hist}
+            # объединяем, а не заменяем: если один источник сейчас не ответил, его записи из прошлых опросов
+            # не должны после восстановления прийти как новые
+            self.acc_seen[ex] = (seen or set()) | {hist_key(it) for it in hist}
 
     async def accounts_loop(self):
         while True:
@@ -1791,7 +1801,10 @@ class Bot:
             return
         mid = cq["message"]["message_id"]
         if data.startswith("onb_amt:") and ob["step"] == "amount":
-            self.cfg.amount = float(data[len("onb_amt:"):])
+            amount = parse_amount(data[len("onb_amt:"):])   # callback_data можно подделать — как в apply
+            if amount is None:
+                return
+            self.cfg.amount = amount
             save_env("AMOUNT", f"{self.cfg.amount:.0f}")
             ob["step"] = "banks"
             text, kb = onboarding_banks_view(ob["banks"])
@@ -1811,7 +1824,10 @@ class Bot:
             await self.call("editMessageText", chat_id=self.chat_id, message_id=mid,
                             text=text, parse_mode="HTML", reply_markup=kb)
         elif data.startswith("onb_min:") and ob["step"] == "min":
-            self.cfg.min_profit = float(data[len("onb_min:"):])
+            v = parse_min_profit(data[len("onb_min:"):])
+            if v is None:
+                return
+            self.cfg.min_profit = v
             save_env("MIN_PROFIT", f"{self.cfg.min_profit:g}")
             self.onboarding = None
             await self.call("editMessageText", chat_id=self.chat_id, message_id=mid, parse_mode="HTML",

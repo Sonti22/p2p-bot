@@ -645,16 +645,20 @@ def test_check_alerts_sends_message(monkeypatch):
 
 
 class Flaky(Stub):
-    """Telegram не принимает сообщения, пока fail задан: «raise» — сбой сети, иначе ответ ok=False (429)."""
+    """Telegram не принимает сообщения, пока fail задан: «raise» — сбой сети, число — ответ ok=False с этим
+    error_code, иначе ok=False (429). Попытки отправки — в self.tries."""
     def __init__(self, cfg, fail="raise"):
         super().__init__(cfg)
         self.fail = fail
+        self.tries = 0
         self.fancy = False   # без разового повтора с обычными кнопками (_fancy_failed)
 
     def _failure(self):
+        self.tries += 1
         if self.fail == "raise":
             raise aiohttp.ClientConnectionError("telegram down")
-        return {"ok": False, "error_code": 429, "description": "Too Many Requests"}
+        code = self.fail if isinstance(self.fail, int) else 429
+        return {"ok": False, "error_code": code, "description": f"error {code}"}
 
     async def call(self, method, **p):
         if self.fail and method == "sendMessage":
@@ -688,6 +692,55 @@ def test_notify_not_marked_sent_when_not_ok(monkeypatch):
     bot.fail = None
     asyncio.run(bot.notify(snap([deal(5)])))
     assert len(photos(bot)) == 1 and len(bot.sent) == 1
+
+
+def test_notify_permanent_refusal_consumes_signal(monkeypatch):
+    """400/403 повтор не исправит: связка считается отправленной и не долбит Telegram каждый скан."""
+    monkeypatch.setattr(B, "deal_card", lambda d, c, a=None, r=None, breakdown=None: b"png")
+    for code in (400, 403):
+        bot = Flaky(p2p.Config(min_profit=2.0), fail=code)
+        bot.live_scans = 1
+        asyncio.run(bot.notify(snap([deal(5)])))
+        tries = bot.tries
+        assert tries and bot._deal_key(deal(5)) in bot.sent, code
+        asyncio.run(bot.notify(snap([deal(5)])))
+        assert bot.tries == tries, code
+
+
+def test_notify_rate_limit_retries_next_scan(monkeypatch):
+    monkeypatch.setattr(B, "deal_card", lambda d, c, a=None, r=None, breakdown=None: b"png")
+    bot = Flaky(p2p.Config(min_profit=2.0), fail=429)
+    bot.live_scans = 1
+    asyncio.run(bot.notify(snap([deal(5)])))
+    tries = bot.tries
+    asyncio.run(bot.notify(snap([deal(5)])))
+    assert bot.sent == {} and bot.tries > tries
+
+
+def test_telegram_send_errors_logged_without_bot_token(monkeypatch, caplog):
+    """str() ошибки aiohttp содержит URL запроса, а в нём токен бота — в лог только код и причина."""
+    url = URL("https://api.telegram.org/bot123456:TEST-BOT-TOKEN/sendMessage")
+    err = aiohttp.ClientResponseError(aiohttp.RequestInfo(url, "POST", CIMultiDictProxy(CIMultiDict()), url), (),
+                                      status=502, message="Bad Gateway")
+    monkeypatch.setattr(B, "deal_card", lambda d, c, a=None, r=None, breakdown=None: b"png")
+    ad = make_ad("MEXC", "sell", 93.0)
+    monkeypatch.setattr(B.alerts, "due", lambda snap, cfg: [(1, "1", "USDT", "sell", 92.0, 93.0, ad)])
+    bot = Stub(p2p.Config(min_profit=2.0))
+    bot.live_scans, bot.fancy = 1, False
+
+    async def call(method, **p):
+        raise err
+
+    async def send_photo(png, caption, markup=None):
+        return {"ok": False, "description": "no photo"}
+
+    bot.call, bot.send_photo = call, send_photo
+    caplog.set_level(logging.WARNING)
+    assert asyncio.run(bot.delete_message(5)) is False
+    asyncio.run(bot.notify(snap([deal(5)])))
+    asyncio.run(bot.check_alerts(snap([])))
+    assert caplog.text.count("HTTP 502") == 3
+    assert "TEST-BOT-TOKEN" not in caplog.text
 
 
 def _alerts_db(tmp_path, monkeypatch):
@@ -725,6 +778,19 @@ def test_check_alerts_marks_only_delivered(tmp_path, monkeypatch):
     asyncio.run(bot.check_alerts(s))
     assert len(texts(bot)) == 2
     assert len(B.alerts.list_all("2")) == 1 and B.alerts.list_all("1") == []
+
+
+def test_check_alerts_permanent_refusal_marks_fired(tmp_path, monkeypatch):
+    """429 — алерт ждёт следующего скана; 403 (бот заблокирован) — повтор не поможет, одноразовый израсходован."""
+    best = _alerts_db(tmp_path, monkeypatch)
+    B.alerts.add("1", "USDT", "sell", 92.0, time.time() + 86400)
+    s = p2p.Snapshot(88.0, "test", {}, best, [], {}, {}, {})
+    bot = Flaky(p2p.Config(), fail=429)
+    asyncio.run(bot.check_alerts(s))
+    assert len(B.alerts.list_all("1")) == 1
+    bot.fail = 403
+    asyncio.run(bot.check_alerts(s))
+    assert B.alerts.list_all("1") == []
 
 
 def test_mark_done_unknown_id_not_logged(monkeypatch):
@@ -1706,6 +1772,17 @@ def test_check_accounts_none_history_does_not_seed_baseline(tmp_path, monkeypatc
     assert bot.acc_seen.get("mexc") is None                   # ошибка — не первый опрос
     asyncio.run(bot.check_accounts())
     assert texts(bot) == [] and bot.acc_seen["mexc"] == {B.hist_key(dep)}
+
+
+def test_check_accounts_partial_failure_does_not_forget_items(tmp_path, monkeypatch):
+    """Источник депозитов на один опрос не ответил (в ленте только вывод): его записи не забываем —
+    после восстановления старый депозит не приходит как новый."""
+    dep = {"kind": "deposit", "asset": "USDT", "amount": 100.0, "ts": 1.0}
+    wd = {"kind": "withdraw", "asset": "USDT", "amount": 30.0, "ts": 2.0}
+    bot = _history_bot(tmp_path, monkeypatch, [[wd, dep], [wd], [wd, dep]])
+    for _ in range(3):
+        asyncio.run(bot.check_accounts())
+    assert texts(bot) == []
 
 
 def test_deal_markup_has_steps_button():

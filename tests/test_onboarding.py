@@ -67,6 +67,25 @@ def test_amount_step_saves_amount_and_advances_to_banks(tmp_path, monkeypatch):
     assert "Шаг 2/3" in edits(bot)[-1]["text"]
 
 
+def test_forged_onboarding_amount_and_min_are_ignored(tmp_path, monkeypatch):
+    """callback_data можно подделать: onb_amt:/onb_min: проверяются тем же парсером, что /amount и /min —
+    nan, ноль и минус не попадут ни в cfg, ни в .env, шаг не переключается."""
+    import functools
+    env = tmp_path / ".env"
+    env.write_text("", encoding="utf-8")
+    monkeypatch.setattr(B, "save_env", functools.partial(B.save_env, path=str(env)))
+    bot = Stub(p2p.Config(amount=50000, min_profit=1.0))
+    bot.onboarding = {"step": "amount", "banks": set()}
+    for data in ("onb_amt:nan", "onb_amt:0", "onb_amt:-5", "onb_amt:inf"):
+        asyncio.run(bot.on_callback(cb(data)))
+    assert bot.cfg.amount == 50000 and bot.onboarding["step"] == "amount"
+    bot.onboarding["step"] = "min"
+    for data in ("onb_min:nan", "onb_min:-5", "onb_min:1e308"):
+        asyncio.run(bot.on_callback(cb(data)))
+    assert bot.cfg.min_profit == 1.0 and bot.onboarding["step"] == "min"
+    assert env.read_text(encoding="utf-8") == ""
+
+
 def test_bank_toggle_marks_selected():
     bot = Stub(p2p.Config())
     bot.onboarding = {"step": "banks", "banks": set()}
