@@ -1,0 +1,21 @@
+{
+ "result": {
+  "list": [
+   {
+    "symbol": "USDCUSDT",
+    "bid1Price": "1.0001",
+    "ask1Price": "1.0002"
+   },
+   {
+    "symbol": "BTCUSDT",
+    "bid1Price": "83327.5",
+    "ask1Price": "83327.6"
+   },
+   {
+    "symbol": "ETHUSDT",
+    "bid1Price": "2640.19",
+    "ask1Price": "2640.2"
+   }
+  ]
+ }
+}

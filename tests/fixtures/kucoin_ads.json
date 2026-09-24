@@ -1,0 +1,191 @@
+{
+ "items": [
+  {
+   "floatPrice": "91",
+   "limitMinQuote": "20000",
+   "limitMaxQuote": "700000",
+   "currencyBalanceQuantity": "8000",
+   "adPayTypes": [
+    {
+     "id": "66c1e9e84c84a600014e5ed5",
+     "bankName": null,
+     "payTypeCode": "BANK",
+     "payQrcodePic": null,
+     "payTypeNumber": null,
+     "subBranch": null,
+     "reservedFields": null,
+     "payTypeNameEn": "BANK",
+     "color": "#00B47D"
+    },
+    {
+     "id": "697725f0a543c90001fcca79",
+     "bankName": null,
+     "payTypeCode": "BANK_TRANSFER",
+     "payQrcodePic": null,
+     "payTypeNumber": null,
+     "subBranch": null,
+     "reservedFields": null,
+     "payTypeNameEn": "Bank Transfer",
+     "color": "#00B47D"
+    },
+    {
+     "id": "697bde384fdee3000155ff48",
+     "bankName": null,
+     "payTypeCode": "OTHER",
+     "payQrcodePic": null,
+     "payTypeNumber": null,
+     "subBranch": null,
+     "reservedFields": "{\"payTypeName\":\"Любой ваш банк\"}",
+     "payTypeNameEn": "Other",
+     "color": "#00B47D"
+    }
+   ],
+   "nickName": "Dr.Crypto01",
+   "dealOrderNum": "6646",
+   "dealOrderRate": "99.31%"
+  },
+  {
+   "floatPrice": "91.01",
+   "limitMinQuote": "20000",
+   "limitMaxQuote": "650000",
+   "currencyBalanceQuantity": "5880.276131",
+   "adPayTypes": [
+    {
+     "id": "68ff9e128a145700016c7a57",
+     "bankName": null,
+     "payTypeCode": "BANK",
+     "payQrcodePic": null,
+     "payTypeNumber": null,
+     "subBranch": null,
+     "reservedFields": null,
+     "payTypeNameEn": "BANK",
+     "color": "#00B47D"
+    },
+    {
+     "id": "68ff9e3d8989770001e8d8dd",
+     "bankName": null,
+     "payTypeCode": "BANK_TRANSFER",
+     "payQrcodePic": null,
+     "payTypeNumber": null,
+     "subBranch": null,
+     "reservedFields": null,
+     "payTypeNameEn": "Bank Transfer",
+     "color": "#00B47D"
+    }
+   ],
+   "nickName": "Doveriai_usdt ",
+   "dealOrderNum": "1572",
+   "dealOrderRate": "99.30%"
+  },
+  {
+   "floatPrice": "91.03",
+   "limitMinQuote": "20000",
+   "limitMaxQuote": "999999",
+   "currencyBalanceQuantity": "8310.976449",
+   "adPayTypes": [
+    {
+     "id": "68a9c5698386840001564e72",
+     "bankName": null,
+     "payTypeCode": "BANK",
+     "payQrcodePic": null,
+     "payTypeNumber": null,
+     "subBranch": null,
+     "reservedFields": null,
+     "payTypeNameEn": "BANK",
+     "color": "#00B47D"
+    },
+    {
+     "id": "68ef540ee444e80001ec7182",
+     "bankName": null,
+     "payTypeCode": "BANK_TRANSFER",
+     "payQrcodePic": null,
+     "payTypeNumber": null,
+     "subBranch": null,
+     "reservedFields": null,
+     "payTypeNameEn": "Bank Transfer",
+     "color": "#00B47D"
+    },
+    {
+     "id": "69aa8702c71ea20001b88191",
+     "bankName": null,
+     "payTypeCode": "OTHER",
+     "payQrcodePic": null,
+     "payTypeNumber": null,
+     "subBranch": null,
+     "reservedFields": "{\"payTypeName\":\"Реквизиты в чате\"}",
+     "payTypeNameEn": "Other",
+     "color": "#00B47D"
+    },
+    {
+     "id": "69b99961c618de0001c7d729",
+     "bankName": null,
+     "payTypeCode": "MOBILE_TOP-UP",
+     "payQrcodePic": null,
+     "payTypeNumber": null,
+     "subBranch": null,
+     "reservedFields": null,
+     "payTypeNameEn": "Mobile Top-up",
+     "color": "#00B47D"
+    }
+   ],
+   "nickName": "Kleopatra_usdt",
+   "dealOrderNum": "3842",
+   "dealOrderRate": "99.30%"
+  },
+  {
+   "floatPrice": "91.16",
+   "limitMinQuote": "9000",
+   "limitMaxQuote": "215475",
+   "currencyBalanceQuantity": "874.259359",
+   "adPayTypes": [
+    {
+     "id": "649a87dd8f4ad80001f0b62a",
+     "bankName": null,
+     "payTypeCode": "BANK_TRANSFER",
+     "payQrcodePic": null,
+     "payTypeNumber": null,
+     "subBranch": null,
+     "reservedFields": null,
+     "payTypeNameEn": "Bank Transfer",
+     "color": "#00B47D"
+    },
+    {
+     "id": "660417a47dad0d0001cdee11",
+     "bankName": null,
+     "payTypeCode": "BANK",
+     "payQrcodePic": null,
+     "payTypeNumber": null,
+     "subBranch": null,
+     "reservedFields": null,
+     "payTypeNameEn": "BANK",
+     "color": "#00B47D"
+    },
+    {
+     "id": "69a9363ffda7960001102889",
+     "bankName": null,
+     "payTypeCode": "MOBILE_TOP-UP",
+     "payQrcodePic": null,
+     "payTypeNumber": null,
+     "subBranch": null,
+     "reservedFields": null,
+     "payTypeNameEn": "Mobile Top-up",
+     "color": "#00B47D"
+    },
+    {
+     "id": "69a936fb64cb6100014a2c5a",
+     "bankName": null,
+     "payTypeCode": "OTHER",
+     "payQrcodePic": null,
+     "payTypeNumber": null,
+     "subBranch": null,
+     "reservedFields": "{\"payTypeName\":\"сбп все банки \"}",
+     "payTypeNameEn": "Other",
+     "color": "#00B47D"
+    }
+   ],
+   "nickName": "Bulat16",
+   "dealOrderNum": "6005",
+   "dealOrderRate": "97.30%"
+  }
+ ]
+}

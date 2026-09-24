@@ -1,0 +1,261 @@
+{
+ "result": {
+  "paymentConfigVo": [
+   {
+    "paymentType": "14",
+    "checkType": 119,
+    "sort": 0,
+    "paymentName": "Bank Transfer",
+    "addTips": "Please note that cross-border transfers may be delayed; in addition, we kindly suggest you choosing an accurate bank to facilitate the transaction.",
+    "itemTips": "Please note that cross-border transfers may be delayed.",
+    "online": 0,
+    "items": [
+     {
+      "view": true,
+      "name": "realName",
+      "label": "Name",
+      "placeholder": "Please Enter Name",
+      "type": "text",
+      "maxLength": "150",
+      "required": true,
+      "loadType": ""
+     },
+     {
+      "view": true,
+      "name": "bankName",
+      "label": "Bank Name",
+      "placeholder": "Please Enter Bank Name",
+      "type": "text",
+      "maxLength": "150",
+      "required": true,
+      "loadType": ""
+     },
+     {
+      "view": true,
+      "name": "branchName",
+      "label": "Bank Branch",
+      "placeholder": "Please Enter Bank Branch",
+      "type": "text",
+      "maxLength": "50",
+      "required": false,
+      "loadType": ""
+     },
+     {
+      "view": true,
+      "name": "accountNo",
+      "label": "Card Number",
+      "placeholder": "Please Enter Account Number/Card No",
+      "type": "text",
+      "maxLength": "50",
+      "required": false,
+      "loadType": ""
+     },
+     {
+      "view": true,
+      "name": "mobile",
+      "label": "Mobile Number",
+      "placeholder": "Please enter your phone number",
+      "type": "number",
+      "maxLength": "20",
+      "required": false,
+      "loadType": ""
+     },
+     {
+      "view": true,
+      "name": "payMessage",
+      "label": "IBAN",
+      "placeholder": "Please enter your IBAN number",
+      "type": "text",
+      "maxLength": "35",
+      "required": false,
+      "loadType": ""
+     },
+     {
+      "view": true,
+      "name": "paymentExt1",
+      "label": "Payment Details",
+      "placeholder": "Please Enter Payment Details",
+      "type": "text",
+      "maxLength": "50",
+      "required": false,
+      "loadType": ""
+     },
+     {
+      "view": true,
+      "name": "qrcode",
+      "label": "QR code",
+      "placeholder": "Add QR Code",
+      "type": "image",
+      "maxLength": "450",
+      "required": false,
+      "loadType": ""
+     },
+     {
+      "view": true,
+      "name": "paymentExt2",
+      "label": "Bank Account Number",
+      "placeholder": "Please Enter Account Number",
+      "type": "text",
+      "maxLength": "50",
+      "required": false,
+      "loadType": ""
+     }
+    ],
+    "paymentAlias": "Bank Transfer",
+    "paymentExtInfo": {
+     "supportCurrencyIds": [],
+     "supportAllCurrency": true
+    },
+    "checkChannel": "NONE"
+   },
+   {
+    "paymentType": "18",
+    "checkType": 4,
+    "sort": 0,
+    "paymentName": "Cash Deposit to Bank",
+    "addTips": "",
+    "itemTips": "",
+    "online": 0,
+    "items": [
+     {
+      "view": true,
+      "name": "realName",
+      "label": "Name",
+      "placeholder": "Please Enter Name",
+      "type": "text",
+      "maxLength": "150",
+      "required": true,
+      "loadType": ""
+     },
+     {
+      "view": true,
+      "name": "accountNo",
+      "label": "Payment Details",
+      "placeholder": "Please Enter Payment Details",
+      "type": "text",
+      "maxLength": "100",
+      "required": true,
+      "loadType": ""
+     }
+    ],
+    "paymentAlias": "Cash Deposit to Bank",
+    "paymentExtInfo": {
+     "supportCurrencyIds": [],
+     "supportAllCurrency": true
+    },
+    "checkChannel": "NONE"
+   },
+   {
+    "paymentType": "90",
+    "checkType": 4,
+    "sort": 0,
+    "paymentName": "Cash in Person",
+    "addTips": "This payment method requires a face-to-face transaction offline. Choose other bank transfer payment methods to trade instantly.",
+    "itemTips": "This payment method requires a face-to-face transaction offline. Choose other bank transfer payment methods to trade instantly.",
+    "online": 0,
+    "items": [
+     {
+      "view": true,
+      "name": "realName",
+      "label": "Name",
+      "placeholder": "Please Enter Name",
+      "type": "text",
+      "maxLength": "150",
+      "required": true,
+      "loadType": ""
+     },
+     {
+      "view": true,
+      "name": "accountNo",
+      "label": "Payment Details",
+      "placeholder": "Please Enter Payment Details",
+      "type": "text",
+      "maxLength": "100",
+      "required": true,
+      "loadType": ""
+     }
+    ],
+    "paymentAlias": "Cash in Person",
+    "paymentExtInfo": {
+     "supportCurrencyIds": [],
+     "supportAllCurrency": true
+    },
+    "checkChannel": "NONE"
+   },
+   {
+    "paymentType": "40",
+    "checkType": 3,
+    "sort": 0,
+    "paymentName": "Mobile Top-up",
+    "addTips": "",
+    "itemTips": "",
+    "online": 0,
+    "items": [
+     {
+      "view": true,
+      "name": "realName",
+      "label": "Name",
+      "placeholder": "Please Enter Name",
+      "type": "text",
+      "maxLength": "150",
+      "required": true,
+      "loadType": ""
+     },
+     {
+      "view": true,
+      "name": "accountNo",
+      "label": "Bank Account Number",
+      "placeholder": "Please Enter Account Number",
+      "type": "text",
+      "maxLength": "150",
+      "required": true,
+      "loadType": ""
+     }
+    ],
+    "paymentAlias": "Mobile Top-up",
+    "paymentExtInfo": {
+     "supportCurrencyIds": [],
+     "supportAllCurrency": true
+    },
+    "checkChannel": "NONE"
+   },
+   {
+    "paymentType": "784",
+    "checkType": 166,
+    "sort": 0,
+    "paymentName": "PAY-API",
+    "addTips": "Merchants placing orders with payment links via API: Please follow the required steps",
+    "itemTips": "Third-party payments are strictly prohibited for this payment method.",
+    "online": 0,
+    "items": [
+     {
+      "view": true,
+      "name": "realName",
+      "label": "Name",
+      "placeholder": "Please Enter Name",
+      "type": "text",
+      "maxLength": "150",
+      "required": true,
+      "loadType": ""
+     },
+     {
+      "view": true,
+      "name": "accountNo",
+      "label": "Mobile Number",
+      "placeholder": "Please enter your phone number",
+      "type": "number",
+      "maxLength": "50",
+      "required": true,
+      "loadType": "MOBILE"
+     }
+    ],
+    "paymentAlias": "Sberpay",
+    "paymentExtInfo": {
+     "supportCurrencyIds": [],
+     "supportAllCurrency": true
+    },
+    "checkChannel": "NONE"
+   }
+  ]
+ }
+}

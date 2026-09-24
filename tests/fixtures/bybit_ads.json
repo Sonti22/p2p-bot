@@ -1,0 +1,59 @@
+{
+ "result": {
+  "items": [
+   {
+    "price": "84.50",
+    "minAmount": "50000.00",
+    "maxAmount": "75000.00",
+    "lastQuantity": "1994.0179",
+    "payments": [
+     "90"
+    ],
+    "nickName": "Bitoxovich",
+    "recentOrderNum": 2,
+    "recentExecuteRate": 100
+   },
+   {
+    "price": "84.84",
+    "minAmount": "50000.00",
+    "maxAmount": "50000.00",
+    "lastQuantity": "600",
+    "payments": [
+     "90"
+    ],
+    "nickName": "PLUG_ex",
+    "recentOrderNum": 141,
+    "recentExecuteRate": 100
+   },
+   {
+    "price": "85.00",
+    "minAmount": "1000.00",
+    "maxAmount": "90000.00",
+    "lastQuantity": "1847.0038",
+    "payments": [
+     "18",
+     "40",
+     "90",
+     "14"
+    ],
+    "nickName": "VaSa",
+    "recentOrderNum": 384,
+    "recentExecuteRate": 100
+   },
+   {
+    "price": "85.00",
+    "minAmount": "1000.00",
+    "maxAmount": "50000.00",
+    "lastQuantity": "2010.256",
+    "payments": [
+     "18",
+     "40",
+     "14"
+    ],
+    "nickName": "FuckGG",
+    "recentOrderNum": 261,
+    "recentExecuteRate": 100
+   }
+  ]
+ }
+}

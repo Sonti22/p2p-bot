@@ -1,0 +1,20 @@
+{
+ "data": [
+  {
+   "coinId": "128f589271cb4951b03e71e6323eb7be",
+   "coinName": "USDT"
+  },
+  {
+   "coinId": "febc9973be4d4d53bb374476239eb219",
+   "coinName": "BTC"
+  },
+  {
+   "coinId": "93c38b0169214f8689763ce9a63a73ff",
+   "coinName": "ETH"
+  },
+  {
+   "coinId": "34309140878b4ae99f195ac091d49bab",
+   "coinName": "USDC"
+  }
+ ]
+}

@@ -1,0 +1,76 @@
+import asyncio
+
+import pytest
+
+import p2p
+from helpers import make_ad
+
+SPOT = {"Bybit": {"USDT": (1.0, 1.0), "ETH": (2500.0, 2501.0), "USDC": (0.9999, 1.0)},
+        "MEXC": {"USDT": (1.0, 1.0), "ETH": (2499.0, 2500.0)}}
+
+
+def cfg(**kw):
+    c = p2p.Config()
+    c.risk_buffer, c.pay_fee = {}, 0.0
+    for k, v in kw.items():
+        setattr(c, k, v)
+    return c
+
+
+def test_same_venue_no_transfer():
+    profit, route = p2p._route(make_ad("MEXC", "buy", 88.0), make_ad("MEXC", "sell", 89.76), cfg(), SPOT)
+    assert route == "внутри биржи"
+    assert profit == pytest.approx((89.76 / 88 - 1) * 100)
+
+
+def test_transfer_uses_cheapest_network():
+    profit, route = p2p._route(make_ad("MEXC", "buy", 88.0), make_ad("Bybit", "sell", 90.0), cfg(), SPOT)
+    assert "BEP20" in route and "−0.01 USDT" in route
+    assert profit == pytest.approx(((50000 / 88 - 0.01) * 90 / 50000 - 1) * 100)
+
+
+def test_bitpapa_receives_only_trc20():
+    _, route = p2p._route(make_ad("MEXC", "buy", 88.0), make_ad("BitPapa", "sell", 94.0), cfg(), SPOT)
+    assert "TRC20" in route and "−1 USDT" in route
+
+
+def test_exchanger_network_is_respected():
+    _, route = p2p._route(make_ad("Bybit", "buy", 85.0), make_ad("BestChange", "sell", 89.9, net="ERC20"), cfg(), SPOT)
+    assert "ERC20" in route and "−0.8 USDT" in route
+
+
+def test_spot_on_buy_venue_and_risk_buffer():
+    b, s = make_ad("MEXC", "buy", 88.0), make_ad("MEXC", "sell", 245000.0, asset="ETH")
+    profit, route = p2p._route(b, s, cfg(risk_buffer={"ETH": 0.5}), SPOT)
+    assert "спот USDT→ETH на MEXC" in route and "перевод" not in route and "запас на курс −0.5%" in route
+    qty = 50000 / 88 / 2500.0 * (1 - 0.001) * (1 - 0.005)
+    assert profit == pytest.approx((qty * 245000 / 50000 - 1) * 100)
+
+
+def test_two_conversions_rejected():
+    b, s = make_ad("MEXC", "buy", 7_000_000, asset="BTC"), make_ad("MEXC", "sell", 245000, asset="ETH")
+    assert p2p._route(b, s, cfg(), SPOT) is None
+
+
+def test_pay_fee_applied():
+    profit, route = p2p._route(make_ad("MEXC", "buy", 88.0), make_ad("MEXC", "sell", 88.0), cfg(pay_fee=0.5), SPOT)
+    assert profit == pytest.approx(-0.5) and "банка" in route
+
+
+def test_usable_filters():
+    c = p2p.Config()
+    assert p2p.usable(make_ad(pays=("T-Bank",)), c)
+    assert not p2p.usable(make_ad(pays=("Mobile Top-up",)), c)
+    assert not p2p.usable(make_ad(pays=("реквизиты в чат",)), c)
+    assert not p2p.usable(make_ad(orders=10), c)
+    assert not p2p.usable(make_ad(min_amt=60000), c)
+    assert not p2p.usable(make_ad(avail=1), c)
+
+
+def test_scan_offline_keeps_prices_near_reference(offline):
+    c = p2p.Config(exchanges=["bybit", "htx", "kucoin", "mexc", "bitpapa"], assets=["USDT"], min_orders=0, min_rate=0)
+    snap = asyncio.run(p2p.scan(None, c))
+    assert snap.ref > 0 and not snap.errors
+    for a in snap.best.values():
+        assert abs(a.price / snap.ref - 1) * 100 <= c.max_dev
+    assert all(d[0] == max(x[0] for x in snap.deals) for d in snap.deals[:1])   # отсортировано по убыванию

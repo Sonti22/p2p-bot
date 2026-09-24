@@ -1,0 +1,64 @@
+{
+ "ads": [
+  {
+   "price": "85.85",
+   "limit_min": 85.07,
+   "limit_max": 85.07,
+   "limit_max_crypto": "0.990914",
+   "payment_method": {
+    "name": "Bank transfers"
+   },
+   "user": {
+    "user_name": "Doustencoins0",
+    "trades_count": 15,
+    "completed_trades_count": 15,
+    "is_suspicious": false
+   }
+  },
+  {
+   "price": "87.0",
+   "limit_min": 600.0,
+   "limit_max": 600.0,
+   "limit_max_crypto": "6.896552",
+   "payment_method": {
+    "name": "Bank transfers"
+   },
+   "user": {
+    "user_name": "KinglyCoigue",
+    "trades_count": 133,
+    "completed_trades_count": 133,
+    "is_suspicious": false
+   }
+  },
+  {
+   "price": "90.0",
+   "limit_min": 2000.0,
+   "limit_max": 6283.36,
+   "limit_max_crypto": "69.815111",
+   "payment_method": {
+    "name": "Bank transfers"
+   },
+   "user": {
+    "user_name": "TriuneHorst",
+    "trades_count": 28,
+    "completed_trades_count": 28,
+    "is_suspicious": false
+   }
+  },
+  {
+   "price": "92.1",
+   "limit_min": 20000.0,
+   "limit_max": 103485.75,
+   "limit_max_crypto": "1123.623779",
+   "payment_method": {
+    "name": "Bank transfers"
+   },
+   "user": {
+    "user_name": "TradeBridge",
+    "trades_count": 0,
+    "completed_trades_count": 0,
+    "is_suspicious": false
+   }
+  }
+ ]
+}

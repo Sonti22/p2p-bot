@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - run: pip install -r requirements.txt pytest
+      - run: python -m py_compile *.py scripts/*.py
+      - run: python -m pytest -q
+      - name: Guard (защищённые файлы, домены, опасные вызовы, секреты)
+        run: python scripts/guard.py origin/main
+
+  # Ветки облачного Claude: PR создаётся всегда, мерж — только если тесты и guard зелёные.
+  automerge:
+    needs: test
+    if: always() && startsWith(github.ref_name, 'claude/')
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      BRANCH: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: PR
+        run: |
+          if [ -z "$(gh pr list --head "$BRANCH" --state open --json number -q '.[].number')" ]; then
+            gh pr create --head "$BRANCH" --base main --title "$(git log -1 --pretty=%s)" \
+              --body "Автоулучшение по ROADMAP.md от облачного Claude."
+          fi
+      - name: Merge
+        if: needs.test.result == 'success'
+        run: gh pr merge "$BRANCH" --squash --delete-branch
+      - name: Нужна ручная проверка
+        if: needs.test.result != 'success'
+        run: gh pr comment "$BRANCH" --body "Тесты или guard не прошли — автомерж отключён, нужна ручная проверка."

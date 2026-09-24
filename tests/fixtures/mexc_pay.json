@@ -1,0 +1,108 @@
+{
+ "data": [
+  {
+   "id": 1,
+   "name": "Bank Account"
+  },
+  {
+   "id": 5,
+   "name": "Payeer"
+  },
+  {
+   "id": 6,
+   "name": "Volet"
+  },
+  {
+   "id": 12,
+   "name": "Sberbank"
+  },
+  {
+   "id": 13,
+   "name": "T-Bank"
+  },
+  {
+   "id": 14,
+   "name": "Alfa-bank"
+  },
+  {
+   "id": 17,
+   "name": "VTB Bank"
+  },
+  {
+   "id": 23,
+   "name": "SBP - Fast Bank Transfer"
+  },
+  {
+   "id": 31,
+   "name": "ЮMoney"
+  },
+  {
+   "id": 96,
+   "name": "Ak Bars Bank"
+  },
+  {
+   "id": 97,
+   "name": "Raiffeisen Bank"
+  },
+  {
+   "id": 98,
+   "name": "Rosbank"
+  },
+  {
+   "id": 99,
+   "name": "Russian Standard Bank"
+  },
+  {
+   "id": 100,
+   "name": "Uralsib Bank"
+  },
+  {
+   "id": 102,
+   "name": "Gazprombank"
+  },
+  {
+   "id": 103,
+   "name": "Otkritie FC Bank"
+  },
+  {
+   "id": 104,
+   "name": "Pochta Bank"
+  },
+  {
+   "id": 106,
+   "name": "Rosselkhozbank"
+  },
+  {
+   "id": 107,
+   "name": "Sovcombank"
+  },
+  {
+   "id": 116,
+   "name": "Perfect Money"
+  },
+  {
+   "id": 118,
+   "name": "Cash Deposit to Bank"
+  },
+  {
+   "id": 166,
+   "name": "Yandex Bank"
+  },
+  {
+   "id": 167,
+   "name": "OZON Bank"
+  },
+  {
+   "id": 321,
+   "name": "Promsvyazbank"
+  },
+  {
+   "id": 450,
+   "name": "OTP Bank"
+  },
+  {
+   "id": 578,
+   "name": "Cash in Person"
+  }
+ ]
+}

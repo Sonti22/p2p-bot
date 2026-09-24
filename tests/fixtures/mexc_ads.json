@@ -1,0 +1,60 @@
+{
+ "data": [
+  {
+   "price": 87.1,
+   "minTradeLimit": 50000.0,
+   "maxTradeLimit": 183781.0,
+   "availableQuantity": 2110.0,
+   "payMethod": "13",
+   "merchant": {
+    "nickName": "Alhimik 🧪"
+   },
+   "merchantStatistics": {
+    "doneLastMonthCount": 10,
+    "completeRate": "1.0000"
+   }
+  },
+  {
+   "price": 87.3,
+   "minTradeLimit": 40000.0,
+   "maxTradeLimit": 50970.91,
+   "availableQuantity": 583.8593,
+   "payMethod": "13,23",
+   "merchant": {
+    "nickName": "🌑onetwo"
+   },
+   "merchantStatistics": {
+    "doneLastMonthCount": 690,
+    "completeRate": "1.0000"
+   }
+  },
+  {
+   "price": 87.39,
+   "minTradeLimit": 40000.0,
+   "maxTradeLimit": 200997.0,
+   "availableQuantity": 2300.0,
+   "payMethod": "13",
+   "merchant": {
+    "nickName": "Hackway"
+   },
+   "merchantStatistics": {
+    "doneLastMonthCount": 57,
+    "completeRate": "1.0000"
+   }
+  },
+  {
+   "price": 87.6,
+   "minTradeLimit": 10000.0,
+   "maxTradeLimit": 132753.33,
+   "availableQuantity": 1515.449,
+   "payMethod": "13",
+   "merchant": {
+    "nickName": "Быстро и Честно"
+   },
+   "merchantStatistics": {
+    "doneLastMonthCount": 9,
+    "completeRate": "1.0000"
+   }
+  }
+ ]
+}
