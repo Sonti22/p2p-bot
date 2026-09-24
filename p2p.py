@@ -43,6 +43,10 @@ RECEIVE_NETS = {"BitPapa": ("TRC20",)}
 SPOT_VENUES = ("Bybit", "MEXC", "HTX", "KuCoin")   # порядок = приоритет ориентира и спота, если монета лежит не на бирже
 DEFAULT_SPOT_FEES = "Bybit:0.1,MEXC:0.1,HTX:0.2,KuCoin:0.1"   # % тейкер-комиссии спота
 DEFAULT_RISK = "BTC:0.3,ETH:0.5,TON:0.7"          # % запаса на движение курса, пока идут сделки и переводы
+MAKER_TICK = 0.01   # шаг цены объявления (₽ за монету), чтобы обогнать текущее первое на 1 позицию
+# % мейкера, который биржа берёт именно с объявления (сверх обычных издержек маршрута); площадка -> тип
+# объявления ("buy_ad" — я покупаю монету, "sell_ad" — я продаю) -> %. Нет записи — 0.
+MAKER_FEE = {"Bybit": {"buy_ad": 0.3}}   # Bybit берёт 0.3% с рублёвых объявлений на покупку
 # BestChange: берём все рублёвые банки и карты (тип 2/3 в bm_cy.dat), кроме наличных/QR/юрлиц.
 # Основные — латиницей, чтобы совпадали с названиями на P2P-биржах и в INCLUDE_PAY.
 BC_BANKS = {"Сбербанк RUB": "Sberbank", "Т-Банк RUB": "T-Bank", "Альфа-Банк RUB": "Alfa-bank", "СБП RUB": "SBP"}
@@ -615,6 +619,32 @@ def profit_breakdown(b, s, cfg, spot, over_banks=frozenset()):
             return None
         out.append((label, p))
     return out
+
+
+def maker_quote(groups, ex, asset, post_side):
+    """Режим мейкера: цена, чтобы встать первым объявлением на площадке, и спред против цены,
+    которую сразу даёт лучшее встречное объявление (то есть чем я жертвую ради первого места).
+    post_side: "buy_ad" — я выставляю объявление на покупку монеты (встаю в очередь тех, у кого
+    бот сам бы продал — group[ex,"sell",asset]); "sell_ad" — на продажу (встаю в очередь тех,
+    у кого бот сам бы купил — group[ex,"buy",asset]). None — нет обеих сторон стакана на площадке."""
+    if post_side == "buy_ad":
+        queue, counter = groups.get((ex, "sell", asset)), groups.get((ex, "buy", asset))
+        if not queue or not counter:
+            return None
+        price = queue[0].price + MAKER_TICK
+        counter_price = counter[0].price
+        spread = price - counter_price   # я переплачиваю сверх цены немедленной покупки
+    elif post_side == "sell_ad":
+        queue, counter = groups.get((ex, "buy", asset)), groups.get((ex, "sell", asset))
+        if not queue or not counter:
+            return None
+        price = queue[0].price - MAKER_TICK
+        counter_price = counter[0].price
+        spread = counter_price - price   # я недополучаю против цены немедленной продажи
+    else:
+        raise ValueError(post_side)
+    fee = MAKER_FEE.get(ex, {}).get(post_side, 0.0)
+    return price, counter_price, spread / counter_price * 100 + fee
 
 
 @dataclass
