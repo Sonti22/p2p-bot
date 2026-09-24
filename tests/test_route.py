@@ -54,6 +54,27 @@ def test_two_conversions_rejected():
     assert p2p._route(b, s, cfg(), SPOT) is None
 
 
+def test_intermediate_coin_routes_via_usdt_on_one_venue():
+    # ни BTC, ни ETH не совпадают, но на Bybit есть обе пары к USDT — маршрут BTC→USDT→ETH одной площадкой
+    spot = dict(SPOT, Bybit={**SPOT["Bybit"], "BTC": (7_000_000.0, 7_001_000.0)})
+    b, s = make_ad("Bybit", "buy", 7_000_000.0, asset="BTC"), make_ad("Bybit", "sell", 245000.0, asset="ETH")
+    profit, route = p2p._route(b, s, cfg(), spot)
+    assert "спот BTC→USDT на Bybit (−0.1%)" in route and "спот USDT→ETH на Bybit (−0.1%)" in route
+    assert "перевод" not in route
+    qty = 50000 / 7_000_000.0
+    qty = qty * 7_000_000.0 * (1 - 0.001)   # BTC → USDT
+    qty = (qty / 2501.0) * (1 - 0.001)      # USDT → ETH
+    assert profit == pytest.approx((qty * 245000.0 / 50000 - 1) * 100)
+
+
+def test_intermediate_coin_rejected_without_common_venue():
+    # BTC есть только на Bybit, ETH — только на MEXC: ни одна площадка не держит обе пары
+    spot = {"Bybit": {"USDT": (1.0, 1.0), "BTC": (7_000_000.0, 7_001_000.0)},
+            "MEXC": {"USDT": (1.0, 1.0), "ETH": (2499.0, 2500.0)}}
+    b, s = make_ad("Bybit", "buy", 7_000_000.0, asset="BTC"), make_ad("MEXC", "sell", 245000.0, asset="ETH")
+    assert p2p._route(b, s, cfg(), spot) is None
+
+
 def test_pay_fee_applied():
     profit, route = p2p._route(make_ad("MEXC", "buy", 88.0), make_ad("MEXC", "sell", 88.0), cfg(pay_fee=0.5), SPOT)
     assert profit == pytest.approx(-0.5) and "банка" in route
