@@ -15,7 +15,9 @@ from urllib.parse import urlencode
 KEYS_PATH = os.path.join("data", "keys.json")
 BYBIT_BASE = "https://api.bybit.com"
 MEXC_BASE = "https://api.mexc.com"
-CONNECTABLE = ("bybit", "mexc")   # биржи, для которых уже есть подпись запросов (HTX/KuCoin — позже)
+CONNECTABLE = ("bybit", "mexc")        # биржи, для которых уже есть подпись запросов (HTX/KuCoin — позже)
+PASSPHRASE_REQUIRED = ("kucoin",)      # ключ биржи — 3 шага (key/secret/passphrase); подпись запросов ещё не готова
+ONBOARDABLE = CONNECTABLE + PASSPHRASE_REQUIRED   # биржи, для которых бот предлагает подключить ключ кнопками
 
 
 def _keys_file():
@@ -35,13 +37,25 @@ def keys(exchange):
     return (key, secret) if key and secret else None
 
 
-def save_key(exchange, key, secret):
-    """Сохранить ключ биржи в data/keys.json (создаёт папку/файл при необходимости)."""
+def save_key(exchange, key, secret, passphrase=None):
+    """Сохранить ключ биржи в data/keys.json (создаёт папку/файл при необходимости).
+
+    `passphrase` — только для бирж из PASSPHRASE_REQUIRED (сейчас KuCoin)."""
     data = _keys_file()
-    data[exchange.lower()] = {"key": key, "secret": secret}
+    entry = {"key": key, "secret": secret}
+    if passphrase:
+        entry["passphrase"] = passphrase
+    data[exchange.lower()] = entry
     os.makedirs(os.path.dirname(KEYS_PATH), exist_ok=True)
     with open(KEYS_PATH, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def passphrase(exchange):
+    """Passphrase ключа биржи (сейчас только KuCoin): data/keys.json, иначе {EXCHANGE}_API_PASSPHRASE в .env."""
+    ex = exchange.lower()
+    saved = _keys_file().get(ex, {})
+    return saved.get("passphrase") or os.getenv(f"{exchange.upper()}_API_PASSPHRASE")
 
 
 def delete_key(exchange):

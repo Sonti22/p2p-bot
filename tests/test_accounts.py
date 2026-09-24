@@ -137,6 +137,30 @@ def test_mask_short_key_falls_back():
     assert accounts.mask("abc") == "••••"
 
 
+def test_save_key_with_passphrase(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    accounts.save_key("kucoin", "k", "s", "pp")
+    assert accounts.keys("kucoin") == ("k", "s")
+    assert accounts.passphrase("kucoin") == "pp"
+
+
+def test_save_key_without_passphrase_leaves_it_unset(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    accounts.save_key("bybit", "k", "s")
+    assert accounts.passphrase("bybit") is None
+
+
+def test_passphrase_falls_back_to_env(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "no_such.json"))
+    monkeypatch.setenv("KUCOIN_API_PASSPHRASE", "envpass")
+    assert accounts.passphrase("kucoin") == "envpass"
+
+
+def test_kucoin_is_onboardable_but_not_yet_connectable():
+    assert "kucoin" in accounts.ONBOARDABLE
+    assert "kucoin" not in accounts.CONNECTABLE
+
+
 class _JsonResp:
     def __init__(self, body):
         self.body = body
@@ -193,4 +217,11 @@ def test_verify_unsupported_exchange(tmp_path, monkeypatch):
     monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
     accounts.save_key("htx", "k", "s")
     ok, msg = asyncio.run(accounts.verify(_JsonSession({}), "htx"))
+    assert not ok and "не реализована" in msg
+
+
+def test_verify_kucoin_saved_but_not_signed_yet(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    accounts.save_key("kucoin", "k", "s", "pp")
+    ok, msg = asyncio.run(accounts.verify(_JsonSession({}), "kucoin"))
     assert not ok and "не реализована" in msg
