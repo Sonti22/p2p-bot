@@ -230,6 +230,22 @@ def test_blacklist_command_empty():
     assert "пуст" in texts(bot)[-1].lower()
 
 
+def test_traps_command_empty():
+    p2p._traps.clear()
+    bot = Stub(p2p.Config())
+    asyncio.run(bot.handle("/traps"))
+    assert "не отсеивал" in texts(bot)[-1]
+
+
+def test_traps_command_lists_entries(monkeypatch):
+    trap = {"ex": "Bybit", "asset": "USDT", "side": "sell", "price": 120.0, "ref": 90.0,
+            "dev": 33.3, "max_dev": 4.0, "ts": time.time()}
+    monkeypatch.setattr(B, "recent_traps", lambda n=10: [trap])
+    bot = Stub(p2p.Config())
+    asyncio.run(bot.handle("/traps"))
+    assert "Bybit" in texts(bot)[-1]
+
+
 def test_unbl_callback_removes_entry(tmp_path, monkeypatch):
     db = str(tmp_path / "blacklist.db")
     monkeypatch.setattr(B.blacklist, "list_all", functools.partial(B.blacklist.list_all, path=db))

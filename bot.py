@@ -20,8 +20,8 @@ import presets
 import trades
 from cards import deal_card, history_card, history_compare_card, portfolio_card, top_chart
 from p2p import ALL_EXCHANGES, AMOUNT_MAX, AMOUNT_MIN, DEFAULT_ASSETS, ENV_PATH, Config, _money, _price, \
-    deal_amounts, fmt_ad, fmt_deal, fmt_top, load_env, parse_amount, profit_breakdown, reliability, scan, spot_url, \
-    venue_url
+    deal_amounts, fmt_ad, fmt_deal, fmt_top, fmt_traps, load_env, parse_amount, profit_breakdown, recent_traps, \
+    reliability, scan, spot_url, venue_url
 
 MENU = {"keyboard": [[{"text": "🔥 Лучшая сейчас"}, {"text": "📊 Топ связок"}],
                      [{"text": "⚙️ Настройки"}, {"text": "🛠 Разработка"}],
@@ -37,6 +37,7 @@ COMMANDS = [{"command": "best", "description": "Лучшая связка сей
             {"command": "alert", "description": "Алерт на курс, напр. /alert USDT sell 92 7d"},
             {"command": "alerts", "description": "Список алертов на курс"},
             {"command": "blacklist", "description": "Скрытые мерчанты и обменники"},
+            {"command": "traps", "description": "Последние отсеянные «ловушки» — обучение без риска"},
             {"command": "balance", "description": "Баланс по подключённым биржам"},
             {"command": "fees", "description": "Комиссии вывода по сетям и возраст данных"},
             {"command": "settings", "description": "Порог, сумма, пауза"},
@@ -1143,6 +1144,8 @@ class Bot:
         elif cmd == "/blacklist":
             text, kb = blacklist_view()
             await self.send(text, markup=kb)
+        elif cmd == "/traps":
+            await self.send(fmt_traps(recent_traps()))
         elif cmd == "/balance":
             await self.balance()
         elif cmd == "/fees":

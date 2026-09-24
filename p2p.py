@@ -4,6 +4,7 @@
 One-off snapshot:  python p2p.py
 """
 import asyncio
+import collections
 import dataclasses
 import html
 import io
@@ -632,6 +633,8 @@ class Snapshot:
 
 
 _alt = {"t": 0.0, "ads": [], "errors": {}}
+TRAPS_MAX = 30   # сколько последних отсеянных аномалий помнить для /traps
+_traps = collections.deque(maxlen=TRAPS_MAX)
 
 
 async def scan(s, cfg, force_alt=False):
@@ -695,9 +698,13 @@ async def scan(s, cfg, force_alt=False):
         if not usable(a, cfg, blocked):
             continue
         r = refs.get(a.asset)
-        if r and abs(a.price / r - 1) * 100 > cfg.max_dev:
-            dropped[a.ex] = dropped.get(a.ex, 0) + 1
-            continue
+        if r:
+            dev = abs(a.price / r - 1) * 100
+            if dev > cfg.max_dev:
+                dropped[a.ex] = dropped.get(a.ex, 0) + 1
+                _traps.append({"ts": time.time(), "ex": a.ex, "asset": a.asset, "side": a.side,
+                               "price": a.price, "ref": r, "dev": dev, "max_dev": cfg.max_dev})
+                continue
         better = (lambda cur: cur is None or (a.price < cur.price if a.side == "buy" else a.price > cur.price))
         if better(best.get((a.ex, a.side, a.asset))):
             best[(a.ex, a.side, a.asset)] = a
@@ -820,6 +827,28 @@ def reliability(deal, cfg, snap):
 
 def fmt_reliability(label, reasons):
     return label if not reasons else f"{label} ({'; '.join(reasons)})"
+
+
+def recent_traps(n=10):
+    """Последние объявления, отсеянные как аномалия (цена дальше max_dev от ориентира) — «ловушки»
+    для /traps: показать без риска, что и почему бот не сигналит. Новые — первыми."""
+    return list(_traps)[-n:][::-1]
+
+
+def fmt_traps(traps):
+    if not traps:
+        return "🪤 Ловушек не было: с последних сканов бот не отсеивал аномальных цен."
+    lines = ["<b>🪤 Последние отсеянные «ловушки»</b>",
+             "Мерчант прошёл по сделкам и отзывам, но цена аномально далеко от рынка — реальная сделка обычно "
+             "не по такой цене (либо развод, либо объявление устарело)."]
+    now = time.time()
+    for t in traps:
+        deal_side = "купить" if t["side"] == "buy" else "продать"
+        hint = "подозрительно дёшево" if t["side"] == "buy" else "подозрительно дорого"
+        ago = max(0, int((now - t["ts"]) / 60))
+        lines.append(f"{t['ex']} {t['asset']} {deal_side} {_price(t['price'])} — {hint}, на {t['dev']:.1f}% дальше "
+                     f"ориентира {_price(t['ref'])} (допуск {t['max_dev']:g}%), {ago} мин назад")
+    return "\n".join(lines)
 
 
 def _money(x):
