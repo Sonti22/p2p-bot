@@ -200,6 +200,7 @@ class Ad:
     asset: str = "USDT"
     net: str = ""    # сеть (только у обменников)
     terms: str = ""  # условия мерчанта из объявления (remark/remarks/tradeTerms/conditions)
+    all_pays: list = None  # исходные способы оплаты до фильтра _pays (объявление живёт в кэше _alt несколько сканов)
 
 
 async def _json(s, method, url, body=None):
@@ -418,8 +419,12 @@ def _mid(spot, asset):
 
 
 def _pays(a, cfg):
-    """Отфильтровать способы оплаты объявления по exclude_pay/include_pay (мутирует a.pays)."""
-    pays = [p for p in a.pays if not any(x in p.lower() for x in cfg.exclude_pay)]
+    """Отфильтровать способы оплаты объявления по exclude_pay/include_pay. Объявление из кэша `_alt`
+    переживает несколько сканов и фильтруется каждый раз заново (настройки могли поменяться) — поэтому
+    считаем всегда от исходного списка `a.all_pays`, а не от уже отфильтрованного `a.pays` из прошлого раза."""
+    if a.all_pays is None:
+        a.all_pays = a.pays
+    pays = [p for p in a.all_pays if not any(x in p.lower() for x in cfg.exclude_pay)]
     if cfg.include_pay:
         pays = [p for p in pays if any(x in p.lower() for x in cfg.include_pay)]
     a.pays = pays
