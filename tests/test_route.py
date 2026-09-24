@@ -171,6 +171,52 @@ def test_deal_amounts_missing_group_is_none():
     assert out == {50_000: None}
 
 
+def test_reliability_clean_deal_is_reliable():
+    b, s = make_ad("Bybit", "buy", 88.0, orders=500, rate=100.0), make_ad("MEXC", "sell", 89.0, orders=500, rate=100.0)
+    snap = p2p.Snapshot(88.0, "t", {"USDT": 88.0}, {}, [], {}, {}, {})
+    deal = (1.13, b, s, "перевод −0.01 USDT (BEP20) на MEXC")
+    label, reasons = p2p.reliability(deal, cfg(), snap)
+    assert label == p2p.RELIABLE and reasons == []
+
+
+def test_reliability_flags_price_deviation_and_weak_merchant():
+    b = make_ad("Bybit", "buy", 88.0 * 1.03, orders=100, rate=95.0)   # ~3% от ориентира, порог фильтра по сделкам
+    s = make_ad("MEXC", "sell", 89.0, orders=500, rate=100.0)
+    snap = p2p.Snapshot(88.0, "t", {"USDT": 88.0}, {}, [], {}, {}, {})
+    deal = (1.13, b, s, "перевод −0.01 USDT (BEP20) на MEXC")
+    label, reasons = p2p.reliability(deal, cfg(), snap)
+    assert label == p2p.RISKY
+    assert any("ориентира" in r for r in reasons) and any("порога фильтра" in r for r in reasons)
+
+
+def test_reliability_flags_high_spread_as_reason():
+    b, s = make_ad("Bybit", "buy", 85.0, orders=500, rate=100.0), make_ad("MEXC", "sell", 90.0, orders=500, rate=100.0)
+    snap = p2p.Snapshot(88.0, "t", {"USDT": 87.0}, {}, [], {}, {}, {})
+    deal = (5.88, b, s, "внутри биржи")
+    label, reasons = p2p.reliability(deal, cfg(), snap)
+    assert any("спред" in r for r in reasons) and label in (p2p.RISKY, p2p.TRAP)
+
+
+def test_reliability_flags_volatile_coin_and_many_transfers():
+    b = make_ad("MEXC", "buy", 88.0, asset="ETH", orders=500, rate=100.0)
+    s = make_ad("Bybit", "sell", 89.0, asset="ETH", orders=500, rate=100.0)
+    snap = p2p.Snapshot(88.0, "t", {}, {}, [], {}, {}, {})
+    route = "перевод −0.001 ETH (ERC20) на Bybit → спот ETH→USDT на Bybit (−0.1%) → перевод −1 USDT на MEXC"
+    deal = (1.5, b, s, route)
+    label, reasons = p2p.reliability(deal, cfg(risk_buffer={"ETH": 0.5}), snap)
+    assert any("волатильная" in r for r in reasons) and any("перевода/конвертации" in r for r in reasons)
+    assert label == p2p.RISKY   # 2 фактора риска — до ловушки (3+) не хватает
+
+
+def test_fmt_deal_includes_reliability_when_snap_given():
+    d = (1.13, make_ad("Bybit", "buy", 88.0, orders=500, rate=100.0), make_ad("MEXC", "sell", 89.0, orders=500, rate=100.0),
+         "внутри биржи")
+    snap = p2p.Snapshot(88.0, "t", {"USDT": 88.0}, {}, [], {}, {}, {})
+    text = p2p.fmt_deal(d, cfg(), snap)
+    assert p2p.RELIABLE in text
+    assert p2p.RELIABLE not in p2p.fmt_deal(d, cfg())   # без snap метка не считается
+
+
 def test_scan_applies_auto_fee_for_bank_over_limit(offline, monkeypatch):
     async def fake_fetcher(s, cfg, side, asset):
         return [make_ad("Fake", side, 85.0 if side == "buy" else 90.0, pays=("T-Bank",))]

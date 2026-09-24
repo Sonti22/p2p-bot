@@ -12,7 +12,7 @@ import aiohttp
 import trades
 from cards import deal_card, top_chart
 from p2p import AMOUNT_MAX, AMOUNT_MIN, ENV_PATH, Config, _money, deal_amounts, fmt_deal, fmt_top, load_env, \
-    parse_amount, scan, spot_url, venue_url
+    parse_amount, reliability, scan, spot_url, venue_url
 
 MENU = {"keyboard": [[{"text": "🔥 Лучшая сейчас"}, {"text": "📊 Топ связок"}],
                      [{"text": "⚙️ Настройки"}, {"text": "🛠 Разработка"}],
@@ -201,7 +201,9 @@ class Bot:
         snap = snap if snap is not None else self.last
         deal_id = self.remember_deal(d, cfg)
         amounts = deal_amounts(d, cfg, snap) if snap else None
-        await self.photo_or_text(lambda: deal_card(d, cfg, amounts), prefix + fmt_deal(d, cfg), deal_markup(d, deal_id))
+        rel = reliability(d, cfg, snap) if snap else None
+        await self.photo_or_text(lambda: deal_card(d, cfg, amounts, rel), prefix + fmt_deal(d, cfg, snap),
+                                 deal_markup(d, deal_id))
 
     async def mark_done(self, cq, deal_id):
         """Кнопка «✅ Сделал»: записать сделку в журнал (data/trades.db) и убрать кнопку."""
