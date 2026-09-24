@@ -3,6 +3,7 @@ import asyncio
 import pytest
 
 import p2p
+import trades
 from helpers import make_ad
 
 SPOT = {"Bybit": {"USDT": (1.0, 1.0), "ETH": (2500.0, 2501.0), "USDC": (0.9999, 1.0)},
@@ -57,6 +58,27 @@ def test_pay_fee_applied():
     assert profit == pytest.approx(-0.5) and "банка" in route
 
 
+def test_pay_fee_auto_applied_when_bank_over_limit():
+    b, s = make_ad("MEXC", "buy", 88.0, pays=("T-Bank",)), make_ad("MEXC", "sell", 88.0)
+    profit, route = p2p._route(b, s, cfg(), SPOT, over_banks={"T-Bank"})
+    assert profit == pytest.approx(-trades.SBP_OVER_FEE)
+    assert "лимит СБП T-Bank исчерпан" in route
+
+
+def test_pay_fee_auto_skipped_when_bank_under_limit():
+    b, s = make_ad("MEXC", "buy", 88.0, pays=("T-Bank",)), make_ad("MEXC", "sell", 88.0)
+    profit, route = p2p._route(b, s, cfg(), SPOT, over_banks=set())
+    assert profit == pytest.approx(0.0)
+    assert "комиссия банка" not in route
+
+
+def test_manual_pay_fee_not_overridden_by_auto():
+    b, s = make_ad("MEXC", "buy", 88.0, pays=("T-Bank",)), make_ad("MEXC", "sell", 88.0)
+    profit, route = p2p._route(b, s, cfg(pay_fee=1.0), SPOT, over_banks={"T-Bank"})
+    assert profit == pytest.approx(-1.0)
+    assert "исчерпан" not in route
+
+
 def test_usable_filters():
     c = p2p.Config()
     assert p2p.usable(make_ad(pays=("T-Bank",)), c)
@@ -74,3 +96,16 @@ def test_scan_offline_keeps_prices_near_reference(offline):
     for a in snap.best.values():
         assert abs(a.price / snap.ref - 1) * 100 <= c.max_dev
     assert all(d[0] == max(x[0] for x in snap.deals) for d in snap.deals[:1])   # отсортировано по убыванию
+
+
+def test_scan_applies_auto_fee_for_bank_over_limit(offline, monkeypatch):
+    async def fake_fetcher(s, cfg, side, asset):
+        return [make_ad("Fake", side, 85.0 if side == "buy" else 90.0, pays=("T-Bank",))]
+
+    monkeypatch.setitem(p2p.FETCHERS, "fake", fake_fetcher)
+    monkeypatch.setattr(trades, "bank_month_total",
+                        lambda bank, path=trades.DB_PATH, now=None: 150000.0 if bank == "T-Bank" else 0.0)
+    c = p2p.Config(exchanges=["fake"], assets=["USDT"], min_orders=0, min_rate=0)
+    snap = asyncio.run(p2p.scan(None, c))
+    assert snap.deals
+    assert "лимит СБП T-Bank исчерпан" in snap.deals[0][3]

@@ -16,6 +16,8 @@ from dataclasses import dataclass, field
 
 import aiohttp
 
+import trades
+
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0 Safari/537.36",
     "Accept": "application/json",
@@ -233,10 +235,10 @@ async def bitpapa(s, cfg, side, asset):
         u = a.get("user") or {}
         if u.get("is_suspicious"):
             continue
-        trades, done = u.get("trades_count") or 0, u.get("completed_trades_count") or 0
+        trade_count, done = u.get("trades_count") or 0, u.get("completed_trades_count") or 0
         out.append(Ad("BitPapa", side, float(a["price"]), float(a["limit_min"] or 0), float(a["limit_max"] or 0),
                       float(a["limit_max_crypto"] or 0), [a["payment_method"]["name"]], u.get("user_name", "?"),
-                      done, done / trades * 100 if trades else 0, asset=asset))
+                      done, done / trade_count * 100 if trade_count else 0, asset=asset))
     return out
 
 
@@ -377,12 +379,19 @@ def _hop(cfg, frm, frm_net, to, to_net, asset):
     return fee, f"перевод {cost}" + (f" ({net})" if net else "") + f" на {to}"
 
 
-def _route(b, s, cfg, spot):
-    """Чистая прибыль % и шаги маршрута со всеми издержками; None, если связка невозможна."""
+def _route(b, s, cfg, spot, over_banks=frozenset()):
+    """Чистая прибыль % и шаги маршрута со всеми издержками; None, если связка невозможна.
+    over_banks — банки, уже превысившие месячный лимит СБП: комиссия банка выставляется автоматически,
+    даже если PAY_FEE в настройках не задан (или задан меньше)."""
     steps = []
-    qty = cfg.amount * (1 - cfg.pay_fee / 100) / b.price
-    if cfg.pay_fee:
-        steps.append(f"комиссия банка −{cfg.pay_fee:g}%")
+    pay_fee, auto_bank = cfg.pay_fee, ""
+    bank = trades.sbp_bank(b.pays)
+    if bank in over_banks and pay_fee < trades.SBP_OVER_FEE:
+        pay_fee, auto_bank = trades.SBP_OVER_FEE, bank
+    qty = cfg.amount * (1 - pay_fee / 100) / b.price
+    if pay_fee:
+        note = f" (лимит СБП {auto_bank} исчерпан)" if auto_bank else ""
+        steps.append(f"комиссия банка −{pay_fee:g}%{note}")
     if b.asset == s.asset:
         fee, label = _hop(cfg, b.ex, b.net, s.ex, s.net, b.asset)
         qty -= fee
@@ -492,10 +501,11 @@ async def scan(s, cfg):
 
     buys = [a for (_, side, _), a in best.items() if side == "buy"]
     sells = [a for (_, side, _), a in best.items() if side == "sell"]
+    over_banks = trades.banks_over_limit({trades.sbp_bank(b.pays) for b in buys})
     deals = []
     for b in buys:
         for sl in sells:
-            r = _route(b, sl, cfg, spot)
+            r = _route(b, sl, cfg, spot, over_banks)
             if r:
                 deals.append((r[0], b, sl, r[1]))
     deals.sort(key=lambda d: d[0], reverse=True)
