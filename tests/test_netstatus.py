@@ -23,21 +23,25 @@ def test_normalize(raw, want):
 def test_parse_public_fixtures():
     htx = netstatus._parse_htx(_htx_currency("https://api.htx.com/v2/reference/currencies?currency=usdt"))
     assert htx["BEP20"]["wd"] is True and htx["BEP20"]["dep"] is True and htx["BEP20"]["fee"] == pytest.approx(0.01)
+    assert htx["BEP20"]["min"] == pytest.approx(1)
     assert htx["POLYGON"]["wd"] is False           # в фикстуре вывод POLYGON у HTX закрыт
     ku = netstatus._parse_kucoin(_kucoin_currency("https://api.kucoin.com/api/v3/currencies/USDT"))
     assert ku["BEP20"]["wd"] is True and ku["TON"]["wd"] is True   # из двух записей TON взята открытая
+    assert ku["BEP20"]["min"] == pytest.approx(10) and ku["TRC20"]["min"] == pytest.approx(4)
 
 
 def test_parse_bybit_and_mexc_shapes():
     by = netstatus._parse_bybit({"result": {"rows": [{"coin": "USDT", "chains": [
-        {"chain": "TRX", "chainType": "Tron (TRC20)", "chainDeposit": "1", "chainWithdraw": "0", "withdrawFee": "1"},
-        {"chain": "BSC", "chainType": "BSC (BEP20)", "chainDeposit": "1", "chainWithdraw": "1", "withdrawFee": "0.2"}]}]}})
+        {"chain": "TRX", "chainType": "Tron (TRC20)", "chainDeposit": "1", "chainWithdraw": "0", "withdrawFee": "1", "withdrawMin": "5"},
+        {"chain": "BSC", "chainType": "BSC (BEP20)", "chainDeposit": "1", "chainWithdraw": "1", "withdrawFee": "0.2", "withdrawMin": "1"}]}]}})
     assert by["TRC20"]["wd"] is False and by["BEP20"]["fee"] == pytest.approx(0.2)
+    assert by["BEP20"]["min"] == pytest.approx(1)
     mx = netstatus._parse_mexc([{"coin": "USDT", "networkList": [
-        {"network": "TRC20", "depositEnable": True, "withdrawEnable": True, "withdrawFee": "1"},
+        {"network": "TRC20", "depositEnable": True, "withdrawEnable": True, "withdrawFee": "1", "withdrawMin": "10"},
         {"network": "BEP20(BSC)", "depositEnable": False, "withdrawEnable": True, "withdrawFee": "0.01"}]},
         {"coin": "ETH", "networkList": [{"network": "ERC20", "depositEnable": True, "withdrawEnable": True}]}], "USDT")
     assert mx["BEP20"]["dep"] is False and "ERC20" not in mx
+    assert mx["TRC20"]["min"] == pytest.approx(10) and mx["BEP20"]["min"] is None   # нет поля — сведений нет
 
 
 def test_refresh_offline_fills_status_and_detects_changes(offline):
@@ -45,6 +49,10 @@ def test_refresh_offline_fills_status_and_detects_changes(offline):
     assert netstatus.withdraw_ok("HTX", "USDT", "BEP20") is True
     assert netstatus.withdraw_ok("KuCoin", "USDT", "BEP20") is True
     assert netstatus.withdraw_ok("Bybit", "USDT", "BEP20") is None    # ключа нет — статус неизвестен
+    assert netstatus.min_withdraw("HTX", "USDT", "BEP20") == pytest.approx(1)
+    assert netstatus.min_withdraw("KuCoin", "USDT", "TRC20") == pytest.approx(4)
+    assert netstatus.min_withdraw("Bybit", "USDT", "BEP20") is None   # ключа нет — сведений нет
+    assert netstatus.min_withdraw("HTX", "USDT", "XYZ") is None       # такой сети нет вовсе
     assert not netstatus.pop_changes()                                 # первая загрузка — без алертов
     netstatus._apply("HTX", "USDT", {"BEP20": {"dep": True, "wd": False, "fee": 0.01},
                                      "XYZ": {"dep": False, "wd": False, "fee": 1}})
