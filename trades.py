@@ -11,6 +11,7 @@ PERIODS = {"day": 86400, "week": 7 * 86400, "month": 30 * 86400}
 # Свободный лимит СБП физлицу — 100 тыс. ₽ в календарный месяц НА КАЖДЫЙ банк, дальше — комиссия до 0.5%.
 SBP_BANKS = ("Sberbank", "T-Bank", "Alfa-bank", "VTB", "SBP")
 BANK_LIMIT = 100_000.0
+SBP_OVER_FEE = 0.5  # % — комиссия банка сверх бесплатного лимита СБП (до 0.5%)
 
 
 def _connect(path):
@@ -50,6 +51,11 @@ def bank_month_total(bank, path=DB_PATH, now=None):
                          (bank, _month_start(now))).fetchone()
     con.close()
     return total
+
+
+def banks_over_limit(banks, path=DB_PATH, now=None):
+    """Из списка банков — те, что уже набрали 100 тыс. ₽ за календарный месяц (лимит СБП исчерпан)."""
+    return {b for b in banks if b and bank_month_total(b, path, now) >= BANK_LIMIT}
 
 
 def log_trade(d, amount, path=DB_PATH, ts=None):

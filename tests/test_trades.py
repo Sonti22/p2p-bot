@@ -49,6 +49,14 @@ def test_log_trade_no_bank_when_pay_method_unknown(tmp_path):
     assert bank == "" and total == 500000 and not crossed
 
 
+def test_banks_over_limit_only_lists_banks_at_or_above_limit(tmp_path):
+    db = str(tmp_path / "trades.db")
+    now = time.time()
+    trades.log_trade(deal(), 60000, path=db, ts=now)          # T-Bank 60к — ниже лимита
+    trades.log_trade(deal(), 60000, path=db, ts=now)          # T-Bank 120к — уже выше
+    assert trades.banks_over_limit(["T-Bank", "SBP", ""], path=db, now=now) == {"T-Bank"}
+
+
 def test_bank_month_total_excludes_previous_month(tmp_path):
     db = str(tmp_path / "trades.db")
     now = time.time()
