@@ -174,6 +174,30 @@ def test_mark_done_unknown_id_not_logged(monkeypatch):
     assert "устарел" in bot.out[-1][1]["text"]
 
 
+def test_calc_command_scans_with_custom_amount(offline, monkeypatch):
+    monkeypatch.setattr(B, "deal_card", lambda d, c: b"png")
+    monkeypatch.setattr(B, "top_chart", lambda snap, c: b"png")
+    bot = Stub(p2p.Config(exchanges=["bybit", "htx", "kucoin", "mexc", "bitpapa"], assets=["USDT"],
+                          min_orders=0, min_rate=0, amount=50000))
+    asyncio.run(bot.handle("/calc 20000"))
+    caps = [p["caption"] for m, p in photos(bot)]
+    assert any("20 000" in c for c in caps)
+    assert bot.cfg.amount == 50000            # настройки не изменились
+
+
+def test_calc_command_rejects_garbage_amount():
+    bot = Stub(p2p.Config())
+    asyncio.run(bot.handle("/calc много"))
+    assert "сумму" in texts(bot)[-1].lower()
+    assert not bot.out or bot.out[-1][0] == "sendMessage"
+
+
+def test_calc_command_needs_argument():
+    bot = Stub(p2p.Config())
+    asyncio.run(bot.handle("/calc"))
+    assert "сумма" in texts(bot)[-1].lower()
+
+
 def test_stats_view_reports_counts(tmp_path, monkeypatch):
     db = str(tmp_path / "trades.db")
     monkeypatch.setattr(B.trades, "stats", functools.partial(B.trades.stats, path=db))
