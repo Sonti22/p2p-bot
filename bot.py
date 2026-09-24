@@ -6,6 +6,7 @@ import json
 import os
 import re
 import time
+from datetime import datetime, timedelta, timezone
 
 import aiohttp
 
@@ -33,6 +34,8 @@ COMMANDS = [{"command": "best", "description": "Лучшая связка сей
             {"command": "blacklist", "description": "Скрытые мерчанты и обменники"},
             {"command": "balance", "description": "Баланс по подключённым биржам"},
             {"command": "settings", "description": "Порог, сумма, пауза"},
+            {"command": "pause", "description": "Пауза сигналов: /pause 30m|1h|3h|до утра"},
+            {"command": "resume", "description": "Снять паузу сигналов"},
             {"command": "dev", "description": "Как развивается бот: версия, изменения, план"},
             {"command": "help", "description": "Как работать с сигналами"}]
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -72,6 +75,59 @@ VENUE_FAIL_STREAK = 3       # или столько сканов подряд с
 VENUE_ALERT_COOLDOWN = 3600  # не чаще раза в час на площадку
 EXCHANGE_NAMES = {"bybit": "Bybit", "mexc": "MEXC", "htx": "HTX", "kucoin": "KuCoin", "bitpapa": "BitPapa"}
 ACCOUNT_POLL_INTERVAL = int(os.getenv("ACCOUNT_POLL_INTERVAL", 60))  # опрос истории аккаунтов, сек
+MSK = timezone(timedelta(hours=3))                    # тихие часы и /pause считаем по МСК, не по времени ПК
+PAUSE_PRESETS = {"30m": 1800, "1h": 3600, "3h": 3 * 3600}  # аргументы /pause -> секунды
+
+
+def parse_quiet_hours(spec):
+    """«01:00-08:00» -> (начало, конец) в минутах с полуночи по МСК; None — не разобрано."""
+    m = re.fullmatch(r"(\d{1,2}):(\d{2})-(\d{1,2}):(\d{2})", (spec or "").strip())
+    if not m:
+        return None
+    h1, m1, h2, m2 = map(int, m.groups())
+    if h1 > 23 or m1 > 59 or h2 > 23 or m2 > 59:
+        return None
+    return h1 * 60 + m1, h2 * 60 + m2
+
+
+def in_quiet_hours(spec, ts=None):
+    """Текущее время (МСК) внутри окна тихих часов? Учитывает переход через полночь (23:00-07:00)."""
+    hours = parse_quiet_hours(spec)
+    if not hours:
+        return False
+    start, end = hours
+    now = datetime.fromtimestamp(ts if ts is not None else time.time(), MSK)
+    minute = now.hour * 60 + now.minute
+    return start <= minute < end if start < end else (minute >= start or minute < end)
+
+
+def quiet_hours_end_ts(spec, ts=None):
+    """Ближайший unix-timestamp окончания окна тихих часов (МСК), не раньше текущего момента. None — не задано."""
+    hours = parse_quiet_hours(spec)
+    if not hours:
+        return None
+    _, end = hours
+    now = datetime.fromtimestamp(ts if ts is not None else time.time(), MSK)
+    end_dt = now.replace(hour=end // 60, minute=end % 60, second=0, microsecond=0)
+    if end_dt <= now:
+        end_dt += timedelta(days=1)
+    return end_dt.timestamp()
+
+
+def parse_pause_arg(arg):
+    """/pause 30m|1h|3h|до утра -> секунды паузы, "morning" (до конца тихих часов) либо None — не разобрано."""
+    a = (arg or "").strip().lower()
+    if a in PAUSE_PRESETS:
+        return PAUSE_PRESETS[a]
+    if a in ("до утра", "утра", "morning"):
+        return "morning"
+    return None
+
+
+def _hhmm_msk(ts):
+    return datetime.fromtimestamp(ts, MSK).strftime("%H:%M")
+
+
 KEY_HINT = {
     "bybit": ("Создай ключ на Bybit: Профиль → API → Create New Key → System-generated API Keys. "
               "Права — только «Read-Only» (сними «Trade» и «Withdrawal»), в IP access whitelist впиши IP своего ПК."),
@@ -328,6 +384,11 @@ class Bot:
         self.max_signals = int(os.getenv("MAX_SIGNALS", 3))      # сигналим только из топ-N
         self.last = None
         self.paused = False
+        self.pause_until = 0.0   # unix-время окончания /pause с аргументом; 0 или прошлое = не активна
+        self.quiet_hours = os.getenv("QUIET_HOURS", "01:00-08:00")   # окно тихих часов, МСК "HH:MM-HH:MM"
+        self.quiet_on = os.getenv("QUIET_HOURS_ON", "0") == "1"      # тихие часы включены (кнопка в настройках)
+        self.night_deals = {}    # (ex,asset,ex,asset) -> лучшая связка за тихие часы, для утреннего дайджеста
+        self._was_quiet = False  # тихие часы были на прошлом скане — для разового дайджеста при выходе из них
         self.awaiting_amount = False  # ждём сумму текстом после «✏️ Своя сумма»
         self.awaiting_key = None      # {"ex":.., "step": "key"/"secret", "key":..} — ждём ключ биржи
         self.sent = {}
@@ -558,16 +619,29 @@ class Bot:
 
     def settings_view(self):
         c = self.cfg
-        status = "⏸ пауза сигналов" if self.paused else f"▶️ сканирую каждые {c.interval} с"
+        now = time.time()
+        pause_active = self.paused or (self.pause_until and now < self.pause_until)
+        if self.paused:
+            status = "⏸ пауза сигналов (бессрочно)"
+        elif self.pause_until and now < self.pause_until:
+            status = f"⏸ пауза до {_hhmm_msk(self.pause_until)}"
+        elif self.is_quiet_now():
+            status = f"🌙 тихие часы до {_hhmm_msk(quiet_hours_end_ts(self.quiet_hours))}"
+        else:
+            status = f"▶️ сканирую каждые {c.interval} с"
         text = (f"⚙️ <b>Настройки</b>\n\nПорог сигнала: <b>{c.min_profit:g}%</b> (1-я строка кнопок)\n"
-                f"Сумма круга: <b>{_money(c.amount)} ₽</b> (2-я строка)\nСтатус: {status}\n\n"
+                f"Сумма круга: <b>{_money(c.amount)} ₽</b> (2-я строка)\nСтатус: {status}\n"
+                f"Тихие часы: {'✅ вкл' if self.quiet_on else '➖ выкл'} ({self.quiet_hours} МСК)\n\n"
                 f"Монеты: {', '.join(c.assets)}\nПлощадки: {', '.join(c.exchanges)}")
         mark = lambda on, t: ("✅ " if on else "") + t
         kb = [[{"text": mark(c.min_profit == v, f"{v}%"), "callback_data": f"min:{v}"} for v in MIN_PRESETS],
               [{"text": mark(c.amount == v, f"{v // 1000}к"), "callback_data": f"amt:{v}"} for v in AMOUNT_PRESETS],
               [{"text": "✏️ Своя сумма", "callback_data": "amt_custom"}],
               [{"text": "🔑 Мои биржи", "callback_data": "accounts"}],
-              [{"text": "▶️ Возобновить" if self.paused else "⏸ Пауза", "callback_data": "resume" if self.paused else "pause"}]]
+              [{"text": "🌙 Тихие часы: выкл" if self.quiet_on else "🌙 Тихие часы: вкл",
+                "callback_data": "quiet_off" if self.quiet_on else "quiet_on"},
+               {"text": "▶️ Возобновить" if pause_active else "⏸ Пауза",
+                "callback_data": "resume" if pause_active else "pause"}]]
         return text, {"inline_keyboard": kb}
 
     async def set_custom_amount(self, text):
@@ -623,7 +697,13 @@ class Bot:
             return f"Сумма {_money(self.cfg.amount)} ₽ — применится со следующего скана"
         if data in ("pause", "resume"):
             self.paused = data == "pause"
+            if data == "resume":
+                self.pause_until = 0.0
             return "Сигналы на паузе" if self.paused else "Сигналы включены"
+        if data in ("quiet_on", "quiet_off"):
+            self.quiet_on = data == "quiet_on"
+            save_env("QUIET_HOURS_ON", "1" if self.quiet_on else "0")
+            return f"Тихие часы ({self.quiet_hours} МСК) " + ("включены" if self.quiet_on else "выключены")
         return ""
 
     async def scan_loop(self):
@@ -634,8 +714,7 @@ class Bot:
                     await self.check_venues(self.last)
                     await self.check_alerts(self.last)
                     await self.check_networks()
-                    if not self.paused:
-                        await self.notify(self.last)
+                    await self.quiet_and_pause_tick(self.last)
             except Exception as e:
                 print("scan error:", e)
             await asyncio.sleep(self.cfg.interval)
@@ -645,6 +724,67 @@ class Bot:
         for venue, asset, net, kind, is_open in netstatus.pop_changes():
             await self.send(f"{'✅' if is_open else '⚠️'} {venue}: {kind} {asset} ({net}) "
                             + ("снова открыт" if is_open else "приостановлен — связки через эту сеть не показываю"))
+
+    def is_quiet_now(self):
+        """Сейчас внутри окна тихих часов (МСК) и они включены в настройках?"""
+        return self.quiet_on and in_quiet_hours(self.quiet_hours)
+
+    def collect_night_deals(self, snap):
+        """Запомнить связки выше порога за тихие часы — по одной, лучшей по прибыли, на пару площадок."""
+        for d in snap.deals[:self.max_signals]:
+            if d[0] < self.cfg.min_profit:
+                break
+            _, b, s, _ = d
+            key = (b.ex, b.asset, s.ex, s.asset)
+            if key not in self.night_deals or d[0] > self.night_deals[key][0]:
+                self.night_deals[key] = d
+
+    async def send_night_digest(self):
+        """Дайджест по окончании тихих часов: топ-3 связки за ночь по прибыли, одним сообщением."""
+        deals, self.night_deals = list(self.night_deals.values()), {}
+        if not deals:
+            await self.send("🌅 Тихие часы закончились — связок выше порога не было.")
+            return
+        top = sorted(deals, key=lambda d: d[0], reverse=True)[:3]
+        parts = [f"{i}) {fmt_deal(d, self.cfg)}" for i, d in enumerate(top, 1)]
+        await self.send("🌅 <b>Доброе утро! Топ-3 связки за ночь</b>\n\n" + "\n\n".join(parts))
+
+    async def quiet_and_pause_tick(self, snap):
+        """Тихие часы копят связки для утреннего дайджеста вместо отправки; обычная пауза (ручная или
+        по /pause) просто не шлёт сигналы. Дайджест уходит один раз — в момент выхода из тихих часов."""
+        quiet = self.is_quiet_now()
+        if quiet:
+            self.collect_night_deals(snap)
+        elif self._was_quiet:
+            await self.send_night_digest()
+        self._was_quiet = quiet
+        paused = self.paused or (self.pause_until and time.time() < self.pause_until)
+        if not quiet and not paused:
+            await self.notify(snap)
+
+    async def cmd_pause(self, arg):
+        """/pause [30m|1h|3h|до утра] — пауза сигналов; без аргумента — бессрочно, как кнопка «⏸ Пауза»."""
+        if not arg:
+            self.paused, self.pause_until = True, 0.0
+            await self.send("⏸ Сигналы на паузе. /resume — снять.")
+            return
+        sec = parse_pause_arg(arg)
+        if sec is None:
+            await self.send("Не понял срок паузы. Пример: /pause 30m, /pause 1h, /pause 3h, /pause до утра.")
+            return
+        if sec == "morning":
+            end = quiet_hours_end_ts(self.quiet_hours)
+            if end is None:
+                await self.send("Не задано окно тихих часов (QUIET_HOURS) — не могу поставить паузу «до утра».")
+                return
+        else:
+            end = time.time() + sec
+        self.paused, self.pause_until = False, end
+        await self.send(f"⏸ Сигналы на паузе до {_hhmm_msk(end)} (МСК). /resume — снять раньше.")
+
+    async def cmd_resume(self):
+        self.paused, self.pause_until = False, 0.0
+        await self.send("▶️ Сигналы включены.")
 
     async def check_venues(self, snap):
         """Алерт, если площадка недоступна >15 мин или падает 3 скана подряд; и сообщение о восстановлении."""
@@ -877,8 +1017,10 @@ class Bot:
                 await self.send("Нужно число.")
                 return
             await self.send(self.apply(f"{'min' if cmd == '/min' else 'amt'}:{v}"))
-        elif cmd in ("/pause", "/resume"):
-            await self.send(self.apply(cmd[1:]))
+        elif cmd == "/pause":
+            await self.cmd_pause(arg)
+        elif cmd == "/resume":
+            await self.cmd_resume()
         else:
             await self.send(GUIDE, markup=LINKS)
 
