@@ -49,12 +49,19 @@ def _f(v):
         return None
 
 
-def _parse_htx(j):
+def _parse_htx(j, asset=None):
+    """Справочник валют HTX по одной монете. У HTX для BTC/ETH вместе с настоящей сетью в списке
+    приходят обёрнутые токены на чужих блокчейнах (chain trc20btc/trc20wbtc/wbtc и т.п. с displayName
+    TRC20/ERC20/BEP20) — это не настоящий вывод BTC/ETH в этой сети, а другой актив под тем же именем
+    сети. Для BTC/ETH (asset задан) берём только запись с настоящим chain (== код монеты), иначе
+    маршрут посчитает копеечную комиссию обёрнутого токена как обычный вывод BTC/ETH."""
     if j.get("code") != 200:      # HTTP 200, но ошибка в теле — не путать с «монеты нет в ответе»
         raise ValueError(j.get("message") or j.get("code"))
     out = {}
     for c in j.get("data") or []:
         for ch in c.get("chains") or []:
+            if asset in ("BTC", "ETH") and (ch.get("chain") or "").lower() != asset.lower():
+                continue
             out[normalize(ch.get("displayName") or ch.get("chain"))] = {
                 "dep": ch.get("depositStatus") == "allowed", "wd": ch.get("withdrawStatus") == "allowed",
                 "fee": _f(ch.get("transactFeeWithdraw")), "min": _f(ch.get("minWithdrawAmt"))}
@@ -119,7 +126,7 @@ async def refresh(s, assets, exchanges, get_json):
     for a in assets:
         if "htx" in ex:
             tasks.append(get_json(s, "GET", f"https://api.htx.com/v2/reference/currencies?currency={a.lower()}"))
-            keys.append(("HTX", a, _parse_htx))
+            keys.append(("HTX", a, lambda r, a=a: _parse_htx(r, a)))
         if "kucoin" in ex:
             tasks.append(get_json(s, "GET", f"https://api.kucoin.com/api/v3/currencies/{a}"))
             keys.append(("KuCoin", a, _parse_kucoin))

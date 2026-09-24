@@ -30,6 +30,35 @@ def test_parse_public_fixtures():
     assert ku["BEP20"]["min"] == pytest.approx(10) and ku["TRC20"]["min"] == pytest.approx(4)
 
 
+@pytest.mark.parametrize("asset,native,fee,wrapped_net", [
+    ("BTC", "BTC", 0.00005, "TRC20"),    # chain trc20btc/trc20wbtc — обёрнутый BTC на Tron, не настоящая сеть
+    ("ETH", "ERC20", 0.0005, "BEP20"),   # chain bep20eth — обёрнутый ETH на BSC, не настоящая сеть
+])
+def test_parse_htx_ignores_wrapped_tokens_for_btc_eth(asset, native, fee, wrapped_net):
+    # HTX вместе с настоящей сетью BTC/ETH отдаёт обёрнутые токены на чужих блокчейнах (trc20btc,
+    # trc20wbtc, wbtc, bep20eth...) с displayName TRC20/BEP20/ERC20 — это не настоящий вывод BTC/ETH
+    # в этой сети, и его нельзя путать с настоящими TRC20/BEP20/ERC20 у USDT/USDC.
+    j = _htx_currency(f"https://api.htx.com/v2/reference/currencies?currency={asset.lower()}")
+    htx = netstatus._parse_htx(j, asset)
+    assert set(htx) == {native}
+    assert htx[native]["fee"] == pytest.approx(fee)
+    # без asset (как для USDT/USDC) обёрнутые сети по-прежнему разбираются как есть — это и была причина бага
+    raw = netstatus._parse_htx(j)
+    assert wrapped_net in raw and raw[wrapped_net]["fee"] != pytest.approx(fee)
+
+
+def test_route_htx_btc_does_not_use_wrapped_trc20():
+    # раньше маршрут HTX(BTC)→Bybit/BitPapa шёл «через TRC20» с копеечной комиссией обёрнутого токена —
+    # теперь у HTX для BTC остаётся только настоящая сеть BTC.
+    j = _htx_currency("https://api.htx.com/v2/reference/currencies?currency=btc")
+    netstatus._apply("HTX", "BTC", netstatus._parse_htx(j, "BTC"))
+    fee, net = p2p._withdraw(_cfg(), "HTX", "BTC", "", "Bybit")
+    assert net == "BTC" and fee == pytest.approx(0.00005)
+    # BitPapa принимает по RECEIVE_NETS только TRC20, но это ограничение не для BTC — сеть BTC не блокируется
+    fee, net = p2p._withdraw(_cfg(), "HTX", "BTC", "", "BitPapa")
+    assert net == "BTC" and fee == pytest.approx(0.00005)
+
+
 def test_parse_bybit_and_mexc_shapes():
     by = netstatus._parse_bybit({"result": {"rows": [{"coin": "USDT", "chains": [
         {"chain": "TRX", "chainType": "Tron (TRC20)", "chainDeposit": "1", "chainWithdraw": "0", "withdrawFee": "1", "withdrawMin": "5"},
@@ -210,9 +239,10 @@ def test_listed_directory_without_receiver_net_blocks_route():
     netstatus.reset()
     _, route = p2p._route(b, s, _cfg(), SPOT)
     assert "−1 USDC на BitPapa" in route                        # сведений нет — запасная комиссия
-    # ETH в TRC20 не бывает: справочник HTX без TRC20 не значит, что BitPapa монету не примет
+    # ETH в TRC20 не бывает: RECEIVE_NETS BitPapa (TRC20) — ограничение только для монет, у которых
+    # TRC20 в принципе существует (USDT/USDC); для ETH оно не действует, и берётся настоящая сеть ERC20.
     netstatus._apply("HTX", "ETH", {"ERC20": {"dep": True, "wd": True, "fee": 0.002}})
-    assert p2p._withdraw(_cfg(), "HTX", "ETH", "", "BitPapa") == (0.001, "")
+    assert p2p._withdraw(_cfg(), "HTX", "ETH", "", "BitPapa") == (0.002, "ERC20")
 
 
 def test_exchanger_to_exchange_checks_receiver_deposit():
