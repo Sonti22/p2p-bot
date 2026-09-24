@@ -717,8 +717,11 @@ class Bot:
         self.fancy = os.getenv("FANCY_BUTTONS", "1") != "0"   # цветные кнопки и «📋»; сам выключится при ошибке API
         self.topics = {}          # ключ топика -> message_thread_id, если у бота включены топики в личке
         self.cur_thread = None    # топик, из которого пришла последняя команда/кнопка — туда и отвечаем
-        self.guests = {g.strip() for g in os.getenv("TG_GUESTS", "").split(",") if g.strip()}
+        entries = {g.strip() for g in os.getenv("TG_GUESTS", "").split(",") if g.strip()}
+        self.guests = {g for g in entries if not g.startswith("@")}          # id чатов гостей
+        self.pending = {g.lower() for g in entries if g.startswith("@")}   # @ники: доступ откроется с первого сообщения
         self.asked = set()        # чужие чаты, которым уже ответили «бот приватный» (раз за запуск)
+        self.username = ""       # @ник бота из getMe — для подсказок
         self.repeat_step = float(os.getenv("REPEAT_STEP", 0.3))  # п.п. роста профита для досрочного повтора
         self.max_signals = int(os.getenv("MAX_SIGNALS", 3))      # сигналим только из топ-N
         self.last = None
@@ -760,6 +763,8 @@ class Bot:
         if not self.chat_id:
             return
         me = await self.call("getMe")
+        if me.get("ok"):
+            self.username = me["result"].get("username") or ""
         if not me.get("ok") or not me["result"].get("has_topics_enabled"):
             return
         saved = load_topics()
@@ -1617,7 +1622,17 @@ class Bot:
             REPLY_CHAT.reset(token)
 
     async def ask_access(self, chat, sender):
-        """Чужой чат: один раз за запуск сказать ему id и один раз сообщить владельцу, как дать доступ."""
+        """Чужой чат: если его @ник заранее разрешён (/allow @name) — подключить сразу; иначе один раз за запуск
+        сказать ему id и один раз сообщить владельцу, как дать доступ."""
+        uname = "@" + (sender.get("username") or "").lower()
+        if uname in self.pending:
+            self.pending.discard(uname)
+            self.guests.add(chat)
+            self.save_guests()
+            await self.send(GUEST_WELCOME, chat_id=chat, markup=GUEST_MENU)
+            await self.send(f"✅ {html.escape(uname)} (id <code>{chat}</code>) написал боту и подключён как гость. "
+                            f"Убрать: /deny {chat}", topic="settings")
+            return
         if chat in self.asked:
             return
         self.asked.add(chat)
@@ -1629,12 +1644,17 @@ class Bot:
                         f"командам: <code>/allow {chat}</code>", topic="settings")
 
     def save_guests(self):
-        save_env("TG_GUESTS", ",".join(sorted(self.guests)))
+        save_env("TG_GUESTS", ",".join(sorted(self.guests) + sorted(self.pending)))
 
     async def cmd_allow(self, arg):
         gid = (arg or "").strip()
-        if not re.fullmatch(r"-?\d+", gid):
-            await self.send("Нужен id чата: /allow 123456789 (бот присылает его, когда человек пишет ему).")
+        if re.fullmatch(r"@[A-Za-z0-9_]{5,32}", gid):          # по нику: подключится с первого сообщения боту
+            self.pending.add(gid.lower())
+            self.save_guests()
+            await self.send(f"✅ {html.escape(gid)} получит доступ, как только напишет боту @{self.username or 'боту'} "
+                            f"любое сообщение. Список: /guests")
+        elif not re.fullmatch(r"-?\d+", gid):
+            await self.send("Нужен id чата или @ник: /allow 123456789 либо /allow @username.")
         elif gid == self.chat_id:
             await self.send("Это твой собственный чат.")
         elif gid in self.guests:
@@ -1648,6 +1668,11 @@ class Bot:
 
     async def cmd_deny(self, arg):
         gid = (arg or "").strip()
+        if gid.lower() in self.pending:
+            self.pending.discard(gid.lower())
+            self.save_guests()
+            await self.send(f"🚫 {html.escape(gid)} убран из ожидающих.")
+            return
         if gid not in self.guests:
             await self.send(f"{gid or '?'} не в списке гостей. Список: /guests")
             return
@@ -1657,11 +1682,14 @@ class Bot:
         await self.send("🔒 Владелец закрыл доступ к боту.", chat_id=gid, markup={"remove_keyboard": True})
 
     async def cmd_guests(self):
-        if not self.guests:
-            await self.send("Гостей нет. Когда друг напишет боту, пришлю его id и команду /allow.")
-        else:
-            await self.send("👥 <b>Гости</b> (сигналы + /best, /top, /calc, /banks, /maker, /fees, /history):\n"
-                            + "\n".join(f"• <code>{g}</code> — /deny {g}" for g in sorted(self.guests)))
+        if not self.guests and not self.pending:
+            await self.send("Гостей нет. /allow @ник — доступ откроется с первого сообщения; "
+                            "или, когда друг напишет боту, пришлю его id и команду /allow.")
+            return
+        lines = ["👥 <b>Гости</b> (сигналы + /best, /top, /calc, /banks, /maker, /fees, /history):"]
+        lines += [f"• <code>{g}</code> — /deny {g}" for g in sorted(self.guests)]
+        lines += [f"• {html.escape(u)} — ждёт первого сообщения боту, /deny {html.escape(u)}" for u in sorted(self.pending)]
+        await self.send("\n".join(lines))
 
     async def welcome(self):
         if REPLY_CHAT.get() is not None:
