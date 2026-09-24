@@ -13,6 +13,7 @@ import aiohttp
 import accounts
 import alerts
 import blacklist
+import fees
 import netstatus
 import trades
 from cards import deal_card, portfolio_card, top_chart
@@ -33,6 +34,7 @@ COMMANDS = [{"command": "best", "description": "Лучшая связка сей
             {"command": "alerts", "description": "Список алертов на курс"},
             {"command": "blacklist", "description": "Скрытые мерчанты и обменники"},
             {"command": "balance", "description": "Баланс по подключённым биржам"},
+            {"command": "fees", "description": "Комиссии вывода по сетям и возраст данных"},
             {"command": "settings", "description": "Порог, сумма, пауза"},
             {"command": "pause", "description": "Пауза сигналов: /pause 30m|1h|3h|до утра"},
             {"command": "resume", "description": "Снять паузу сигналов"},
@@ -1004,6 +1006,8 @@ class Bot:
             await self.send(text, markup=kb)
         elif cmd == "/balance":
             await self.balance()
+        elif cmd == "/fees":
+            await self.send(fees.view(live=netstatus.live_fee))
         elif cmd == "/settings":
             text, kb = self.settings_view()
             await self.send(text, markup=kb)
