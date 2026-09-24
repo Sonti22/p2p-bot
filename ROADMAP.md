@@ -55,7 +55,10 @@
   `accounts.htx_signed_params`/`htx_get` (HTX Signature Version 2, `api.htx.com` — в allowlist guard) и
   `accounts.kucoin_headers`/`kucoin_get` (KuCoin v2, KC-API-PASSPHRASE тоже подписывается HMAC) в accounts.py;
   обе биржи в `CONNECTABLE`, `verify()` проверяет ключ запросом баланса как у Bybit/MEXC.)
-- [ ] Проверка ключа при старте: если API отдаёт права ключа и там есть торговля или вывод — не использовать ключ и написать в Telegram «создай ключ только на чтение».
+- [x] Проверка ключа при старте: если API отдаёт права ключа и там есть торговля или вывод — не использовать ключ и написать в Telegram «создай ключ только на чтение». (2026-09-24 — `accounts.api_permissions` (Bybit `/v5/user/query-api` `readOnly`,
+  MEXC `canTrade`/`canWithdraw`, HTX `/v2/user/api-key` `permission`, KuCoin `/api/v1/user/api-key` `permission` ≠
+  `General`) и `Bot.check_key_safety` в bot.py: на старте с `TG_CHAT_ID` удаляет небезопасный ключ и просит
+  создать read-only; ошибка проверки не блокирует уже сохранённый ключ.)
 - [ ] `/balance`: балансы USDT/USDC/BTC/ETH/TON по биржам (Bybit — Funding + Unified, MEXC — спот) и итог в ₽ по ориентиру; картинка-карточка портфеля и кнопка «🔄 Обновить».
 - [ ] Автожурнал: история P2P-ордеров, если доступна по ключу пользователя (Bybit P2P API), иначе — депозиты, выводы и спот-сделки; сопоставлять со «✅ Сделал» и автоматически заполнять факт для «расчёт vs факт».
 - [ ] Уведомления по аккаунтам (опрос раз в минуту): пришёл депозит, завершён вывод, исполнен спот-ордер; без повторов.
@@ -183,3 +186,6 @@ _(облачный Claude добавляет сюда предложения, к
 - 2026-09-24 — подключение HTX и KuCoin: подписанные read-only GET к приватному API обеих бирж
   (HTX Signature Version 2, KuCoin v2 с подписанным KC-API-PASSPHRASE), `verify()` проверяет ключ
   запросом баланса, как у Bybit/MEXC.
+- 2026-09-24 — проверка ключа при старте: `accounts.api_permissions` читает права ключа из самого API
+  биржи (Bybit/MEXC/HTX/KuCoin), `Bot.check_key_safety` при запуске удаляет ключ с правом на торговлю
+  или вывод и просит в Telegram создать read-only ключ взамен.
