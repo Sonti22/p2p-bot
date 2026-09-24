@@ -441,6 +441,74 @@ def test_portfolio_skips_exchange_on_error(tmp_path, monkeypatch):
     assert asyncio.run(accounts.portfolio(_Boom())) == {}
 
 
+class _FakePostResp:
+    def __init__(self, url, headers, data):
+        self.url, self.headers, self.data = url, headers, data
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+    def raise_for_status(self):
+        pass
+
+    async def json(self, content_type=None):
+        return {"url": self.url, "headers": self.headers, "data": self.data}
+
+
+class _FakePostSession:
+    def post(self, url, headers=None, data=None):
+        return _FakePostResp(url, headers, data)
+
+
+def test_bybit_post_signs_body():
+    ts = "1700000000000"
+    j = asyncio.run(accounts.bybit_post(_FakePostSession(), "k", "s", "/v5/p2p/order/simplifyList",
+                                         {"page": 1, "size": 20}, timestamp=ts))
+    assert j["url"] == "https://api.bybit.com/v5/p2p/order/simplifyList"
+    assert j["headers"]["X-BAPI-API-KEY"] == "k"
+    payload = j["data"]
+    expected = hmac.new("s".encode(), (ts + "k" + "5000" + payload).encode(), hashlib.sha256).hexdigest()
+    assert j["headers"]["X-BAPI-SIGN"] == expected
+
+
+class _P2pSession:
+    def __init__(self, body):
+        self.body = body
+
+    def post(self, url, headers=None, data=None):
+        return _JsonResp(self.body)
+
+
+def test_bybit_p2p_orders_parses_completed_items():
+    body = {"retCode": 0, "result": {"items": [
+        {"id": "1", "side": "1", "tokenId": "USDT", "currencyId": "RUB", "amount": "100.5",
+         "price": "95.2", "createDate": "1700000000000"},
+        {"id": "2", "side": "2", "tokenId": "USDT", "currencyId": "RUB", "amount": "50",
+         "price": "94", "createDate": "1700000001000"},
+    ]}}
+    orders = asyncio.run(accounts.bybit_p2p_orders(_P2pSession(body), "k", "s"))
+    assert orders == [
+        {"id": "1", "side": "buy", "asset": "USDT", "fiat": "RUB", "amount": 100.5, "price": 95.2, "ts": 1700000000.0},
+        {"id": "2", "side": "sell", "asset": "USDT", "fiat": "RUB", "amount": 50.0, "price": 94.0, "ts": 1700000001.0},
+    ]
+
+
+def test_bybit_p2p_orders_returns_none_on_bad_retcode():
+    body = {"retCode": 10005, "retMsg": "Permission denied"}
+    assert asyncio.run(accounts.bybit_p2p_orders(_P2pSession(body), "k", "s")) is None
+
+
+def test_bybit_p2p_orders_returns_none_on_error():
+    class _Boom:
+        def post(self, url, headers=None, data=None):
+            raise RuntimeError("network down")
+
+    assert asyncio.run(accounts.bybit_p2p_orders(_Boom(), "k", "s")) is None
+
+
 def test_api_permissions_fails_open_when_api_errors(tmp_path, monkeypatch):
     """Если проверку прав нельзя выполнить (ошибка сети/формата) — не блокируем уже сохранённый ключ."""
     monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))

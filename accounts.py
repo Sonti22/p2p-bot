@@ -122,6 +122,25 @@ async def mexc_get(s, api_key, api_secret, path, params=None):
     return await _get_json(s, url, {"X-MEXC-APIKEY": api_key})
 
 
+async def bybit_post(s, api_key, api_secret, path, body=None, recv_window="5000", timestamp=None):
+    """Подписанный POST к приватному Bybit v5 (например P2P-эндпоинты) — та же формула подписи,
+    что и у GET (ts+key+recv_window+данные), только query заменяется на JSON-тело запроса."""
+    ts = timestamp or str(int(time.time() * 1000))
+    payload = json.dumps(body or {}, separators=(",", ":"))
+    sign = hmac.new(api_secret.encode(), (ts + api_key + recv_window + payload).encode(), hashlib.sha256).hexdigest()
+    headers = {
+        "X-BAPI-API-KEY": api_key,
+        "X-BAPI-SIGN": sign,
+        "X-BAPI-SIGN-TYPE": "2",
+        "X-BAPI-TIMESTAMP": ts,
+        "X-BAPI-RECV-WINDOW": recv_window,
+        "Content-Type": "application/json",
+    }
+    async with s.post(f"{BYBIT_BASE}{path}", headers=headers, data=payload) as r:
+        r.raise_for_status()
+        return await r.json(content_type=None)
+
+
 def htx_signed_params(api_key, api_secret, method, path, params=None, timestamp=None, host="api.htx.com"):
     """Query-параметры для приватного HTX v1 (Signature Version 2): подпись = Base64(HMAC_SHA256(secret,
     METHOD+"\\n"+host+"\\n"+path+"\\n"+отсортированная_query))."""
@@ -307,3 +326,35 @@ async def verify(s, exchange):
     except Exception as e:
         return False, str(e)
     return True, "ключ рабочий, доступ только для чтения"
+
+
+P2P_STATUS_COMPLETED = 50  # Bybit P2P: код статуса завершённого ордера
+
+
+async def bybit_p2p_orders(s, api_key, api_secret, size=20):
+    """История последних завершённых P2P-ордеров Bybit пользователя (только чтение, для автожурнала).
+
+    Возвращает список {id, side, asset, fiat, amount, price, ts} или None, если P2P API недоступно
+    этому ключу (нет прав/бизнес-аккаунта, ошибка сети) — тогда автожурнал берёт факт из другого места."""
+    try:
+        j = await bybit_post(s, api_key, api_secret, "/v5/p2p/order/simplifyList",
+                              {"page": 1, "size": size, "status": P2P_STATUS_COMPLETED})
+    except Exception:
+        return None
+    if j.get("retCode") != 0:
+        return None
+    out = []
+    for it in (j.get("result") or {}).get("items") or []:
+        try:
+            out.append({
+                "id": it.get("id"),
+                "side": "buy" if str(it.get("side")) in ("1", "buy", "Buy") else "sell",
+                "asset": it.get("tokenId"),
+                "fiat": it.get("currencyId"),
+                "amount": float(it.get("amount") or 0),
+                "price": float(it.get("price") or 0),
+                "ts": int(it.get("createDate") or 0) / 1000,
+            })
+        except (TypeError, ValueError):
+            continue
+    return out
