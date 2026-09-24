@@ -3,6 +3,7 @@ import asyncio
 import dataclasses
 import html
 import json
+import logging
 import os
 import re
 import time
@@ -19,9 +20,11 @@ import netstatus
 import presets
 import trades
 from cards import deal_card, history_card, history_compare_card, portfolio_card, top_chart
-from p2p import ALL_EXCHANGES, AMOUNT_MAX, AMOUNT_MIN, DEFAULT_ASSETS, ENV_PATH, Config, _money, _price, \
+from p2p import ALL_EXCHANGES, AMOUNT_MAX, AMOUNT_MIN, DEFAULT_ASSETS, ENV_PATH, LOG_PATH, Config, _money, _price, \
     deal_amounts, fmt_ad, fmt_deal, fmt_top, load_env, maker_quote, parse_amount, profit_breakdown, reliability, \
-    scan, spot_url, traps_log, venue_url
+    scan, setup_logging, spot_url, traps_log, venue_url
+
+logger = logging.getLogger(__name__)
 
 MENU = {"keyboard": [[{"text": "🔥 Лучшая сейчас"}, {"text": "📊 Топ связок"}],
                      [{"text": "⚙️ Настройки"}, {"text": "🛠 Разработка"}],
@@ -46,6 +49,8 @@ COMMANDS = [{"command": "best", "description": "Лучшая связка сей
             {"command": "pause", "description": "Пауза сигналов: /pause 30m|1h|3h|до утра"},
             {"command": "resume", "description": "Снять паузу сигналов"},
             {"command": "dev", "description": "Как развивается бот: версия, изменения, план"},
+            {"command": "status", "description": "Версия, аптайм, последний скан, ошибки площадок"},
+            {"command": "logs", "description": "Последние строки лога (logs/bot.log)"},
             {"command": "help", "description": "Как работать с сигналами"}]
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEV_STATUS = os.path.join(HERE, ".dev_status.json")   # пишет launcher.py при каждом запуске
@@ -436,13 +441,18 @@ def roadmap_progress(path=os.path.join(HERE, "ROADMAP.md")):
     return sum(1 for s, _ in items if s != " "), len(items), nxt.replace("`", "")
 
 
+def _dev_status(path=DEV_STATUS):
+    """Содержимое .dev_status.json (пишет launcher.py): версия, репозиторий, время запуска, лог коммитов."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
 def dev_view(status_path=DEV_STATUS, roadmap_path=os.path.join(HERE, "ROADMAP.md")):
     """Текст и кнопки раздела «🛠 Разработка»."""
-    try:
-        with open(status_path, encoding="utf-8") as f:
-            st = json.load(f)
-    except (OSError, ValueError):
-        st = {}
+    st = _dev_status(status_path)
     done, total, nxt = roadmap_progress(roadmap_path)
     lines = ["🛠 <b>Разработка бота</b>", ""]
     if st:
@@ -463,8 +473,33 @@ def dev_view(status_path=DEV_STATUS, roadmap_path=os.path.join(HERE, "ROADMAP.md
                  [{"text": "✅ Проверки (CI)", "url": f"{repo}/actions"}, {"text": "📋 План", "url": f"{repo}/blob/main/ROADMAP.md"}]]
     if routine:
         rows.append([{"text": "☁️ Облачные запуски", "url": routine}])
-    rows.append([{"text": "🔄 Обновить", "callback_data": "dev"}])
+    rows.append([{"text": "📟 Статус", "callback_data": "status"}, {"text": "🔄 Обновить", "callback_data": "dev"}])
     return "\n".join(lines), {"inline_keyboard": rows}
+
+
+def _uptime_str(seconds):
+    """86461 -> «1д 00:01:01», 330 -> «00:05:30» — человекочитаемый аптайм бота."""
+    seconds = max(0, int(seconds))
+    d, rem = divmod(seconds, 86400)
+    h, rem = divmod(rem, 3600)
+    m, sec = divmod(rem, 60)
+    hms = f"{h:02d}:{m:02d}:{sec:02d}"
+    return f"{d}д {hms}" if d else hms
+
+
+def logs_view(path=LOG_PATH, n=30):
+    """Текст «/logs»: последние n строк logs/bot.log, экранированные под HTML."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+    except OSError:
+        return "📄 <b>Логи</b>\n\nФайл логов пока пуст — бот ещё не писал (logs/bot.log)."
+    tail = "".join(lines[-n:]).strip()
+    if not tail:
+        return "📄 <b>Логи</b>\n\nФайл логов пуст."
+    if len(tail) > 3500:   # запас под лимит сообщения Telegram (4096) и заголовок
+        tail = tail[-3500:]
+    return f"📄 <b>Последние {min(n, len(lines))} строк лога</b>\n\n<pre>{html.escape(tail)}</pre>"
 
 
 TOP_MARKUP = {"inline_keyboard": [
@@ -533,6 +568,9 @@ class Bot:
         self.deals_by_id = {}   # id -> (d, cfg, snap на момент сигнала) для кнопок «✅ Сделал»/«📋 Шаги»; не переживает рестарт
         self.next_deal_id = 1
         self.acc_seen = {}   # ex -> set известных ключей истории; None пока не было первого опроса
+        self.start_ts = time.time()     # для аптайма в /status
+        self.last_scan_ts = 0.0         # unix-время окончания последнего скана
+        self.last_scan_duration = 0.0   # сколько секунд занял последний скан
 
     async def call(self, method, **params):
         async with self.s.post(f"https://api.telegram.org/bot{self.token}/{method}", json=params,
@@ -564,9 +602,9 @@ class Bot:
                 r = await self.send_photo(await asyncio.to_thread(render), caption, markup)
                 if r.get("ok"):
                     return
-                print("sendPhoto:", r.get("description"))
+                logger.warning("sendPhoto: %s", r.get("description"))
             except Exception as e:
-                print("card error:", e)
+                logger.warning("card error: %s", e)
         await self.send(caption, markup=markup)
 
     def remember_deal(self, d, cfg=None, snap=None):
@@ -966,7 +1004,9 @@ class Bot:
     async def scan_loop(self):
         while True:
             try:
+                t0 = time.time()
                 self.last = await scan(self.s, self.cfg)
+                self.last_scan_ts, self.last_scan_duration = time.time(), time.time() - t0
                 self.track_liveness(self.last)
                 if history.record(self.last):   # не чаще раза в 5 минут, независимо от чата
                     history.cleanup()
@@ -976,8 +1016,33 @@ class Bot:
                     await self.check_networks()
                     await self.quiet_and_pause_tick(self.last)
             except Exception as e:
-                print("scan error:", e)
+                logger.error("scan error: %s", e)
             await asyncio.sleep(self.cfg.interval)
+
+    def status_view(self, status_path=DEV_STATUS):
+        """Текст «/status»: версия, аптайм, время/длительность последнего скана, ошибки площадок,
+        сколько связок сейчас выше порога сигнала."""
+        st = _dev_status(status_path)
+        lines = ["📟 <b>Статус бота</b>", "",
+                 f"Версия: <code>{html.escape(st.get('version', '?'))}</code>",
+                 f"Аптайм: {_uptime_str(time.time() - self.start_ts)}"]
+        if self.last_scan_ts:
+            when = datetime.fromtimestamp(self.last_scan_ts).strftime("%d.%m %H:%M:%S")
+            lines.append(f"Последний скан: {when} ({self.last_scan_duration:.1f} с)")
+        else:
+            lines.append("Последний скан: ещё не было")
+        snap = self.last
+        if snap is None:
+            lines.append("Скан ещё не выполнялся.")
+            return "\n".join(lines)
+        above = sum(1 for d in snap.deals if d[0] >= self.cfg.min_profit)
+        lines.append(f"Связок выше порога {self.cfg.min_profit:g}%: {above}")
+        if snap.errors:
+            lines += ["", "<b>Ошибки площадок:</b>"]
+            lines += [f"• {html.escape(k)}: {html.escape(e)}" for k, e in snap.errors.items()]
+        else:
+            lines.append("Ошибок нет — все площадки отвечают.")
+        return "\n".join(lines)
 
     async def check_networks(self):
         """Сеть вывода/ввода переключилась (открыт ↔ закрыт) — одно сообщение на переключение."""
@@ -1117,7 +1182,7 @@ class Bot:
             try:
                 hist = await accounts.account_history(self.s, ex)
             except Exception as e:
-                print("account history error:", ex, e)
+                logger.warning("account history error: %s %s", ex, e)
                 continue
             if not hist:
                 continue
@@ -1134,7 +1199,7 @@ class Bot:
                 try:
                     await self.check_accounts()
                 except Exception as e:
-                    print("accounts_loop error:", e)
+                    logger.error("accounts_loop error: %s", e)
             await asyncio.sleep(ACCOUNT_POLL_INTERVAL)
 
     async def command_loop(self):
@@ -1143,11 +1208,11 @@ class Bot:
             try:
                 r = await self.call("getUpdates", offset=offset, timeout=30)
             except Exception as e:
-                print("getUpdates error:", e)
+                logger.warning("getUpdates error: %s", e)
                 await asyncio.sleep(5)
                 continue
             if not r.get("ok"):
-                print("Telegram:", r.get("description"))
+                logger.warning("Telegram: %s", r.get("description"))
                 await asyncio.sleep(10)
                 continue
             for u in r["result"]:
@@ -1155,7 +1220,7 @@ class Bot:
                 try:
                     await self.on_update(u)
                 except Exception as e:
-                    print("update error:", e)
+                    logger.error("update error: %s", e)
 
     async def on_update(self, u):
         cq = u.get("callback_query")
@@ -1171,7 +1236,7 @@ class Bot:
             # первый написавший чат становится получателем сигналов
             self.chat_id = chat
             save_env("TG_CHAT_ID", chat)
-            print("chat_id сохранён в .env:", chat)
+            logger.info("chat_id сохранён в .env: %s", chat)
             await self.welcome()
         elif chat == self.chat_id:
             text = (msg.get("text") or "").strip()
@@ -1223,6 +1288,8 @@ class Bot:
         elif data == "dev":
             text, kb = dev_view()
             await self.send(text, markup=kb)
+        elif data == "status":
+            await self.send(self.status_view())
         elif data == "balance":
             await self.balance()
         elif data.startswith("did:"):
@@ -1348,6 +1415,10 @@ class Bot:
         elif cmd == "/dev":
             text, kb = dev_view()
             await self.send(text, markup=kb)
+        elif cmd == "/status":
+            await self.send(self.status_view())
+        elif cmd == "/logs":
+            await self.send(logs_view(LOG_PATH))
         elif cmd in ("/min", "/amount") and arg:
             try:
                 v = float(arg.replace(",", ".").replace(" ", ""))
@@ -1381,12 +1452,13 @@ class Bot:
             try:
                 r = await self.call(method, **params)
                 if not r.get("ok"):
-                    print(method, r.get("description"))
+                    logger.warning("%s: %s", method, r.get("description"))
             except Exception as e:
-                print(method, e)
+                logger.warning("%s: %s", method, e)
 
 
 async def main():
+    setup_logging()
     load_env()
     token = os.getenv("TG_TOKEN", "").strip()
     if not token:
@@ -1397,7 +1469,8 @@ async def main():
         await bot.setup()
         if bot.chat_id:
             await bot.check_key_safety()
-        print(f"Бот запущен: каждые {cfg.interval}s, порог {cfg.min_profit:g}%, биржи {', '.join(cfg.exchanges)}")
+        logger.info("Бот запущен: каждые %ss, порог %g%%, биржи %s", cfg.interval, cfg.min_profit,
+                    ', '.join(cfg.exchanges))
         await asyncio.gather(bot.scan_loop(), bot.command_loop(), bot.accounts_loop())
 
 

@@ -8,13 +8,16 @@ import dataclasses
 import html
 import io
 import json
+import logging
 import os
 import re
 import statistics
+import sys
 import time
 import zipfile
 from collections import deque
 from dataclasses import dataclass, field
+from logging.handlers import RotatingFileHandler
 
 import aiohttp
 
@@ -60,7 +63,32 @@ BC_COINS = {  # имя в bm_cy.dat -> (монета, сеть)
     "USDC ERC20 (USDC)": ("USDC", "ERC20"), "USDC SOL (USDC)": ("USDC", "SOL"),
     "Bitcoin (BTC)": ("BTC", "BTC"), "Ethereum (ETH)": ("ETH", "ERC20"),
 }
-ENV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+HERE = os.path.dirname(os.path.abspath(__file__))
+ENV_PATH = os.path.join(HERE, ".env")
+LOG_PATH = os.path.join(HERE, "logs", "bot.log")   # ротация 5 x 1 МБ; хвост читает Bot.logs_view (/logs)
+
+logger = logging.getLogger(__name__)
+_log_handlers = []   # хендлеры, поставленные setup_logging — чтобы повторный вызов не плодил дубликаты
+
+
+def setup_logging(path=LOG_PATH):
+    """Логи в файл с ротацией (5 x 1 МБ, 5 бэкапов) + консоль, вместо print. Можно звать повторно
+    (например, из тестов с другим path) — старые хендлеры этой функции снимаются и закрываются."""
+    root = logging.getLogger()
+    for h in _log_handlers:
+        root.removeHandler(h)
+        h.close()
+    _log_handlers.clear()
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s", "%d.%m %H:%M:%S")
+    file_h = RotatingFileHandler(path, maxBytes=1_000_000, backupCount=5, encoding="utf-8")
+    file_h.setFormatter(fmt)
+    console_h = logging.StreamHandler(sys.stdout)
+    console_h.setFormatter(fmt)
+    root.setLevel(logging.INFO)
+    root.addHandler(file_h)
+    root.addHandler(console_h)
+    _log_handlers.extend([file_h, console_h])
 
 
 def load_env(path=ENV_PATH):
@@ -664,6 +692,33 @@ class Snapshot:
 
 _alt = {"t": 0.0, "ads": [], "errors": {}}
 
+VENUE_BACKOFF_BASE = 30    # сек: первая пауза площадки после ошибки
+VENUE_BACKOFF_MAX = 600    # сек: потолок паузы (10 мин)
+_venue_backoff = {}   # ex -> {"delay": текущая пауза (0 = нет бэкоффа), "until": unix-время окончания паузы}
+
+
+def _venue_paused_until(ex):
+    """Unix-время окончания паузы площадки, если она сейчас в бэкоффе после серии ошибок, иначе None."""
+    st = _venue_backoff.get(ex)
+    if st and st["until"] > time.time():
+        return st["until"]
+    return None
+
+
+def _venue_backoff_fail(ex):
+    """Ошибка площадки: следующая пауза растёт 30с → 60 → 120 … до потолка VENUE_BACKOFF_MAX (10 мин)."""
+    st = _venue_backoff.setdefault(ex, {"delay": 0, "until": 0.0})
+    st["delay"] = VENUE_BACKOFF_BASE if not st["delay"] else min(st["delay"] * 2, VENUE_BACKOFF_MAX)
+    st["until"] = time.time() + st["delay"]
+    logger.warning("%s: ошибка, пропускаю %d с", ex, st["delay"])
+
+
+def _venue_backoff_ok(ex):
+    """Площадка ответила успешно — сброс паузы (следующая ошибка снова начнёт с VENUE_BACKOFF_BASE)."""
+    if _venue_backoff.pop(ex, None):
+        logger.info("%s: снова отвечает, бэкофф сброшен", ex)
+
+
 TRAPS_LOG_SIZE = 30
 TRAPS_LOG = deque(maxlen=TRAPS_LOG_SIZE)   # последние отсеянные «ловушки» — для /traps, обучение без риска
 
@@ -693,7 +748,9 @@ def traps_log():
 async def scan(s, cfg, force_alt=False):
     """force_alt — разовый скан под свою сумму (`/calc`, «своя сумма»): всегда опросить не-USDT монеты
     заново и не трогать общий кэш _alt, потому что лимиты объявлений зависят от cfg.amount."""
-    names = [n for n in cfg.exchanges if n in FETCHERS]
+    names_all = [n for n in cfg.exchanges if n in FETCHERS]
+    paused = {n: u for n in names_all if (u := _venue_paused_until(n))}   # площадки на паузе после ошибок
+    names = [n for n in names_all if n not in paused]
     alts = [a for a in cfg.assets if a != "USDT"]
     alt_due = force_alt or (bool(alts) and time.time() - _alt["t"] >= cfg.alt_interval)
     jobs = [(n, side, asset) for n in names
@@ -709,12 +766,19 @@ async def scan(s, cfg, force_alt=False):
         net_errors = {"сети": f"{type(e).__name__}: {e}"[:80]}
 
     ads, errors, alt_ads, alt_errors = [], {}, [], {}
+    venue_seen, venue_failed = set(), set()
     for (n, _, asset), r in zip(jobs, res):
+        venue_seen.add(n)
         cached = asset != "USDT" and n != "bestchange"   # не-USDT монеты кэшируем на alt_interval
         if isinstance(r, Exception):
+            venue_failed.add(n)
             (alt_errors if cached else errors)[f"{n}/{asset}"] = f"{type(r).__name__}: {r}"[:120]
         else:
             (alt_ads if cached else ads).extend(r)
+    for n in venue_seen:   # бэкофф по площадке: сбрасываем на успехе, растим паузу на ошибке
+        (_venue_backoff_fail if n in venue_failed else _venue_backoff_ok)(n)
+    for n, until in paused.items():
+        errors[n] = f"пауза до {time.strftime('%H:%M', time.localtime(until))}"
     if alt_due and not force_alt:
         _alt.update(t=time.time(), ads=alt_ads, errors=alt_errors)
     ads += alt_ads if force_alt else _alt["ads"]
@@ -954,8 +1018,9 @@ async def main():
     cfg = Config.from_env()
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as s:
         snap = await scan(s, cfg)
-    print(html.unescape(re.sub(r"<[^>]+>", "", fmt_top(snap, cfg, n=10))))
+    logger.info(html.unescape(re.sub(r"<[^>]+>", "", fmt_top(snap, cfg, n=10))))
 
 
 if __name__ == "__main__":
+    setup_logging()
     asyncio.run(main())
