@@ -21,7 +21,7 @@ import trades
 from cards import deal_card, history_card, history_compare_card, portfolio_card, top_chart
 from p2p import ALL_EXCHANGES, AMOUNT_MAX, AMOUNT_MIN, DEFAULT_ASSETS, ENV_PATH, Config, _money, _price, \
     deal_amounts, fmt_ad, fmt_deal, fmt_top, load_env, parse_amount, profit_breakdown, reliability, scan, spot_url, \
-    venue_url
+    traps_log, venue_url
 
 MENU = {"keyboard": [[{"text": "🔥 Лучшая сейчас"}, {"text": "📊 Топ связок"}],
                      [{"text": "⚙️ Настройки"}, {"text": "🛠 Разработка"}],
@@ -37,6 +37,7 @@ COMMANDS = [{"command": "best", "description": "Лучшая связка сей
             {"command": "alert", "description": "Алерт на курс, напр. /alert USDT sell 92 7d"},
             {"command": "alerts", "description": "Список алертов на курс"},
             {"command": "blacklist", "description": "Скрытые мерчанты и обменники"},
+            {"command": "traps", "description": "Последние отсеянные ловушки (обучение без риска)"},
             {"command": "balance", "description": "Баланс по подключённым биржам"},
             {"command": "fees", "description": "Комиссии вывода по сетям и возраст данных"},
             {"command": "settings", "description": "Порог, сумма, пауза"},
@@ -305,6 +306,21 @@ def blacklist_view():
         lines.append(f"{name}: {html.escape(nick)}")
         kb.append([{"text": f"🗑 {name}: {nick}"[:64], "callback_data": f"unbl:{entry_id}"}])
     return "\n".join(lines), {"inline_keyboard": kb}
+
+
+def traps_view():
+    """Текст «/traps»: последние отсеянные аномальные объявления — обучение видеть ловушки без риска."""
+    rows = traps_log()
+    if not rows:
+        return ("🪤 <b>Ловушки</b>\n\nПока ни одной: объявление с ценой намного выгоднее рынка (отсев по "
+                "MAX_DEV) автоматически отсеивается и в сигналы не попадает — здесь появятся примеры.")
+    lines = ["🪤 <b>Отсеянные ловушки</b>", "",
+              "Цена выглядит заманчиво, но слишком далека от рынка — скан такие объявления отсеивает "
+              "и в сигнал не пускает. Ниже — последние примеры, без риска.", ""]
+    for t in rows:
+        when = datetime.fromtimestamp(t["ts"]).strftime("%d.%m %H:%M")
+        lines.append(f"{when} — {html.escape(t['reason'])}")
+    return "\n".join(lines)
 
 
 ALERT_HELP = ("Формат: /alert USDT sell 92 7d — сообщу, когда надёжный покупатель или обменник даст "
@@ -1143,6 +1159,8 @@ class Bot:
         elif cmd == "/blacklist":
             text, kb = blacklist_view()
             await self.send(text, markup=kb)
+        elif cmd == "/traps":
+            await self.send(traps_view())
         elif cmd == "/balance":
             await self.balance()
         elif cmd == "/fees":
