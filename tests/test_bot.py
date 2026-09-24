@@ -93,6 +93,62 @@ def test_send_deal_passes_amount_breakdown_from_snap(monkeypatch):
     assert captured["amounts"] is not None and set(captured["amounts"]) == set(p2p.DEPTH_AMOUNTS)
 
 
+def test_live_card_edits_instead_of_resending(monkeypatch):
+    """Живая карточка: пока связка почти не меняется, вместо нового сообщения правим старое."""
+    monkeypatch.setattr(B, "deal_card", lambda d, c, a=None, r=None, breakdown=None: b"png")
+    bot = Stub(p2p.Config(min_profit=2.0))
+    bot.live_scans = 1
+
+    async def fake_send_photo(png, caption, markup=None):
+        bot.out.append(("sendPhoto", {"caption": caption, "markup": markup}))
+        return {"ok": True, "result": {"message_id": 555}}
+
+    bot.send_photo = fake_send_photo
+    asyncio.run(bot.notify(snap([deal(5)])))
+    assert len(photos(bot)) == 1
+    key = next(iter(bot.live_msg))
+    bot.live_msg[key]["last_edit"] -= B.LIVE_EDIT_INTERVAL + 1   # прошло достаточно времени для правки
+
+    asyncio.run(bot.notify(snap([deal(5.1)])))   # почти та же прибыль — новое сообщение не шлём
+    assert len(photos(bot)) == 1
+    edits = [p for m, p in bot.out if m == "editMessageCaption"]
+    assert len(edits) == 1 and edits[0]["message_id"] == 555
+
+
+def test_live_card_too_soon_not_edited(monkeypatch):
+    """Не чаще раза в LIVE_EDIT_INTERVAL секунд — сразу после отправки правку не делаем."""
+    monkeypatch.setattr(B, "deal_card", lambda d, c, a=None, r=None, breakdown=None: b"png")
+    bot = Stub(p2p.Config(min_profit=2.0))
+    bot.live_scans = 1
+
+    async def fake_send_photo(png, caption, markup=None):
+        return {"ok": True, "result": {"message_id": 1}}
+
+    bot.send_photo = fake_send_photo
+    asyncio.run(bot.notify(snap([deal(5)])))
+    asyncio.run(bot.notify(snap([deal(5.1)])))
+    assert not [p for m, p in bot.out if m == "editMessageCaption"]
+
+
+def test_live_card_marks_stale_when_deal_disappears(monkeypatch):
+    """Связка ушла из топа — последний сигнал по ней помечается «⌛ устарел», и только один раз."""
+    monkeypatch.setattr(B, "deal_card", lambda d, c, a=None, r=None, breakdown=None: b"png")
+    bot = Stub(p2p.Config(min_profit=2.0))
+    bot.live_scans = 1
+
+    async def fake_send_photo(png, caption, markup=None):
+        return {"ok": True, "result": {"message_id": 42}}
+
+    bot.send_photo = fake_send_photo
+    asyncio.run(bot.notify(snap([deal(5)])))
+    asyncio.run(bot.notify(snap([])))   # связка пропала из скана
+    edits = [p for m, p in bot.out if m == "editMessageCaption"]
+    assert len(edits) == 1 and "устарел" in edits[0]["caption"] and edits[0]["message_id"] == 42
+
+    asyncio.run(bot.notify(snap([])))   # повторно помечать не нужно
+    assert len([p for m, p in bot.out if m == "editMessageCaption"]) == 1
+
+
 def test_deal_markup_links():
     kb = B.deal_markup(deal(route="спот USDT→ETH на Bybit (−0.1%)", s_asset="ETH"))["inline_keyboard"]
     urls = [b["url"] for row in kb for b in row if "url" in b]

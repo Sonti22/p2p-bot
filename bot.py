@@ -117,6 +117,7 @@ ASSET_LIST = tuple(DEFAULT_ASSETS.split(","))       # монеты для кно
 EXCHANGE_LIST = tuple(ALL_EXCHANGES.split(","))      # площадки для кнопок «🎛 Фильтры»
 VENUE_NAMES = dict(EXCHANGE_NAMES, bestchange="BestChange")  # + обменник, которого нет в EXCHANGE_NAMES
 ACCOUNT_POLL_INTERVAL = int(os.getenv("ACCOUNT_POLL_INTERVAL", 60))  # опрос истории аккаунтов, сек
+LIVE_EDIT_INTERVAL = 30     # сек: не чаще обновляем карточку последнего сигнала вместо повторной отправки
 MSK = timezone(timedelta(hours=3))                    # тихие часы и /pause считаем по МСК, не по времени ПК
 PAUSE_PRESETS = {"30m": 1800, "1h": 3600, "3h": 3 * 3600}  # аргументы /pause -> секунды
 
@@ -655,6 +656,7 @@ class Bot:
         self.awaiting_key = None      # {"ex":.., "step": "key"/"secret", "key":..} — ждём ключ биржи
         self.awaiting_fact = None     # id сделки — ждём фактический результат текстом после «✏️ ввести число»
         self.sent = {}
+        self.live_msg = {}   # (ex,asset,ex,asset) -> последнее сообщение сигнала для «живой карточки» (editMessage)
         self.live = {}                                            # (ex,asset,ex,asset) -> {"first": ts, "streak": n}
         self.live_scans = int(os.getenv("LIVE_SCANS", 2))        # сигнал, только если связка держится ≥ N сканов
         self.venue = {}   # ex -> {"streak": сканов подряд с ошибкой, "down_since": ts, "alerted_at": ts}
@@ -746,17 +748,17 @@ class Bot:
             return await r.json()
 
     async def photo_or_text(self, render, caption, markup, topic=None):
-        """Картинка с подписью; если не вышло — тем же текстом."""
+        """Картинка с подписью; если не вышло — тем же текстом. Возвращает (ответ Telegram, картинка ли)."""
         if len(caption) <= 1024:
             try:
                 kw = {"topic": topic} if topic and self.topics else {}
                 r = await self.send_photo(await asyncio.to_thread(render), caption, markup, **kw)
                 if r.get("ok"):
-                    return
+                    return r, True
                 logger.warning("sendPhoto: %s", r.get("description"))
             except Exception as e:
                 logger.warning("card error: %s", e)
-        await self.send(caption, markup=markup, topic=topic)
+        return await self.send(caption, markup=markup, topic=topic), False
 
     def remember_deal(self, d, cfg=None, snap=None):
         """Запомнить связку под кнопками «✅ Сделал»/«📋 Шаги»; хранится ограниченное число последних."""
@@ -775,8 +777,14 @@ class Bot:
         amounts = deal_amounts(d, cfg, snap) if snap else None
         rel = reliability(d, cfg, snap) if snap else None
         breakdown = profit_breakdown(d[1], d[2], cfg, snap.spot, snap.over_banks) if snap else None
-        await self.photo_or_text(lambda: deal_card(d, cfg, amounts, rel, breakdown), prefix + fmt_deal(d, cfg, snap),
-                                 deal_markup(d, deal_id, cfg, snap), topic)
+        caption = prefix + fmt_deal(d, cfg, snap)
+        r, is_photo = await self.photo_or_text(lambda: deal_card(d, cfg, amounts, rel, breakdown), caption,
+                                               deal_markup(d, deal_id, cfg, snap), topic)
+        message_id = (r.get("result") or {}).get("message_id") if r.get("ok") else None
+        if topic == "signals" and message_id is not None:
+            key = self._deal_key(d)
+            self.live_msg[key] = {"message_id": message_id, "photo": is_photo,
+                                  "last_edit": time.time(), "caption": caption, "stale": False}
 
     async def show_steps(self, cq, deal_id):
         """Кнопка «📋 Шаги»: отдельным сообщением пошаговый чек-лист маршрута."""
@@ -1326,18 +1334,58 @@ class Bot:
 
     async def notify(self, snap):
         now = time.time()
+        active = set()
         for d in snap.deals[:self.max_signals]:   # только топ-N: новые сигналы, когда меняется верх списка
             profit, b, s, _ = d
             if profit < self.cfg.min_profit:
                 break
             key = (b.ex, b.asset, s.ex, s.asset)
+            active.add(key)
             if self.live_scans > 1 and self.live.get(key, {}).get("streak", 0) < self.live_scans:
                 continue                                          # появилась только что — ждём подтверждения
             prev = self.sent.get(key)
             if prev and now - prev[0] < self.cooldown and profit < prev[1] + self.repeat_step:
+                await self.update_live_card(key, d, snap, now)    # без нового сообщения — обновляем на месте
                 continue
             self.sent[key] = (now, profit)
             await self.send_deal(d, "🔔 " + self.held_label(d, now), snap=snap, topic="signals")
+        await self.mark_stale_deals(active)
+
+    async def update_live_card(self, key, d, snap, now):
+        """«Живая карточка»: вместо повторной отправки того же сигнала правим последнее сообщение по нему
+        (editMessage), но не чаще раза в LIVE_EDIT_INTERVAL секунд."""
+        live = self.live_msg.get(key)
+        if not live or live["stale"] or now - live["last_edit"] < LIVE_EDIT_INTERVAL:
+            return
+        caption = "🔔 " + self.held_label(d, now) + fmt_deal(d, self.cfg, snap)
+        live["last_edit"], live["caption"] = now, caption
+        try:
+            if live["photo"]:
+                await self.call("editMessageCaption", chat_id=self.chat_id, message_id=live["message_id"],
+                                caption=caption, parse_mode="HTML")
+            else:
+                await self.call("editMessageText", chat_id=self.chat_id, message_id=live["message_id"],
+                                text=caption, parse_mode="HTML", disable_web_page_preview=True)
+        except Exception as e:
+            logger.warning("live card edit error: %s", e)
+
+    async def mark_stale_deals(self, active):
+        """Связка пропала из топа — один раз пометить последний сигнал по ней «⌛ устарел»."""
+        stale_mark = "\n\n⌛ <i>связка устарела</i>"
+        for key, live in self.live_msg.items():
+            if key in active or live["stale"]:
+                continue
+            live["stale"] = True
+            text = live["caption"] + stale_mark
+            try:
+                if live["photo"]:
+                    await self.call("editMessageCaption", chat_id=self.chat_id, message_id=live["message_id"],
+                                    caption=text, parse_mode="HTML")
+                else:
+                    await self.call("editMessageText", chat_id=self.chat_id, message_id=live["message_id"],
+                                    text=text, parse_mode="HTML", disable_web_page_preview=True)
+            except Exception as e:
+                logger.warning("live card stale error: %s", e)
 
     async def check_accounts(self):
         """Уведомление о новых движениях по подключённым биржам: депозит, вывод, спот-сделка, P2P-ордер.
