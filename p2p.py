@@ -894,7 +894,7 @@ class Snapshot:
     over_banks: frozenset = field(default_factory=frozenset)
 
 
-_alt = {"t": 0.0, "ads": [], "errors": {}}
+_alt = {"t": 0.0, "ads": [], "errors": {}, "key": None}   # key — (монеты, площадки), под которые собран кэш
 
 VENUE_BACKOFF_BASE = 30    # сек: первая пауза площадки после ошибки
 VENUE_BACKOFF_MAX = 600    # сек: потолок паузы (10 мин)
@@ -953,6 +953,9 @@ async def scan(s, cfg, force_alt=False):
     """force_alt — разовый скан под свою сумму (`/calc`, «своя сумма»): всегда опросить не-USDT монеты
     заново и не трогать общий кэш _alt, потому что лимиты объявлений зависят от cfg.amount."""
     names_all = [n for n in cfg.exchanges if n in FETCHERS]
+    key = (tuple(cfg.assets), tuple(names_all))
+    if not force_alt and _alt["key"] != key:   # сменили монеты/площадки — старый кэш не годится, опросить заново
+        _alt.update(t=0.0, ads=[], errors={}, key=key)
     paused = {n: u for n in names_all if (u := _venue_paused_until(n))}   # площадки на паузе после ошибок
     names = [n for n in names_all if n not in paused]
     alts = [a for a in cfg.assets if a != "USDT"]

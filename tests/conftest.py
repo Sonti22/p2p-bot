@@ -53,7 +53,7 @@ def offline(monkeypatch):
     netstatus.reset()
     for cache in (p2p._bybit_pay, p2p._mexc_pay, p2p._mexc_coins):
         cache.clear()
-    p2p._alt.update(t=0.0, ads=[], errors={})
+    p2p._alt.update(t=0.0, ads=[], errors={}, key=None)
     p2p.TRAPS_LOG.clear()
     p2p._venue_backoff.clear()
     return fake_json
