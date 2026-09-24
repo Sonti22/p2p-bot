@@ -48,6 +48,9 @@ LINKS = {"inline_keyboard": [
 WAIT = "Первый скан ещё идёт, подожди пару секунд."
 MIN_PRESETS = (1, 2, 3, 5)
 AMOUNT_PRESETS = (25000, 50000, 100000, 200000)
+VENUE_DOWN_AFTER = 900      # сек: площадка отдаёт ошибку дольше — алерт, даже если сканы не подряд
+VENUE_FAIL_STREAK = 3       # или столько сканов подряд с ошибкой
+VENUE_ALERT_COOLDOWN = 3600  # не чаще раза в час на площадку
 
 
 def save_env(key, value, path=ENV_PATH):
@@ -88,6 +91,7 @@ class Bot:
         self.last = None
         self.paused = False
         self.sent = {}
+        self.venue = {}   # ex -> {"streak": сканов подряд с ошибкой, "down_since": ts, "alerted_at": ts}
 
     async def call(self, method, **params):
         async with self.s.post(f"https://api.telegram.org/bot{self.token}/{method}", json=params,
@@ -177,11 +181,31 @@ class Bot:
         while True:
             try:
                 self.last = await scan(self.s, self.cfg)
-                if self.chat_id and not self.paused:
-                    await self.notify(self.last)
+                if self.chat_id:
+                    await self.check_venues(self.last)
+                    if not self.paused:
+                        await self.notify(self.last)
             except Exception as e:
                 print("scan error:", e)
             await asyncio.sleep(self.cfg.interval)
+
+    async def check_venues(self, snap):
+        """Алерт, если площадка недоступна >15 мин или падает 3 скана подряд; и сообщение о восстановлении."""
+        now = time.time()
+        failed = {k.split("/", 1)[0]: e for k, e in snap.errors.items() if k != "spot"}
+        for ex in self.cfg.exchanges:
+            st = self.venue.setdefault(ex, {"streak": 0, "down_since": None, "alerted_at": None})
+            if ex in failed:
+                st["streak"] += 1
+                st["down_since"] = st["down_since"] or now
+                trouble = st["streak"] >= VENUE_FAIL_STREAK or now - st["down_since"] > VENUE_DOWN_AFTER
+                if trouble and (not st["alerted_at"] or now - st["alerted_at"] > VENUE_ALERT_COOLDOWN):
+                    st["alerted_at"] = now
+                    await self.send(f"⚠️ {ex}: недоступна ({failed[ex]})")
+            else:
+                if st["alerted_at"]:
+                    await self.send(f"✅ {ex}: снова доступна")
+                st.update(streak=0, down_since=None, alerted_at=None)
 
     async def notify(self, snap):
         now = time.time()
