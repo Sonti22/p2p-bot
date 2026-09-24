@@ -246,8 +246,24 @@ def test_add_alert_creates_entry(tmp_path, monkeypatch):
     bot = Stub(p2p.Config())
     asyncio.run(bot.handle("/alert USDT sell 92 7d"))
     rows = B.alerts.list_all("1", path=db)
-    assert [(a, s, r) for _, a, s, r, _ in rows] == [("USDT", "sell", 92.0)]
+    assert [(a, s, r, c) for _, a, s, r, _, c in rows] == [("USDT", "sell", 92.0, None)]
     assert "Алерт создан" in texts(bot)[-1]
+
+
+def test_add_alert_repeat_creates_entry_with_cooldown(tmp_path, monkeypatch):
+    db = str(tmp_path / "alerts.db")
+    monkeypatch.setattr(B.alerts, "add", functools.partial(B.alerts.add, path=db))
+    bot = Stub(p2p.Config())
+    asyncio.run(bot.handle("/alert USDT sell 92 7d repeat 1h"))
+    rows = B.alerts.list_all("1", path=db)
+    assert [(a, s, r, c) for _, a, s, r, _, c in rows] == [("USDT", "sell", 92.0, 3600)]
+    assert "повтор" in texts(bot)[-1].lower()
+
+
+def test_add_alert_bad_repeat_duration():
+    bot = Stub(p2p.Config())
+    asyncio.run(bot.handle("/alert USDT sell 92 7d repeat 999d"))
+    assert "Кулдаун" in texts(bot)[-1]
 
 
 def test_add_alert_bad_format_sends_help():
