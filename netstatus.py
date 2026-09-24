@@ -1,0 +1,184 @@
+"""Статус сетей ввода/вывода монет по биржам — чтобы не сигналить связку, в которой вывод закрыт.
+
+HTX и KuCoin — публичные справочники валют; Bybit и MEXC — только при подключённом ключе «только чтение»
+(accounts.keys). Неизвестный статус = не мешаем. Обновление раз в TTL секунд; если биржа не ответила,
+остаётся прежняя таблица. Переключения открыт ↔ закрыт копятся в CHANGES — бот забирает их и шлёт алерт.
+"""
+import asyncio
+import time
+
+import accounts
+
+TTL = 600
+KNOWN_NETS = ("TRC20", "BEP20", "ERC20", "TON", "SOL", "POLYGON", "ARBITRUM", "APT", "BTC")
+STATUS = {}      # (площадка, монета) -> {сеть: {"dep": bool|None, "wd": bool|None, "fee": float|None}}
+CHANGES = []     # (площадка, монета, сеть, "вывод"/"ввод", открыт: bool)
+_meta = {"t": 0.0, "errors": {}}
+
+
+def normalize(name):
+    """Название сети у биржи -> наше: TRC20/BEP20/ERC20/TON/SOL/POLYGON/ARBITRUM/APT/BTC, иначе как есть."""
+    n = (name or "").upper().strip()
+    if "TRC20" in n or n in ("TRX", "TRON") or n.startswith("TRON"):
+        return "TRC20"
+    if "BEP20" in n or n in ("BSC", "BNB", "BNB SMART CHAIN") or n.startswith("BSC"):
+        return "BEP20"
+    if "ERC20" in n or n in ("ETH", "ETHEREUM"):
+        return "ERC20"
+    if n in ("TON", "TONCOIN") or n.startswith("TON("):
+        return "TON"
+    if n in ("SOL", "SOLANA") or "SOLANA" in n:
+        return "SOL"
+    if "POLYGON" in n or n == "MATIC":
+        return "POLYGON"
+    if "ARBITRUM" in n or n in ("ARB", "ARBI"):
+        return "ARBITRUM"
+    if n in ("APT", "APTOS") or "APTOS" in n:
+        return "APT"
+    if n in ("BTC", "BITCOIN"):
+        return "BTC"
+    return n
+
+
+def _f(v):
+    try:
+        return float(v) if v not in (None, "") else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_htx(j):
+    out = {}
+    for c in j.get("data") or []:
+        for ch in c.get("chains") or []:
+            out[normalize(ch.get("displayName") or ch.get("chain"))] = {
+                "dep": ch.get("depositStatus") == "allowed", "wd": ch.get("withdrawStatus") == "allowed",
+                "fee": _f(ch.get("transactFeeWithdraw"))}
+    return out
+
+
+def _parse_kucoin(j):
+    out = {}
+    for ch in (j.get("data") or {}).get("chains") or []:
+        net = normalize(ch.get("chainName"))
+        rec = {"dep": bool(ch.get("isDepositEnabled")), "wd": bool(ch.get("isWithdrawEnabled")),
+               "fee": _f(ch.get("withdrawalMinFee"))}
+        cur = out.get(net)
+        if cur is None or (rec["wd"] and not cur["wd"]):   # у KuCoin бывает две записи TON — берём открытую
+            out[net] = rec
+    return out
+
+
+def _parse_bybit(j):
+    out = {}
+    for row in (j.get("result") or {}).get("rows") or []:
+        for ch in row.get("chains") or []:
+            out[normalize(ch.get("chainType") or ch.get("chain"))] = {
+                "dep": str(ch.get("chainDeposit")) == "1", "wd": str(ch.get("chainWithdraw")) == "1",
+                "fee": _f(ch.get("withdrawFee"))}
+    return out
+
+
+def _parse_mexc(j, asset):
+    out = {}
+    for c in j if isinstance(j, list) else []:
+        if c.get("coin") != asset:
+            continue
+        for ch in c.get("networkList") or []:
+            out[normalize(ch.get("network") or ch.get("netWork"))] = {
+                "dep": bool(ch.get("depositEnable")), "wd": bool(ch.get("withdrawEnable")),
+                "fee": _f(ch.get("withdrawFee"))}
+    return out
+
+
+def _apply(venue, asset, nets):
+    old = STATUS.get((venue, asset)) or {}
+    for net, rec in nets.items():
+        prev = old.get(net)
+        if prev and net in KNOWN_NETS:
+            for kind, label in (("wd", "вывод"), ("dep", "ввод")):
+                if prev.get(kind) is not None and rec.get(kind) is not None and prev[kind] != rec[kind]:
+                    CHANGES.append((venue, asset, net, label, rec[kind]))
+    STATUS[(venue, asset)] = nets
+
+
+async def refresh(s, assets, exchanges, get_json):
+    """Обновить STATUS по всем монетам. get_json(s, method, url) — публичный запрос (в тестах подменяется)."""
+    ex = {e.lower() for e in exchanges}
+    tasks, keys = [], []
+    for a in assets:
+        if "htx" in ex:
+            tasks.append(get_json(s, "GET", f"https://api.htx.com/v2/reference/currencies?currency={a.lower()}"))
+            keys.append(("HTX", a, _parse_htx))
+        if "kucoin" in ex:
+            tasks.append(get_json(s, "GET", f"https://api.kucoin.com/api/v3/currencies/{a}"))
+            keys.append(("KuCoin", a, _parse_kucoin))
+        if "bybit" in ex and accounts.keys("bybit"):
+            k, sec = accounts.keys("bybit")
+            tasks.append(accounts.bybit_get(s, k, sec, "/v5/asset/coin/query-info", {"coin": a}))
+            keys.append(("Bybit", a, _parse_bybit))
+    if "mexc" in ex and accounts.keys("mexc"):
+        k, sec = accounts.keys("mexc")
+        tasks.append(accounts.mexc_get(s, k, sec, "/api/v3/capital/config/getall"))
+        keys.append(("MEXC", None, None))
+    res = await asyncio.gather(*tasks, return_exceptions=True)
+    errors = {}
+    for (venue, asset, parse), r in zip(keys, res):
+        if isinstance(r, Exception):
+            errors[venue] = f"{type(r).__name__}: {r}"[:80]
+            continue
+        try:
+            if venue == "MEXC":
+                for a in assets:
+                    _apply(venue, a, _parse_mexc(r, a))
+            else:
+                _apply(venue, asset, parse(r))
+        except (KeyError, TypeError, AttributeError) as e:   # формат ответа изменился — оставляем прежние данные
+            errors[venue] = f"parse: {e}"[:80]
+    _meta["errors"] = errors
+    _meta["t"] = time.time()
+    return errors
+
+
+async def refresh_if_due(s, assets, exchanges, get_json):
+    if time.time() - _meta["t"] < TTL:
+        return None
+    _meta["t"] = time.time()   # сначала отметка времени: при сбое не долбим биржи каждый скан
+    return await refresh(s, assets, exchanges, get_json)
+
+
+def _rec(venue, asset, net):
+    return (STATUS.get((venue, asset)) or {}).get(net)
+
+
+def withdraw_ok(venue, asset, net):
+    """True/False, None — статус неизвестен (площадка без справочника или ключа)."""
+    r = _rec(venue, asset, net)
+    return None if r is None else r.get("wd")
+
+
+def deposit_ok(venue, asset, net):
+    r = _rec(venue, asset, net)
+    return None if r is None else r.get("dep")
+
+
+def live_fee(venue, asset, net):
+    r = _rec(venue, asset, net)
+    return None if r is None else r.get("fee")
+
+
+def open_nets(venue, asset):
+    """Сети, где вывод точно открыт (по живому справочнику)."""
+    return [n for n, r in (STATUS.get((venue, asset)) or {}).items() if r.get("wd")]
+
+
+def pop_changes():
+    c = CHANGES[:]
+    CHANGES.clear()
+    return c
+
+
+def reset():
+    STATUS.clear()
+    CHANGES.clear()
+    _meta.update(t=0.0, errors={})
