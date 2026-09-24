@@ -50,6 +50,19 @@ def test_top_chart_renders_empty_and_full():
     assert cards.top_chart(full, p2p.Config())[:8] == PNG
 
 
+def test_history_card_renders_empty_and_full():
+    assert cards.history_card({h: None for h in range(24)}, {})[:8] == PNG
+    hourly = {h: (h - 10) * 0.4 for h in range(24)}
+    grid = {(dow, h): (h + dow) * 0.3 for dow in range(7) for h in range(24)}
+    assert cards.history_card(hourly, grid)[:8] == PNG
+
+
+def test_history_compare_card_renders_empty_and_with_gaps():
+    assert cards.history_compare_card([], [], [])[:8] == PNG
+    labels = ["01.09", "02.09", "03.09"]
+    assert cards.history_compare_card(labels, [1.0, None, 2.5], [0.5, 0.6, None])[:8] == PNG
+
+
 def test_avatars_render():
     for style in cards.AVATARS:
         assert cards.avatar(128, style)[:8] == PNG
