@@ -118,3 +118,22 @@ def test_venue_no_alert_when_healthy():
     bot = Stub(p2p.Config(exchanges=["bybit", "mexc"]))
     asyncio.run(bot.check_venues(err_snap({})))
     assert not texts(bot)
+
+
+def test_dev_view(tmp_path):
+    status = tmp_path / "status.json"
+    status.write_text('{"version": "abc1234", "repo": "https://github.com/o/r", "started_at": "24.09 14:00", '
+                      '"log": [{"sha": "abc1234", "date": "2026-09-24", "subject": "Add /status"}]}', encoding="utf-8")
+    roadmap = tmp_path / "ROADMAP.md"
+    roadmap.write_text("## Очередь\n- [x] первая\n- [ ] `/status` вторая\n- [ ] третья\n## Идеи\n- [ ] не считать\n",
+                       encoding="utf-8")
+    assert B.roadmap_progress(str(roadmap)) == (1, 3, "/status вторая")
+    text, kb = B.dev_view(str(status), str(roadmap))
+    assert "abc1234" in text and "1 из 3" in text and "Add /status" in text
+    urls = [b.get("url", "") for row in kb["inline_keyboard"] for b in row]
+    assert "https://github.com/o/r/commits/main" in urls
+
+
+def test_dev_view_without_files(tmp_path):
+    text, kb = B.dev_view(str(tmp_path / "none.json"), str(tmp_path / "none.md"))
+    assert "Разработка" in text and kb["inline_keyboard"]

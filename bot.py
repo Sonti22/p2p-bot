@@ -1,5 +1,6 @@
 """Telegram-бот сигналов P2P-связок: карточки-картинки, кнопки, меню. Запуск: python bot.py (настройки в .env)."""
 import asyncio
+import html
 import json
 import os
 import re
@@ -11,13 +12,18 @@ from cards import deal_card, top_chart
 from p2p import ENV_PATH, Config, _money, fmt_deal, fmt_top, load_env, scan, spot_url, venue_url
 
 MENU = {"keyboard": [[{"text": "🔥 Лучшая сейчас"}, {"text": "📊 Топ связок"}],
-                     [{"text": "⚙️ Настройки"}, {"text": "❓ Как работать"}]],
+                     [{"text": "⚙️ Настройки"}, {"text": "🛠 Разработка"}],
+                     [{"text": "❓ Как работать"}]],
         "resize_keyboard": True, "is_persistent": True}
-BUTTONS = {"🔥 Лучшая сейчас": "/best", "📊 Топ связок": "/top", "⚙️ Настройки": "/settings", "❓ Как работать": "/help"}
+BUTTONS = {"🔥 Лучшая сейчас": "/best", "📊 Топ связок": "/top", "⚙️ Настройки": "/settings",
+           "🛠 Разработка": "/dev", "❓ Как работать": "/help"}
 COMMANDS = [{"command": "best", "description": "Лучшая связка сейчас"},
             {"command": "top", "description": "Топ связок графиком"},
             {"command": "settings", "description": "Порог, сумма, пауза"},
+            {"command": "dev", "description": "Как развивается бот: версия, изменения, план"},
             {"command": "help", "description": "Как работать с сигналами"}]
+HERE = os.path.dirname(os.path.abspath(__file__))
+DEV_STATUS = os.path.join(HERE, ".dev_status.json")   # пишет launcher.py при каждом запуске
 DESCRIPTION = ("Сканирую P2P Bybit, MEXC, HTX, KuCoin, BitPapa и обменники BestChange. "
                "Присылаю связки USDT, USDC, BTC, ETH, TON за рубли: чистая прибыль, карточка, ссылки на площадки.")
 SHORT_DESCRIPTION = "Сигналы P2P-связок за рубли"
@@ -75,6 +81,49 @@ def deal_markup(d):
         rows.append([{"text": f"🔁 Спот {m.group(1)}→{m.group(2)} · {m.group(3)}", "url": spot_url(route)}])
     rows.append([{"text": "📊 Все связки", "callback_data": "top"}, {"text": "🔄 Обновить", "callback_data": "best"}])
     return {"inline_keyboard": rows}
+
+
+def roadmap_progress(path=os.path.join(HERE, "ROADMAP.md")):
+    """(сделано, всего, следующая задача) из раздела «Очередь» ROADMAP.md."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            queue = f.read().split("## Очередь", 1)[-1].split("\n## ", 1)[0]
+    except OSError:
+        return 0, 0, ""
+    items = re.findall(r"^- \[([ x~])\] (.+)$", queue, re.M)
+    nxt = next((t for s, t in items if s == " "), "")
+    return sum(1 for s, _ in items if s != " "), len(items), nxt.replace("`", "")
+
+
+def dev_view(status_path=DEV_STATUS, roadmap_path=os.path.join(HERE, "ROADMAP.md")):
+    """Текст и кнопки раздела «🛠 Разработка»."""
+    try:
+        with open(status_path, encoding="utf-8") as f:
+            st = json.load(f)
+    except (OSError, ValueError):
+        st = {}
+    done, total, nxt = roadmap_progress(roadmap_path)
+    lines = ["🛠 <b>Разработка бота</b>", ""]
+    if st:
+        lines.append(f"Версия: <code>{html.escape(st.get('version', '?'))}</code> · запущена {html.escape(st.get('started_at', '?'))}")
+    if total:
+        bar = "▰" * round(10 * done / total) + "▱" * (10 - round(10 * done / total))
+        lines.append(f"📋 План: {bar} {done} из {total}")
+    if nxt:
+        lines.append(f"➡️ Дальше: {html.escape(nxt[:160])}")
+    if st.get("log"):
+        lines += ["", "<b>Последние изменения:</b>"]
+        lines += [f"• {html.escape(c['date'])} — {html.escape(c['subject'][:90])}" for c in st["log"][:6]]
+    lines += ["", "Облачный Claude улучшает бота в 06:00, 14:00 и 22:00 МСК; обновление ставится само."]
+    repo, routine = st.get("repo", ""), os.getenv("ROUTINE_URL", "")
+    rows = []
+    if repo:
+        rows += [[{"text": "📜 Изменения", "url": f"{repo}/commits/main"}, {"text": "🔀 Pull requests", "url": f"{repo}/pulls?q=is%3Apr"}],
+                 [{"text": "✅ Проверки (CI)", "url": f"{repo}/actions"}, {"text": "📋 План", "url": f"{repo}/blob/main/ROADMAP.md"}]]
+    if routine:
+        rows.append([{"text": "☁️ Облачные запуски", "url": routine}])
+    rows.append([{"text": "🔄 Обновить", "callback_data": "dev"}])
+    return "\n".join(lines), {"inline_keyboard": rows}
 
 
 TOP_MARKUP = {"inline_keyboard": [
@@ -262,7 +311,8 @@ class Bot:
     async def welcome(self):
         await self.send("👋 <b>Бот P2P-связок на связи.</b>\n\n"
                         "Сам пришлю 🔔 карточку, когда появится связка выше порога. "
-                        "Кнопки внизу: 🔥 лучшая связка сейчас, 📊 топ графиком, ⚙️ настройки, ❓ как работать.",
+                        "Кнопки внизу: 🔥 лучшая связка сейчас, 📊 топ графиком, ⚙️ настройки, "
+                        "🛠 как развивается бот, ❓ как работать.",
                         markup=MENU)
 
     async def on_callback(self, cq):
@@ -282,6 +332,9 @@ class Bot:
         elif data == "settings":
             text, kb = self.settings_view()
             await self.send(text, markup=kb)
+        elif data == "dev":
+            text, kb = dev_view()
+            await self.send(text, markup=kb)
 
     async def handle(self, text):
         cmd, _, arg = BUTTONS.get(text, text).partition(" ")
@@ -294,6 +347,9 @@ class Bot:
             await self.show_top()
         elif cmd == "/settings":
             text, kb = self.settings_view()
+            await self.send(text, markup=kb)
+        elif cmd == "/dev":
+            text, kb = dev_view()
             await self.send(text, markup=kb)
         elif cmd in ("/min", "/amount") and arg:
             try:

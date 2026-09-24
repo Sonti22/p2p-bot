@@ -13,3 +13,4 @@ samples.jsonl
 logs/
 data/
 .pytest_cache/
+.dev_status.json

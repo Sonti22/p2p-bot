@@ -5,7 +5,10 @@
   перезапуск бота и сообщение в Telegram; смоук не прошёл → возврат на прежний коммит;
 - бот падает быстрее CRASH_WINDOW сек CRASH_LIMIT раза подряд → откат на последнюю рабочую версию.
 """
+import json
 import os
+import re
+import shutil
 import subprocess
 import sys
 import time
@@ -14,6 +17,7 @@ import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 LAST_GOOD = os.path.join(HERE, ".last_good")
+DEV_STATUS = os.path.join(HERE, ".dev_status.json")   # для кнопки «🛠 Разработка» в боте
 STABLE_AFTER = 600            # сек работы, после которых версия считается рабочей
 CRASH_WINDOW, CRASH_LIMIT = 60, 3
 
@@ -56,6 +60,37 @@ def clean_tree():
     return git("status", "--porcelain", "--untracked-files=no") == ""
 
 
+def repo_url():
+    url = git("remote", "get-url", "origin", check=False)
+    return url[:-4] if url.endswith(".git") else url
+
+
+def roadmap_progress():
+    """(сделано, всего, следующая задача) из раздела «Очередь» ROADMAP.md."""
+    try:
+        with open(os.path.join(HERE, "ROADMAP.md"), encoding="utf-8") as f:
+            queue = f.read().split("## Очередь", 1)[-1].split("\n## ", 1)[0]
+    except OSError:
+        return 0, 0, ""
+    items = re.findall(r"^- \[([ x~])\] (.+)$", queue, re.M)
+    nxt = next((t for s, t in items if s == " "), "")
+    return sum(1 for s, _ in items if s != " "), len(items), nxt.replace("`", "")[:120]
+
+
+def write_dev_status():
+    entries = []
+    for line in git("log", "-8", "--pretty=format:%h%x09%cs%x09%s", check=False).splitlines():
+        sha, date, subject = (line.split("\t", 2) + ["", ""])[:3]
+        entries.append({"sha": sha, "date": date, "subject": subject})
+    status = {"version": git("rev-parse", "--short", "HEAD", check=False), "repo": repo_url(),
+              "started_at": time.strftime("%d.%m %H:%M"), "log": entries}
+    try:
+        with open(DEV_STATUS, "w", encoding="utf-8") as f:
+            json.dump(status, f, ensure_ascii=False)
+    except OSError as e:
+        log(f"dev status: {e}")
+
+
 def smoke():
     """Компиляция и тесты новой версии до перезапуска бота."""
     py = [sys.executable, "-m"]
@@ -73,6 +108,21 @@ class Launcher:
     def __init__(self):
         self.bad = set()          # коммиты, которые не прошли смоук или падали — не ставим повторно
         self.warned_dirty = False
+        self.seen_prs = set()     # PR, о которых уже сообщили
+
+    def check_prs(self):
+        """Открытые PR = автомерж не прошёл (тесты/guard) — сообщить один раз со ссылкой."""
+        if not shutil.which("gh"):
+            return
+        r = subprocess.run(["gh", "pr", "list", "--state", "open", "--json", "number,title,url"], cwd=HERE,
+                           capture_output=True, text=True, encoding="utf-8", errors="replace")
+        if r.returncode:
+            return
+        for pr in json.loads(r.stdout or "[]"):
+            if pr["number"] not in self.seen_prs:
+                self.seen_prs.add(pr["number"])
+                notify(f"👀 PR #{pr['number']} ждёт ручной проверки (тесты или guard не пропустили автомерж):\n"
+                       f"{pr['title']}\n{pr['url']}")
 
     def try_update(self):
         """True — код обновлён, бота нужно перезапустить."""
@@ -90,6 +140,7 @@ class Launcher:
                 self.warned_dirty = True
             return False
         self.warned_dirty = False
+        changes = git("log", "--pretty=format:• %s", "HEAD..origin/main", check=False).splitlines()[:10]
         try:
             git("pull", "--ff-only", "--quiet", "origin", "main")
         except RuntimeError as e:
@@ -102,7 +153,11 @@ class Launcher:
             self.bad.add(remote)
             notify(f"⚠️ Обновление {remote[:7]} не прошло проверку — оставил {head[:7]}.\n{err}")
             return False
-        notify(f"🔄 Бот обновился до {remote[:7]}: {git('log', '-1', '--pretty=%s')}")
+        done, total, nxt = roadmap_progress()
+        notify(f"🔄 Бот обновился до {remote[:7]}\n\nЧто нового:\n" + "\n".join(changes)
+               + (f"\n\n📋 ROADMAP: сделано {done} из {total}" if total else "")
+               + (f"\n➡️ Дальше: {nxt}" if nxt else "")
+               + f"\n\n{repo_url()}/commits/main")
         return True
 
     def rollback(self):
@@ -121,6 +176,7 @@ class Launcher:
         crashes, last_check = 0, time.time()
         while True:
             started = time.time()
+            write_dev_status()
             proc = subprocess.Popen([sys.executable, "bot.py"], cwd=HERE)
             log(f"бот запущен (pid {proc.pid}, версия {git('rev-parse', '--short', 'HEAD')})")
             good_marked, updated = False, False
@@ -132,6 +188,7 @@ class Launcher:
                     good_marked, crashes = True, 0
                 if time.time() - last_check > every:
                     last_check = time.time()
+                    self.check_prs()
                     if self.try_update():
                         proc.terminate()
                         try:
