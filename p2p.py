@@ -486,11 +486,25 @@ def _stack(ads, amount):
     if remaining > 0.01 or not used:
         return None
     one = len(used) == 1
+    nets = {a.net for a in used}   # сеть сохраняем, если она у всех объявлений одна
     terms = "; ".join(dict.fromkeys(a.terms.strip() for a in used if a.terms and a.terms.strip()))
     return Ad(used[0].ex, used[0].side, amount / qty, amount, sum(a.max_amt for a in used), qty,
               sorted(set(p for a in used for p in a.pays)), used[0].nick if one else f"{len(used)} объявл.",
               min(a.orders for a in used), min(a.rate for a in used), used[0].url if one else "",
-              used[0].asset, used[0].net if one else "", terms=terms)
+              used[0].asset, nets.pop() if len(nets) == 1 else "", terms=terms)
+
+
+def _net_parts(grp):
+    """Части стакана, которые можно складывать вместе: у обменников — по сетям (монету шлют в сеть
+    конкретного обменника), у бирж — весь стакан."""
+    if not grp or grp[0].ex != "BestChange":
+        return [grp]
+    return [[a for a in grp if a.net == n] for n in dict.fromkeys(a.net for a in grp)]
+
+
+def _same_net(grp, ad):
+    """Объявления стакана, которые можно складывать с ad: у обменника — только той же сети."""
+    return [a for a in grp if a.net == ad.net] if ad.ex == "BestChange" else grp
 
 
 def _same_venue(b, s):
@@ -974,7 +988,8 @@ async def scan(s, cfg, force_alt=False):
             networks[a.net][a.side] = a
 
     # для связок — стакан глубины: складываем объявления по цене, пока не наберётся сумма круга;
-    # связку, которую суммарный объём не покрывает, не сигналим (сюда она просто не попадёт)
+    # связку, которую суммарный объём не покрывает, не сигналим (сюда она просто не попадёт);
+    # обменники складываем только в пределах одной сети
     groups = {}
     for a in ads:
         if not _signal_ok(a, cfg, blocked):
@@ -983,15 +998,14 @@ async def scan(s, cfg, force_alt=False):
         if r and abs(a.price / r - 1) * 100 > cfg.max_dev:
             continue
         groups.setdefault((a.ex, a.side, a.asset), []).append(a)
-    depth = {}
+    buys, sells = [], []
     for key, grp in groups.items():
         grp.sort(key=lambda a: a.price, reverse=(key[1] == "sell"))
-        stacked = _stack(grp, cfg.amount)
-        if stacked:
-            depth[key] = stacked
+        for part in _net_parts(grp):
+            stacked = _stack(part, cfg.amount)
+            if stacked:
+                (buys if key[1] == "buy" else sells).append(stacked)
 
-    buys = [a for (_, side, _), a in depth.items() if side == "buy"]
-    sells = [a for (_, side, _), a in depth.items() if side == "sell"]
     over_banks = trades.banks_over_limit({trades.sbp_bank(b.pays) for b in buys})
     deals = []
     for b in buys:
@@ -1015,8 +1029,8 @@ def deal_amounts(deal, cfg, snap, amounts=DEPTH_AMOUNTS):
     """Прибыль % той же связки на другие суммы круга: пересобрать те же объявления стакана
     (snap.groups) через _stack под каждую сумму. None для суммы, на которую не хватает глубины."""
     _, b, s, _ = deal
-    buy_ads = snap.groups.get((b.ex, "buy", b.asset), [])
-    sell_ads = snap.groups.get((s.ex, "sell", s.asset), [])
+    buy_ads = _same_net(snap.groups.get((b.ex, "buy", b.asset), []), b)
+    sell_ads = _same_net(snap.groups.get((s.ex, "sell", s.asset), []), s)
     out = {}
     for amount in amounts:
         bb, ss = _stack(buy_ads, amount), _stack(sell_ads, amount)

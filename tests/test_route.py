@@ -192,6 +192,52 @@ def test_stack_returns_none_when_depth_insufficient():
     assert p2p._stack(ads, 50000) is None
 
 
+def test_stack_keeps_net_only_when_all_ads_share_it():
+    trc = [make_ad("BestChange", "sell", 89.9, net="TRC20", max_amt=25000, avail=25000 / 89.9),
+           make_ad("BestChange", "sell", 89.7, net="TRC20", max_amt=25000, avail=25000 / 89.7)]
+    assert p2p._stack(trc, 50000).net == "TRC20"
+    mixed = [trc[0], make_ad("BestChange", "sell", 89.8, net="ERC20", max_amt=25000, avail=25000 / 89.8)]
+    assert p2p._stack(mixed, 50000).net == ""
+
+
+def _exchangers(*nets):
+    """Обменники BestChange на продажу по 25 000 ₽ каждый — в указанных сетях, цены по убыванию."""
+    return [make_ad("BestChange", "sell", 89.9 - i * 0.1, net=n, max_amt=25000, avail=25000 / (89.9 - i * 0.1))
+            for i, n in enumerate(nets)]
+
+
+def test_scan_stacks_exchangers_per_network(offline, monkeypatch):
+    nets = ["TRC20", "ERC20"]
+
+    async def mexc(s, cfg, side, asset):
+        return [make_ad("MEXC", "buy", 88.0)] if side == "buy" else []
+
+    async def bc(s, cfg, side, asset):
+        return _exchangers(*nets) if side == "sell" else []
+
+    monkeypatch.setitem(p2p.FETCHERS, "fakemexc", mexc)
+    monkeypatch.setitem(p2p.FETCHERS, "bestchange", bc)
+    c = cfg(exchanges=["fakemexc", "bestchange"], assets=["USDT"], min_orders=0, min_rate=0)
+    assert not asyncio.run(p2p.scan(None, c)).deals   # 25 000 в TRC20 + 25 000 в ERC20 — ни одна сеть не покрывает круг
+    nets += ["TRC20", "TRC20"]
+    snap = asyncio.run(p2p.scan(None, c))
+    profit, b, s, route = snap.deals[0]
+    assert s.net == "TRC20" and "объявл." in s.nick
+    assert "перевод −1 USDT (TRC20) на BestChange" in route and "BEP20" not in route
+
+
+def test_deal_amounts_respects_exchanger_network():
+    ads = _exchangers("TRC20", "ERC20", "TRC20")
+    buy_ads = [make_ad("MEXC", "buy", 88.0)]
+    snap = p2p.Snapshot(88.0, "t", {}, {}, [], {}, {}, {}, spot=SPOT,
+                        groups={("MEXC", "buy", "USDT"): buy_ads, ("BestChange", "sell", "USDT"): ads})
+    deal = (2.0, buy_ads[0], p2p._stack([ads[0], ads[2]], 50000), "перевод −1 USDT (TRC20) на BestChange")
+    out = p2p.deal_amounts(deal, cfg(), snap, amounts=(40_000, 75_000))
+    assert out[75_000] is None   # 75 000 набирается только вместе с ERC20
+    price = 40000 / (25000 / 89.9 + 15000 / 89.7)   # TRC20 89.9 целиком + 15 000 из TRC20 89.7, ERC20 89.8 пропущен
+    assert out[40_000] == pytest.approx(((40000 / 88 - 1.0) * price / 40000 - 1) * 100)   # вывод TRC20 −1 USDT
+
+
 def test_scan_combines_depth_across_ads_to_form_deal(offline, monkeypatch):
     async def fake_fetcher(s, cfg, side, asset):
         if side == "buy":

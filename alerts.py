@@ -94,8 +94,8 @@ def remove(alert_id, chat_id, path=DB_PATH):
 
 def _volume_ok(snap, ad, side, asset, rate, min_volume):
     """В стакане площадки ad.ex по цене не хуже rate должно набираться не меньше min_volume ₽ —
-    переиспользуем p2p._stack на срезе snap.groups, отфильтрованном по цене."""
-    grp = snap.groups.get((ad.ex, side, asset), [])
+    переиспользуем p2p._stack на срезе snap.groups, отфильтрованном по цене (у обменника — и по его сети)."""
+    grp = p2p._same_net(snap.groups.get((ad.ex, side, asset), []), ad)
     qualifying = [a for a in grp if (a.price >= rate if side == "sell" else a.price <= rate)]
     return p2p._stack(qualifying, min_volume) is not None
 
