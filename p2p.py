@@ -731,6 +731,43 @@ def profit_breakdown(b, s, cfg, spot, over_banks=frozenset()):
     return out
 
 
+def breakeven_rate(b, s, cfg, spot, over_banks=frozenset()):
+    """Курс покупки (₽ за b.asset), при котором связка выходит в ноль — цена продажи и остальные
+    условия маршрута (комиссии, курсы конвертации) считаются неизменными. Цена покупки входит в
+    маршрут только через первое деление суммы круга на неё, поэтому итоговое количество монеты на
+    выходе — аффинная функция от 1/цена (M/price − K); берём две точки и решаем систему на M и K.
+    None — маршрут невозможен или в нём нет цены, при которой связка выходит в ноль."""
+    target = cfg.amount / s.price   # сколько s.asset нужно на выходе, чтобы прибыль была нулевой
+    x1 = b.price
+    x2 = x1 * 1.01
+    q1 = _route_qty(b, s, cfg, spot, over_banks)
+    q2 = _route_qty(dataclasses.replace(b, price=x2), s, cfg, spot, over_banks)
+    if q1 is None or q2 is None:
+        return None
+    inv1, inv2 = 1 / x1, 1 / x2
+    m = (q1 - q2) / (inv1 - inv2)
+    if m <= 0:
+        return None
+    k = m * inv1 - q1
+    denom = target + k
+    if denom <= 0:
+        return None
+    return m / denom
+
+
+def fmt_breakeven(d, cfg, snap):
+    """Текст с ROI на сумму круга (в ₽) и курсом безубыточности покупки — для «/calc»."""
+    profit, b, s, _ = d
+    profit_rub = cfg.amount * profit / 100
+    text = f"📐 ROI на {_money(cfg.amount)} {cfg.fiat}: <b>{profit:+.2f}%</b> ({profit_rub:+.0f} ₽)\n"
+    rate = breakeven_rate(b, s, cfg, snap.spot, snap.over_banks)
+    if rate is None:
+        return text + "Курс безубыточности посчитать не удалось (маршрут не зависит от цены покупки)."
+    cushion = (rate / b.price - 1) * 100
+    return text + (f"Курс безубыточности покупки: <b>{_price(rate)} ₽</b> за {b.asset} "
+                   f"(сейчас {_price(b.price)} ₽, запас {cushion:+.1f}%)")
+
+
 def maker_quote(groups, ex, asset, post_side):
     """Режим мейкера: цена, чтобы встать первым объявлением на площадке, и спред против цены,
     которую сразу даёт лучшее встречное объявление (то есть чем я жертвую ради первого места).

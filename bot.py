@@ -21,8 +21,8 @@ import presets
 import trades
 from cards import deal_card, history_card, history_compare_card, portfolio_card, top_chart
 from p2p import ALL_EXCHANGES, AMOUNT_MAX, AMOUNT_MIN, DEFAULT_ASSETS, ENV_PATH, LOG_PATH, Config, _money, _price, \
-    _route_qty, bank_liquidity, deal_amounts, fmt_ad, fmt_deal, fmt_top, load_env, maker_quote, parse_amount, \
-    profit_breakdown, reliability, scan, setup_logging, spot_url, traps_log, venue_url
+    _route_qty, bank_liquidity, deal_amounts, fmt_ad, fmt_breakeven, fmt_deal, fmt_top, load_env, maker_quote, \
+    parse_amount, profit_breakdown, reliability, scan, setup_logging, spot_url, traps_log, venue_url
 
 logger = logging.getLogger(__name__)
 
@@ -991,6 +991,8 @@ class Bot:
         snap = await scan(self.s, calc_cfg, force_alt=True)
         await self.show_top(snap, calc_cfg)
         await self.show_best(snap, calc_cfg)
+        if snap.deals:
+            await self.send(fmt_breakeven(snap.deals[0], calc_cfg, snap))
 
     async def maker(self, arg):
         """/maker <монета>: режим мейкера на всех подключённых площадках по текущему снимку стакана."""

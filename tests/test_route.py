@@ -1,4 +1,5 @@
 import asyncio
+import dataclasses
 
 import pytest
 
@@ -382,3 +383,52 @@ def test_spot_fee_default_for_venue_missing_in_env():
     c = cfg(spot_fees={"Bybit": 0.1})          # в .env только Bybit — для HTX берётся встроенный дефолт
     assert p2p._spot_fee(c, "HTX") == pytest.approx(0.2)
     assert p2p._spot_fee(c, "Bybit") == pytest.approx(0.1)
+
+
+def test_breakeven_rate_no_fees_equals_sell_price():
+    # без комиссий (внутри биржи, pay_fee=0) связка выходит в ноль, если купить по той же цене, что продать
+    b, s = make_ad("MEXC", "buy", 88.0), make_ad("MEXC", "sell", 89.76)
+    rate = p2p.breakeven_rate(b, s, cfg(), SPOT)
+    assert rate == pytest.approx(89.76)
+
+
+def test_breakeven_rate_matches_manual_formula_with_withdraw_fee():
+    b, s = make_ad("MEXC", "buy", 88.0), make_ad("Bybit", "sell", 90.0)
+    rate = p2p.breakeven_rate(b, s, cfg(), SPOT)
+    expected = 50000 / (50000 / 90 + 0.01)   # перевод BEP20 −0.01 USDT
+    assert rate == pytest.approx(expected)
+
+
+@pytest.mark.parametrize("b, s, c", [
+    (make_ad("MEXC", "buy", 88.0), make_ad("Bybit", "sell", 90.0), cfg()),
+    (make_ad("MEXC", "buy", 88.0), make_ad("MEXC", "sell", 245000.0, asset="ETH"), cfg(risk_buffer={"ETH": 0.5})),
+    (make_ad("MEXC", "buy", 88.0, pays=("T-Bank",)), make_ad("MEXC", "sell", 88.5), cfg(pay_fee=0.3)),
+])
+def test_breakeven_rate_makes_route_profit_zero(b, s, c):
+    rate = p2p.breakeven_rate(b, s, c, SPOT)
+    assert rate is not None
+    profit, _ = p2p._route(dataclasses.replace(b, price=rate), s, c, SPOT)
+    assert profit == pytest.approx(0.0, abs=1e-6)
+
+
+def test_breakeven_rate_above_current_price_when_deal_is_profitable():
+    b, s = make_ad("MEXC", "buy", 88.0), make_ad("Bybit", "sell", 90.0)
+    profit, _ = p2p._route(b, s, cfg(), SPOT)
+    rate = p2p.breakeven_rate(b, s, cfg(), SPOT)
+    assert profit > 0 and rate > b.price   # прибыльная связка — можно купить дороже и всё равно выйти в ноль
+
+
+def test_breakeven_rate_unroutable_pair_is_none():
+    b = make_ad("MEXC", "buy", 7_000_000, asset="BTC")
+    s = make_ad("MEXC", "sell", 245000, asset="ETH")
+    assert p2p.breakeven_rate(b, s, cfg(), SPOT) is None
+
+
+def test_fmt_breakeven_reports_roi_and_rate():
+    b, s = make_ad("MEXC", "buy", 88.0), make_ad("Bybit", "sell", 90.0)
+    profit, route = p2p._route(b, s, cfg(), SPOT)
+    snap = p2p.Snapshot(88.0, "t", {}, {}, [], {}, {}, {}, spot=SPOT, over_banks=set())
+    text = p2p.fmt_breakeven((profit, b, s, route), cfg(), snap)
+    assert f"{profit:+.2f}%" in text
+    rate = p2p.breakeven_rate(b, s, cfg(), SPOT)
+    assert p2p._price(rate) in text
