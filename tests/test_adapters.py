@@ -23,9 +23,24 @@ def test_htx_unknown_coin_is_empty(offline):
 
 def test_spot_prices(offline):
     spot = asyncio.run(p2p.spot_prices(None, ["USDT", "BTC", "ETH", "USDC"]))
-    for venue in ("Bybit", "MEXC"):
+    for venue in ("Bybit", "MEXC", "HTX", "KuCoin"):
         bid, ask = spot[venue]["ETH"]
-        assert 0 < bid <= ask
+        assert 0 < bid <= ask, venue
+    assert spot["KuCoin"]["USDC"][0] > 0        # символ KuCoin с дефисом (USDC-USDT) распознан
+    assert spot["HTX"]["BTC"][0] > 0            # символ HTX в нижнем регистре (btcusdt) распознан
+
+
+def test_spot_prices_survive_one_venue_down(offline, monkeypatch):
+    real = p2p._json
+
+    async def flaky(s, method, url, body=None):
+        if "api.htx.com" in url:
+            raise RuntimeError("htx down")
+        return await real(s, method, url, body)
+
+    monkeypatch.setattr(p2p, "_json", flaky)
+    spot = asyncio.run(p2p.spot_prices(None, ["USDT", "ETH"]))
+    assert "ETH" not in spot["HTX"] and spot["KuCoin"]["ETH"][0] > 0
 
 
 def _bc_zip():

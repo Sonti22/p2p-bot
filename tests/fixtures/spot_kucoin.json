@@ -1,0 +1,22 @@
+{
+ "code": "200000",
+ "data": {
+  "ticker": [
+   {
+    "symbol": "USDC-USDT",
+    "buy": "1.0001",
+    "sell": "1.0002"
+   },
+   {
+    "symbol": "BTC-USDT",
+    "buy": "84521.7",
+    "sell": "84521.8"
+   },
+   {
+    "symbol": "ETH-USDT",
+    "buy": "2685.84",
+    "sell": "2685.85"
+   }
+  ]
+ }
+}

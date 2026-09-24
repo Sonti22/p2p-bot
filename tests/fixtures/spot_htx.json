@@ -1,0 +1,20 @@
+{
+ "status": "ok",
+ "data": [
+  {
+   "symbol": "ethusdt",
+   "bid": 2686.69,
+   "ask": 2686.7
+  },
+  {
+   "symbol": "btcusdt",
+   "bid": 84494.0,
+   "ask": 84494.01
+  },
+  {
+   "symbol": "usdcusdt",
+   "bid": 1.0001,
+   "ask": 1.0002
+  }
+ ]
+}
