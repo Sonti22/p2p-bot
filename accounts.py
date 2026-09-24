@@ -396,13 +396,60 @@ async def kucoin_history(s, api_key, api_secret, passphrase_value, limit=20):
     return None
 
 
-HISTORY_FETCHERS = {"mexc": mexc_history, "htx": htx_history}  # kucoin отдельно — нужен passphrase
+HISTORY_FETCHERS = {"htx": htx_history}  # mexc/kucoin — своя цепочка фолбэков ниже, bybit — P2P-эндпоинт
+
+
+SPOT_TRADE_SYMBOLS = ("USDCUSDT", "BTCUSDT", "ETHUSDT", "TONUSDT")   # монеты бота (DEFAULT_ASSETS в p2p.py) к USDT
+
+
+def _trade_item(asset, side, amount, price, ts):
+    try:
+        return {"kind": "trade", "asset": asset, "side": "buy" if side else "sell",
+                "amount": float(amount or 0), "price": float(price or 0), "ts": _hist_ts(ts)}
+    except (TypeError, ValueError):
+        return None
+
+
+async def mexc_spot_trades(s, api_key, api_secret, limit=20):
+    """Фолбэк-история MEXC, третий источник (после депозитов/выводов): спот-сделки. У MEXC нет эндпоинта
+    истории без символа — перебираем монеты бота (SPOT_TRADE_SYMBOLS) против USDT и объединяем результат."""
+    out = []
+    for sym in SPOT_TRADE_SYMBOLS:
+        try:
+            j = await mexc_get(s, api_key, api_secret, "/api/v3/myTrades", {"symbol": sym, "limit": limit})
+        except Exception:
+            continue
+        if not isinstance(j, list):
+            continue
+        asset = sym[:-len("USDT")]
+        out.extend(it for it in (_trade_item(asset, tr.get("isBuyer"), tr.get("qty"), tr.get("price"),
+                                              tr.get("time")) for tr in j) if it)
+    if not out:
+        return None
+    out.sort(key=lambda it: it["ts"], reverse=True)
+    return out[:limit]
+
+
+async def kucoin_spot_trades(s, api_key, api_secret, passphrase_value, limit=20):
+    """Фолбэк-история KuCoin, третий источник: спот-сделки (`/api/v1/fills`). В отличие от MEXC, тут
+    обязателен не symbol, а tradeType — одним запросом получаем сделки по всем парам."""
+    try:
+        j = await kucoin_get(s, api_key, api_secret, passphrase_value, "/api/v1/fills",
+                              {"tradeType": "TRADE", "pageSize": limit})
+    except Exception:
+        return None
+    if j.get("code") != "200000":
+        return None
+    items = (j.get("data") or {}).get("items") or []
+    out = [it for it in (_trade_item(str(tr.get("symbol") or "").split("-")[0], tr.get("side") == "buy",
+                                      tr.get("size"), tr.get("price"), tr.get("createdAt")) for tr in items) if it]
+    return out or None
 
 
 async def account_history(s, exchange, limit=20):
     """История последних движений по счёту для автожурнала: (id, side, asset, ..., ts) для Bybit
-    (P2P-эндпоинт, см. bybit_p2p_orders) или фолбэк депозиты→выводы для остальных площадок.
-    Нет ключа или ни один источник не сработал — None."""
+    (P2P-эндпоинт, см. bybit_p2p_orders), депозиты→выводы→спот-сделки для MEXC/KuCoin, депозиты→выводы
+    для остальных площадок. Нет ключа или ни один источник не сработал — None."""
     ex = exchange.lower()
     pair = keys(ex)
     if not pair:
@@ -411,7 +458,13 @@ async def account_history(s, exchange, limit=20):
         return await bybit_p2p_orders(s, *pair, size=limit)
     if ex == "kucoin":
         pp = passphrase(ex)
-        return await kucoin_history(s, *pair, pp, limit=limit) if pp else None
+        if not pp:
+            return None
+        hist = await kucoin_history(s, *pair, pp, limit=limit)
+        return hist if hist is not None else await kucoin_spot_trades(s, *pair, pp, limit=limit)
+    if ex == "mexc":
+        hist = await mexc_history(s, *pair, limit=limit)
+        return hist if hist is not None else await mexc_spot_trades(s, *pair, limit=limit)
     fetch = HISTORY_FETCHERS.get(ex)
     return await fetch(s, *pair, limit=limit) if fetch else None
 
