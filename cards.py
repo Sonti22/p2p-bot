@@ -81,7 +81,10 @@ def _amounts_line(amounts):
     return "На другую сумму: " + " · ".join(parts)
 
 
-def deal_card(deal, cfg, amounts=None):
+REL_COLORS = {"✅ надёжно": GREEN, "⚠️ риск": AMBER, "🪤 ловушка": RED}
+
+
+def deal_card(deal, cfg, amounts=None, rel=None):
     profit, b, s, route = deal
     W, H = 1080, 640
     img = Image.new("RGB", (W, H), BG)
@@ -96,6 +99,11 @@ def deal_card(deal, cfg, amounts=None):
     d.text((36, 58), big, font=f_big, fill=color)
     d.text((56 + f_big.getlength(big), 108), f"чистыми на {_money(cfg.amount)} ₽", font=_font(30), fill=MUTED)
     d.text((40, 180), f"{b.ex} {b.asset}  →  {s.ex} {s.asset}", font=_font(30, "semi"), fill=TEXT)
+    if rel:
+        label, _reasons = rel
+        f_rel = _font(22, "semi")
+        pw = f_rel.getlength(label) + 24
+        _pill(d, W - 40 - pw, 176, label, REL_COLORS.get(label, AMBER), f_rel)
     if amounts:
         d.text((40, 212), _fit(_amounts_line(amounts), _font(18), W - 80), font=_font(18), fill=MUTED)
 
@@ -123,6 +131,8 @@ def deal_card(deal, cfg, amounts=None):
     note = "Проверь ФИО отправителя и условия мерчанта. Первая сделка — малой суммой."
     if profit >= 5:
         note = "Спред ≥5% часто плата за риск: проверь мерчанта и ФИО, начни с малой суммы."
+    if rel and rel[1]:
+        note = rel[1][0][0].upper() + rel[1][0][1:] + ". Проверь мерчанта, начни с малой суммы."
     d.text((108, 545), _fit(note, _font(22), W - 170), font=_font(22), fill="#F5D9A8")
     return _png(img)
 

@@ -632,6 +632,40 @@ def spot_url(route):
             "MEXC": f"https://www.mexc.com/ru-RU/exchange/{coin}_USDT"}.get(m.group(3), "")
 
 
+RELIABLE, RISKY, TRAP = "✅ надёжно", "⚠️ риск", "🪤 ловушка"
+
+
+def reliability(deal, cfg, snap):
+    """Метка надёжности связки и причины: очки риска за отклонение цены от ориентира, мерчанта
+    у порога фильтра по сделкам/отзывам, число переводов/конвертаций в маршруте, волатильную
+    монету и спред ≥5%. 0 очков — надёжно, 1-2 — риск, 3+ — похоже на ловушку."""
+    profit, b, s, route = deal
+    reasons = []
+    for ad, side in ((b, "покупка"), (s, "продажа")):
+        ref = snap.refs.get(ad.asset)
+        if ref:
+            dev = abs(ad.price / ref - 1) * 100
+            if dev >= cfg.max_dev * 0.6:
+                reasons.append(f"{side}: цена {dev:.1f}% от ориентира (отсев >{cfg.max_dev:g}%)")
+        if ad.orders < cfg.min_orders * 1.5 or ad.rate < cfg.min_rate + 1:
+            reasons.append(f"{side}: мерчант у порога фильтра ({ad.orders} сделок/{ad.rate:.0f}%)")
+    steps = route.split(" → ") if route else []
+    transfers = sum(1 for st in steps if "перевод" in st or "спот" in st or "через" in st)
+    if transfers >= 2:
+        reasons.append(f"{transfers} перевода/конвертации в маршруте")
+    vol = next((a for a in (b.asset, s.asset) if cfg.risk_buffer.get(a)), None)
+    if vol:
+        reasons.append(f"{vol} — волатильная монета, курс может уйти за время сделки")
+    if profit >= 5:
+        reasons.append(f"спред {profit:.1f}% ≥5% — часто плата за риск")
+    label = TRAP if len(reasons) >= 3 else RISKY if reasons else RELIABLE
+    return label, reasons
+
+
+def fmt_reliability(label, reasons):
+    return label if not reasons else f"{label} ({'; '.join(reasons)})"
+
+
 def _money(x):
     return f"{x:,.0f}".replace(",", " ")
 
@@ -647,10 +681,12 @@ def fmt_ad(a):
     return f"{a.ex} {a.asset} {_price(a.price)} ({html.escape(pays)}) · {html.escape(a.nick)} · {stats}{link}"
 
 
-def fmt_deal(d, cfg):
+def fmt_deal(d, cfg, snap=None):
     profit, b, s, route = d
-    return (f"<b>{profit:+.2f}%</b> на {_money(cfg.amount)} {cfg.fiat} ({route})\n"
-            f"Купить: {fmt_ad(b)}\nПродать: {fmt_ad(s)}")
+    text = (f"<b>{profit:+.2f}%</b> на {_money(cfg.amount)} {cfg.fiat} ({route})\n")
+    if snap is not None:
+        text += html.escape(fmt_reliability(*reliability(d, cfg, snap))) + "\n"
+    return text + f"Купить: {fmt_ad(b)}\nПродать: {fmt_ad(s)}"
 
 
 def fmt_top(snap, cfg, n=5):
@@ -689,7 +725,7 @@ def fmt_top(snap, cfg, n=5):
     if not snap.deals:
         return text + "\nнет: на одной из сторон не осталось объявлений после фильтров"
     for d in snap.deals[:n]:   # целыми блоками, чтобы не резать HTML и влезть в лимит Telegram 4096
-        block = "\n" + fmt_deal(d, cfg) + "\n"
+        block = "\n" + fmt_deal(d, cfg, snap) + "\n"
         if len(text) + len(block) > 4000:
             break
         text += block
