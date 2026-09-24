@@ -2,6 +2,7 @@ import asyncio
 import functools
 import time
 
+import accounts
 import bot as B
 import p2p
 import trades
@@ -263,6 +264,138 @@ def test_awaiting_amount_reset_by_other_command():
     bot.awaiting_amount = True
     asyncio.run(bot.handle("/best"))
     assert not bot.awaiting_amount
+
+
+def test_accounts_view_lists_exchanges_with_status(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    accounts.save_key("bybit", "abcd1234", "secret")
+    cfg = p2p.Config(exchanges=["bybit", "mexc", "htx"])
+    text, kb = B.accounts_view(cfg)
+    assert "✅ Bybit" in text and "➖ MEXC" in text and "➖ HTX" in text
+    callbacks = [b["callback_data"] for row in kb["inline_keyboard"] for b in row if "callback_data" in b]
+    assert "acc:bybit" in callbacks and "acc:mexc" in callbacks
+
+
+def test_account_view_connected_shows_masked_key(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    accounts.save_key("bybit", "abcd1234", "secret")
+    text, kb = B.account_view("bybit")
+    assert accounts.mask("abcd1234") in text
+    callbacks = [b["callback_data"] for row in kb["inline_keyboard"] for b in row if "callback_data" in b]
+    assert "acc_check:bybit" in callbacks and "acc_del:bybit" in callbacks
+
+
+def test_account_view_not_connected_offers_connect(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "no_such.json"))
+    text, kb = B.account_view("mexc")
+    assert "не подключён" in text
+    callbacks = [b["callback_data"] for row in kb["inline_keyboard"] for b in row if "callback_data" in b]
+    assert "acc_add:mexc" in callbacks
+
+
+def test_account_view_unsupported_exchange_has_no_connect_button(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "no_such.json"))
+    text, kb = B.account_view("htx")
+    assert "не реализовано" in text
+    callbacks = [b.get("callback_data", "") for row in kb["inline_keyboard"] for b in row]
+    assert not any(c.startswith("acc_add:") for c in callbacks)
+
+
+def test_settings_view_has_accounts_button():
+    bot = Stub(p2p.Config())
+    _, kb = bot.settings_view()
+    buttons = [b for row in kb["inline_keyboard"] for b in row]
+    assert any(b.get("callback_data") == "accounts" for b in buttons)
+
+
+def test_acc_add_callback_arms_awaiting_key():
+    bot = Stub(p2p.Config())
+    asyncio.run(bot.on_callback({"id": "1", "data": "acc_add:bybit", "message": {"message_id": 1}}))
+    assert bot.awaiting_key == {"ex": "bybit", "step": "key"}
+    assert "API key" in texts(bot)[-1]
+
+
+def test_handle_key_input_flow_saves_and_verifies(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+
+    async def fake_verify(s, ex):
+        return True, "ключ рабочий, доступ только для чтения"
+
+    monkeypatch.setattr(B.accounts, "verify", fake_verify)
+    bot = Stub(p2p.Config())
+    bot.awaiting_key = {"ex": "bybit", "step": "key"}
+    asyncio.run(bot.handle_key_input("APIKEY123", 55))
+    assert ("deleteMessage", {"chat_id": "1", "message_id": 55}) in bot.out
+    assert bot.awaiting_key == {"ex": "bybit", "step": "secret", "key": "APIKEY123"}
+
+    asyncio.run(bot.handle_key_input("SECRET456", 56))
+    assert bot.awaiting_key is None
+    assert accounts.keys("bybit") == ("APIKEY123", "SECRET456")
+    assert any("✅ Подключено" in t for t in texts(bot))
+
+
+def test_handle_key_input_reports_failed_verification(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+
+    async def fake_verify(s, ex):
+        return False, "Invalid api_key"
+
+    monkeypatch.setattr(B.accounts, "verify", fake_verify)
+    bot = Stub(p2p.Config())
+    bot.awaiting_key = {"ex": "bybit", "step": "secret", "key": "APIKEY123"}
+    asyncio.run(bot.handle_key_input("SECRET456", 56))
+    assert any("Invalid api_key" in t for t in texts(bot))
+
+
+def test_on_update_routes_plain_text_to_key_input_when_awaiting():
+    bot = Stub(p2p.Config())
+    bot.chat_id = "1"
+    bot.awaiting_key = {"ex": "bybit", "step": "key"}
+    asyncio.run(bot.on_update({"message": {"chat": {"id": 1}, "text": "APIKEY123", "message_id": 7}}))
+    assert ("deleteMessage", {"chat_id": "1", "message_id": 7}) in bot.out
+    assert bot.awaiting_key == {"ex": "bybit", "step": "secret", "key": "APIKEY123"}
+
+
+def test_on_update_command_bypasses_key_input():
+    bot = Stub(p2p.Config())
+    bot.chat_id = "1"
+    bot.awaiting_key = {"ex": "bybit", "step": "key"}
+    asyncio.run(bot.on_update({"message": {"chat": {"id": 1}, "text": "/best", "message_id": 7}}))
+    assert not any(m == "deleteMessage" for m, _ in bot.out)
+    assert bot.awaiting_key is None
+
+
+def test_other_callback_resets_awaiting_key():
+    bot = Stub(p2p.Config())
+    bot.awaiting_key = {"ex": "bybit", "step": "key"}
+    asyncio.run(bot.on_callback({"id": "1", "data": "best", "message": {"message_id": 1}}))
+    assert bot.awaiting_key is None
+
+
+def test_command_resets_awaiting_key():
+    bot = Stub(p2p.Config())
+    bot.awaiting_key = {"ex": "bybit", "step": "key"}
+    asyncio.run(bot.handle("/best"))
+    assert bot.awaiting_key is None
+
+
+def test_acc_check_callback_reports_status(monkeypatch):
+    async def fake_verify(s, ex):
+        return False, "bad key"
+
+    monkeypatch.setattr(B.accounts, "verify", fake_verify)
+    bot = Stub(p2p.Config())
+    asyncio.run(bot.on_callback({"id": "1", "data": "acc_check:bybit", "message": {"message_id": 1}}))
+    assert "bad key" in texts(bot)[-1]
+
+
+def test_acc_del_callback_removes_key(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    accounts.save_key("bybit", "k", "s")
+    bot = Stub(p2p.Config())
+    asyncio.run(bot.on_callback({"id": "1", "data": "acc_del:bybit", "message": {"message_id": 1}}))
+    assert accounts.keys("bybit") is None
+    assert any("удалён" in t for t in texts(bot))
 
 
 def test_stats_view_reports_counts(tmp_path, monkeypatch):
