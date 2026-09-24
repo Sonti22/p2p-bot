@@ -11,7 +11,7 @@ import aiohttp
 
 import accounts
 import trades
-from cards import deal_card, top_chart
+from cards import deal_card, portfolio_card, top_chart
 from p2p import AMOUNT_MAX, AMOUNT_MIN, ENV_PATH, Config, _money, deal_amounts, fmt_deal, fmt_top, load_env, \
     parse_amount, reliability, scan, spot_url, venue_url
 
@@ -144,21 +144,32 @@ def account_view(ex):
     return text, {"inline_keyboard": kb}
 
 
+def portfolio_rows(port, snap):
+    """[(биржа, [(монета, кол-во, ₽ или None)])] и итог в ₽ — общие данные для текста и карточки баланса."""
+    rows, total = [], 0.0
+    for ex, bal in port.items():
+        coins = []
+        for coin, amt in sorted(bal.items()):
+            ref = snap.refs.get(coin) if snap else (1.0 if coin in ("USDT", "USDC") else None)
+            rub = amt * ref if ref else None
+            if rub:
+                total += rub
+            coins.append((coin, amt, rub))
+        rows.append((EXCHANGE_NAMES.get(ex, ex), coins))
+    return rows, total
+
+
 def portfolio_view(port, snap):
     """Текст «💰 Баланс»: монеты по подключённым биржам и итог в ₽ по ориентиру текущего снимка."""
     if not port:
         connectable = ", ".join(EXCHANGE_NAMES.get(ex, ex) for ex in accounts.BALANCE_FETCHERS)
         return (f"💰 <b>Баланс</b>\n\nНи одна биржа не подключена ({connectable}) или баланс пуст. "
                 f"Подключи ключ: ⚙️ Настройки → 🔑 Мои биржи.")
+    rows, total = portfolio_rows(port, snap)
     lines = ["💰 <b>Баланс по биржам</b>", ""]
-    total = 0.0
-    for ex, bal in port.items():
-        lines.append(f"<b>{EXCHANGE_NAMES.get(ex, ex)}</b>")
-        for coin, amt in sorted(bal.items()):
-            ref = snap.refs.get(coin) if snap else (1.0 if coin in ("USDT", "USDC") else None)
-            rub = amt * ref if ref else None
-            if rub:
-                total += rub
+    for name, coins in rows:
+        lines.append(f"<b>{name}</b>")
+        for coin, amt, rub in coins:
             lines.append(f"  {amt:g} {coin}" + (f" ≈ {_money(rub)} ₽" if rub else " (нет ориентира в ₽)"))
         lines.append("")
     lines.append(f"<b>Итого:</b> ≈ {_money(total)} ₽")
@@ -350,9 +361,16 @@ class Bot:
         await self.show_best(snap, calc_cfg)
 
     async def balance(self):
-        """`/balance`: балансы по подключённым биржам (Bybit — Unified + Funding, MEXC — спот) и итог в ₽."""
+        """`/balance`: балансы по подключённым биржам (Bybit — Unified + Funding, MEXC — спот) и итог в ₽.
+
+        Картинка-карточка портфеля; не вышло отрисовать — тот же текст, как у остальных карточек."""
         port = await accounts.portfolio(self.s)
-        await self.send(portfolio_view(port, self.last), markup=BALANCE_MARKUP)
+        caption = portfolio_view(port, self.last)
+        if not port:
+            await self.send(caption, markup=BALANCE_MARKUP)
+            return
+        rows, total = portfolio_rows(port, self.last)
+        await self.photo_or_text(lambda: portfolio_card(rows, total), caption, BALANCE_MARKUP)
 
     def settings_view(self):
         c = self.cfg

@@ -27,6 +27,11 @@ def test_amounts_line_formats_missing_depth_as_dash():
     assert "50к +1.23%" in line and "300к —" in line
 
 
+def test_portfolio_card_renders():
+    rows = [("Bybit", [("USDT", 10.0, 880.0), ("BTC", 0.01, 50_000.0)]), ("MEXC", [("TON", 100.0, None)])]
+    assert cards.portfolio_card(rows, 50_880.0)[:8] == PNG
+
+
 def test_top_chart_renders_empty_and_full():
     empty = p2p.Snapshot(88.0, "t", {}, {}, [], {}, {}, {})
     full = p2p.Snapshot(88.0, "t", {}, {}, [(3.0, make_ad(), make_ad(side="sell", price=90.0), "внутри биржи")], {}, {}, {})

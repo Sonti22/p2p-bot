@@ -519,18 +519,45 @@ def test_portfolio_view_missing_ref_marked_instead_of_crashing():
     assert "нет ориентира" in text
 
 
-def test_balance_command_sends_view_with_refresh_button(monkeypatch):
+def test_portfolio_rows_matches_totals_from_view():
+    port = {"bybit": {"USDT": 10.0, "BTC": 0.01}, "mexc": {"USDT": 5.0}}
+    snap = p2p.Snapshot(88.0, "test", {"USDT": 88.0, "BTC": 5_000_000.0}, {}, [], {}, {}, {})
+    rows, total = B.portfolio_rows(port, snap)
+    assert total == 51_320.0
+    names = [name for name, _ in rows]
+    assert names == ["Bybit", "MEXC"]
+    assert rows[0][1] == [("BTC", 0.01, 50_000.0), ("USDT", 10.0, 880.0)]
+
+
+def test_balance_command_sends_card_with_refresh_button(monkeypatch):
     async def fake_portfolio(s):
         return {"mexc": {"USDT": 1.0}}
 
     monkeypatch.setattr(B.accounts, "portfolio", fake_portfolio)
+    monkeypatch.setattr(B, "portfolio_card", lambda rows, total: b"png")
     bot = Stub(p2p.Config())
     bot.last = p2p.Snapshot(88.0, "test", {"USDT": 88.0}, {}, [], {}, {}, {})
     asyncio.run(bot.handle("/balance"))
-    msgs = [(m, p) for m, p in bot.out if m == "sendMessage"]
-    assert len(msgs) == 1
-    assert "MEXC" in msgs[0][1]["text"]
-    assert msgs[0][1]["reply_markup"]["inline_keyboard"][0][0]["callback_data"] == "balance"
+    pics = photos(bot)
+    assert len(pics) == 1
+    assert "MEXC" in pics[0][1]["caption"]
+    assert pics[0][1]["markup"]["inline_keyboard"][0][0]["callback_data"] == "balance"
+
+
+def test_balance_falls_back_to_text_when_card_render_fails(monkeypatch):
+    async def fake_portfolio(s):
+        return {"mexc": {"USDT": 1.0}}
+
+    def boom(rows, total):
+        raise ValueError("render error")
+
+    monkeypatch.setattr(B.accounts, "portfolio", fake_portfolio)
+    monkeypatch.setattr(B, "portfolio_card", boom)
+    bot = Stub(p2p.Config())
+    bot.last = p2p.Snapshot(88.0, "test", {"USDT": 88.0}, {}, [], {}, {}, {})
+    asyncio.run(bot.handle("/balance"))
+    assert not photos(bot)
+    assert any("MEXC" in t for t in texts(bot))
 
 
 def test_balance_callback_refreshes(monkeypatch):
