@@ -308,6 +308,14 @@ def accounts_view(cfg):
     return "\n".join(lines), {"inline_keyboard": rows}
 
 
+def env_key_hint(ex):
+    """Подсказка после отключения ключа, если он записан ещё и в .env: бот его уже не берёт, но секрет лежит в файле."""
+    if not accounts.in_env(ex):
+        return ""
+    return (f"\nКлюч также задан в .env ({ex.upper()}_API_KEY/{ex.upper()}_API_SECRET) — бот его больше "
+            "не использует, но сотри его оттуда.")
+
+
 def account_view(ex):
     """Текст и кнопки карточки одной биржи: статус, «Проверить»/«Удалить» или «Подключить»."""
     name = EXCHANGE_NAMES.get(ex, ex)
@@ -1687,8 +1695,10 @@ class Bot:
             await self.send("✅ Ключ рабочий (только чтение)" if ok else f"⚠️ {msg}")
         elif data.startswith("acc_del:"):
             ex = data[8:]
-            accounts.delete_key(ex)
-            await self.send("🗑 Ключ удалён")
+            if accounts.delete_key(ex):
+                await self.send("🗑 Ключ удалён" + env_key_hint(ex))
+            else:
+                await self.send("Ключ не был подключён")
             t, kb = account_view(ex)
             await self.send(t, markup=kb)
         elif data.startswith("acc:"):
@@ -1786,7 +1796,8 @@ class Bot:
                 accounts.delete_key(ex)
                 name = EXCHANGE_NAMES.get(ex, ex)
                 await self.send(f"⚠️ {name}: ключ даёт больше, чем чтение ({detail}) — удалил его из бота.\n"
-                                f"Создай новый ключ ТОЛЬКО для чтения и подключи заново: «⚙️ Настройки → 🔑 Мои биржи».")
+                                f"Создай новый ключ ТОЛЬКО для чтения и подключи заново: «⚙️ Настройки → 🔑 Мои биржи»."
+                                + env_key_hint(ex))
 
     async def setup(self):
         for method, params in (("setMyCommands", {"commands": COMMANDS}),

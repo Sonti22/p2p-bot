@@ -2,8 +2,9 @@
 
 Ключи хранятся локально: сначала `data/keys.json` (папка `data/` в git не попадает), иначе `.env`
 (`BYBIT_API_KEY`/`BYBIT_API_SECRET`, `MEXC_API_KEY`/`MEXC_API_SECRET`). Нет ключей для биржи —
-`keys()` вернёт None, функции аккаунтов для неё выключены. Никаких торговых/выводных запросов —
-только подписанные GET к read-only эндпоинтам.
+`keys()` вернёт None, функции аккаунтов для неё выключены. Удалённый в боте ключ помечается в
+`data/keys.json` как `disabled` — пометка выключает его, даже если он остался в `.env`. Никаких
+торговых/выводных запросов — только подписанные GET к read-only эндпоинтам.
 """
 import base64
 import hashlib
@@ -32,10 +33,25 @@ def _keys_file():
         return {}
 
 
+def _write_keys_file(data):
+    os.makedirs(os.path.dirname(KEYS_PATH), exist_ok=True)
+    with open(KEYS_PATH, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def in_env(exchange):
+    """Есть ли ключ биржи в окружении (.env): {EXCHANGE}_API_KEY или {EXCHANGE}_API_SECRET."""
+    ex = exchange.upper()
+    return bool(os.getenv(f"{ex}_API_KEY") or os.getenv(f"{ex}_API_SECRET"))
+
+
 def keys(exchange):
-    """(api_key, api_secret) для биржи или None, если ключей нет (файл имеет приоритет над .env)."""
+    """(api_key, api_secret) для биржи или None, если ключей нет или ключ выключен пометкой disabled
+    (файл имеет приоритет над .env)."""
     ex = exchange.lower()
     saved = _keys_file().get(ex, {})
+    if saved.get("disabled"):   # ключ удалён в боте — не подхватываем его и из .env
+        return None
     key = saved.get("key") or os.getenv(f"{exchange.upper()}_API_KEY")
     secret = saved.get("secret") or os.getenv(f"{exchange.upper()}_API_SECRET")
     return (key, secret) if key and secret else None
@@ -49,27 +65,30 @@ def save_key(exchange, key, secret, passphrase=None):
     entry = {"key": key, "secret": secret}
     if passphrase:
         entry["passphrase"] = passphrase
-    data[exchange.lower()] = entry
-    os.makedirs(os.path.dirname(KEYS_PATH), exist_ok=True)
-    with open(KEYS_PATH, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    data[exchange.lower()] = entry   # новая запись целиком — снимает и пометку disabled
+    _write_keys_file(data)
 
 
 def passphrase(exchange):
     """Passphrase ключа биржи (сейчас только KuCoin): data/keys.json, иначе {EXCHANGE}_API_PASSPHRASE в .env."""
     ex = exchange.lower()
     saved = _keys_file().get(ex, {})
+    if saved.get("disabled"):
+        return None
     return saved.get("passphrase") or os.getenv(f"{exchange.upper()}_API_PASSPHRASE")
 
 
 def delete_key(exchange):
-    """Удалить сохранённый ключ биржи из data/keys.json, если он там есть."""
-    data = _keys_file()
-    if data.pop(exchange.lower(), None) is None:
+    """Отключить ключ биржи из любого источника: убрать запись из data/keys.json, а если ключ есть
+    и в .env — записать пометку disabled, которая перекрывает .env. False — ключ не был подключён."""
+    ex = exchange.lower()
+    if keys(ex) is None:
         return False
-    os.makedirs(os.path.dirname(KEYS_PATH), exist_ok=True)
-    with open(KEYS_PATH, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    data = _keys_file()
+    data.pop(ex, None)
+    if in_env(ex):
+        data[ex] = {"disabled": True}
+    _write_keys_file(data)
     return True
 
 

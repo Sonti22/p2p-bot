@@ -135,6 +135,63 @@ def test_delete_key_removes_saved_entry(tmp_path, monkeypatch):
     assert accounts.delete_key("bybit") is False
 
 
+def _clear_env_keys(monkeypatch):
+    for ex in ("BYBIT", "MEXC", "HTX", "KUCOIN"):
+        for suffix in ("API_KEY", "API_SECRET", "API_PASSPHRASE"):
+            monkeypatch.delenv(f"{ex}_{suffix}", raising=False)
+
+
+def test_delete_key_blocks_env_fallback(tmp_path, monkeypatch):
+    # ключ и в файле, и в .env: удаление должно выключить оба источника
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    _clear_env_keys(monkeypatch)
+    monkeypatch.setenv("BYBIT_API_KEY", "envkey")
+    monkeypatch.setenv("BYBIT_API_SECRET", "envsecret")
+    accounts.save_key("bybit", "k1", "s1")
+    assert accounts.delete_key("bybit") is True
+    assert accounts.keys("bybit") is None
+    assert accounts._keys_file()["bybit"] == {"disabled": True}
+
+
+def test_delete_key_env_only_disables(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    _clear_env_keys(monkeypatch)
+    monkeypatch.setenv("BYBIT_API_KEY", "envkey")
+    monkeypatch.setenv("BYBIT_API_SECRET", "envsecret")
+    assert accounts.delete_key("bybit") is True
+    assert accounts.keys("bybit") is None
+    assert accounts.delete_key("bybit") is False   # уже выключен
+
+
+def test_delete_key_nothing_returns_false(tmp_path, monkeypatch):
+    path = tmp_path / "keys.json"
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(path))
+    _clear_env_keys(monkeypatch)
+    assert accounts.delete_key("bybit") is False
+    assert not path.exists()
+
+
+def test_save_key_after_delete_reenables(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    _clear_env_keys(monkeypatch)
+    monkeypatch.setenv("BYBIT_API_KEY", "envkey")
+    monkeypatch.setenv("BYBIT_API_SECRET", "envsecret")
+    accounts.delete_key("bybit")
+    accounts.save_key("bybit", "k2", "s2")
+    assert accounts.keys("bybit") == ("k2", "s2")
+    assert "disabled" not in accounts._keys_file()["bybit"]
+
+
+def test_passphrase_disabled_overrides_env(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    _clear_env_keys(monkeypatch)
+    for suffix, value in (("API_KEY", "envkey"), ("API_SECRET", "envsecret"), ("API_PASSPHRASE", "envpass")):
+        monkeypatch.setenv(f"KUCOIN_{suffix}", value)
+    assert accounts.delete_key("kucoin") is True
+    assert accounts.keys("kucoin") is None
+    assert accounts.passphrase("kucoin") is None
+
+
 def test_mask_short_key_falls_back():
     assert accounts.mask("") == "••••"
     assert accounts.mask("abc") == "••••"

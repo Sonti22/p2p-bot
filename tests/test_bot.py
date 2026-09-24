@@ -668,6 +668,56 @@ def test_acc_del_callback_removes_key(tmp_path, monkeypatch):
     assert any("удалён" in t for t in texts(bot))
 
 
+def _clear_env_keys(monkeypatch):
+    for ex in ("BYBIT", "MEXC", "HTX", "KUCOIN"):
+        for suffix in ("API_KEY", "API_SECRET", "API_PASSPHRASE"):
+            monkeypatch.delenv(f"{ex}_{suffix}", raising=False)
+
+
+def test_acc_del_callback_disables_env_key(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    _clear_env_keys(monkeypatch)
+    monkeypatch.setenv("BYBIT_API_KEY", "envkey")
+    monkeypatch.setenv("BYBIT_API_SECRET", "envsecret")
+    bot = Stub(p2p.Config())
+    asyncio.run(bot.on_callback({"id": "1", "data": "acc_del:bybit", "message": {"message_id": 1}}))
+    assert accounts.keys("bybit") is None
+    out = texts(bot)
+    assert any("удалён" in t and ".env" in t for t in out)
+    assert any("Ключ не подключён" in t for t in out)
+    assert not any("Ключ подключён" in t for t in out)
+    assert not any("envkey" in t or "envsecret" in t for t in out)
+
+
+def test_acc_del_callback_without_key_says_not_connected(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    _clear_env_keys(monkeypatch)
+    bot = Stub(p2p.Config())
+    asyncio.run(bot.on_callback({"id": "1", "data": "acc_del:bybit", "message": {"message_id": 1}}))
+    out = texts(bot)
+    assert "не был подключён" in out[0] and not any("удалён" in t for t in out)
+
+
+def test_check_key_safety_disables_env_only_key(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    _clear_env_keys(monkeypatch)
+    monkeypatch.setenv("BYBIT_API_KEY", "envkey")
+    monkeypatch.setenv("BYBIT_API_SECRET", "envsecret")
+    calls = []
+
+    async def fake_permissions(s, ex):
+        calls.append(ex)
+        return False, "торговля"
+
+    monkeypatch.setattr(B.accounts, "api_permissions", fake_permissions)
+    bot = Stub(p2p.Config())
+    asyncio.run(bot.check_key_safety())
+    assert accounts.keys("bybit") is None
+    assert len(texts(bot)) == 1 and ".env" in texts(bot)[0]
+    asyncio.run(bot.check_key_safety())   # следующий старт: ключ выключен, проверять и предупреждать нечего
+    assert calls == ["bybit"] and len(texts(bot)) == 1
+
+
 def test_check_key_safety_removes_unsafe_key_and_warns(tmp_path, monkeypatch):
     monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
     accounts.save_key("bybit", "k", "s")
