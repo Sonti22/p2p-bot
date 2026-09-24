@@ -42,6 +42,25 @@ def test_exchanger_network_is_respected():
     assert "ERC20" in route and "−0.8 USDT" in route
 
 
+def test_withdraw_fee_multiplied_by_exchanger_stack_parts():
+    # стакан из 3 объявлений одной сети обменника — 3 отдельных перевода с биржи, комиссия вывода ×3
+    ads = [make_ad("BestChange", "sell", 89.9 - i * 0.1, net="ERC20", min_amt=500, max_amt=25_000,
+                    avail=25_000 / (89.9 - i * 0.1)) for i in range(3)]
+    b = make_ad("Bybit", "buy", 85.0)
+    profit, b2, s, route = p2p._match(b, ads, cfg(), SPOT)
+    assert s.parts == 3
+    assert "−2.4 USDT (ERC20) ×3 на BestChange" in route   # 0.8 USDT × 3
+    qty_no_fee = 50000 / 85.0
+    assert profit == pytest.approx(((qty_no_fee - 2.4) * s.price / 50000 - 1) * 100)
+
+
+def test_withdraw_fee_not_multiplied_for_single_exchanger_ad():
+    profit, b2, s, route = p2p._match(make_ad("Bybit", "buy", 85.0), [make_ad("BestChange", "sell", 89.9, net="ERC20")],
+                                       cfg(), SPOT)
+    assert s.parts == 1
+    assert "×" not in route and "−0.8 USDT" in route
+
+
 def test_spot_on_buy_venue_and_risk_buffer():
     b, s = make_ad("MEXC", "buy", 88.0), make_ad("MEXC", "sell", 245000.0, asset="ETH")
     profit, route = p2p._route(b, s, cfg(risk_buffer={"ETH": 0.5}), SPOT)
@@ -233,7 +252,9 @@ def test_scan_stacks_exchangers_per_network(offline, monkeypatch):
     snap = asyncio.run(p2p.scan(None, c))
     profit, b, s, route = snap.deals[0]
     assert s.net == "TRC20" and "объявл." in s.nick
-    assert "перевод −1 USDT (TRC20) на BestChange" in route and "BEP20" not in route
+    assert s.parts == 3   # три TRC20-объявления в стакане — три отдельных перевода с биржи
+    # комиссия вывода MEXC→TRC20 (1 USDT) утроена — по переводу на каждого обменника
+    assert f"перевод −{1.0 * s.parts:g} USDT (TRC20) ×{s.parts} на BestChange" in route and "BEP20" not in route
 
 
 def test_scan_keeps_one_deal_per_venue_pair(offline, monkeypatch):
@@ -264,12 +285,17 @@ def test_deal_amounts_respects_exchanger_network():
     buy_ads = [make_ad("MEXC", "buy", 88.0)]
     snap = p2p.Snapshot(88.0, "t", {}, {}, [], {}, {}, {}, spot=SPOT,
                         groups={("MEXC", "buy", "USDT"): buy_ads, ("BestChange", "sell", "USDT"): ads})
-    deal = (2.0, buy_ads[0], p2p._stack([ads[0], ads[2]], 50000), "перевод −1 USDT (TRC20) на BestChange")
+    deal = (2.0, buy_ads[0], p2p._stack([ads[0], ads[2]], 50000), "перевод −2 USDT (TRC20) ×2 на BestChange")
     out = p2p.deal_amounts(deal, cfg(), snap, amounts=(40_000, 75_000))
     assert out[75_000] is None   # 75 000 набирается только вместе с ERC20
-    qty = 40000 / 88 - 1.0    # вывод TRC20 −1 USDT
-    first = 25000 / 89.9      # TRC20 89.9 целиком, остаток — в TRC20 89.7; ERC20 89.8 пропущен
-    assert out[40_000] == pytest.approx(((first * 89.9 + (qty - first) * 89.7) / 40000 - 1) * 100)
+    # первый проход считает вывод под одно объявление (fee=1 USDT), стакаются два TRC20-объявления
+    # (89.9 целиком + остаток по 89.7, ERC20 89.8 пропущен); итоговый маршрут уже знает, что объявлений
+    # два — комиссия вывода удваивается (по объявлению на каждого обменника)
+    qty0 = 40000 / 88 - 1.0
+    first = 25000 / 89.9
+    price = (first * 89.9 + (qty0 - first) * 89.7) / qty0
+    out_qty = 40000 / 88 - 2.0
+    assert out[40_000] == pytest.approx((out_qty * price / 40000 - 1) * 100)
 
 
 def test_stack_qty_combines_ads_by_quantity():

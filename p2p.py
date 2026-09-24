@@ -230,6 +230,7 @@ class Ad:
     net: str = ""    # сеть (только у обменников)
     terms: str = ""  # условия мерчанта из объявления (remark/remarks/tradeTerms/conditions)
     all_pays: list = None  # исходные способы оплаты до фильтра _pays (объявление живёт в кэше _alt несколько сканов)
+    parts: int = 1   # из скольких объявлений стакана собрано (_combined) — обменникам нужен свой перевод на каждого
 
 
 async def _json(s, method, url, body=None):
@@ -560,7 +561,7 @@ def _combined(used, price, total, qty):
     return Ad(used[0].ex, used[0].side, price, total, sum(a.max_amt for a in used), qty,
               sorted(set(p for a in used for p in a.pays)), used[0].nick if one else f"{len(used)} объявл.",
               min(a.orders for a in used), min(a.rate for a in used), used[0].url if one else "",
-              used[0].asset, nets.pop() if len(nets) == 1 else "", terms=terms)
+              used[0].asset, nets.pop() if len(nets) == 1 else "", terms=terms, parts=len(used))
 
 
 def _net_parts(grp):
@@ -628,10 +629,12 @@ def _withdraw(cfg, sender, asset, net="", receiver="", qty=None):
     return cfg.transfer_fees.get(asset, 0), ""
 
 
-def _hop(cfg, frm, frm_net, to, to_net, asset, qty=None):
+def _hop(cfg, frm, frm_net, to, to_net, asset, qty=None, parts=1):
     """Перевод монеты между площадками: (комиссия в монете, подпись шага); та же биржа — (0, '');
     (None, '') — перевод невозможен: вывод или ввод в нужной сети закрыт (или сумма qty меньше
-    минимума вывода биржи в единственной подходящей сети)."""
+    минимума вывода биржи в единственной подходящей сети). parts — из скольких объявлений собран
+    получатель (стакан обменников одной сети, см. Ad.parts): каждому нужен свой перевод, комиссия
+    вывода умножается на их число."""
     if frm == to and frm != "BestChange":
         return 0.0, ""
     if frm == "BestChange" and to == "BestChange":   # обменник → твой кошелёк на бирже → другой обменник
@@ -641,7 +644,9 @@ def _hop(cfg, frm, frm_net, to, to_net, asset, qty=None):
         if w is None:
             return None, ""
         fee, net = w
-        return fee, f"через Bybit: перевод −{fee:g} {asset} ({net})"
+        fee *= parts
+        mult = f" ×{parts}" if parts > 1 else ""
+        return fee, f"через Bybit: перевод −{fee:g} {asset} ({net}){mult}"
     if frm == "BestChange":                          # обменник сам шлёт монету, комиссия в его курсе
         need = _receive_nets(to, asset)
         if need and frm_net not in need:
@@ -653,8 +658,10 @@ def _hop(cfg, frm, frm_net, to, to_net, asset, qty=None):
     if w is None:
         return None, ""
     fee, net = w
+    fee *= parts
+    mult = f" ×{parts}" if parts > 1 else ""
     cost = f"−{fee:g} {asset}" if fee else f"{asset} без комиссии"
-    return fee, f"перевод {cost}" + (f" ({net})" if net else "") + f" на {to}"
+    return fee, f"перевод {cost}" + (f" ({net})" if net else "") + mult + f" на {to}"
 
 
 def _route_qty(b, s, cfg, spot, over_banks=frozenset(), disable=frozenset()):
@@ -669,8 +676,10 @@ def _route_qty(b, s, cfg, spot, over_banks=frozenset(), disable=frozenset()):
     # вывод меньше минимума биржи в сети — сеть недоступна (как закрытая); при "withdraw" в disable
     # комиссия и минимум вывода игнорируются (для profit_breakdown без стадии вывода)
     wqty = None if "withdraw" in disable else qty
+    # стакан обменников из N объявлений одной сети (_stack_qty) — каждому нужен свой перевод с биржи
+    s_parts = s.parts if s.ex == "BestChange" else 1
     if b.asset == s.asset:
-        fee, _ = _hop(cfg, b.ex, b.net, s.ex, s.net, b.asset, qty=wqty)
+        fee, _ = _hop(cfg, b.ex, b.net, s.ex, s.net, b.asset, qty=wqty, parts=s_parts)
         if fee is None:
             return None
         qty -= 0.0 if "withdraw" in disable else fee
@@ -688,7 +697,7 @@ def _route_qty(b, s, cfg, spot, over_banks=frozenset(), disable=frozenset()):
         sf = 0.0 if "spot" in disable else _spot_fee(cfg, venue)
         qty = (qty / ask if b.asset == "USDT" else qty * bid) * (1 - sf / 100)
         wqty = None if "withdraw" in disable else qty
-        fee, _ = _hop(cfg, venue, "", s.ex, s.net, s.asset, qty=wqty)
+        fee, _ = _hop(cfg, venue, "", s.ex, s.net, s.asset, qty=wqty, parts=s_parts)
         if fee is None:
             return None
         qty -= 0.0 if "withdraw" in disable else fee
@@ -708,7 +717,7 @@ def _route_qty(b, s, cfg, spot, over_banks=frozenset(), disable=frozenset()):
             qty = qty * bid1 * (1 - sf / 100)     # b.asset → USDT
             qty = (qty / ask2) * (1 - sf / 100)   # USDT → s.asset
             wqty = None if "withdraw" in disable else qty
-            fee, _ = _hop(cfg, venue, "", s.ex, s.net, s.asset, qty=wqty)
+            fee, _ = _hop(cfg, venue, "", s.ex, s.net, s.asset, qty=wqty, parts=s_parts)
             if fee is None:
                 return None
             qty -= 0.0 if "withdraw" in disable else fee
@@ -734,7 +743,7 @@ def _route_qty(b, s, cfg, spot, over_banks=frozenset(), disable=frozenset()):
             sf2 = 0.0 if "spot" in disable else _spot_fee(cfg, venue2)
             qty = (qty / ask2) * (1 - sf2 / 100)  # USDT → s.asset на venue2
             wqty = None if "withdraw" in disable else qty
-            fee, _ = _hop(cfg, venue2, "", s.ex, s.net, s.asset, qty=wqty)
+            fee, _ = _hop(cfg, venue2, "", s.ex, s.net, s.asset, qty=wqty, parts=s_parts)
             if fee is None:
                 return None
             qty -= 0.0 if "withdraw" in disable else fee
@@ -759,8 +768,10 @@ def _route(b, s, cfg, spot, over_banks=frozenset()):
     # тот же расчёт количества, что и в _route_qty — чтобы _hop здесь выбирал ту же сеть (сумма
     # вывода на каждом шаге влияет на то, проходит ли сеть по минимуму биржи)
     qty = cfg.amount * (1 - pay_fee / 100) / b.price
+    # стакан обменников из N объявлений одной сети (_stack_qty) — каждому нужен свой перевод с биржи
+    s_parts = s.parts if s.ex == "BestChange" else 1
     if b.asset == s.asset:
-        fee, label = _hop(cfg, b.ex, b.net, s.ex, s.net, b.asset, qty=qty)
+        fee, label = _hop(cfg, b.ex, b.net, s.ex, s.net, b.asset, qty=qty, parts=s_parts)
         if fee is None:
             return None
         steps.append(label or "внутри биржи")
@@ -779,7 +790,7 @@ def _route(b, s, cfg, spot, over_banks=frozenset()):
         sf = _spot_fee(cfg, venue)
         steps.append(f"спот {b.asset}→{s.asset} на {venue} (−{sf:g}%)")
         qty = (qty / ask if b.asset == "USDT" else qty * bid) * (1 - sf / 100)
-        fee, label = _hop(cfg, venue, "", s.ex, s.net, s.asset, qty=qty)
+        fee, label = _hop(cfg, venue, "", s.ex, s.net, s.asset, qty=qty, parts=s_parts)
         if fee is None:
             return None
         if label:
@@ -802,7 +813,7 @@ def _route(b, s, cfg, spot, over_banks=frozenset()):
             steps.append(f"спот USDT→{s.asset} на {venue} (−{sf:g}%)")
             qty = qty * bid1 * (1 - sf / 100)     # b.asset → USDT
             qty = (qty / ask2) * (1 - sf / 100)   # USDT → s.asset
-            fee, label = _hop(cfg, venue, "", s.ex, s.net, s.asset, qty=qty)
+            fee, label = _hop(cfg, venue, "", s.ex, s.net, s.asset, qty=qty, parts=s_parts)
             if fee is None:
                 return None
             if label:
@@ -833,7 +844,7 @@ def _route(b, s, cfg, spot, over_banks=frozenset()):
             sf2 = _spot_fee(cfg, venue2)
             steps.append(f"спот USDT→{s.asset} на {venue2} (−{sf2:g}%)")
             qty = (qty / ask2) * (1 - sf2 / 100)  # USDT → s.asset на venue2
-            fee, label = _hop(cfg, venue2, "", s.ex, s.net, s.asset, qty=qty)
+            fee, label = _hop(cfg, venue2, "", s.ex, s.net, s.asset, qty=qty, parts=s_parts)
             if fee is None:
                 return None
             if label:
