@@ -98,6 +98,61 @@ def test_scan_offline_keeps_prices_near_reference(offline):
     assert all(d[0] == max(x[0] for x in snap.deals) for d in snap.deals[:1])   # отсортировано по убыванию
 
 
+def test_stack_combines_several_ads_by_price():
+    ads = [make_ad(price=85.0, min_amt=1000, max_amt=20000, avail=20000 / 85.0),
+           make_ad(price=86.0, min_amt=1000, max_amt=40000, avail=40000 / 86.0)]
+    stacked = p2p._stack(ads, 50000)
+    assert stacked is not None
+    assert "2 объявл." in stacked.nick
+    qty = 20000 / 85.0 + 30000 / 86.0
+    assert stacked.price == pytest.approx(50000 / qty)
+
+
+def test_stack_single_ad_matches_original_price():
+    ads = [make_ad(price=85.0, min_amt=1000, max_amt=500000, avail=10000)]
+    stacked = p2p._stack(ads, 50000)
+    assert stacked.price == pytest.approx(85.0) and stacked.nick == "nick"
+
+
+def test_stack_skips_ad_below_its_minimum_for_remainder():
+    ads = [make_ad(price=85.0, min_amt=1000, max_amt=45000, avail=45000 / 85.0),
+           make_ad(price=86.0, min_amt=10000, max_amt=40000, avail=40000 / 86.0)]
+    assert p2p._stack(ads, 50000) is None   # остаток 5000 меньше min_amt второго объявления
+
+
+def test_stack_returns_none_when_depth_insufficient():
+    ads = [make_ad(price=85.0, min_amt=1000, max_amt=20000, avail=20000 / 85.0)]
+    assert p2p._stack(ads, 50000) is None
+
+
+def test_scan_combines_depth_across_ads_to_form_deal(offline, monkeypatch):
+    async def fake_fetcher(s, cfg, side, asset):
+        if side == "buy":
+            return [make_ad("Fake", "buy", 85.0, min_amt=1000, max_amt=20000, avail=20000 / 85.0),
+                    make_ad("Fake", "buy", 86.0, min_amt=1000, max_amt=30000, avail=30000 / 86.0)]
+        return [make_ad("Fake", "sell", 90.0, min_amt=1000, max_amt=500000, avail=10000)]
+
+    monkeypatch.setitem(p2p.FETCHERS, "fake", fake_fetcher)
+    c = p2p.Config(exchanges=["fake"], assets=["USDT"], min_orders=0, min_rate=0)
+    snap = asyncio.run(p2p.scan(None, c))
+    assert snap.deals
+    qty = 20000 / 85.0 + 30000 / 86.0
+    buy_price = 50000 / qty
+    assert snap.deals[0][1].price == pytest.approx(buy_price)
+
+
+def test_scan_drops_deal_when_depth_does_not_cover_amount(offline, monkeypatch):
+    async def fake_fetcher(s, cfg, side, asset):
+        if side == "buy":
+            return [make_ad("Fake", "buy", 85.0, min_amt=1000, max_amt=20000, avail=20000 / 85.0)]
+        return [make_ad("Fake", "sell", 90.0, min_amt=1000, max_amt=500000, avail=10000)]
+
+    monkeypatch.setitem(p2p.FETCHERS, "fake", fake_fetcher)
+    c = p2p.Config(exchanges=["fake"], assets=["USDT"], min_orders=0, min_rate=0)
+    snap = asyncio.run(p2p.scan(None, c))
+    assert not snap.deals   # 20 000 доступного объёма не хватает на круг в 50 000
+
+
 def test_scan_applies_auto_fee_for_bank_over_limit(offline, monkeypatch):
     async def fake_fetcher(s, cfg, side, asset):
         return [make_ad("Fake", side, 85.0 if side == "buy" else 90.0, pays=("T-Bank",))]
