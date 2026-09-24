@@ -1,6 +1,7 @@
 import asyncio
 import functools
 import time
+from datetime import datetime
 
 import accounts
 import bot as B
@@ -799,3 +800,199 @@ def test_check_accounts_skips_exchanges_without_saved_key(tmp_path, monkeypatch)
     bot = Stub(p2p.Config())
     asyncio.run(bot.check_accounts())
     assert calls == []
+
+
+# --- тихие часы и пауза сигналов ---
+
+def msk_ts(hour, minute=0, day=24):
+    """Unix-timestamp для заданного часа:минуты 24 сентября 2026 по МСК — удобно для тестов без сети."""
+    return datetime(2026, 9, day, hour, minute, tzinfo=B.MSK).timestamp()
+
+
+def test_parse_pause_arg_variants():
+    assert B.parse_pause_arg("30m") == 1800
+    assert B.parse_pause_arg("1h") == 3600
+    assert B.parse_pause_arg("3h") == 10800
+    assert B.parse_pause_arg("до утра") == "morning"
+    assert B.parse_pause_arg("Утра") == "morning"
+    assert B.parse_pause_arg("ерунда") is None
+    assert B.parse_pause_arg("") is None
+
+
+def test_in_quiet_hours_window_and_edges():
+    assert B.in_quiet_hours("01:00-08:00", msk_ts(2, 30))
+    assert not B.in_quiet_hours("01:00-08:00", msk_ts(9, 0))
+    assert not B.in_quiet_hours("01:00-08:00", msk_ts(0, 30))
+    assert not B.in_quiet_hours("", msk_ts(2, 0))
+    assert not B.in_quiet_hours("ерунда", msk_ts(2, 0))
+
+
+def test_in_quiet_hours_wraps_midnight():
+    assert B.in_quiet_hours("23:00-07:00", msk_ts(0, 30))
+    assert B.in_quiet_hours("23:00-07:00", msk_ts(23, 30))
+    assert not B.in_quiet_hours("23:00-07:00", msk_ts(12, 0))
+
+
+def test_quiet_hours_end_ts_next_occurrence():
+    end = B.quiet_hours_end_ts("01:00-08:00", msk_ts(2, 30))
+    assert datetime.fromtimestamp(end, B.MSK).strftime("%d %H:%M") == "24 08:00"
+    end2 = B.quiet_hours_end_ts("01:00-08:00", msk_ts(9, 0))   # уже позже конца окна — переносим на завтра
+    assert datetime.fromtimestamp(end2, B.MSK).strftime("%d %H:%M") == "25 08:00"
+
+
+def test_quiet_hours_blocks_signal_and_stores_for_digest(monkeypatch):
+    monkeypatch.setattr(B, "deal_card", lambda d, c, a=None, r=None, breakdown=None: b"png")
+    monkeypatch.setattr(B.time, "time", lambda: msk_ts(2, 0))
+    bot = Stub(p2p.Config(min_profit=2.0))
+    bot.quiet_on = True
+    d = deal(5, "MEXC")
+    asyncio.run(bot.quiet_and_pause_tick(snap([d])))
+    assert not bot.out                              # сигнал не отправлен
+    assert list(bot.night_deals.values()) == [d]     # но накоплен для утреннего дайджеста
+
+
+def test_quiet_hours_off_sends_signal_as_usual(monkeypatch):
+    monkeypatch.setattr(B, "deal_card", lambda d, c, a=None, r=None, breakdown=None: b"png")
+    monkeypatch.setattr(B.time, "time", lambda: msk_ts(2, 0))
+    bot = Stub(p2p.Config(min_profit=2.0))
+    d = deal(5, "MEXC")
+    asyncio.run(bot.quiet_and_pause_tick(snap([d])))
+    assert photos(bot)                               # тихие часы выключены — сигнал уходит как обычно
+
+
+def test_night_digest_aggregates_across_scans_and_sends_top3_once(monkeypatch):
+    monkeypatch.setattr(B, "deal_card", lambda d, c, a=None, r=None, breakdown=None: b"png")
+    bot = Stub(p2p.Config(min_profit=2.0))
+    bot.quiet_on = True
+    a, bd, c = deal(5, "MEXC"), deal(4, "KuCoin"), deal(6, "HTX")
+    monkeypatch.setattr(B.time, "time", lambda: msk_ts(2, 0))
+    asyncio.run(bot.quiet_and_pause_tick(snap([a, bd])))
+    monkeypatch.setattr(B.time, "time", lambda: msk_ts(3, 0))
+    asyncio.run(bot.quiet_and_pause_tick(snap([c])))
+    assert not texts(bot)                            # всю ночь — тишина, дайджеста ещё нет
+    assert len(bot.night_deals) == 3
+
+    monkeypatch.setattr(B.time, "time", lambda: msk_ts(9, 0))     # тихие часы закончились
+    asyncio.run(bot.quiet_and_pause_tick(snap([])))
+    msgs = texts(bot)
+    assert len(msgs) == 1 and "Топ-3 связки за ночь" in msgs[0]
+    assert msgs[0].index("+6.00%") < msgs[0].index("+5.00%") < msgs[0].index("+4.00%")  # по убыванию прибыли
+    assert bot.night_deals == {}
+
+    asyncio.run(bot.quiet_and_pause_tick(snap([])))   # повторный тик после конца ночи — дайджест не дублируем
+    assert len(texts(bot)) == 1
+
+
+def test_night_digest_empty_when_nothing_above_threshold(monkeypatch):
+    bot = Stub(p2p.Config(min_profit=2.0))
+    bot.quiet_on = True
+    monkeypatch.setattr(B.time, "time", lambda: msk_ts(2, 0))
+    asyncio.run(bot.quiet_and_pause_tick(snap([])))
+    monkeypatch.setattr(B.time, "time", lambda: msk_ts(9, 0))
+    asyncio.run(bot.quiet_and_pause_tick(snap([])))
+    assert "связок выше порога не было" in texts(bot)[-1]
+
+
+def test_pause_command_no_arg_is_indefinite():
+    bot = Stub(p2p.Config())
+    asyncio.run(bot.handle("/pause"))
+    assert bot.paused and bot.pause_until == 0.0
+    assert "паузе" in texts(bot)[-1]
+
+
+def test_pause_1h_blocks_signals_and_expires(monkeypatch):
+    monkeypatch.setattr(B, "deal_card", lambda d, c, a=None, r=None, breakdown=None: b"png")
+    now = [1_000_000.0]
+    monkeypatch.setattr(B.time, "time", lambda: now[0])
+    bot = Stub(p2p.Config(min_profit=2.0))
+    asyncio.run(bot.handle("/pause 1h"))
+    assert bot.pause_until == now[0] + 3600 and not bot.paused
+
+    d = deal(5, "MEXC")
+    asyncio.run(bot.quiet_and_pause_tick(snap([d])))
+    assert not photos(bot)                 # сигналы блокированы на время паузы
+
+    now[0] += 3601                          # час прошёл — пауза истекла сама, без /resume
+    asyncio.run(bot.quiet_and_pause_tick(snap([d])))
+    assert photos(bot)                      # сигналы снова идут
+
+
+def test_pause_bad_arg_reports_error():
+    bot = Stub(p2p.Config())
+    asyncio.run(bot.handle("/pause ерунда"))
+    assert "срок" in texts(bot)[-1].lower()
+    assert bot.pause_until == 0.0 and not bot.paused
+
+
+def test_pause_until_morning_uses_quiet_hours_end(monkeypatch):
+    ts = msk_ts(2, 0)
+    monkeypatch.setattr(B.time, "time", lambda: ts)
+    bot = Stub(p2p.Config())
+    asyncio.run(bot.handle("/pause до утра"))
+    assert bot.pause_until == B.quiet_hours_end_ts(bot.quiet_hours, ts)
+    assert "08:00" in texts(bot)[-1]
+
+
+def test_pause_until_morning_without_quiet_hours_configured():
+    bot = Stub(p2p.Config())
+    bot.quiet_hours = ""
+    asyncio.run(bot.handle("/pause до утра"))
+    assert bot.pause_until == 0.0
+    assert "QUIET_HOURS" in texts(bot)[-1]
+
+
+def test_resume_command_clears_manual_and_timed_pause():
+    bot = Stub(p2p.Config())
+    bot.paused = True
+    bot.pause_until = time.time() + 999
+    asyncio.run(bot.handle("/resume"))
+    assert not bot.paused and bot.pause_until == 0.0
+    assert "включены" in texts(bot)[-1].lower()
+
+
+def test_apply_resume_button_clears_timed_pause():
+    bot = Stub(p2p.Config())
+    bot.pause_until = time.time() + 500
+    bot.apply("resume")
+    assert bot.pause_until == 0.0 and not bot.paused
+
+
+def test_settings_view_shows_quiet_hours_until(monkeypatch):
+    monkeypatch.setattr(B.time, "time", lambda: msk_ts(2, 0))
+    bot = Stub(p2p.Config())
+    bot.quiet_on = True
+    text, _ = bot.settings_view()
+    assert "тихие часы до 08:00" in text
+
+
+def test_settings_view_shows_pause_until():
+    bot = Stub(p2p.Config())
+    bot.pause_until = time.time() + 3600
+    text, _ = bot.settings_view()
+    assert "пауза до" in text
+
+
+def test_settings_view_pause_button_reflects_timed_pause():
+    bot = Stub(p2p.Config())
+    bot.pause_until = time.time() + 3600
+    _, kb = bot.settings_view()
+    buttons = [b for row in kb["inline_keyboard"] for b in row]
+    assert any(b.get("callback_data") == "resume" for b in buttons)
+
+
+def test_settings_view_quiet_toggle_button_and_persist(tmp_path, monkeypatch):
+    env = tmp_path / ".env"
+    env.write_text("QUIET_HOURS_ON=0\n", encoding="utf-8")
+    monkeypatch.setattr(B, "save_env", functools.partial(B.save_env, path=str(env)))
+    bot = Stub(p2p.Config())
+    _, kb = bot.settings_view()
+    buttons = [b for row in kb["inline_keyboard"] for b in row]
+    assert any(b.get("callback_data") == "quiet_on" for b in buttons)
+
+    toast = bot.apply("quiet_on")
+    assert bot.quiet_on and "включены" in toast
+    assert "QUIET_HOURS_ON=1" in env.read_text(encoding="utf-8")
+
+    toast2 = bot.apply("quiet_off")
+    assert not bot.quiet_on and "выключены" in toast2
+    assert "QUIET_HOURS_ON=0" in env.read_text(encoding="utf-8")
