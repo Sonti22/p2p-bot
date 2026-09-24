@@ -35,6 +35,18 @@ def test_record_writes_best_profit_per_exchange_pair(tmp_path, monkeypatch):
     assert rows == [("HTX", "BestChange", 2.0, 88.0), ("Bybit", "MEXC", 5.0, 88.0)]   # выбран лучший из пары
 
 
+def test_record_stores_amount_next_to_profit(tmp_path, monkeypatch):
+    db = str(tmp_path / "history.db")
+    reset(monkeypatch, BASE)
+    d = make_ad("Bybit", "buy", 85.0)
+    s = make_ad("MEXC", "sell", 90.0)
+    assert history.record(snap([(3.0, d, s, "route")]), 75000, path=db) is True
+    con = sqlite3.connect(db)
+    amount, = con.execute("SELECT amount FROM history").fetchone()
+    con.close()
+    assert amount == 75000
+
+
 def test_record_false_when_no_deals_and_does_not_spend_throttle(tmp_path, monkeypatch):
     db = str(tmp_path / "history.db")
     clock = reset(monkeypatch, BASE)
@@ -164,6 +176,27 @@ def test_backtest_counts_hits_and_computes_avg_median(tmp_path):
     assert by_pair_30[("HTX", "KuCoin")]["hits"] == 2   # обе записи попадают в окно 30 дней
     # топ отсортирован по числу попаданий, лучшая пара первой
     assert data[7][0]["hits"] >= data[7][-1]["hits"]
+
+
+def test_backtest_uses_stored_amount_not_fallback(tmp_path):
+    """У записи есть своя сумма круга (amount) — она определяла % на момент записи, поэтому оценку
+    в рублях считаем по ней, а не по сумме, переданной в backtest() (та — только запасной вариант
+    для старых записей без сохранённой суммы)."""
+    db = str(tmp_path / "history.db")
+    now = BASE + 40 * 86400
+    history._insert([(now - 1 * 86400, "Bybit", "MEXC", "USDT", "USDT", 4.0, 88.0, 100000)], db)
+    data = history.backtest(2.0, 50000, path=db, now=now)
+    row = data[7][0]
+    assert row["est_rub"] == 4.0 / 100 * 100000
+
+
+def test_backtest_falls_back_to_passed_amount_for_old_rows(tmp_path):
+    db = str(tmp_path / "history.db")
+    now = BASE + 40 * 86400
+    history._insert([(now - 1 * 86400, "Bybit", "MEXC", "USDT", "USDT", 4.0, 88.0)], db)   # без amount — NULL
+    data = history.backtest(2.0, 50000, path=db, now=now)
+    row = data[7][0]
+    assert row["est_rub"] == 4.0 / 100 * 50000
 
 
 def test_backtest_pair_without_hits_is_excluded(tmp_path):

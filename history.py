@@ -20,29 +20,37 @@ def _connect(path):
     con = sqlite3.connect(path)
     con.execute("CREATE TABLE IF NOT EXISTS history ("
                 "id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, "
-                "buy_ex TEXT, sell_ex TEXT, asset_buy TEXT, asset_sell TEXT, profit REAL, ref REAL)")
+                "buy_ex TEXT, sell_ex TEXT, asset_buy TEXT, asset_sell TEXT, profit REAL, ref REAL, amount REAL)")
+    cols = {r[1] for r in con.execute("PRAGMA table_info(history)")}
+    if "amount" not in cols:   # старая база без колонки — довносим её
+        con.execute("ALTER TABLE history ADD COLUMN amount REAL")
     con.execute("CREATE INDEX IF NOT EXISTS idx_history_ts ON history (ts)")
     return con
 
 
 def _insert(rows, path=DB_PATH):
-    """rows: [(ts, buy_ex, sell_ex, asset_buy, asset_sell, profit, ref), ...]."""
+    """rows: [(ts, buy_ex, sell_ex, asset_buy, asset_sell, profit, ref[, amount]), ...].
+    Сумма круга (amount) необязательна для обратной совместимости со старыми записями/тестами —
+    без неё в базе останется NULL, и backtest() возьмёт сумму, переданную в него самого."""
     if not rows:
         return
+    rows = [r if len(r) == 8 else (*r, None) for r in rows]
     con = _connect(path)
     with con:
-        con.executemany("INSERT INTO history (ts, buy_ex, sell_ex, asset_buy, asset_sell, profit, ref) "
-                        "VALUES (?, ?, ?, ?, ?, ?, ?)", rows)
+        con.executemany("INSERT INTO history (ts, buy_ex, sell_ex, asset_buy, asset_sell, profit, ref, amount) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)", rows)
     con.close()
 
 
 _last = {"t": 0.0}   # время последней записи — троттлинг раз в 5 минут (сбрасывается в тестах)
 
 
-def record(snap, path=DB_PATH):
-    """Лучший % по каждой паре площадок (buy_ex, sell_ex) из snap.deals + ориентир snap.ref.
-    Не чаще раза в 5 минут; пустой снимок (нет связок) кулдаун не расходует — запишем, как
-    только связки появятся."""
+def record(snap, amount=None, path=DB_PATH):
+    """Лучший % по каждой паре площадок (buy_ex, sell_ex) из snap.deals + ориентир snap.ref и
+    сумма круга (`amount`, cfg.amount на момент скана — от неё зависит сам % через комиссию вывода
+    и глубину стакана), чтобы backtest() честно переводил исторический % в рубли той суммы, для
+    которой он был посчитан, а не текущей настройки. Не чаще раза в 5 минут; пустой снимок (нет
+    связок) кулдаун не расходует — запишем, как только связки появятся."""
     now = time.time()
     if now - _last["t"] < THROTTLE or not snap.deals:
         return False
@@ -51,7 +59,7 @@ def record(snap, path=DB_PATH):
         key = (b.ex, s.ex)
         if key not in best or profit > best[key][0]:
             best[key] = (profit, b.asset, s.asset)
-    _insert([(now, buy_ex, sell_ex, ab, sa, profit, snap.ref)
+    _insert([(now, buy_ex, sell_ex, ab, sa, profit, snap.ref, amount)
             for (buy_ex, sell_ex), (profit, ab, sa) in best.items()], path)
     _last["t"] = now
     return True
@@ -73,7 +81,7 @@ def _rows(path, since):
     if not os.path.exists(path):
         return []
     con = _connect(path)
-    rows = con.execute("SELECT ts, buy_ex, sell_ex, profit FROM history WHERE ts >= ? ORDER BY ts",
+    rows = con.execute("SELECT ts, buy_ex, sell_ex, profit, amount FROM history WHERE ts >= ? ORDER BY ts",
                        (since,)).fetchall()
     con.close()
     return rows
@@ -87,7 +95,7 @@ def hourly_avg(path=DB_PATH, days=7, now=None):
     """{час МСК 0..23: средний лучший % за `days` дней} — None, если по часу нет данных."""
     now = time.time() if now is None else now
     buckets = {h: [] for h in range(24)}
-    for ts, _buy_ex, _sell_ex, profit in _rows(path, now - days * 86400):
+    for ts, _buy_ex, _sell_ex, profit, _amount in _rows(path, now - days * 86400):
         buckets[time.gmtime(ts + MSK_OFFSET).tm_hour].append(profit)
     return {h: (sum(v) / len(v) if v else None) for h, v in buckets.items()}
 
@@ -97,7 +105,7 @@ def heatmap(path=DB_PATH, days=7, now=None):
     непустые ячейки."""
     now = time.time() if now is None else now
     grid = {}
-    for ts, _buy_ex, _sell_ex, profit in _rows(path, now - days * 86400):
+    for ts, _buy_ex, _sell_ex, profit, _amount in _rows(path, now - days * 86400):
         t = time.gmtime(ts + MSK_OFFSET)
         key = (t.tm_wday, t.tm_hour)
         if key not in grid or profit > grid[key]:
@@ -108,23 +116,27 @@ def heatmap(path=DB_PATH, days=7, now=None):
 def backtest(min_profit, amount, path=DB_PATH, now=None):
     """Бэктест маршрута по истории спредов за 7 и 30 дней: для каждой пары площадок — сколько раз
     записанный лучший % (уже чистый, с комиссиями) был >= порога `min_profit`, средний и медианный %
-    в такие моменты, оценка результата в ₽ на сумму круга `amount`. Возвращает {7: [...], 30: [...]},
-    списки словарей отсортированы по числу попаданий (для топ-N); пары без ни одного попадания не
-    включаются."""
+    в такие моменты, оценка результата в ₽. Рубли считаются по сумме круга, которая была активна на
+    момент самой записи (хранится рядом с процентом — от неё зависел расчёт %); `amount` — только
+    запасной вариант для старых записей без сохранённой суммы. Это оценка по прошлым снимкам, а не
+    перепрогон маршрута на текущих объявлениях — реальный результат может отличаться. Возвращает
+    {7: [...], 30: [...]}, списки словарей отсортированы по числу попаданий (для топ-N); пары без ни
+    одного попадания не включаются."""
     now = time.time() if now is None else now
     out = {}
     for days in (7, 30):
         by_pair = {}
-        for ts, buy_ex, sell_ex, profit in _rows(path, now - days * 86400):
-            by_pair.setdefault((buy_ex, sell_ex), []).append(profit)
+        for ts, buy_ex, sell_ex, profit, amt in _rows(path, now - days * 86400):
+            by_pair.setdefault((buy_ex, sell_ex), []).append((profit, amt if amt is not None else amount))
         rows = []
-        for (buy_ex, sell_ex), profits in by_pair.items():
-            hits = [p for p in profits if p >= min_profit]
+        for (buy_ex, sell_ex), pairs in by_pair.items():
+            hits = [(p, a) for p, a in pairs if p >= min_profit]
             if not hits:
                 continue
-            avg = statistics.mean(hits)
-            rows.append({"buy_ex": buy_ex, "sell_ex": sell_ex, "hits": len(hits), "total": len(profits),
-                        "avg": avg, "median": statistics.median(hits), "est_rub": avg / 100 * amount})
+            profits = [p for p, _a in hits]
+            rows.append({"buy_ex": buy_ex, "sell_ex": sell_ex, "hits": len(hits), "total": len(pairs),
+                        "avg": statistics.mean(profits), "median": statistics.median(profits),
+                        "est_rub": statistics.mean([p / 100 * a for p, a in hits])})
         rows.sort(key=lambda r: r["hits"], reverse=True)
         out[days] = rows
     return out
@@ -136,7 +148,7 @@ def median_vs_bestchange(path=DB_PATH, days=30, now=None):
     Возвращает (даты по возрастанию "ДД.MM", p2p-медианы, bc-медианы); None — за день нет сделок группы."""
     now = time.time() if now is None else now
     by_day = {}   # "YYYY-MM-DD" -> {"p2p": [...], "bc": [...]}
-    for ts, buy_ex, sell_ex, profit in _rows(path, now - days * 86400):
+    for ts, buy_ex, sell_ex, profit, _amount in _rows(path, now - days * 86400):
         t = time.gmtime(ts + MSK_OFFSET)
         day = time.strftime("%Y-%m-%d", t)
         bucket = by_day.setdefault(day, {"p2p": [], "bc": []})

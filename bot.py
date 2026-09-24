@@ -709,6 +709,7 @@ def backtest_view(cfg):
                              f"≈{_money(r['est_rub'])} {cfg.fiat} за круг")
         lines.append("")
     lines.append("⚠️ Прошлое — не прогноз: реальные объявления, курс и комиссии к моменту сделки могут отличаться.")
+    lines.append("ℹ️ Это оценка по сохранённым снимкам истории, а не перепрогон маршрутов на текущих объявлениях.")
     return "\n".join(lines)
 
 
@@ -1348,7 +1349,7 @@ class Bot:
                 self.last = await scan(self.s, self.cfg)
                 self.last_scan_ts, self.last_scan_duration = time.time(), time.time() - t0
                 self.track_liveness(self.last)
-                if history.record(self.last):   # не чаще раза в 5 минут, независимо от чата
+                if history.record(self.last, self.cfg.amount):   # не чаще раза в 5 минут, независимо от чата
                     history.cleanup()
                 if self.chat_id:
                     await self.check_venues(self.last)
