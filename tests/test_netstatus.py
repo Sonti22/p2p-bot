@@ -73,6 +73,32 @@ def test_refresh_keeps_old_data_on_error():
     assert "HTX" in errors and netstatus.withdraw_ok("HTX", "USDT", "TRC20") is True
 
 
+@pytest.mark.parametrize("parse,bad", [
+    (netstatus._parse_htx, {"code": 500, "message": "boom"}),
+    (netstatus._parse_kucoin, {"code": "400001", "msg": "bad request"}),
+    (netstatus._parse_bybit, {"retCode": 10001, "retMsg": "params error"}),
+])
+def test_parse_raises_on_api_error_in_body(parse, bad):
+    with pytest.raises(ValueError):
+        parse(bad)
+
+
+def test_parse_mexc_raises_on_api_error_in_body():
+    with pytest.raises(ValueError):
+        netstatus._parse_mexc({"code": 700002, "msg": "signature invalid"}, "USDT")
+
+
+def test_refresh_keeps_old_data_on_http_200_api_error():
+    """HTTP 200, но ошибка в теле (retCode/code не «успех») — не должно стирать прежний статус сети,
+    как если бы у площадки внезапно не осталось ни одной сети."""
+    async def bad_body(s, method, url):
+        return {"code": 500, "message": "boom"}
+
+    netstatus._apply("HTX", "USDT", {"TRC20": {"dep": True, "wd": True, "fee": 1.0}})
+    errors = asyncio.run(netstatus.refresh(None, ["USDT"], ["htx"], bad_body))
+    assert "HTX" in errors and netstatus.withdraw_ok("HTX", "USDT", "TRC20") is True
+
+
 def _cfg():
     c = p2p.Config()
     c.risk_buffer, c.pay_fee = {}, 0.0
