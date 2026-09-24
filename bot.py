@@ -118,6 +118,7 @@ EXCHANGE_LIST = tuple(ALL_EXCHANGES.split(","))      # площадки для �
 VENUE_NAMES = dict(EXCHANGE_NAMES, bestchange="BestChange")  # + обменник, которого нет в EXCHANGE_NAMES
 ACCOUNT_POLL_INTERVAL = int(os.getenv("ACCOUNT_POLL_INTERVAL", 60))  # опрос истории аккаунтов, сек
 LIVE_EDIT_INTERVAL = 30     # сек: не чаще обновляем карточку последнего сигнала вместо повторной отправки
+MARKET_STATUS_INTERVAL = 60  # сек: не чаще обновляем закреплённое сообщение «Статус рынка»
 MSK = timezone(timedelta(hours=3))                    # тихие часы и /pause считаем по МСК, не по времени ПК
 PAUSE_PRESETS = {"30m": 1800, "1h": 3600, "3h": 3 * 3600}  # аргументы /pause -> секунды
 
@@ -635,6 +636,27 @@ def backtest_view(cfg):
     return "\n".join(lines)
 
 
+def market_status_view(snap, cfg):
+    """Текст закреплённого сообщения «Статус рынка»: ориентир курса, лучшая связка, площадки ок/недоступны."""
+    lines = ["📌 <b>Статус рынка</b>", "", f"Ориентир USDT: {snap.ref:.2f} ₽ ({html.escape(snap.ref_src)})"]
+    if snap.deals:
+        profit, b, s, _ = snap.deals[0]
+        lines.append(f"🔥 Лучшая связка: {b.ex} → {s.ex} ({b.asset}→{s.asset}) {profit:+.2f}%")
+    else:
+        lines.append("🔥 Лучшая связка: сейчас нет связок выше порога")
+    failed = {k.split("/", 1)[0] for k in snap.errors} & set(cfg.exchanges)
+    ok = [VENUE_NAMES.get(ex, ex) for ex in cfg.exchanges if ex not in failed]
+    down = [VENUE_NAMES.get(ex, ex) for ex in cfg.exchanges if ex in failed]
+    parts = []
+    if ok:
+        parts.append("✅ " + ", ".join(ok))
+    if down:
+        parts.append("⚠️ " + ", ".join(down))
+    lines.append("Площадки: " + (" · ".join(parts) if parts else "—"))
+    lines.append(f"обновлено {datetime.now(MSK).strftime('%H:%M')} МСК")
+    return "\n".join(lines)
+
+
 class Bot:
     def __init__(self, session, token, chat_id, cfg):
         self.s, self.token, self.chat_id, self.cfg = session, token, chat_id, cfg
@@ -666,6 +688,8 @@ class Bot:
         self.start_ts = time.time()     # для аптайма в /status
         self.last_scan_ts = 0.0         # unix-время окончания последнего скана
         self.last_scan_duration = 0.0   # сколько секунд занял последний скан
+        self.market_msg_id = None       # id закреплённого сообщения «Статус рынка»
+        self.market_status_ts = 0.0     # unix-время последнего обновления статуса рынка
 
     async def call(self, method, **params):
         async with self.s.post(f"https://api.telegram.org/bot{self.token}/{method}", json=params,
@@ -1190,6 +1214,7 @@ class Bot:
                     await self.check_alerts(self.last)
                     await self.check_networks()
                     await self.quiet_and_pause_tick(self.last)
+                    await self.update_market_status(self.last)
             except Exception as e:
                 logger.error("scan error: %s", e)
             await asyncio.sleep(self.cfg.interval)
@@ -1218,6 +1243,29 @@ class Bot:
         else:
             lines.append("Ошибок нет — все площадки отвечают.")
         return "\n".join(lines)
+
+    async def update_market_status(self, snap):
+        """Закреплённое сообщение «📌 Статус рынка»: ориентир курса, лучшая связка, площадки ок/недоступны.
+        Первый раз шлёт сообщение и закрепляет его, дальше правит на месте (editMessageText) не чаще раза
+        в MARKET_STATUS_INTERVAL секунд, чтобы не спамить и не упереться в лимиты Telegram."""
+        if not self.chat_id:
+            return
+        now = time.time()
+        if self.market_msg_id and now - self.market_status_ts < MARKET_STATUS_INTERVAL:
+            return
+        text = market_status_view(snap, self.cfg)
+        if self.market_msg_id:
+            r = await self.call("editMessageText", chat_id=self.chat_id, message_id=self.market_msg_id,
+                                text=text, parse_mode="HTML", disable_web_page_preview=True)
+            if not r.get("ok") and "message is not modified" not in r.get("description", ""):
+                self.market_msg_id = None   # сообщение удалили/недоступно — создадим заново ниже
+        if not self.market_msg_id:
+            r = await self.send(text)
+            if r.get("ok"):
+                self.market_msg_id = r["result"]["message_id"]
+                await self.call("pinChatMessage", chat_id=self.chat_id, message_id=self.market_msg_id,
+                                disable_notification=True)
+        self.market_status_ts = now
 
     async def check_networks(self):
         """Сеть вывода/ввода переключилась (открыт ↔ закрыт) — одно сообщение на переключение."""
