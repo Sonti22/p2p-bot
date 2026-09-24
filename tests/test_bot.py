@@ -4,6 +4,7 @@ import time
 
 import bot as B
 import p2p
+import trades
 from helpers import make_ad
 
 
@@ -137,3 +138,47 @@ def test_dev_view(tmp_path):
 def test_dev_view_without_files(tmp_path):
     text, kb = B.dev_view(str(tmp_path / "none.json"), str(tmp_path / "none.md"))
     assert "Разработка" in text and kb["inline_keyboard"]
+
+
+def test_send_deal_adds_done_button(monkeypatch):
+    monkeypatch.setattr(B, "deal_card", lambda d, c: b"png")
+    bot = Stub(p2p.Config())
+    asyncio.run(bot.send_deal(deal(), "🔔 "))
+    markup = photos(bot)[0][1]["markup"]
+    buttons = [b for row in markup["inline_keyboard"] for b in row]
+    assert any(b.get("callback_data", "").startswith("did:") for b in buttons)
+    assert len(bot.deals_by_id) == 1
+
+
+def test_mark_done_logs_trade_and_clears_button(tmp_path, monkeypatch):
+    db = str(tmp_path / "trades.db")
+    monkeypatch.setattr(B.trades, "log_trade", functools.partial(B.trades.log_trade, path=db))
+    bot = Stub(p2p.Config(amount=70000))
+    deal_id = bot.remember_deal(deal(5.0))
+    asyncio.run(bot.mark_done({"id": "1", "message": {"message_id": 9}}, deal_id))
+    st = trades.stats(path=db)
+    assert st["day"]["count"] == 1 and st["day"]["amount"] == 70000
+    assert deal_id not in bot.deals_by_id
+    method, params = bot.out[-1]
+    assert method == "editMessageReplyMarkup"
+    buttons = [b for row in params["reply_markup"]["inline_keyboard"] for b in row]
+    assert not any(b.get("callback_data", "").startswith("did:") for b in buttons)
+
+
+def test_mark_done_unknown_id_not_logged(monkeypatch):
+    logged = []
+    monkeypatch.setattr(B.trades, "log_trade", lambda *a, **k: logged.append(a))
+    bot = Stub(p2p.Config())
+    asyncio.run(bot.mark_done({"id": "1", "message": {"message_id": 9}}, 999))
+    assert not logged
+    assert "устарел" in bot.out[-1][1]["text"]
+
+
+def test_stats_view_reports_counts(tmp_path, monkeypatch):
+    db = str(tmp_path / "trades.db")
+    monkeypatch.setattr(B.trades, "stats", functools.partial(B.trades.stats, path=db))
+    trades.log_trade(deal(2.5), 50000, path=db)
+    bot = Stub(p2p.Config())
+    text = bot.stats_view()
+    assert "За сегодня: 1 сделок" in text and "За неделю: сделок нет" not in text
+    assert "За месяц" in text
