@@ -1025,6 +1025,14 @@ def test_key_permissions_mexc_readonly_and_trade(tmp_path, monkeypatch):
     assert asyncio.run(accounts.key_permissions(_JsonSession(trade), "mexc")) == (False, "торговля, вывод")
 
 
+def test_key_permissions_htx_uid_error_is_unknown(tmp_path, monkeypatch):
+    """Не узнали uid владельца ключа — права не проверены: None, а не подтверждённое «только чтение»."""
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    accounts.save_key("htx", "k", "s")
+    s = _HtxKeySession("readOnly,trade", uid_body={"code": 1002, "message": "unauthorized"})
+    assert asyncio.run(accounts.key_permissions(s, "htx")) == (None, "")
+
+
 def test_key_permissions_htx_unknown_key_and_kucoin_no_passphrase_are_unknown(tmp_path, monkeypatch):
     monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
     accounts.save_key("htx", "k", "s")

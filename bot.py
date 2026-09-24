@@ -1,6 +1,7 @@
 """Telegram-бот сигналов P2P-связок: карточки-картинки, кнопки, меню. Запуск: python bot.py (настройки в .env)."""
 import asyncio
 import contextvars
+import copy
 import dataclasses
 import html
 import json
@@ -338,7 +339,7 @@ def readonly_note(safe):
     """Хвост к «✅ Подключено»/«✅ Ключ рабочий»: «только чтение» — лишь когда биржа сама подтвердила права ключа."""
     if safe:
         return " (только чтение)"
-    return ", но права ключа проверить не удалось — убедись, что у него только чтение (без торговли и вывода)."
+    return ", но права ключа проверить не удалось — убедись, что у него нет прав на торговлю и вывод."
 
 
 def account_view(ex):
@@ -347,8 +348,9 @@ def account_view(ex):
     pair = accounts.keys(ex)
     back = {"text": "⬅️ Мои биржи", "callback_data": "accounts"}
     if pair:
+        # права здесь не известны — не утверждаем их, только напоминаем, когда бот их проверяет
         text = (f"🔑 <b>{name}</b>\n\nКлюч подключён: <code>{accounts.mask(pair[0])}</code>\n"
-                f"Доступ: только чтение.")
+                f"Нужен ключ только для чтения: права проверяю при подключении, по «🔄 Проверить» и при старте бота.")
         kb = [[{"text": "🔄 Проверить", "callback_data": f"acc_check:{ex}"}],
               [{"text": "🗑 Удалить ключ", "callback_data": f"acc_del:{ex}"}], [back]]
     elif ex in accounts.ONBOARDABLE:
@@ -887,7 +889,7 @@ class Bot:
 
     def remember_deal(self, d, cfg=None, snap=None):
         """Запомнить связку под кнопками «✅ Сделал»/«📋 Шаги»; хранится ограниченное число последних."""
-        cfg = dataclasses.replace(cfg or self.cfg)   # снимок настроек: старая карточка не увидит новую сумму/порог
+        cfg = copy.deepcopy(cfg or self.cfg)   # снимок настроек (и списков): старая карточка не увидит новые сумму/порог
         snap = snap if snap is not None else self.last
         deal_id, self.next_deal_id = self.next_deal_id, self.next_deal_id + 1
         self.deals_by_id[deal_id] = (d, cfg, snap)
@@ -910,7 +912,7 @@ class Bot:
         message_id = (r.get("result") or {}).get("message_id") if r.get("ok") else None
         if topic == "signals" and message_id is not None and not guest:
             key = self._deal_key(d)
-            self.live_msg[key] = {"message_id": message_id, "photo": is_photo,
+            self.live_msg[key] = {"message_id": message_id, "photo": is_photo, "deal_id": deal_id,
                                   "last_edit": time.time(), "caption": caption, "stale": False}
         return r
 
@@ -1558,13 +1560,18 @@ class Bot:
         live["last_edit"], live["caption"] = now, caption
         try:
             if live["photo"]:
-                await self.call("editMessageCaption", chat_id=self.chat_id, message_id=live["message_id"],
-                                caption=caption, parse_mode="HTML")
+                r = await self.call("editMessageCaption", chat_id=self.chat_id, message_id=live["message_id"],
+                                    caption=caption, parse_mode="HTML")
             else:
-                await self.call("editMessageText", chat_id=self.chat_id, message_id=live["message_id"],
-                                text=caption, parse_mode="HTML", disable_web_page_preview=True)
+                r = await self.call("editMessageText", chat_id=self.chat_id, message_id=live["message_id"],
+                                    text=caption, parse_mode="HTML", disable_web_page_preview=True)
         except Exception as e:
             logger.warning("live card edit error: %s", e)
+            return
+        # подпись теперь по новой связке и текущим настройкам — кнопки «✅ Сделал»/«📋 Шаги»/«🚫» этого
+        # сообщения тоже, иначе в журнал уйдёт сумма, которой на карточке уже нет
+        if r.get("ok") and live.get("deal_id") in self.deals_by_id:
+            self.deals_by_id[live["deal_id"]] = (d, copy.deepcopy(self.cfg), snap)
 
     async def mark_stale_deals(self, active):
         """Связка пропала из топа — один раз пометить последний сигнал по ней «⌛ устарел»."""

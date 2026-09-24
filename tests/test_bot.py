@@ -366,6 +366,72 @@ def test_amount_change_via_settings_keeps_old_card_amount(tmp_path, monkeypatch)
     assert trades.stats(path=db)["day"]["amount"] == 50000
 
 
+def test_live_card_edit_moves_buttons_to_edited_amount(tmp_path, monkeypatch):
+    """Сигнал на 50 000 → «amt:200000» → живая карточка переписана «на 200 000»: кнопки того же сообщения
+    («📋 Шаги», «✅ Сделал») — по той же сумме и связке, что теперь в подписи."""
+    monkeypatch.setattr(B, "deal_card", lambda d, c, a=None, r=None, breakdown=None: b"png")
+    monkeypatch.setattr(B, "save_env", lambda *a, **k: None)
+    db = str(tmp_path / "trades.db")
+    monkeypatch.setattr(B.trades, "log_trade", functools.partial(B.trades.log_trade, path=db))
+    bot = Stub(p2p.Config(amount=50000, min_profit=2.0))
+    bot.live_scans = 1
+
+    async def fake_send_photo(png, caption, markup=None):
+        bot.out.append(("sendPhoto", {"caption": caption, "markup": markup}))
+        return {"ok": True, "result": {"message_id": 555}}
+
+    bot.send_photo = fake_send_photo
+    asyncio.run(bot.notify(snap([deal(5.0)])))
+    buttons = _callbacks(photos(bot)[0][1]["markup"])
+    bot.apply("amt:200000")
+    bot.live_msg[next(iter(bot.live_msg))]["last_edit"] -= B.LIVE_EDIT_INTERVAL + 1
+    asyncio.run(bot.notify(snap([deal(5.1)])))   # в пределах cooldown — правка вместо нового сообщения
+    edits = [p for m, p in bot.out if m == "editMessageCaption"]
+    assert len(photos(bot)) == 1 and len(edits) == 1 and "200 000" in edits[0]["caption"]
+
+    asyncio.run(bot.on_callback({"id": "1", "data": buttons["steps"], "message": {"message_id": 555}}))
+    head = texts(bot)[-1].splitlines()[0]
+    assert "200 000" in head and "50 000" not in head
+    asyncio.run(bot.on_callback({"id": "2", "data": buttons["did"], "message": {"message_id": 555}}))
+    assert trades.stats(path=db)["day"]["amount"] == 200000
+    assert any(t.startswith("Расчёт был +5.10%") for t in texts(bot))   # по связке из правки
+
+
+def test_live_card_edit_failed_keeps_buttons_on_old_snapshot(tmp_path, monkeypatch):
+    """Telegram не принял правку — на карточке старая подпись, кнопки остаются на старом снимке."""
+    monkeypatch.setattr(B, "deal_card", lambda d, c, a=None, r=None, breakdown=None: b"png")
+    monkeypatch.setattr(B, "save_env", lambda *a, **k: None)
+    db = str(tmp_path / "trades.db")
+    monkeypatch.setattr(B.trades, "log_trade", functools.partial(B.trades.log_trade, path=db))
+    bot = Stub(p2p.Config(amount=50000, min_profit=2.0))
+    bot.live_scans = 1
+
+    async def fake_send_photo(png, caption, markup=None):
+        bot.out.append(("sendPhoto", {"caption": caption, "markup": markup}))
+        return {"ok": True, "result": {"message_id": 555}}
+
+    async def call(method, **p):
+        bot.out.append((method, p))
+        return {"ok": False, "error_code": 400} if method == "editMessageCaption" else {"ok": True}
+
+    bot.send_photo, bot.call = fake_send_photo, call
+    asyncio.run(bot.notify(snap([deal(5.0)])))
+    buttons = _callbacks(photos(bot)[0][1]["markup"])
+    bot.apply("amt:200000")
+    bot.live_msg[next(iter(bot.live_msg))]["last_edit"] -= B.LIVE_EDIT_INTERVAL + 1
+    asyncio.run(bot.notify(snap([deal(5.1)])))
+    asyncio.run(bot.on_callback({"id": "2", "data": buttons["did"], "message": {"message_id": 555}}))
+    assert trades.stats(path=db)["day"]["amount"] == 50000
+
+
+def test_deal_snapshot_does_not_share_filter_lists():
+    """Снимок настроек — глубокая копия: _toggle меняет списки self.cfg на месте, снимок это не задевает."""
+    bot = Stub(p2p.Config(assets=["USDT"]))
+    deal_id = bot.remember_deal(deal(5.0))
+    bot.cfg.assets.append("BTC")
+    assert bot.deals_by_id[deal_id][1].assets == ["USDT"]
+
+
 def _callbacks(markup):
     return {b["callback_data"].split(":", 1)[0]: b["callback_data"]
             for row in markup["inline_keyboard"] for b in row if ":" in b.get("callback_data", "")}
@@ -1127,7 +1193,7 @@ def test_handle_key_input_unverified_permissions_not_called_readonly(tmp_path, m
     assert accounts.keys("bybit") == ("APIKEY123", "SECRET456")
     connected = [t for t in texts(bot) if t.startswith("✅ Подключено")]
     assert connected and "проверить не удалось" in connected[0]
-    assert not any("(только чтение)" in t for t in texts(bot))
+    assert not any("только чтение" in t for t in texts(bot))
 
 
 def test_acc_check_drops_trade_key(tmp_path, monkeypatch):
@@ -1165,6 +1231,31 @@ def test_acc_check_unverified_permissions_not_called_readonly(tmp_path, monkeypa
     assert accounts.keys("bybit") == ("k", "s")
     assert texts(bot)[-1].startswith("✅ Ключ рабочий") and "проверить не удалось" in texts(bot)[-1]
     assert "(только чтение)" not in texts(bot)[-1]
+
+
+def test_unverified_key_never_claimed_readonly_in_any_message(tmp_path, monkeypatch):
+    """Права не проверены (safe=None): ни «Подключено», ни карточка биржи после него, ни «🔄 Проверить»,
+    ни открытая заново карточка не утверждают «только чтение»."""
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    monkeypatch.setattr(B.accounts, "key_permissions", _perms((None, "")))
+    monkeypatch.setattr(B.accounts, "verify", _verify_ok())
+    bot = Stub(p2p.Config())
+    bot.awaiting_key = {"ex": "bybit", "step": "secret", "key": "APIKEY123"}
+    asyncio.run(bot.handle_key_input("SECRET456", 56))
+    asyncio.run(bot.on_callback({"id": "1", "data": "acc_check:bybit", "message": {"message_id": 1}}))
+    asyncio.run(bot.on_callback({"id": "2", "data": "acc:bybit", "message": {"message_id": 1}}))
+    assert accounts.keys("bybit") == ("APIKEY123", "SECRET456")
+    assert len(texts(bot)) >= 4 and "Ключ подключён" in texts(bot)[-1]
+    assert not any("только чтение" in t for t in texts(bot))
+
+
+def test_account_view_does_not_claim_readonly(tmp_path, monkeypatch):
+    """Карточка биржи не знает, проверены ли права, — «Доступ: только чтение» не пишет."""
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    accounts.save_key("bybit", "APIKEY123", "SECRET456")
+    text, kb = B.account_view("bybit")
+    assert "Ключ подключён" in text and "только чтение" not in text
+    assert any(b.get("callback_data") == "acc_check:bybit" for row in kb["inline_keyboard"] for b in row)
 
 
 # те же сценарии с настоящими key_permissions/verify — подменён только транспорт к бирже
@@ -1220,7 +1311,7 @@ def test_connect_bybit_permissions_api_error_not_called_readonly(tmp_path, monke
     asyncio.run(bot.handle_key_input("SECRET456", 56))
     assert accounts.keys("bybit") == ("APIKEY123", "SECRET456")
     assert any(t.startswith("✅ Подключено") and "проверить не удалось" in t for t in texts(bot))
-    assert not any("(только чтение)" in t for t in texts(bot))
+    assert not any("только чтение" in t for t in texts(bot))   # и в карточке биржи после «Подключено»
 
 
 def test_acc_check_bybit_trade_key_via_api_is_dropped(tmp_path, monkeypatch):
