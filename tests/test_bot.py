@@ -198,6 +198,59 @@ def test_calc_command_needs_argument():
     assert "сумма" in texts(bot)[-1].lower()
 
 
+def test_settings_view_has_custom_amount_button():
+    bot = Stub(p2p.Config())
+    _, kb = bot.settings_view()
+    buttons = [b for row in kb["inline_keyboard"] for b in row]
+    assert any(b.get("callback_data") == "amt_custom" for b in buttons)
+
+
+def test_amt_custom_button_arms_waiting_state():
+    bot = Stub(p2p.Config())
+    asyncio.run(bot.on_callback({"id": "1", "data": "amt_custom", "message": {"message_id": 1}}))
+    assert bot.awaiting_amount
+    assert "сумму" in texts(bot)[-1].lower()
+
+
+def test_custom_amount_text_scans_and_saves(tmp_path, monkeypatch, offline):
+    monkeypatch.setattr(B, "deal_card", lambda d, c: b"png")
+    monkeypatch.setattr(B, "top_chart", lambda snap, c: b"png")
+    env = tmp_path / ".env"
+    env.write_text("AMOUNT=50000\n", encoding="utf-8")
+    monkeypatch.setattr(B, "save_env", functools.partial(B.save_env, path=str(env)))
+    bot = Stub(p2p.Config(exchanges=["bybit", "htx", "kucoin", "mexc", "bitpapa"], assets=["USDT"],
+                          min_orders=0, min_rate=0, amount=50000))
+    bot.awaiting_amount = True
+    asyncio.run(bot.handle("30 000"))
+    assert not bot.awaiting_amount
+    assert bot.cfg.amount == 30000
+    assert "AMOUNT=30000" in env.read_text(encoding="utf-8")
+    caps = [p["caption"] for m, p in photos(bot)]
+    assert any("30 000" in c for c in caps)
+
+
+def test_custom_amount_garbage_reports_error():
+    bot = Stub(p2p.Config())
+    bot.awaiting_amount = True
+    asyncio.run(bot.handle("ерунда"))
+    assert not bot.awaiting_amount
+    assert "сумму" in texts(bot)[-1].lower()
+
+
+def test_awaiting_amount_reset_by_other_button():
+    bot = Stub(p2p.Config())
+    bot.awaiting_amount = True
+    asyncio.run(bot.on_callback({"id": "1", "data": "best", "message": {"message_id": 1}}))
+    assert not bot.awaiting_amount
+
+
+def test_awaiting_amount_reset_by_other_command():
+    bot = Stub(p2p.Config())
+    bot.awaiting_amount = True
+    asyncio.run(bot.handle("/best"))
+    assert not bot.awaiting_amount
+
+
 def test_stats_view_reports_counts(tmp_path, monkeypatch):
     db = str(tmp_path / "trades.db")
     monkeypatch.setattr(B.trades, "stats", functools.partial(B.trades.stats, path=db))
