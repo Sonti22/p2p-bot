@@ -1,5 +1,6 @@
 import asyncio
 import functools
+import time
 
 import bot as B
 import p2p
@@ -29,8 +30,16 @@ def snap(deals):
     return p2p.Snapshot(88.0, "test", {}, {}, deals, {}, {}, {})
 
 
+def err_snap(errors):
+    return p2p.Snapshot(88.0, "test", {}, {}, [], {}, {}, errors)
+
+
 def photos(bot):
     return [m for m in bot.out if m[0] == "sendPhoto"]
+
+
+def texts(bot):
+    return [p["text"] for m, p in bot.out if m == "sendMessage"]
 
 
 def test_notify_top_n_and_dedup(monkeypatch):
@@ -73,3 +82,39 @@ def test_deal_markup_links():
 def test_fmt_top_fits_telegram():
     ds = [deal(5 - i * 0.1) for i in range(30)]
     assert len(p2p.fmt_top(snap(ds), p2p.Config(), n=30)) <= 4000
+
+
+def test_venue_alert_after_fail_streak():
+    bot = Stub(p2p.Config(exchanges=["bybit"]))
+    bad = err_snap({"bybit/USDT": "TimeoutError: x"})
+    asyncio.run(bot.check_venues(bad))
+    asyncio.run(bot.check_venues(bad))
+    assert not texts(bot)                 # 2 подряд — ещё рано
+    asyncio.run(bot.check_venues(bad))
+    assert any("bybit" in t and "недоступна" in t for t in texts(bot))
+
+
+def test_venue_alert_cooldown_then_recovery():
+    bot = Stub(p2p.Config(exchanges=["bybit"]))
+    bad, ok = err_snap({"bybit/USDT": "err"}), err_snap({})
+    for _ in range(5):
+        asyncio.run(bot.check_venues(bad))
+    assert len(texts(bot)) == 1            # повтор в течение часа не шлём
+    asyncio.run(bot.check_venues(ok))
+    msgs = texts(bot)
+    assert len(msgs) == 2 and "снова доступна" in msgs[-1]
+
+
+def test_venue_alert_after_15min_without_streak():
+    bot = Stub(p2p.Config(exchanges=["bybit"]))
+    bad = err_snap({"bybit/USDT": "err"})
+    asyncio.run(bot.check_venues(bad))     # streak 1, down_since = сейчас
+    bot.venue["bybit"]["down_since"] = time.time() - B.VENUE_DOWN_AFTER - 1
+    asyncio.run(bot.check_venues(bad))     # streak 2, но уже дольше 15 мин
+    assert any("bybit" in t and "недоступна" in t for t in texts(bot))
+
+
+def test_venue_no_alert_when_healthy():
+    bot = Stub(p2p.Config(exchanges=["bybit", "mexc"]))
+    asyncio.run(bot.check_venues(err_snap({})))
+    assert not texts(bot)
