@@ -557,9 +557,7 @@ def _route_qty(b, s, cfg, spot, over_banks=frozenset(), disable=frozenset()):
         if fee is None:
             return None
         qty -= 0.0 if "withdraw" in disable else fee
-    else:
-        if "USDT" not in (b.asset, s.asset):
-            return None
+    elif "USDT" in (b.asset, s.asset):
         alt = s.asset if b.asset == "USDT" else b.asset
         # спот там, где монета уже лежит: меньше переводов
         venue = next((v for v in (b.ex, s.ex) + SPOT_VENUES if v in SPOT_VENUES and alt in spot.get(v, {})), None)
@@ -572,6 +570,26 @@ def _route_qty(b, s, cfg, spot, over_banks=frozenset(), disable=frozenset()):
         qty -= 0.0 if "withdraw" in disable else fee
         sf = 0.0 if "spot" in disable else _spot_fee(cfg, venue)
         qty = (qty / ask if b.asset == "USDT" else qty * bid) * (1 - sf / 100)
+        fee, _ = _hop(cfg, venue, "", s.ex, s.net, s.asset)
+        if fee is None:
+            return None
+        qty -= 0.0 if "withdraw" in disable else fee
+    else:
+        # промежуточная монета: обе стороны — не USDT (например BTC→USDT→ETH), нужны две спот-конвертации;
+        # берём площадку, где есть обе пары к USDT — без лишнего перевода самого USDT между биржами
+        venue = next((v for v in (b.ex, s.ex) + SPOT_VENUES
+                      if v in SPOT_VENUES and b.asset in spot.get(v, {}) and s.asset in spot.get(v, {})), None)
+        if not venue:
+            return None
+        bid1, _ = spot[venue][b.asset]
+        _, ask2 = spot[venue][s.asset]
+        fee, _ = _hop(cfg, b.ex, b.net, venue, "", b.asset)
+        if fee is None:
+            return None
+        qty -= 0.0 if "withdraw" in disable else fee
+        sf = 0.0 if "spot" in disable else _spot_fee(cfg, venue)
+        qty = qty * bid1 * (1 - sf / 100)     # b.asset → USDT
+        qty = (qty / ask2) * (1 - sf / 100)   # USDT → s.asset
         fee, _ = _hop(cfg, venue, "", s.ex, s.net, s.asset)
         if fee is None:
             return None
@@ -599,9 +617,7 @@ def _route(b, s, cfg, spot, over_banks=frozenset()):
         if fee is None:
             return None
         steps.append(label or "внутри биржи")
-    else:
-        if "USDT" not in (b.asset, s.asset):
-            return None
+    elif "USDT" in (b.asset, s.asset):
         alt = s.asset if b.asset == "USDT" else b.asset
         venue = next((v for v in (b.ex, s.ex) + SPOT_VENUES if v in SPOT_VENUES and alt in spot.get(v, {})), None)
         if not venue:
@@ -613,6 +629,25 @@ def _route(b, s, cfg, spot, over_banks=frozenset()):
             steps.append(label)
         sf = _spot_fee(cfg, venue)
         steps.append(f"спот {b.asset}→{s.asset} на {venue} (−{sf:g}%)")
+        fee, label = _hop(cfg, venue, "", s.ex, s.net, s.asset)
+        if fee is None:
+            return None
+        if label:
+            steps.append(label)
+    else:
+        # промежуточная монета: две спот-конвертации на одной площадке, где есть обе пары к USDT
+        venue = next((v for v in (b.ex, s.ex) + SPOT_VENUES
+                      if v in SPOT_VENUES and b.asset in spot.get(v, {}) and s.asset in spot.get(v, {})), None)
+        if not venue:
+            return None
+        fee, label = _hop(cfg, b.ex, b.net, venue, "", b.asset)
+        if fee is None:
+            return None
+        if label:
+            steps.append(label)
+        sf = _spot_fee(cfg, venue)
+        steps.append(f"спот {b.asset}→USDT на {venue} (−{sf:g}%)")
+        steps.append(f"спот USDT→{s.asset} на {venue} (−{sf:g}%)")
         fee, label = _hop(cfg, venue, "", s.ex, s.net, s.asset)
         if fee is None:
             return None
