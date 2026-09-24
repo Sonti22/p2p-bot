@@ -202,10 +202,14 @@ class Bot:
             await self.call("answerCallbackQuery", callback_query_id=cq["id"], text="Сигнал устарел, не записан")
             return
         d, amount = entry
-        trades.log_trade(d, amount)
+        bank, total, crossed = trades.log_trade(d, amount)
         await self.call("answerCallbackQuery", callback_query_id=cq["id"], text="Записано в журнал ✅")
         await self.call("editMessageReplyMarkup", chat_id=self.chat_id, message_id=cq["message"]["message_id"],
                         reply_markup=deal_markup(d))
+        if crossed:
+            await self.send(f"⚠️ Через {bank} по СБП в этом месяце отправлено {_money(total)} ₽ — выше "
+                            f"бесплатного лимита 100 000 ₽, дальше банк может взять комиссию до 0.5%. "
+                            f"Для следующих сделок с этим мерчантом лучше выбрать другой банк.")
 
     def stats_view(self):
         st = trades.stats()
