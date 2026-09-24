@@ -95,7 +95,8 @@ def test_scan_offline_keeps_prices_near_reference(offline):
     assert snap.ref > 0 and not snap.errors
     for a in snap.best.values():
         assert abs(a.price / snap.ref - 1) * 100 <= c.max_dev
-    assert all(d[0] == max(x[0] for x in snap.deals) for d in snap.deals[:1])   # отсортировано по убыванию
+    scores = [d[0] - c.risk_penalty * len(p2p.reliability(d, c, snap)[1]) for d in snap.deals]
+    assert scores == sorted(scores, reverse=True)   # отсортировано по прибыли с поправкой на надёжность
 
 
 def test_stack_combines_several_ads_by_price():
@@ -215,6 +216,23 @@ def test_fmt_deal_includes_reliability_when_snap_given():
     text = p2p.fmt_deal(d, cfg(), snap)
     assert p2p.RELIABLE in text
     assert p2p.RELIABLE not in p2p.fmt_deal(d, cfg())   # без snap метка не считается
+
+
+def test_scan_ranks_deals_by_profit_times_reliability(offline, monkeypatch):
+    async def fake_r(s, cfg, side, asset):   # чистая связка: цена рядом с ориентиром (88.15), профит поменьше
+        return [make_ad("R", side, 88.15 if side == "buy" else 89.5, orders=500, rate=100.0)]
+
+    async def fake_k(s, cfg, side, asset):   # выше профит, но цена продажи у порога отсева (риск) + спред ≥5%
+        return [make_ad("K", side, 87.14 if side == "buy" else 91.5, orders=500, rate=100.0)]
+
+    monkeypatch.setitem(p2p.FETCHERS, "r", fake_r)
+    monkeypatch.setitem(p2p.FETCHERS, "k", fake_k)
+    c = p2p.Config(exchanges=["r", "k"], assets=["USDT"], min_orders=0, min_rate=0, risk_penalty=3.0)
+    snap = asyncio.run(p2p.scan(None, c))
+    rel = next(d for d in snap.deals if d[1].ex == "R" and d[2].ex == "R")
+    risky = next(d for d in snap.deals if d[1].ex == "K" and d[2].ex == "K")
+    assert risky[0] > rel[0]                                  # чистый профит выше у рискованной связки
+    assert snap.deals.index(rel) < snap.deals.index(risky)    # но с поправкой на риск она позади
 
 
 def test_scan_applies_auto_fee_for_bank_over_limit(offline, monkeypatch):

@@ -115,6 +115,7 @@ class Config:
     alt_interval: int = 60         # сек между опросами монет кроме USDT
     bc_refresh: int = 120          # сек между скачиваниями выгрузки BestChange (~16 МБ)
     pay_fee: float = 0.0           # % комиссии банка за оплату продавцу (СБП сверх 100 тыс./мес — до 0.5%)
+    risk_penalty: float = 1.5      # штраф в п.п. профита за каждую причину риска при сортировке связок
     spot_fees: dict = field(default_factory=lambda: _fees(DEFAULT_SPOT_FEES, upper=False))
     risk_buffer: dict = field(default_factory=lambda: _fees(DEFAULT_RISK))
     assets: list = field(default_factory=lambda: DEFAULT_ASSETS.split(","))
@@ -139,6 +140,7 @@ class Config:
             alt_interval=int(os.getenv("ALT_INTERVAL", 60)),
             bc_refresh=int(os.getenv("BC_REFRESH", 120)),
             pay_fee=float(os.getenv("PAY_FEE", 0)),
+            risk_penalty=float(os.getenv("RISK_PENALTY", 1.5)),
             spot_fees=_fees(os.getenv("SPOT_FEES", DEFAULT_SPOT_FEES), upper=False),
             risk_buffer=_fees(os.getenv("RISK_BUFFER", DEFAULT_RISK)),
             assets=[a.upper() for a in _list("ASSETS", DEFAULT_ASSETS)],
@@ -584,8 +586,11 @@ async def scan(s, cfg, force_alt=False):
             r = _route(b, sl, cfg, spot, over_banks)
             if r:
                 deals.append((r[0], b, sl, r[1]))
-    deals.sort(key=lambda d: d[0], reverse=True)
-    return Snapshot(ref or 0, ref_src, refs, best, deals, networks, dropped, errors, groups, spot, over_banks)
+    snap = Snapshot(ref or 0, ref_src, refs, best, [], networks, dropped, errors, groups, spot, over_banks)
+    # сортировка «прибыль × надёжность»: каждая причина риска снимает risk_penalty п.п. с профита
+    deals.sort(key=lambda d: d[0] - cfg.risk_penalty * len(reliability(d, cfg, snap)[1]), reverse=True)
+    snap.deals = deals
+    return snap
 
 
 DEPTH_AMOUNTS = (50_000, 100_000, 300_000)   # суммы круга для разбивки прибыли в карточке связки
