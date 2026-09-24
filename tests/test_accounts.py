@@ -4,9 +4,13 @@ import hashlib
 import hmac
 import json
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from urllib.parse import urlencode
 
+import aiohttp
 import pytest
+from multidict import CIMultiDict, CIMultiDictProxy
+from yarl import URL
 
 import accounts
 
@@ -363,6 +367,72 @@ def test_verify_kucoin_bad_key(tmp_path, monkeypatch):
     accounts.save_key("kucoin", "k", "s", "pp")
     ok, msg = asyncio.run(accounts.verify(_JsonSession({"code": "400003", "msg": "KC-API-KEY not exists"}), "kucoin"))
     assert not ok and "KC-API-KEY not exists" in msg
+
+
+def _request_info(url):
+    u = URL(url)
+    return aiohttp.RequestInfo(u, "GET", CIMultiDictProxy(CIMultiDict()), u)
+
+
+class _HttpErrorSession:
+    """raise_for_status() бросает настоящий aiohttp.ClientResponseError с фактическим URL запроса,
+    как aiohttp при ответе 4xx/5xx (str() такой ошибки содержит URL целиком)."""
+    def __init__(self, status=401, message="Unauthorized"):
+        self.status, self.message, self.errors = status, message, []
+
+    def get(self, url, headers=None):
+        session = self
+
+        class _Resp(_JsonResp):
+            def raise_for_status(self):
+                e = aiohttp.ClientResponseError(_request_info(url), (), status=session.status, message=session.message)
+                session.errors.append(e)
+                raise e
+
+        return _Resp(None)
+
+
+def test_verify_htx_http_error_hides_key(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    accounts.save_key("htx", "AKID-TEST-KEY-1234", "s")
+    s = _HttpErrorSession()
+    ok, msg = asyncio.run(accounts.verify(s, "htx"))
+    assert "AKID-TEST-KEY-1234" in str(s.errors[0])   # сама ошибка aiohttp несёт ключ в URL
+    assert not ok and "401" in msg
+    assert "AKID-TEST-KEY-1234" not in msg and "Signature" not in msg and "https://" not in msg
+
+
+def test_verify_mexc_http_error_hides_signature(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    accounts.save_key("mexc", "k", "s")
+    ok, msg = asyncio.run(accounts.verify(_HttpErrorSession(429, "Too Many Requests"), "mexc"))
+    assert not ok and msg == "HTTP 429: Too Many Requests"
+
+
+def test_verify_timeout_readable(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    accounts.save_key("bybit", "k", "s")
+
+    class _Slow:
+        def get(self, url, headers=None):
+            raise asyncio.TimeoutError()
+
+    ok, msg = asyncio.run(accounts.verify(_Slow(), "bybit"))
+    assert not ok and "таймаут" in msg   # str(TimeoutError()) пустой — пользователь видел пустое «⚠️ »
+
+
+_URL_WITH_KEY = "https://api.htx.com/v1/account/accounts?AccessKeyId=AKID-TEST&Signature=abc%3D"
+
+
+@pytest.mark.parametrize("exc", [
+    aiohttp.ContentTypeError(_request_info(_URL_WITH_KEY), (), status=200, message="unexpected mimetype: text/html"),
+    aiohttp.InvalidURL(_URL_WITH_KEY),
+    RuntimeError(f"boom {_URL_WITH_KEY}"),
+    aiohttp.ClientConnectorError(SimpleNamespace(host="api.htx.com", port=443, ssl=True), OSError(1, "refused")),
+])
+def test_api_error_text_has_no_url_or_query(exc):
+    text = accounts.api_error_text(exc)
+    assert text and "AKID-TEST" not in text and "https://" not in text and "?" not in text
 
 
 def test_api_permissions_no_key_is_safe(tmp_path, monkeypatch):

@@ -6,6 +6,7 @@
 `data/keys.json` как `disabled` — пометка выключает его, даже если он остался в `.env`. Никаких
 торговых/выводных запросов — только подписанные GET к read-only эндпоинтам.
 """
+import asyncio
 import base64
 import hashlib
 import hmac
@@ -14,6 +15,8 @@ import os
 import time
 from datetime import datetime, timezone
 from urllib.parse import urlencode
+
+import aiohttp
 
 KEYS_PATH = os.path.join("data", "keys.json")
 BYBIT_BASE = "https://api.bybit.com"
@@ -125,6 +128,18 @@ async def _get_json(s, url, headers):
     async with s.get(url, headers=headers) as r:
         r.raise_for_status()
         return await r.json(content_type=None)
+
+
+def api_error_text(e):
+    """Текст ошибки запроса к бирже для пользователя и лога — без URL и параметров запроса: str() ошибки
+    aiohttp содержит полный URL, а в query HTX лежат AccessKeyId и Signature, у MEXC — signature."""
+    if isinstance(e, (asyncio.TimeoutError, TimeoutError)):
+        return "таймаут запроса"
+    if isinstance(e, aiohttp.ClientResponseError):   # и ContentTypeError: только код и причина
+        return f"HTTP {e.status}: {e.message}"[:120] if e.message else f"HTTP {e.status}"
+    if isinstance(e, aiohttp.ClientConnectorError):   # только хост, без пути и query
+        return f"нет соединения с {e.host}"
+    return type(e).__name__   # прочие ошибки: str(e) может содержать URL
 
 
 async def bybit_get(s, api_key, api_secret, path, params=None):
@@ -347,7 +362,7 @@ async def verify(s, exchange):
         else:
             return False, f"{exchange}: подпись запросов пока не реализована"
     except Exception as e:
-        return False, str(e)
+        return False, api_error_text(e)
     return True, "ключ рабочий, доступ только для чтения"
 
 

@@ -1207,7 +1207,8 @@ class Bot:
         self.awaiting_key = None
         accounts.save_key(state["ex"], state["key"], state["secret"], state.get("passphrase"))
         ok, msg = await accounts.verify(self.s, state["ex"])
-        await self.send("✅ Подключено (только чтение)" if ok else f"⚠️ Ключ сохранён, но проверка не прошла: {msg}")
+        await self.send("✅ Подключено (только чтение)" if ok
+                        else f"⚠️ Ключ сохранён, но проверка не прошла: {html.escape(msg)}")
         t, kb = account_view(state["ex"])
         await self.send(t, markup=kb)
 
@@ -1483,7 +1484,7 @@ class Bot:
             try:
                 hist = await accounts.account_history(self.s, ex)
             except Exception as e:
-                logger.warning("account history error: %s %s", ex, e)
+                logger.warning("account history error: %s %s", ex, accounts.api_error_text(e))   # без URL с ключом
                 continue
             if not hist:
                 continue
@@ -1692,7 +1693,7 @@ class Bot:
         elif data.startswith("acc_check:"):
             ex = data[10:]
             ok, msg = await accounts.verify(self.s, ex)
-            await self.send("✅ Ключ рабочий (только чтение)" if ok else f"⚠️ {msg}")
+            await self.send("✅ Ключ рабочий (только чтение)" if ok else f"⚠️ {html.escape(msg)}")
         elif data.startswith("acc_del:"):
             ex = data[8:]
             if accounts.delete_key(ex):
