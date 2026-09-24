@@ -1,5 +1,6 @@
 """Telegram-бот сигналов P2P-связок: карточки-картинки, кнопки, меню. Запуск: python bot.py (настройки в .env)."""
 import asyncio
+import dataclasses
 import html
 import json
 import os
@@ -10,7 +11,8 @@ import aiohttp
 
 import trades
 from cards import deal_card, top_chart
-from p2p import ENV_PATH, Config, _money, fmt_deal, fmt_top, load_env, scan, spot_url, venue_url
+from p2p import AMOUNT_MAX, AMOUNT_MIN, ENV_PATH, Config, _money, fmt_deal, fmt_top, load_env, parse_amount, scan, \
+    spot_url, venue_url
 
 MENU = {"keyboard": [[{"text": "🔥 Лучшая сейчас"}, {"text": "📊 Топ связок"}],
                      [{"text": "⚙️ Настройки"}, {"text": "🛠 Разработка"}],
@@ -20,6 +22,7 @@ BUTTONS = {"🔥 Лучшая сейчас": "/best", "📊 Топ связок"
            "🛠 Разработка": "/dev", "❓ Как работать": "/help"}
 COMMANDS = [{"command": "best", "description": "Лучшая связка сейчас"},
             {"command": "top", "description": "Топ связок графиком"},
+            {"command": "calc", "description": "Разовый расчёт под сумму, напр. /calc 20000"},
             {"command": "stats", "description": "Журнал сделок: день/неделя/месяц"},
             {"command": "settings", "description": "Порог, сумма, пауза"},
             {"command": "dev", "description": "Как развивается бот: версия, изменения, план"},
@@ -183,17 +186,19 @@ class Bot:
                 print("card error:", e)
         await self.send(caption, markup=markup)
 
-    def remember_deal(self, d):
+    def remember_deal(self, d, cfg=None):
         """Запомнить связку под кнопкой «✅ Сделал»; хранится ограниченное число последних."""
+        cfg = cfg or self.cfg
         deal_id, self.next_deal_id = self.next_deal_id, self.next_deal_id + 1
-        self.deals_by_id[deal_id] = (d, self.cfg.amount)
+        self.deals_by_id[deal_id] = (d, cfg.amount)
         if len(self.deals_by_id) > 200:
             del self.deals_by_id[min(self.deals_by_id)]
         return deal_id
 
-    async def send_deal(self, d, prefix=""):
-        deal_id = self.remember_deal(d)
-        await self.photo_or_text(lambda: deal_card(d, self.cfg), prefix + fmt_deal(d, self.cfg), deal_markup(d, deal_id))
+    async def send_deal(self, d, prefix="", cfg=None):
+        cfg = cfg or self.cfg
+        deal_id = self.remember_deal(d, cfg)
+        await self.photo_or_text(lambda: deal_card(d, cfg), prefix + fmt_deal(d, cfg), deal_markup(d, deal_id))
 
     async def mark_done(self, cq, deal_id):
         """Кнопка «✅ Сделал»: записать сделку в журнал (data/trades.db) и убрать кнопку."""
@@ -225,25 +230,40 @@ class Bot:
         lines.append("\nОтмечай связку кнопкой «✅ Сделал» под сигналом — так она попадёт в журнал.")
         return "\n".join(lines)
 
-    async def show_best(self):
-        if not self.last:
+    async def show_best(self, snap=None, cfg=None):
+        snap = self.last if snap is None else snap
+        cfg = cfg or self.cfg
+        if not snap:
             await self.send(WAIT)
-        elif not self.last.deals:
+        elif not snap.deals:
             await self.send("Связок сейчас нет: все объявления отсеяны фильтрами.")
         else:
-            await self.send_deal(self.last.deals[0], "🔥 ")
+            await self.send_deal(snap.deals[0], "🔥 ", cfg)
 
-    async def show_top(self):
-        snap = self.last
+    async def show_top(self, snap=None, cfg=None):
+        snap = self.last if snap is None else snap
+        cfg = cfg or self.cfg
         if not snap:
             await self.send(WAIT)
             return
         nets = sorted(((v["sell"].price, net) for net, v in snap.networks.items() if v.get("sell")), reverse=True)[:3]
-        caption = (f"📊 <b>Топ связок</b> · USDT {snap.ref:.2f} ₽ · круг {_money(self.cfg.amount)} ₽\n"
+        caption = (f"📊 <b>Топ связок</b> · USDT {snap.ref:.2f} ₽ · круг {_money(cfg.amount)} ₽\n"
                    + (f"Лучше продать USDT обменнику: {', '.join(f'{n} {p:.2f}' for p, n in nets)}\n" if nets else "")
-                   + f"Связок всего: {len(snap.deals)} · от {self.cfg.min_profit:g}%: "
-                   + f"{sum(1 for d in snap.deals if d[0] >= self.cfg.min_profit)}")
-        await self.photo_or_text(lambda: top_chart(snap, self.cfg), caption, TOP_MARKUP)
+                   + f"Связок всего: {len(snap.deals)} · от {cfg.min_profit:g}%: "
+                   + f"{sum(1 for d in snap.deals if d[0] >= cfg.min_profit)}")
+        await self.photo_or_text(lambda: top_chart(snap, cfg), caption, TOP_MARKUP)
+
+    async def calc(self, arg):
+        """Разовый расчёт под сумму (`/calc 20000`): скан с копией Config, без смены настроек."""
+        amount = parse_amount(arg)
+        if amount is None:
+            await self.send(f"Не понял сумму. Пример: /calc 20000, /calc 1,5 млн "
+                            f"(от {_money(AMOUNT_MIN)} до {_money(AMOUNT_MAX)} ₽).")
+            return
+        calc_cfg = dataclasses.replace(self.cfg, amount=amount)
+        snap = await scan(self.s, calc_cfg, force_alt=True)
+        await self.show_top(snap, calc_cfg)
+        await self.show_best(snap, calc_cfg)
 
     def settings_view(self):
         c = self.cfg
@@ -392,6 +412,11 @@ class Bot:
             await self.show_best()
         elif cmd == "/top":
             await self.show_top()
+        elif cmd == "/calc":
+            if arg:
+                await self.calc(arg)
+            else:
+                await self.send("Нужна сумма: /calc 20000")
         elif cmd == "/stats":
             await self.send(self.stats_view())
         elif cmd == "/settings":

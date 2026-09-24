@@ -83,6 +83,25 @@ def _fees(spec, upper=True):
     return out
 
 
+AMOUNT_MIN, AMOUNT_MAX = 1000, 5_000_000
+_AMOUNT_UNITS = {"млн": 1_000_000, "m": 1_000_000, "тыс": 1_000, "к": 1_000, "k": 1_000}
+
+
+def parse_amount(text):
+    """Сумма круга из текста: «20000», «20 000», «20к», «1,5 млн». None — не разобрано или вне
+    диапазона 1 000–5 000 000 ₽."""
+    t = re.sub(r"\s+", "", (text or "").strip().lower())
+    m = re.fullmatch(r"([\d.,]+)(млн\.?|тыс\.?|к|k|m)?", t)
+    if not m:
+        return None
+    try:
+        num = float(m.group(1).replace(",", "."))
+    except ValueError:
+        return None
+    num *= _AMOUNT_UNITS.get((m.group(2) or "").rstrip("."), 1)
+    return num if AMOUNT_MIN <= num <= AMOUNT_MAX else None
+
+
 @dataclass
 class Config:
     fiat: str = "RUB"
@@ -438,10 +457,12 @@ class Snapshot:
 _alt = {"t": 0.0, "ads": [], "errors": {}}
 
 
-async def scan(s, cfg):
+async def scan(s, cfg, force_alt=False):
+    """force_alt — разовый скан под свою сумму (`/calc`, «своя сумма»): всегда опросить не-USDT монеты
+    заново и не трогать общий кэш _alt, потому что лимиты объявлений зависят от cfg.amount."""
     names = [n for n in cfg.exchanges if n in FETCHERS]
     alts = [a for a in cfg.assets if a != "USDT"]
-    alt_due = bool(alts) and time.time() - _alt["t"] >= cfg.alt_interval
+    alt_due = force_alt or (bool(alts) and time.time() - _alt["t"] >= cfg.alt_interval)
     jobs = [(n, side, asset) for n in names
             for asset in (["USDT"] if "USDT" in cfg.assets else []) + (alts if alt_due or n == "bestchange" else [])
             for side in ("buy", "sell")]
@@ -456,10 +477,10 @@ async def scan(s, cfg):
             (alt_errors if cached else errors)[f"{n}/{asset}"] = f"{type(r).__name__}: {r}"[:120]
         else:
             (alt_ads if cached else ads).extend(r)
-    if alt_due:
+    if alt_due and not force_alt:
         _alt.update(t=time.time(), ads=alt_ads, errors=alt_errors)
-    ads += _alt["ads"]
-    errors.update(_alt["errors"])
+    ads += alt_ads if force_alt else _alt["ads"]
+    errors.update(alt_errors if force_alt else _alt["errors"])
 
     ref, ref_src = None, "-"
     if ref_task:
