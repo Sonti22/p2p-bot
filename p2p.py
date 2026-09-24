@@ -501,9 +501,9 @@ def _withdraw(cfg, sender, asset, net="", receiver=""):
     иначе самую дешёвую из тех, что принимает получатель. None — открытой сети нет: у отправителя
     закрыт вывод или у получателя ввод (по живому справочнику netstatus; неизвестно = не мешаем)."""
     table = dict(WITHDRAW.get((sender, asset), {}))
-    for n in netstatus.open_nets(sender, asset):       # живой справочник дополняет таблицу комиссий
+    for n in netstatus.open_nets(sender, asset):       # живой справочник дополняет таблицу и переопределяет её
         fee = netstatus.live_fee(sender, asset, n)
-        if n not in table and fee is not None:
+        if fee is not None:
             table[n] = fee
 
     def ok(n):

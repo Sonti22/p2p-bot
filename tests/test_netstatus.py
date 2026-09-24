@@ -116,6 +116,28 @@ def test_live_fee_extends_table_for_venues_without_one():
     assert "BEP20" in route and "−0.01 USDT" in route           # у HTX нет таблицы — комиссия из справочника
 
 
+# Живой справочник MEXC: BEP20 подорожал до 10 (в таблице 0.01), TON и ERC20 до 5 — дешевле всех TRC20.
+LIVE_MEXC = {"BEP20": {"dep": True, "wd": True, "fee": 10.0}, "TRC20": {"dep": True, "wd": True, "fee": 1.0},
+             "TON": {"dep": True, "wd": True, "fee": 5.0}, "ERC20": {"dep": True, "wd": True, "fee": 5.0}}
+
+
+def test_live_fee_overrides_table_same_net():
+    assert p2p.WITHDRAW[("MEXC", "USDT")]["BEP20"] == pytest.approx(0.01)   # табличная из fees.json
+    netstatus._apply("MEXC", "USDT", LIVE_MEXC)
+    assert p2p._withdraw(_cfg(), "MEXC", "USDT", "BEP20") == (10.0, "BEP20")       # явная сеть — живое значение
+    assert p2p._withdraw(_cfg(), "MEXC", "USDT", "", "Bybit") == (1.0, "TRC20")   # автовыбор — по живым комиссиям
+
+
+def test_route_uses_live_fee_over_table():
+    b, s = make_ad("MEXC", "buy", 88.0), make_ad("Bybit", "sell", 90.0)
+    _, route = p2p._route(b, s, _cfg(), SPOT)
+    assert "BEP20" in route and "−0.01 USDT" in route                              # без живых данных — таблица
+    netstatus._apply("MEXC", "USDT", LIVE_MEXC)
+    profit, route = p2p._route(b, s, _cfg(), SPOT)
+    assert "TRC20" in route and "−1 USDT" in route and "BEP20" not in route      # живое значение приоритетнее
+    assert profit == pytest.approx(((50000 / 88 - 1.0) * 90 / 50000 - 1) * 100)
+
+
 def test_scan_offline_refreshes_networks(offline):
     c = p2p.Config(exchanges=["htx", "kucoin"], assets=["USDT"], min_orders=0, min_rate=0)
     snap = asyncio.run(p2p.scan(None, c))
