@@ -42,8 +42,8 @@ WITHDRAW = {
 }
 # Сети, которые точно принимает площадка-получатель (не подтверждено иное — только TRC20). Нет в списке — любые.
 RECEIVE_NETS = {"BitPapa": ("TRC20",)}
-SPOT_VENUES = ("Bybit", "MEXC")
-DEFAULT_SPOT_FEES = "Bybit:0.1,MEXC:0.1"          # % тейкер-комиссии спота
+SPOT_VENUES = ("Bybit", "MEXC", "HTX", "KuCoin")   # порядок = приоритет ориентира и спота, если монета лежит не на бирже
+DEFAULT_SPOT_FEES = "Bybit:0.1,MEXC:0.1,HTX:0.2,KuCoin:0.1"   # % тейкер-комиссии спота
 DEFAULT_RISK = "BTC:0.3,ETH:0.5,TON:0.7"          # % запаса на движение курса, пока идут сделки и переводы
 # BestChange: берём все рублёвые банки и карты (тип 2/3 в bm_cy.dat), кроме наличных/QR/юрлиц.
 # Основные — латиницей, чтобы совпадали с названиями на P2P-биржах и в INCLUDE_PAY.
@@ -331,26 +331,44 @@ async def rapira_mid(s):
     return (r["askPrice"] + r["bidPrice"]) / 2
 
 
+def _spot_fee(cfg, venue):
+    return cfg.spot_fees.get(venue, _fees(DEFAULT_SPOT_FEES, upper=False).get(venue, 0.1))
+
+
+# публичные тикеры спота: (URL, список тикеров из ответа, ключ символа, bid, ask, как записан символ ETH/USDT)
+SPOT_SOURCES = {
+    "Bybit": ("https://api.bybit.com/v5/market/tickers?category=spot",
+              lambda j: j["result"]["list"], "symbol", "bid1Price", "ask1Price", lambda a: a + "USDT"),
+    "MEXC": ("https://api.mexc.com/api/v3/ticker/bookTicker",
+             lambda j: j, "symbol", "bidPrice", "askPrice", lambda a: a + "USDT"),
+    "HTX": ("https://api.htx.com/market/tickers",
+            lambda j: j["data"], "symbol", "bid", "ask", lambda a: (a + "usdt").lower()),
+    "KuCoin": ("https://api.kucoin.com/api/v1/market/allTickers",
+               lambda j: j["data"]["ticker"], "symbol", "buy", "sell", lambda a: a + "-USDT"),
+}
+
+
 async def spot_prices(s, assets):
-    """{площадка: {монета: (bid, ask)}} к USDT на споте Bybit и MEXC (одним запросом на биржу)."""
-    by, mx = await asyncio.gather(_json(s, "GET", "https://api.bybit.com/v5/market/tickers?category=spot"),
-                                  _json(s, "GET", "https://api.mexc.com/api/v3/ticker/bookTicker"),
-                                  return_exceptions=True)
-    out = {"Bybit": {"USDT": (1.0, 1.0)}, "MEXC": {"USDT": (1.0, 1.0)}}
-    if not isinstance(by, Exception):
-        t = {x["symbol"]: x for x in by["result"]["list"]}
+    """{площадка: {монета: (bid, ask)}} к USDT на споте Bybit, MEXC, HTX, KuCoin (одним запросом на биржу)."""
+    res = await asyncio.gather(*(_json(s, "GET", SPOT_SOURCES[v][0]) for v in SPOT_VENUES), return_exceptions=True)
+    out, errors = {}, []
+    for venue, j in zip(SPOT_VENUES, res):
+        out[venue] = {"USDT": (1.0, 1.0)}
+        if isinstance(j, Exception):
+            errors.append(j)
+            continue
+        _, items, k_sym, k_bid, k_ask, sym = SPOT_SOURCES[venue]
+        try:
+            t = {x[k_sym]: x for x in items(j)}
+        except (KeyError, TypeError) as e:   # формат ответа изменился — площадка без спота, остальные работают
+            errors.append(e)
+            continue
         for a in assets:
-            x = t.get(a + "USDT")
-            if x and float(x["bid1Price"] or 0) > 0:
-                out["Bybit"][a] = (float(x["bid1Price"]), float(x["ask1Price"]))
-    if not isinstance(mx, Exception):
-        t = {x["symbol"]: x for x in mx}
-        for a in assets:
-            x = t.get(a + "USDT")
-            if x and float(x["bidPrice"] or 0) > 0:
-                out["MEXC"][a] = (float(x["bidPrice"]), float(x["askPrice"]))
-    if isinstance(by, Exception) and isinstance(mx, Exception):
-        raise by
+            x = t.get(sym(a))
+            if x and float(x.get(k_bid) or 0) > 0 and float(x.get(k_ask) or 0) > 0:
+                out[venue][a] = (float(x[k_bid]), float(x[k_ask]))
+    if len(errors) == len(SPOT_VENUES):
+        raise errors[0]
     return out
 
 
@@ -460,7 +478,7 @@ def _route_qty(b, s, cfg, spot, over_banks=frozenset(), disable=frozenset()):
         bid, ask = spot[venue][alt]
         fee, _ = _hop(cfg, b.ex, b.net, venue, "", b.asset)
         qty -= 0.0 if "withdraw" in disable else fee
-        sf = 0.0 if "spot" in disable else cfg.spot_fees.get(venue, 0.1)
+        sf = 0.0 if "spot" in disable else _spot_fee(cfg, venue)
         qty = (qty / ask if b.asset == "USDT" else qty * bid) * (1 - sf / 100)
         fee, _ = _hop(cfg, venue, "", s.ex, s.net, s.asset)
         qty -= 0.0 if "withdraw" in disable else fee
@@ -495,7 +513,7 @@ def _route(b, s, cfg, spot, over_banks=frozenset()):
         _, label = _hop(cfg, b.ex, b.net, venue, "", b.asset)
         if label:
             steps.append(label)
-        sf = cfg.spot_fees.get(venue, 0.1)
+        sf = _spot_fee(cfg, venue)
         steps.append(f"спот {b.asset}→{s.asset} на {venue} (−{sf:g}%)")
         _, label = _hop(cfg, venue, "", s.ex, s.net, s.asset)
         if label:
@@ -687,7 +705,9 @@ def spot_url(route):
         return ""
     coin = m.group(2) if m.group(1) == "USDT" else m.group(1)
     return {"Bybit": f"https://www.bybit.com/trade/spot/{coin}/USDT",
-            "MEXC": f"https://www.mexc.com/ru-RU/exchange/{coin}_USDT"}.get(m.group(3), "")
+            "MEXC": f"https://www.mexc.com/ru-RU/exchange/{coin}_USDT",
+            "HTX": f"https://www.htx.com/trade/{coin.lower()}_usdt",
+            "KuCoin": f"https://www.kucoin.com/trade/{coin}-USDT"}.get(m.group(3), "")
 
 
 RELIABLE, RISKY, TRAP = "✅ надёжно", "⚠️ риск", "🪤 ловушка"

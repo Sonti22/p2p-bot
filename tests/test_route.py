@@ -309,3 +309,20 @@ def test_scan_applies_auto_fee_for_bank_over_limit(offline, monkeypatch):
     snap = asyncio.run(p2p.scan(None, c))
     assert snap.deals
     assert "лимит СБП T-Bank исчерпан" in snap.deals[0][3]
+
+
+def test_spot_on_htx_and_kucoin_without_transfer():
+    spot = dict(SPOT, HTX={"USDT": (1.0, 1.0), "ETH": (2490.0, 2491.0)}, KuCoin={"USDT": (1.0, 1.0), "ETH": (2495.0, 2496.0)})
+    # монета куплена на HTX — спот там же, комиссия HTX 0.2%, переводов нет
+    profit, route = p2p._route(make_ad("HTX", "buy", 88.0), make_ad("HTX", "sell", 245000.0, asset="ETH"), cfg(), spot)
+    assert "спот USDT→ETH на HTX (−0.2%)" in route and "перевод" not in route
+    assert profit == pytest.approx((50000 / 88 / 2491.0 * (1 - 0.002) * 245000 / 50000 - 1) * 100)
+    # KuCoin — свой спот, комиссия 0.1%
+    _, route = p2p._route(make_ad("KuCoin", "buy", 88.0), make_ad("KuCoin", "sell", 245000.0, asset="ETH"), cfg(), spot)
+    assert "спот USDT→ETH на KuCoin (−0.1%)" in route and "перевод" not in route
+
+
+def test_spot_fee_default_for_venue_missing_in_env():
+    c = cfg(spot_fees={"Bybit": 0.1})          # в .env только Bybit — для HTX берётся встроенный дефолт
+    assert p2p._spot_fee(c, "HTX") == pytest.approx(0.2)
+    assert p2p._spot_fee(c, "Bybit") == pytest.approx(0.1)

@@ -9,6 +9,8 @@ FIX = os.path.join(os.path.dirname(__file__), "fixtures")
 
 # подстрока URL -> файл фикстуры (урезанные живые ответы площадок)
 ROUTES = [
+    # спот-тикеры — раньше общих правил по доменам htx.com / kucoin.com
+    ("api.htx.com/market/tickers", "spot_htx.json"), ("api.kucoin.com/api/v1/market/allTickers", "spot_kucoin.json"),
     ("queryAllPaymentList", "bybit_pay.json"), ("otc/item/online", "bybit_ads.json"),
     ("htx.com", "htx_ads.json"), ("kucoin.com", "kucoin_ads.json"),
     ("payment/method", "mexc_pay.json"), ("common/coins", "mexc_coins.json"),
