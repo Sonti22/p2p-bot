@@ -21,8 +21,8 @@ import presets
 import trades
 from cards import deal_card, history_card, history_compare_card, portfolio_card, top_chart
 from p2p import ALL_EXCHANGES, AMOUNT_MAX, AMOUNT_MIN, DEFAULT_ASSETS, ENV_PATH, LOG_PATH, Config, _money, _price, \
-    deal_amounts, fmt_ad, fmt_deal, fmt_top, load_env, maker_quote, parse_amount, profit_breakdown, reliability, \
-    scan, setup_logging, spot_url, traps_log, venue_url
+    bank_liquidity, deal_amounts, fmt_ad, fmt_deal, fmt_top, load_env, maker_quote, parse_amount, \
+    profit_breakdown, reliability, scan, setup_logging, spot_url, traps_log, venue_url
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +43,7 @@ COMMANDS = [{"command": "best", "description": "Лучшая связка сей
             {"command": "blacklist", "description": "Скрытые мерчанты и обменники"},
             {"command": "traps", "description": "Последние отсеянные ловушки (обучение без риска)"},
             {"command": "maker", "description": "Цена мейкера на площадках, напр. /maker USDT"},
+            {"command": "banks", "description": "Объём по банкам на площадках, напр. /banks USDT"},
             {"command": "balance", "description": "Баланс по подключённым биржам"},
             {"command": "fees", "description": "Комиссии вывода по сетям и возраст данных"},
             {"command": "settings", "description": "Порог, сумма, пауза"},
@@ -362,6 +363,37 @@ def maker_view(snap, cfg, asset):
             lines.append("")
     if not found:
         lines.append("Нет обеих сторон стакана ни на одной подключённой площадке — попробуй другую монету.")
+    return "\n".join(lines).rstrip()
+
+
+BANKS_HELP = ("Формат: /banks USDT — сколько объявлений и какой объём (₽) по каждому банку/способу оплаты "
+              "на каждой подключённой площадке, отдельно на покупку и на продажу.")
+
+
+def banks_view(snap, cfg, asset):
+    """Текст «/banks <монета>»: на каждой подключённой площадке (`cfg.exchanges`, включая BestChange) —
+    топ банков по объёму (`p2p.bank_liquidity`), отдельно на покупку и на продажу."""
+    lines = [f"🏦 <b>Банки {asset}</b>", "", BANKS_HELP, ""]
+    found = False
+    for ex in cfg.exchanges:
+        name = VENUE_NAMES.get(ex)
+        if not name:
+            continue
+        liq = bank_liquidity(snap.groups, name, asset)
+        if not liq:
+            continue
+        found = True
+        lines.append(f"<b>{name}</b>")
+        for side, label in (("buy", "купить"), ("sell", "продать")):
+            banks = liq.get(side)
+            if not banks:
+                continue
+            top = sorted(banks.items(), key=lambda kv: kv[1][1], reverse=True)[:8]
+            row = "; ".join(f"{html.escape(bank)} {cnt} объявл. / {_money(vol)} ₽" for bank, (cnt, vol) in top)
+            lines.append(f"{label}: {row}")
+        lines.append("")
+    if not found:
+        lines.append("Нет объявлений ни на одной подключённой площадке — попробуй другую монету.")
     return "\n".join(lines).rstrip()
 
 
@@ -854,6 +886,20 @@ class Bot:
             await self.send(WAIT)
             return
         await self.send(maker_view(self.last, self.cfg, asset))
+
+    async def banks(self, arg):
+        """/banks <монета>: объявления и объём по каждому банку на всех подключённых площадках."""
+        asset = (arg or "").strip().upper()
+        if not asset:
+            await self.send(BANKS_HELP)
+            return
+        if asset not in self.cfg.assets:
+            await self.send(f"Монета {asset} не отслеживается ботом ({', '.join(self.cfg.assets)}).")
+            return
+        if not self.last:
+            await self.send(WAIT)
+            return
+        await self.send(banks_view(self.last, self.cfg, asset))
 
     async def balance(self):
         """`/balance`: балансы по подключённым биржам (Bybit — Unified + Funding, MEXC — спот) и итог в ₽.
@@ -1405,6 +1451,8 @@ class Bot:
             await self.send(traps_view())
         elif cmd == "/maker":
             await self.maker(arg)
+        elif cmd == "/banks":
+            await self.banks(arg)
         elif cmd == "/balance":
             await self.balance()
         elif cmd == "/fees":

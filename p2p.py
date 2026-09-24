@@ -675,6 +675,24 @@ def maker_quote(groups, ex, asset, post_side):
     return price, counter_price, spread / counter_price * 100 + fee
 
 
+def bank_liquidity(groups, ex, asset):
+    """{"buy"/"sell": {банк: (число объявлений, объём ₽)}} на площадке `ex` для `asset` — по объявлениям
+    стакана (`groups`, как в `snap.groups`: уже прошли фильтры мерчанта и отсев аномалий). Объём
+    объявления — доступный остаток в фиате, как при сборке стакана в `_stack` (min(лимит объявления,
+    остаток монеты по цене)). Сторона/площадка без объявлений в результат не попадает."""
+    out = {}
+    for side in ("buy", "sell"):
+        banks = {}
+        for a in groups.get((ex, side, asset), []):
+            vol = min(a.max_amt, a.avail * a.price)
+            for p in a.pays:
+                cnt, total = banks.get(p, (0, 0.0))
+                banks[p] = (cnt + 1, total + vol)
+        if banks:
+            out[side] = banks
+    return out
+
+
 @dataclass
 class Snapshot:
     ref: float

@@ -726,6 +726,44 @@ def test_maker_command_sends_quotes():
     assert "MEXC" in texts(bot)[-1]
 
 
+def test_banks_view_lists_volume_per_bank():
+    g = _groups(make_ad("MEXC", "buy", 90.0, pays=("T-Bank",), max_amt=50000, avail=1000),
+                make_ad("MEXC", "sell", 92.0, pays=("Sberbank",), max_amt=20000, avail=1000))
+    s = p2p.Snapshot(88.0, "test", {}, {}, [], {}, {}, {}, groups=g)
+    cfg = p2p.Config(exchanges=["mexc"])
+    text = B.banks_view(s, cfg, "USDT")
+    assert "MEXC" in text and "T-Bank" in text and "Sberbank" in text
+    assert "купить" in text and "продать" in text
+
+
+def test_banks_view_no_ads_anywhere():
+    s = p2p.Snapshot(88.0, "test", {}, {}, [], {}, {}, {})
+    cfg = p2p.Config(exchanges=["mexc"])
+    text = B.banks_view(s, cfg, "USDT")
+    assert "Нет объявлений" in text
+
+
+def test_banks_command_requires_known_asset():
+    bot = Stub(p2p.Config())
+    bot.last = p2p.Snapshot(88.0, "test", {}, {}, [], {}, {}, {})
+    asyncio.run(bot.banks("DOGE"))
+    assert "не отслеживается" in texts(bot)[-1]
+
+
+def test_banks_command_waits_for_first_scan():
+    bot = Stub(p2p.Config())
+    asyncio.run(bot.banks("USDT"))
+    assert texts(bot)[-1] == B.WAIT
+
+
+def test_banks_command_sends_liquidity():
+    g = _groups(make_ad("MEXC", "buy", 90.0, pays=("T-Bank",), max_amt=50000, avail=1000))
+    bot = Stub(p2p.Config(exchanges=["mexc"]))
+    bot.last = p2p.Snapshot(88.0, "test", {}, {}, [], {}, {}, {}, groups=g)
+    asyncio.run(bot.banks("usdt"))
+    assert "T-Bank" in texts(bot)[-1]
+
+
 def test_portfolio_view_no_exchanges_connected():
     text = B.portfolio_view({}, None)
     assert "Ни одна биржа не подключена" in text
