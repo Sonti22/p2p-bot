@@ -20,8 +20,8 @@ import presets
 import trades
 from cards import deal_card, history_card, history_compare_card, portfolio_card, top_chart
 from p2p import ALL_EXCHANGES, AMOUNT_MAX, AMOUNT_MIN, DEFAULT_ASSETS, ENV_PATH, Config, _money, _price, \
-    deal_amounts, fmt_ad, fmt_deal, fmt_top, load_env, parse_amount, profit_breakdown, reliability, scan, spot_url, \
-    traps_log, venue_url
+    deal_amounts, fmt_ad, fmt_deal, fmt_top, load_env, maker_quote, parse_amount, profit_breakdown, reliability, \
+    scan, spot_url, traps_log, venue_url
 
 MENU = {"keyboard": [[{"text": "🔥 Лучшая сейчас"}, {"text": "📊 Топ связок"}],
                      [{"text": "⚙️ Настройки"}, {"text": "🛠 Разработка"}],
@@ -39,6 +39,7 @@ COMMANDS = [{"command": "best", "description": "Лучшая связка сей
             {"command": "alerts", "description": "Список алертов на курс"},
             {"command": "blacklist", "description": "Скрытые мерчанты и обменники"},
             {"command": "traps", "description": "Последние отсеянные ловушки (обучение без риска)"},
+            {"command": "maker", "description": "Цена мейкера на площадках, напр. /maker USDT"},
             {"command": "balance", "description": "Баланс по подключённым биржам"},
             {"command": "fees", "description": "Комиссии вывода по сетям и возраст данных"},
             {"command": "settings", "description": "Порог, сумма, пауза"},
@@ -322,6 +323,41 @@ def traps_view():
         when = datetime.fromtimestamp(t["ts"]).strftime("%d.%m %H:%M")
         lines.append(f"{when} — {html.escape(t['reason'])}")
     return "\n".join(lines)
+
+
+MAKER_HELP = ("Формат: /maker USDT — цена, чтобы встать первым объявлением в очереди на покупку и на продажу "
+              "на каждой подключённой площадке, и во сколько это обходится против цены сделки прямо сейчас.")
+
+
+def maker_view(snap, cfg, asset):
+    """Текст «/maker <монета>»: на каждой подключённой площадке (`cfg.exchanges`) — цена мейкера
+    (`p2p.maker_quote`) на покупку и на продажу и спред против цены немедленной сделки. Площадка без
+    обеих сторон стакана по этой монете пропускается."""
+    lines = [f"📝 <b>Мейкер {asset}</b>", "", MAKER_HELP, ""]
+    found = False
+    for ex in cfg.exchanges:
+        name = EXCHANGE_NAMES.get(ex)
+        if not name:
+            continue
+        rows = []
+        buy = maker_quote(snap.groups, name, asset, "buy_ad")
+        if buy:
+            price, now_price, spread = buy
+            rows.append(f"купить: выставить {_price(price)} ₽ (сейчас купить сразу можно по {_price(now_price)} ₽, "
+                        f"переплата {spread:.2f}%)")
+        sell = maker_quote(snap.groups, name, asset, "sell_ad")
+        if sell:
+            price, now_price, spread = sell
+            rows.append(f"продать: выставить {_price(price)} ₽ (сейчас продать сразу можно по {_price(now_price)} ₽, "
+                        f"недополучим {spread:.2f}%)")
+        if rows:
+            found = True
+            lines.append(f"<b>{name}</b>")
+            lines += rows
+            lines.append("")
+    if not found:
+        lines.append("Нет обеих сторон стакана ни на одной подключённой площадке — попробуй другую монету.")
+    return "\n".join(lines).rstrip()
 
 
 ALERT_HELP = ("Формат: /alert USDT sell 92 7d — сообщу, когда надёжный покупатель или обменник даст "
@@ -766,6 +802,20 @@ class Bot:
         snap = await scan(self.s, calc_cfg, force_alt=True)
         await self.show_top(snap, calc_cfg)
         await self.show_best(snap, calc_cfg)
+
+    async def maker(self, arg):
+        """/maker <монета>: режим мейкера на всех подключённых площадках по текущему снимку стакана."""
+        asset = (arg or "").strip().upper()
+        if not asset:
+            await self.send(MAKER_HELP)
+            return
+        if asset not in self.cfg.assets:
+            await self.send(f"Монета {asset} не отслеживается ботом ({', '.join(self.cfg.assets)}).")
+            return
+        if not self.last:
+            await self.send(WAIT)
+            return
+        await self.send(maker_view(self.last, self.cfg, asset))
 
     async def balance(self):
         """`/balance`: балансы по подключённым биржам (Bybit — Unified + Funding, MEXC — спот) и итог в ₽.
@@ -1286,6 +1336,8 @@ class Bot:
             await self.send(text, markup=kb)
         elif cmd == "/traps":
             await self.send(traps_view())
+        elif cmd == "/maker":
+            await self.maker(arg)
         elif cmd == "/balance":
             await self.balance()
         elif cmd == "/fees":
