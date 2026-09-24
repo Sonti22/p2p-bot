@@ -127,6 +127,16 @@ def test_usable_filters():
     assert not p2p.usable(make_ad(avail=1), c)
 
 
+def test_pays_filter_survives_switching_across_cached_ad():
+    # объявление из кэша _alt переживает несколько сканов и фильтруется тем же объектом Ad каждый раз;
+    # переключение exclude_pay/include_pay между сканами не должно терять способы оплаты, отсеянные раньше
+    ad = make_ad(pays=("T-Bank", "Mobile Top-up"))
+    assert p2p._pays(ad, cfg(exclude_pay=["mobile top-up"])) == ["T-Bank"]
+    assert ad.pays == ["T-Bank"]
+    assert p2p._pays(ad, cfg(exclude_pay=[])) == ["T-Bank", "Mobile Top-up"]
+    assert ad.pays == ["T-Bank", "Mobile Top-up"]
+
+
 def test_usable_and_signal_ok_respect_blacklist():
     c = p2p.Config()
     ad = make_ad()
