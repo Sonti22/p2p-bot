@@ -1,0 +1,346 @@
+{
+ "USDT": {
+  "currency": "usdt",
+  "instStatus": "normal",
+  "chains": [
+   {
+    "chain": "aptusdt",
+    "displayName": "APT",
+    "depositStatus": "allowed",
+    "withdrawStatus": "allowed",
+    "transactFeeWithdraw": "0.1",
+    "minWithdrawAmt": "10"
+   },
+   {
+    "chain": "arc20usdt",
+    "displayName": "ARBITRUM",
+    "depositStatus": "allowed",
+    "withdrawStatus": "prohibited",
+    "transactFeeWithdraw": "0.1",
+    "minWithdrawAmt": "1"
+   },
+   {
+    "chain": "bep20usdt",
+    "displayName": "BEP20",
+    "depositStatus": "allowed",
+    "withdrawStatus": "allowed",
+    "transactFeeWithdraw": "0.01",
+    "minWithdrawAmt": "1"
+   },
+   {
+    "chain": "btt2usdt",
+    "displayName": "BTT",
+    "depositStatus": "allowed",
+    "withdrawStatus": "prohibited",
+    "transactFeeWithdraw": "0.001",
+    "minWithdrawAmt": "1"
+   },
+   {
+    "chain": "cchainusdt",
+    "displayName": "AVAXCCHAIN",
+    "depositStatus": "allowed",
+    "withdrawStatus": "allowed",
+    "transactFeeWithdraw": "0.04",
+    "minWithdrawAmt": "1"
+   },
+   {
+    "chain": "celousdt",
+    "displayName": "CELO",
+    "depositStatus": "allowed",
+    "withdrawStatus": "prohibited",
+    "transactFeeWithdraw": "0.05",
+    "minWithdrawAmt": "10"
+   },
+   {
+    "chain": "nearusdt",
+    "displayName": "NEAR",
+    "depositStatus": "allowed",
+    "withdrawStatus": "prohibited",
+    "transactFeeWithdraw": "0.2",
+    "minWithdrawAmt": "1"
+   },
+   {
+    "chain": "polyusdt",
+    "displayName": "POLYGON",
+    "depositStatus": "allowed",
+    "withdrawStatus": "prohibited",
+    "transactFeeWithdraw": "0.07",
+    "minWithdrawAmt": "1"
+   },
+   {
+    "chain": "solusdt",
+    "displayName": "SOLANA",
+    "depositStatus": "allowed",
+    "withdrawStatus": "allowed",
+    "transactFeeWithdraw": "0.3",
+    "minWithdrawAmt": "2"
+   },
+   {
+    "chain": "tonusdt",
+    "displayName": "TON",
+    "depositStatus": "allowed",
+    "withdrawStatus": "allowed",
+    "transactFeeWithdraw": "0.3",
+    "minWithdrawAmt": "1"
+   },
+   {
+    "chain": "trc20usdt",
+    "displayName": "TRC20",
+    "depositStatus": "allowed",
+    "withdrawStatus": "allowed",
+    "transactFeeWithdraw": "0.5",
+    "minWithdrawAmt": "1"
+   },
+   {
+    "chain": "usdterc20",
+    "displayName": "ERC20",
+    "depositStatus": "allowed",
+    "withdrawStatus": "allowed",
+    "transactFeeWithdraw": "0.3",
+    "minWithdrawAmt": "1"
+   },
+   {
+    "chain": "xrc20usdt",
+    "displayName": "PLASMA",
+    "depositStatus": "allowed",
+    "withdrawStatus": "prohibited",
+    "transactFeeWithdraw": "0.001",
+    "minWithdrawAmt": "10"
+   }
+  ]
+ },
+ "USDC": {
+  "currency": "usdc",
+  "instStatus": "normal",
+  "chains": [
+   {
+    "chain": "arbiusdc",
+    "displayName": "ARBITRUM",
+    "depositStatus": "allowed",
+    "withdrawStatus": "allowed",
+    "transactFeeWithdraw": "0.0548",
+    "minWithdrawAmt": "0.5"
+   },
+   {
+    "chain": "baseusdc",
+    "displayName": "BASE",
+    "depositStatus": "allowed",
+    "withdrawStatus": "allowed",
+    "transactFeeWithdraw": "2.6",
+    "minWithdrawAmt": "0.5"
+   },
+   {
+    "chain": "bep20usdc",
+    "displayName": "BEP20",
+    "depositStatus": "allowed",
+    "withdrawStatus": "allowed",
+    "transactFeeWithdraw": "0.51013669",
+    "minWithdrawAmt": "1"
+   },
+   {
+    "chain": "cchainusdc",
+    "displayName": "AVAXCCHAIN",
+    "depositStatus": "prohibited",
+    "withdrawStatus": "prohibited",
+    "transactFeeWithdraw": "0.21",
+    "minWithdrawAmt": "1"
+   },
+   {
+    "chain": "nearusdc",
+    "displayName": "NEAR",
+    "depositStatus": "allowed",
+    "withdrawStatus": "prohibited",
+    "transactFeeWithdraw": "0.2",
+    "minWithdrawAmt": "10"
+   },
+   {
+    "chain": "optusdc1",
+    "displayName": "OPTIMISM",
+    "depositStatus": "prohibited",
+    "withdrawStatus": "prohibited",
+    "transactFeeWithdraw": "26.6709",
+    "minWithdrawAmt": "0.5"
+   },
+   {
+    "chain": "polyusdc",
+    "displayName": "POLYGON",
+    "depositStatus": "allowed",
+    "withdrawStatus": "allowed",
+    "transactFeeWithdraw": "0.01",
+    "minWithdrawAmt": "1"
+   },
+   {
+    "chain": "solusdc",
+    "displayName": "SOLANA",
+    "depositStatus": "allowed",
+    "withdrawStatus": "allowed",
+    "transactFeeWithdraw": "1.1763",
+    "minWithdrawAmt": "0.1"
+   },
+   {
+    "chain": "sonicusdc",
+    "displayName": "SONIC",
+    "depositStatus": "allowed",
+    "withdrawStatus": "prohibited",
+    "transactFeeWithdraw": "0.01",
+    "minWithdrawAmt": "1"
+   },
+   {
+    "chain": "suiusdc",
+    "displayName": "SUI",
+    "depositStatus": "allowed",
+    "withdrawStatus": "prohibited",
+    "transactFeeWithdraw": "0.1",
+    "minWithdrawAmt": "0.5"
+   },
+   {
+    "chain": "trc20usdc1",
+    "displayName": "TRC20",
+    "depositStatus": "allowed",
+    "withdrawStatus": "prohibited",
+    "transactFeeWithdraw": "0.5",
+    "minWithdrawAmt": "0.5"
+   },
+   {
+    "chain": "usdc",
+    "displayName": "ERC20",
+    "depositStatus": "allowed",
+    "withdrawStatus": "allowed",
+    "transactFeeWithdraw": "1.371759",
+    "minWithdrawAmt": "2"
+   }
+  ]
+ },
+ "BTC": {
+  "currency": "btc",
+  "instStatus": "normal",
+  "chains": [
+   {
+    "chain": "basecbbtc",
+    "displayName": "BASE",
+    "depositStatus": "allowed",
+    "withdrawStatus": "prohibited",
+    "transactFeeWithdraw": null,
+    "minWithdrawAmt": "0.0000064"
+   },
+   {
+    "chain": "bep20btcb",
+    "displayName": "BEP20",
+    "depositStatus": "allowed",
+    "withdrawStatus": "prohibited",
+    "transactFeeWithdraw": "0.000004",
+    "minWithdrawAmt": "0.000001"
+   },
+   {
+    "chain": "btc",
+    "displayName": "BTC",
+    "depositStatus": "allowed",
+    "withdrawStatus": "allowed",
+    "transactFeeWithdraw": "0.00005",
+    "minWithdrawAmt": "0.0001"
+   },
+   {
+    "chain": "solwbtc",
+    "displayName": "SOLANA",
+    "depositStatus": "allowed",
+    "withdrawStatus": "allowed",
+    "transactFeeWithdraw": "0.00001367",
+    "minWithdrawAmt": "0.0000048"
+   },
+   {
+    "chain": "trc20btc",
+    "displayName": "TRC20",
+    "depositStatus": "allowed",
+    "withdrawStatus": "allowed",
+    "transactFeeWithdraw": "0.00001",
+    "minWithdrawAmt": "0.001"
+   },
+   {
+    "chain": "trc20wbtc",
+    "displayName": "TRC20WBTC",
+    "depositStatus": "allowed",
+    "withdrawStatus": "allowed",
+    "transactFeeWithdraw": "0.00001",
+    "minWithdrawAmt": "0.0000041"
+   },
+   {
+    "chain": "wbtc",
+    "displayName": "ERC20",
+    "depositStatus": "allowed",
+    "withdrawStatus": "allowed",
+    "transactFeeWithdraw": "0.0001",
+    "minWithdrawAmt": "0.000097"
+   }
+  ]
+ },
+ "ETH": {
+  "currency": "eth",
+  "instStatus": "normal",
+  "chains": [
+   {
+    "chain": "arbieth",
+    "displayName": "ARBITRUM",
+    "depositStatus": "allowed",
+    "withdrawStatus": "allowed",
+    "transactFeeWithdraw": "0.0002",
+    "minWithdrawAmt": "0.005"
+   },
+   {
+    "chain": "baseeth",
+    "displayName": "BASE",
+    "depositStatus": "allowed",
+    "withdrawStatus": "prohibited",
+    "transactFeeWithdraw": "0.001",
+    "minWithdrawAmt": "0.005"
+   },
+   {
+    "chain": "bep20eth",
+    "displayName": "BEP20",
+    "depositStatus": "allowed",
+    "withdrawStatus": "prohibited",
+    "transactFeeWithdraw": "0.00012",
+    "minWithdrawAmt": "0.0005"
+   },
+   {
+    "chain": "btt2eth",
+    "displayName": "BTT",
+    "depositStatus": "allowed",
+    "withdrawStatus": "prohibited",
+    "transactFeeWithdraw": "0.000036",
+    "minWithdrawAmt": "0.0003"
+   },
+   {
+    "chain": "eth",
+    "displayName": "ETH",
+    "depositStatus": "allowed",
+    "withdrawStatus": "allowed",
+    "transactFeeWithdraw": "0.0005",
+    "minWithdrawAmt": "0.0001"
+   },
+   {
+    "chain": "opteth",
+    "displayName": "OPTIMISM",
+    "depositStatus": "prohibited",
+    "withdrawStatus": "prohibited",
+    "transactFeeWithdraw": "0.001",
+    "minWithdrawAmt": "0.005"
+   },
+   {
+    "chain": "trc20eth",
+    "displayName": "ETHT",
+    "depositStatus": "allowed",
+    "withdrawStatus": "prohibited",
+    "transactFeeWithdraw": "0.0001",
+    "minWithdrawAmt": "0.00019"
+   },
+   {
+    "chain": "trc20eth1",
+    "displayName": "ETHB",
+    "depositStatus": "allowed",
+    "withdrawStatus": "prohibited",
+    "transactFeeWithdraw": "0.0001",
+    "minWithdrawAmt": "0.00024"
+   }
+  ]
+ }
+}

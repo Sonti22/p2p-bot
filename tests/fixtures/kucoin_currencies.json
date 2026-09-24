@@ -1,0 +1,426 @@
+{
+ "USDT": {
+  "currency": "USDT",
+  "chains": [
+   {
+    "chainName": "APT",
+    "chainId": "aptos",
+    "isDepositEnabled": true,
+    "isWithdrawEnabled": true,
+    "withdrawalMinFee": "0.5",
+    "withdrawalMinSize": "1"
+   },
+   {
+    "chainName": "Asset Hub(Polkadot)",
+    "chainId": "statemint",
+    "isDepositEnabled": true,
+    "isWithdrawEnabled": true,
+    "withdrawalMinFee": "1",
+    "withdrawalMinSize": "10"
+   },
+   {
+    "chainName": "OPTIMISM",
+    "chainId": "optimism",
+    "isDepositEnabled": false,
+    "isWithdrawEnabled": true,
+    "withdrawalMinFee": "1",
+    "withdrawalMinSize": "3"
+   },
+   {
+    "chainName": "TON",
+    "chainId": "ton2",
+    "isDepositEnabled": true,
+    "isWithdrawEnabled": false,
+    "withdrawalMinFee": "0.5",
+    "withdrawalMinSize": "1"
+   },
+   {
+    "chainName": "KCC",
+    "chainId": "kcc",
+    "isDepositEnabled": true,
+    "isWithdrawEnabled": true,
+    "withdrawalMinFee": "0.5",
+    "withdrawalMinSize": "1"
+   },
+   {
+    "chainName": "SOL",
+    "chainId": "sol",
+    "isDepositEnabled": true,
+    "isWithdrawEnabled": true,
+    "withdrawalMinFee": "1.5",
+    "withdrawalMinSize": "3"
+   },
+   {
+    "chainName": "TON",
+    "chainId": "ton",
+    "isDepositEnabled": true,
+    "isWithdrawEnabled": true,
+    "withdrawalMinFee": "0.5",
+    "withdrawalMinSize": "1"
+   },
+   {
+    "chainName": "BEP20",
+    "chainId": "bsc",
+    "isDepositEnabled": true,
+    "isWithdrawEnabled": true,
+    "withdrawalMinFee": "1",
+    "withdrawalMinSize": "10"
+   },
+   {
+    "chainName": "CFX",
+    "chainId": "cfx",
+    "isDepositEnabled": true,
+    "isWithdrawEnabled": true,
+    "withdrawalMinFee": "1",
+    "withdrawalMinSize": "2"
+   },
+   {
+    "chainName": "Stable",
+    "chainId": "stable",
+    "isDepositEnabled": true,
+    "isWithdrawEnabled": true,
+    "withdrawalMinFee": "1",
+    "withdrawalMinSize": "2"
+   },
+   {
+    "chainName": "KAVA EVM Co-Chain",
+    "chainId": "kavaevm",
+    "isDepositEnabled": true,
+    "isWithdrawEnabled": true,
+    "withdrawalMinFee": "1",
+    "withdrawalMinSize": "3"
+   },
+   {
+    "chainName": "Polygon POS",
+    "chainId": "matic",
+    "isDepositEnabled": true,
+    "isWithdrawEnabled": true,
+    "withdrawalMinFee": "0.8",
+    "withdrawalMinSize": "1.6"
+   },
+   {
+    "chainName": "ERC20",
+    "chainId": "eth",
+    "isDepositEnabled": true,
+    "isWithdrawEnabled": true,
+    "withdrawalMinFee": "5.5",
+    "withdrawalMinSize": "1"
+   },
+   {
+    "chainName": "AVAX C-Chain",
+    "chainId": "avaxc",
+    "isDepositEnabled": true,
+    "isWithdrawEnabled": true,
+    "withdrawalMinFee": "1",
+    "withdrawalMinSize": "2"
+   },
+   {
+    "chainName": "NEAR",
+    "chainId": "near",
+    "isDepositEnabled": true,
+    "isWithdrawEnabled": true,
+    "withdrawalMinFee": "0.5",
+    "withdrawalMinSize": "3"
+   },
+   {
+    "chainName": "TRC20",
+    "chainId": "trx",
+    "isDepositEnabled": true,
+    "isWithdrawEnabled": true,
+    "withdrawalMinFee": "1.99",
+    "withdrawalMinSize": "4"
+   },
+   {
+    "chainName": "PLASMA",
+    "chainId": "plasma",
+    "isDepositEnabled": true,
+    "isWithdrawEnabled": true,
+    "withdrawalMinFee": "0.4",
+    "withdrawalMinSize": "5"
+   },
+   {
+    "chainName": "XTZ",
+    "chainId": "xtz",
+    "isDepositEnabled": true,
+    "isWithdrawEnabled": true,
+    "withdrawalMinFee": "1",
+    "withdrawalMinSize": "2"
+   },
+   {
+    "chainName": "ARBITRUM",
+    "chainId": "arbitrum",
+    "isDepositEnabled": true,
+    "isWithdrawEnabled": true,
+    "withdrawalMinFee": "1",
+    "withdrawalMinSize": "5"
+   }
+  ]
+ },
+ "USDC": {
+  "currency": "USDC",
+  "chains": [
+   {
+    "chainName": "Movement",
+    "chainId": "move",
+    "isDepositEnabled": true,
+    "isWithdrawEnabled": false,
+    "withdrawalMinFee": "1",
+    "withdrawalMinSize": "2"
+   },
+   {
+    "chainName": "Sonic",
+    "chainId": "sonic",
+    "isDepositEnabled": true,
+    "isWithdrawEnabled": true,
+    "withdrawalMinFee": "0.21",
+    "withdrawalMinSize": "0.42"
+   },
+   {
+    "chainName": "Asset Hub(Polkadot)",
+    "chainId": "statemint",
+    "isDepositEnabled": true,
+    "isWithdrawEnabled": true,
+    "withdrawalMinFee": "1",
+    "withdrawalMinSize": "2"
+   },
+   {
+    "chainName": "OPTIMISM",
+    "chainId": "optimism",
+    "isDepositEnabled": true,
+    "isWithdrawEnabled": true,
+    "withdrawalMinFee": "1",
+    "withdrawalMinSize": "3"
+   },
+   {
+    "chainName": "SUI",
+    "chainId": "sui",
+    "isDepositEnabled": true,
+    "isWithdrawEnabled": true,
+    "withdrawalMinFee": "0.5",
+    "withdrawalMinSize": "1"
+   },
+   {
+    "chainName": "KCC",
+    "chainId": "kcc",
+    "isDepositEnabled": false,
+    "isWithdrawEnabled": false,
+    "withdrawalMinFee": "0.5",
+    "withdrawalMinSize": "2"
+   },
+   {
+    "chainName": "SOL",
+    "chainId": "sol",
+    "isDepositEnabled": true,
+    "isWithdrawEnabled": true,
+    "withdrawalMinFee": "1",
+    "withdrawalMinSize": "5"
+   },
+   {
+    "chainName": "Arc",
+    "chainId": "arc",
+    "isDepositEnabled": true,
+    "isWithdrawEnabled": true,
+    "withdrawalMinFee": "1",
+    "withdrawalMinSize": "2"
+   },
+   {
+    "chainName": "XDC",
+    "chainId": "xdc",
+    "isDepositEnabled": true,
+    "isWithdrawEnabled": true,
+    "withdrawalMinFee": "1",
+    "withdrawalMinSize": "5"
+   },
+   {
+    "chainName": "Polygon POS",
+    "chainId": "matic",
+    "isDepositEnabled": true,
+    "isWithdrawEnabled": true,
+    "withdrawalMinFee": "0.21",
+    "withdrawalMinSize": "0.3"
+   },
+   {
+    "chainName": "Noble",
+    "chainId": "noble",
+    "isDepositEnabled": true,
+    "isWithdrawEnabled": true,
+    "withdrawalMinFee": "1",
+    "withdrawalMinSize": "2"
+   },
+   {
+    "chainName": "ERC20",
+    "chainId": "eth",
+    "isDepositEnabled": true,
+    "isWithdrawEnabled": true,
+    "withdrawalMinFee": "5.5",
+    "withdrawalMinSize": "1"
+   },
+   {
+    "chainName": "AVAX C-Chain",
+    "chainId": "avaxc",
+    "isDepositEnabled": true,
+    "isWithdrawEnabled": true,
+    "withdrawalMinFee": "1",
+    "withdrawalMinSize": "2"
+   },
+   {
+    "chainName": "MONAD",
+    "chainId": "monad",
+    "isDepositEnabled": true,
+    "isWithdrawEnabled": true,
+    "withdrawalMinFee": "0.5",
+    "withdrawalMinSize": "1"
+   },
+   {
+    "chainName": "HBAR",
+    "chainId": "hbar",
+    "isDepositEnabled": false,
+    "isWithdrawEnabled": false,
+    "withdrawalMinFee": "35",
+    "withdrawalMinSize": "70"
+   },
+   {
+    "chainName": "NEAR",
+    "chainId": "near",
+    "isDepositEnabled": true,
+    "isWithdrawEnabled": true,
+    "withdrawalMinFee": "0.5",
+    "withdrawalMinSize": "1"
+   },
+   {
+    "chainName": "Base",
+    "chainId": "base",
+    "isDepositEnabled": true,
+    "isWithdrawEnabled": true,
+    "withdrawalMinFee": "0.5",
+    "withdrawalMinSize": "1"
+   },
+   {
+    "chainName": "ARBITRUM",
+    "chainId": "arbitrum",
+    "isDepositEnabled": true,
+    "isWithdrawEnabled": true,
+    "withdrawalMinFee": "1",
+    "withdrawalMinSize": "5"
+   }
+  ]
+ },
+ "BTC": {
+  "currency": "BTC",
+  "chains": [
+   {
+    "chainName": "BTC",
+    "chainId": "btc",
+    "isDepositEnabled": true,
+    "isWithdrawEnabled": true,
+    "withdrawalMinFee": "0.00009",
+    "withdrawalMinSize": "0.00018"
+   },
+   {
+    "chainName": "BEP20",
+    "chainId": "bsc",
+    "isDepositEnabled": true,
+    "isWithdrawEnabled": true,
+    "withdrawalMinFee": "0.000004",
+    "withdrawalMinSize": "0.000008"
+   },
+   {
+    "chainName": "Lightning Network",
+    "chainId": "btcln",
+    "isDepositEnabled": false,
+    "isWithdrawEnabled": false,
+    "withdrawalMinFee": "0.00002",
+    "withdrawalMinSize": "0.00004"
+   },
+   {
+    "chainName": "KCC",
+    "chainId": "kcc",
+    "isDepositEnabled": true,
+    "isWithdrawEnabled": true,
+    "withdrawalMinFee": "0.00002",
+    "withdrawalMinSize": "0.0008"
+   },
+   {
+    "chainName": "ARBITRUM",
+    "chainId": "arbitrum",
+    "isDepositEnabled": false,
+    "isWithdrawEnabled": false,
+    "withdrawalMinFee": "0.0001",
+    "withdrawalMinSize": "0.0005"
+   },
+   {
+    "chainName": "BTC-Segwit",
+    "chainId": "bech32",
+    "isDepositEnabled": true,
+    "isWithdrawEnabled": false,
+    "withdrawalMinFee": "0.0005",
+    "withdrawalMinSize": "0.0008"
+   }
+  ]
+ },
+ "ETH": {
+  "currency": "ETH",
+  "chains": [
+   {
+    "chainName": "BEP20",
+    "chainId": "bsc",
+    "isDepositEnabled": true,
+    "isWithdrawEnabled": true,
+    "withdrawalMinFee": "0.00024",
+    "withdrawalMinSize": "0.00048"
+   },
+   {
+    "chainName": "OPTIMISM",
+    "chainId": "optimism",
+    "isDepositEnabled": true,
+    "isWithdrawEnabled": true,
+    "withdrawalMinFee": "0.0002",
+    "withdrawalMinSize": "0.001"
+   },
+   {
+    "chainName": "ERC20",
+    "chainId": "eth",
+    "isDepositEnabled": true,
+    "isWithdrawEnabled": true,
+    "withdrawalMinFee": "0.0015",
+    "withdrawalMinSize": "0.003"
+   },
+   {
+    "chainName": "KCC",
+    "chainId": "kcc",
+    "isDepositEnabled": true,
+    "isWithdrawEnabled": true,
+    "withdrawalMinFee": "0.0003",
+    "withdrawalMinSize": "0.0006"
+   },
+   {
+    "chainName": "Robinhood",
+    "chainId": "robinhood",
+    "isDepositEnabled": true,
+    "isWithdrawEnabled": true,
+    "withdrawalMinFee": "0.0002",
+    "withdrawalMinSize": "0.0004"
+   },
+   {
+    "chainName": "Base",
+    "chainId": "base",
+    "isDepositEnabled": true,
+    "isWithdrawEnabled": true,
+    "withdrawalMinFee": "0.0001",
+    "withdrawalMinSize": "0.0002"
+   },
+   {
+    "chainName": "ARBITRUM",
+    "chainId": "arbitrum",
+    "isDepositEnabled": true,
+    "isWithdrawEnabled": true,
+    "withdrawalMinFee": "0.0002",
+    "withdrawalMinSize": "0.0004"
+   }
+  ]
+ },
+ "TON": {
+  "currency": null,
+  "chains": []
+ }
+}

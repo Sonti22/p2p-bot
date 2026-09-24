@@ -12,6 +12,7 @@ import aiohttp
 import accounts
 import alerts
 import blacklist
+import netstatus
 import trades
 from cards import deal_card, portfolio_card, top_chart
 from p2p import AMOUNT_MAX, AMOUNT_MIN, ENV_PATH, Config, _money, _price, deal_amounts, fmt_ad, fmt_deal, fmt_top, \
@@ -604,11 +605,18 @@ class Bot:
                 if self.chat_id:
                     await self.check_venues(self.last)
                     await self.check_alerts(self.last)
+                    await self.check_networks()
                     if not self.paused:
                         await self.notify(self.last)
             except Exception as e:
                 print("scan error:", e)
             await asyncio.sleep(self.cfg.interval)
+
+    async def check_networks(self):
+        """Сеть вывода/ввода переключилась (открыт ↔ закрыт) — одно сообщение на переключение."""
+        for venue, asset, net, kind, is_open in netstatus.pop_changes():
+            await self.send(f"{'✅' if is_open else '⚠️'} {venue}: {kind} {asset} ({net}) "
+                            + ("снова открыт" if is_open else "приостановлен — связки через эту сеть не показываю"))
 
     async def check_venues(self, snap):
         """Алерт, если площадка недоступна >15 мин или падает 3 скана подряд; и сообщение о восстановлении."""

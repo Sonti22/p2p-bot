@@ -17,6 +17,8 @@ from dataclasses import dataclass, field
 
 import aiohttp
 
+import netstatus
+
 import blacklist
 import trades
 
@@ -430,27 +432,47 @@ def _same_venue(b, s):
 
 def _withdraw(cfg, sender, asset, net="", receiver=""):
     """Комиссия вывода монеты с биржи и сеть. Сеть задана (её требует обменник) — берём её,
-    иначе самую дешёвую из тех, что принимает получатель."""
-    table = WITHDRAW.get((sender, asset), {})
+    иначе самую дешёвую из тех, что принимает получатель. None — открытой сети нет: у отправителя
+    закрыт вывод или у получателя ввод (по живому справочнику netstatus; неизвестно = не мешаем)."""
+    table = dict(WITHDRAW.get((sender, asset), {}))
+    for n in netstatus.open_nets(sender, asset):       # живой справочник дополняет таблицу комиссий
+        fee = netstatus.live_fee(sender, asset, n)
+        if n not in table and fee is not None:
+            table[n] = fee
+
+    def ok(n):
+        return netstatus.withdraw_ok(sender, asset, n) is not False and \
+            (not receiver or netstatus.deposit_ok(receiver, asset, n) is not False)
+
     if net:
-        return table.get(net, cfg.transfer_fees.get(asset, 0)), net
-    ok = {n: f for n, f in table.items() if n in RECEIVE_NETS.get(receiver, n)}
-    if ok:
-        best = min(ok, key=ok.get)
-        return ok[best], best
+        return (table.get(net, cfg.transfer_fees.get(asset, 0)), net) if ok(net) else None
+    allowed = {n: f for n, f in table.items() if n in RECEIVE_NETS.get(receiver, n)}
+    if allowed:
+        cand = {n: f for n, f in allowed.items() if ok(n)}
+        if not cand:
+            return None
+        best = min(cand, key=cand.get)
+        return cand[best], best
     return cfg.transfer_fees.get(asset, 0), ""
 
 
 def _hop(cfg, frm, frm_net, to, to_net, asset):
-    """Перевод монеты между площадками: (комиссия в монете, подпись шага); та же биржа — (0, '')."""
+    """Перевод монеты между площадками: (комиссия в монете, подпись шага); та же биржа — (0, '');
+    (None, '') — перевод невозможен: вывод или ввод в нужной сети закрыт."""
     if frm == to and frm != "BestChange":
         return 0.0, ""
     if frm == "BestChange" and to == "BestChange":   # обменник → твой кошелёк на бирже → другой обменник
-        fee, net = _withdraw(cfg, "Bybit", asset, to_net)
+        w = _withdraw(cfg, "Bybit", asset, to_net)
+        if w is None:
+            return None, ""
+        fee, net = w
         return fee, f"через Bybit: перевод −{fee:g} {asset} ({net})"
     if frm == "BestChange":                          # обменник сам шлёт монету, комиссия в его курсе
         return 0.0, f"обменник шлёт {asset} ({frm_net}) на {to}"
-    fee, net = _withdraw(cfg, frm, asset, to_net if to == "BestChange" else "", to)
+    w = _withdraw(cfg, frm, asset, to_net if to == "BestChange" else "", to)
+    if w is None:
+        return None, ""
+    fee, net = w
     cost = f"−{fee:g} {asset}" if fee else f"{asset} без комиссии"
     return fee, f"перевод {cost}" + (f" ({net})" if net else "") + f" на {to}"
 
@@ -466,6 +488,8 @@ def _route_qty(b, s, cfg, spot, over_banks=frozenset(), disable=frozenset()):
     qty = cfg.amount * (1 - pay_fee / 100) / b.price
     if b.asset == s.asset:
         fee, _ = _hop(cfg, b.ex, b.net, s.ex, s.net, b.asset)
+        if fee is None:
+            return None
         qty -= 0.0 if "withdraw" in disable else fee
     else:
         if "USDT" not in (b.asset, s.asset):
@@ -477,10 +501,14 @@ def _route_qty(b, s, cfg, spot, over_banks=frozenset(), disable=frozenset()):
             return None
         bid, ask = spot[venue][alt]
         fee, _ = _hop(cfg, b.ex, b.net, venue, "", b.asset)
+        if fee is None:
+            return None
         qty -= 0.0 if "withdraw" in disable else fee
         sf = 0.0 if "spot" in disable else _spot_fee(cfg, venue)
         qty = (qty / ask if b.asset == "USDT" else qty * bid) * (1 - sf / 100)
         fee, _ = _hop(cfg, venue, "", s.ex, s.net, s.asset)
+        if fee is None:
+            return None
         qty -= 0.0 if "withdraw" in disable else fee
     vol = 0.0 if "risk" in disable else max(cfg.risk_buffer.get(b.asset, 0), cfg.risk_buffer.get(s.asset, 0))
     if vol:   # курс ETH/BTC/TON может уйти, пока идут сделки и переводы
@@ -501,7 +529,9 @@ def _route(b, s, cfg, spot, over_banks=frozenset()):
         note = f" (лимит СБП {auto_bank} исчерпан)" if auto_bank else ""
         steps.append(f"комиссия банка −{pay_fee:g}%{note}")
     if b.asset == s.asset:
-        _, label = _hop(cfg, b.ex, b.net, s.ex, s.net, b.asset)
+        fee, label = _hop(cfg, b.ex, b.net, s.ex, s.net, b.asset)
+        if fee is None:
+            return None
         steps.append(label or "внутри биржи")
     else:
         if "USDT" not in (b.asset, s.asset):
@@ -510,12 +540,16 @@ def _route(b, s, cfg, spot, over_banks=frozenset()):
         venue = next((v for v in (b.ex, s.ex) + SPOT_VENUES if v in SPOT_VENUES and alt in spot.get(v, {})), None)
         if not venue:
             return None
-        _, label = _hop(cfg, b.ex, b.net, venue, "", b.asset)
+        fee, label = _hop(cfg, b.ex, b.net, venue, "", b.asset)
+        if fee is None:
+            return None
         if label:
             steps.append(label)
         sf = _spot_fee(cfg, venue)
         steps.append(f"спот {b.asset}→{s.asset} на {venue} (−{sf:g}%)")
-        _, label = _hop(cfg, venue, "", s.ex, s.net, s.asset)
+        fee, label = _hop(cfg, venue, "", s.ex, s.net, s.asset)
+        if fee is None:
+            return None
         if label:
             steps.append(label)
     vol = max(cfg.risk_buffer.get(b.asset, 0), cfg.risk_buffer.get(s.asset, 0))
@@ -578,7 +612,12 @@ async def scan(s, cfg, force_alt=False):
             for side in ("buy", "sell")]
     ref_task = asyncio.ensure_future(rapira_mid(s)) if cfg.fiat == "RUB" else None
     spot_task = asyncio.ensure_future(spot_prices(s, cfg.assets))
+    net_task = asyncio.ensure_future(netstatus.refresh_if_due(s, cfg.assets, cfg.exchanges, _json))
     res = await asyncio.gather(*(FETCHERS[n](s, cfg, side, asset) for n, side, asset in jobs), return_exceptions=True)
+    try:
+        net_errors = await net_task or {}
+    except Exception as e:
+        net_errors = {"сети": f"{type(e).__name__}: {e}"[:80]}
 
     ads, errors, alt_ads, alt_errors = [], {}, [], {}
     for (n, _, asset), r in zip(jobs, res):
@@ -606,6 +645,7 @@ async def scan(s, cfg, force_alt=False):
     except Exception as e:
         spot = {"Bybit": {"USDT": (1.0, 1.0)}}
         errors["spot"] = f"{type(e).__name__}: {e}"[:120]
+    errors.update({f"сети/{k}": v for k, v in net_errors.items()})
     refs = {}
     for a in cfg.assets:
         mid = _mid(spot, a)
