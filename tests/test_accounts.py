@@ -107,3 +107,90 @@ def test_mexc_get_signs_and_builds_url():
     assert j["url"].startswith("https://api.mexc.com/api/v3/account?")
     assert "signature=" in j["url"]
     assert j["headers"] == {"X-MEXC-APIKEY": "k"}
+
+
+def test_save_key_then_keys_and_mask(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "sub" / "keys.json"))
+    accounts.save_key("bybit", "abcd1234efgh", "secretval")
+    assert accounts.keys("bybit") == ("abcd1234efgh", "secretval")
+    assert accounts.mask("abcd1234efgh") == "•••efgh"
+
+
+def test_save_key_overwrites_only_that_exchange(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    accounts.save_key("bybit", "k1", "s1")
+    accounts.save_key("mexc", "k2", "s2")
+    assert accounts.keys("bybit") == ("k1", "s1")
+    assert accounts.keys("mexc") == ("k2", "s2")
+
+
+def test_delete_key_removes_saved_entry(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    accounts.save_key("bybit", "k1", "s1")
+    assert accounts.delete_key("bybit") is True
+    assert accounts.keys("bybit") is None
+    assert accounts.delete_key("bybit") is False
+
+
+def test_mask_short_key_falls_back():
+    assert accounts.mask("") == "••••"
+    assert accounts.mask("abc") == "••••"
+
+
+class _JsonResp:
+    def __init__(self, body):
+        self.body = body
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+    def raise_for_status(self):
+        pass
+
+    async def json(self, content_type=None):
+        return self.body
+
+
+class _JsonSession:
+    def __init__(self, body):
+        self.body = body
+
+    def get(self, url, headers=None):
+        return _JsonResp(self.body)
+
+
+def test_verify_no_keys_saved(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    ok, msg = asyncio.run(accounts.verify(_JsonSession({}), "bybit"))
+    assert not ok and "не сохранён" in msg
+
+
+def test_verify_bybit_ok(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    accounts.save_key("bybit", "k", "s")
+    ok, msg = asyncio.run(accounts.verify(_JsonSession({"retCode": 0, "result": {}}), "bybit"))
+    assert ok and "чтени" in msg
+
+
+def test_verify_bybit_bad_key(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    accounts.save_key("bybit", "k", "s")
+    ok, msg = asyncio.run(accounts.verify(_JsonSession({"retCode": 10003, "retMsg": "Invalid api_key"}), "bybit"))
+    assert not ok and "Invalid api_key" in msg
+
+
+def test_verify_mexc_ok(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    accounts.save_key("mexc", "k", "s")
+    ok, msg = asyncio.run(accounts.verify(_JsonSession({"balances": []}), "mexc"))
+    assert ok
+
+
+def test_verify_unsupported_exchange(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    accounts.save_key("htx", "k", "s")
+    ok, msg = asyncio.run(accounts.verify(_JsonSession({}), "htx"))
+    assert not ok and "не реализована" in msg

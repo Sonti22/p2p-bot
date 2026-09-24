@@ -9,6 +9,7 @@ import time
 
 import aiohttp
 
+import accounts
 import trades
 from cards import deal_card, top_chart
 from p2p import AMOUNT_MAX, AMOUNT_MIN, ENV_PATH, Config, _money, deal_amounts, fmt_deal, fmt_top, load_env, \
@@ -62,6 +63,7 @@ AMOUNT_PRESETS = (25000, 50000, 100000, 200000)
 VENUE_DOWN_AFTER = 900      # сек: площадка отдаёт ошибку дольше — алерт, даже если сканы не подряд
 VENUE_FAIL_STREAK = 3       # или столько сканов подряд с ошибкой
 VENUE_ALERT_COOLDOWN = 3600  # не чаще раза в час на площадку
+EXCHANGE_NAMES = {"bybit": "Bybit", "mexc": "MEXC", "htx": "HTX", "kucoin": "KuCoin", "bitpapa": "BitPapa"}
 
 
 def save_env(key, value, path=ENV_PATH):
@@ -88,6 +90,43 @@ def deal_markup(d, deal_id=None):
         rows.append([{"text": "✅ Сделал", "callback_data": f"did:{deal_id}"}])
     rows.append([{"text": "📊 Все связки", "callback_data": "top"}, {"text": "🔄 Обновить", "callback_data": "best"}])
     return {"inline_keyboard": rows}
+
+
+def accounts_view(cfg):
+    """Текст и кнопки раздела «🔑 Мои биржи»: список бирж со статусом подключения."""
+    lines = ["🔑 <b>Мои биржи</b>", "",
+             "Только чтение: балансы, история. Торговых ордеров, выводов и P2P-действий бот не делает.", ""]
+    rows = []
+    for ex in cfg.exchanges:
+        name = EXCHANGE_NAMES.get(ex)
+        if not name:
+            continue
+        connected = accounts.keys(ex) is not None
+        lines.append(f"{'✅' if connected else '➖'} {name}")
+        rows.append([{"text": f"{'✅' if connected else '➖'} {name}", "callback_data": f"acc:{ex}"}])
+    rows.append([{"text": "⚙️ Настройки", "callback_data": "settings"}])
+    return "\n".join(lines), {"inline_keyboard": rows}
+
+
+def account_view(ex):
+    """Текст и кнопки карточки одной биржи: статус, «Проверить»/«Удалить» или «Подключить»."""
+    name = EXCHANGE_NAMES.get(ex, ex)
+    pair = accounts.keys(ex)
+    back = {"text": "⬅️ Мои биржи", "callback_data": "accounts"}
+    if pair:
+        text = (f"🔑 <b>{name}</b>\n\nКлюч подключён: <code>{accounts.mask(pair[0])}</code>\n"
+                f"Доступ: только чтение.")
+        kb = [[{"text": "🔄 Проверить", "callback_data": f"acc_check:{ex}"}],
+              [{"text": "🗑 Удалить ключ", "callback_data": f"acc_del:{ex}"}], [back]]
+    elif ex in accounts.CONNECTABLE:
+        text = (f"🔑 <b>{name}</b>\n\nКлюч не подключён.\n\n"
+                f"Создай в личном кабинете {name} API-ключ <b>только для чтения</b> (без торговли и выводов), "
+                f"по возможности ограничь его по IP.")
+        kb = [[{"text": "➕ Подключить", "callback_data": f"acc_add:{ex}"}], [back]]
+    else:
+        text = f"🔑 <b>{name}</b>\n\nПодключение ключа пока не реализовано."
+        kb = [[back]]
+    return text, {"inline_keyboard": kb}
 
 
 def roadmap_progress(path=os.path.join(HERE, "ROADMAP.md")):
@@ -147,6 +186,7 @@ class Bot:
         self.last = None
         self.paused = False
         self.awaiting_amount = False  # ждём сумму текстом после «✏️ Своя сумма»
+        self.awaiting_key = None      # {"ex":.., "step": "key"/"secret", "key":..} — ждём ключ биржи
         self.sent = {}
         self.venue = {}   # ex -> {"streak": сканов подряд с ошибкой, "down_since": ts, "alerted_at": ts}
         self.deals_by_id = {}   # id -> (d, сумма круга) для кнопки «✅ Сделал»; не переживает рестарт
@@ -280,6 +320,7 @@ class Bot:
         kb = [[{"text": mark(c.min_profit == v, f"{v}%"), "callback_data": f"min:{v}"} for v in MIN_PRESETS],
               [{"text": mark(c.amount == v, f"{v // 1000}к"), "callback_data": f"amt:{v}"} for v in AMOUNT_PRESETS],
               [{"text": "✏️ Своя сумма", "callback_data": "amt_custom"}],
+              [{"text": "🔑 Мои биржи", "callback_data": "accounts"}],
               [{"text": "▶️ Возобновить" if self.paused else "⏸ Пауза", "callback_data": "resume" if self.paused else "pause"}]]
         return text, {"inline_keyboard": kb}
 
@@ -295,6 +336,24 @@ class Bot:
         self.last = snap
         await self.show_top(snap)
         await self.show_best(snap)
+
+    async def handle_key_input(self, text, message_id):
+        """Ввод API key/secret после «➕ Подключить»: сообщение с ключом удаляется из чата сразу же."""
+        state = self.awaiting_key
+        if message_id is not None:
+            await self.call("deleteMessage", chat_id=self.chat_id, message_id=message_id)
+        name = EXCHANGE_NAMES.get(state["ex"], state["ex"])
+        if state["step"] == "key":
+            state["key"] = text.strip()
+            state["step"] = "secret"
+            await self.send(f"Ключ получен, сообщение удалено. Теперь пришли <b>secret</b> для {name}.")
+            return
+        self.awaiting_key = None
+        accounts.save_key(state["ex"], state["key"], text.strip())
+        ok, msg = await accounts.verify(self.s, state["ex"])
+        await self.send("✅ Подключено (только чтение)" if ok else f"⚠️ Ключ сохранён, но проверка не прошла: {msg}")
+        t, kb = account_view(state["ex"])
+        await self.send(t, markup=kb)
 
     def apply(self, data):
         if data.startswith("min:"):
@@ -390,7 +449,11 @@ class Bot:
             print("chat_id сохранён в .env:", chat)
             await self.welcome()
         elif chat == self.chat_id:
-            await self.handle((msg.get("text") or "").strip())
+            text = (msg.get("text") or "").strip()
+            if self.awaiting_key and text and text not in BUTTONS and not text.startswith("/"):
+                await self.handle_key_input(text, msg.get("message_id"))
+            else:
+                await self.handle(text)
 
     async def welcome(self):
         await self.send("👋 <b>Бот P2P-связок на связи.</b>\n\n"
@@ -403,6 +466,8 @@ class Bot:
         data = cq.get("data", "")
         if data != "amt_custom":
             self.awaiting_amount = False   # любая другая кнопка сбрасывает ожидание суммы
+        if not data.startswith("acc_add:"):
+            self.awaiting_key = None       # любая другая кнопка прерывает ввод ключа
         toast = self.apply(data)
         await self.call("answerCallbackQuery", callback_query_id=cq["id"], text=toast)
         if toast:
@@ -427,6 +492,29 @@ class Bot:
             self.awaiting_amount = True
             await self.send(f"Введи сумму круга текстом, например 20000 или 1,5 млн "
                             f"(от {_money(AMOUNT_MIN)} до {_money(AMOUNT_MAX)} ₽).")
+        elif data == "accounts":
+            t, kb = accounts_view(self.cfg)
+            await self.send(t, markup=kb)
+        elif data.startswith("acc_add:"):
+            ex = data[8:]
+            name = EXCHANGE_NAMES.get(ex, ex)
+            self.awaiting_key = {"ex": ex, "step": "key"}
+            await self.send(f"Создай в личном кабинете {name} API-ключ <b>только для чтения</b> "
+                            f"(без торговли и выводов), по возможности ограничь его по IP.\n"
+                            f"Пришли <b>API key</b> — сообщение с ним сразу удалю из чата.")
+        elif data.startswith("acc_check:"):
+            ex = data[10:]
+            ok, msg = await accounts.verify(self.s, ex)
+            await self.send("✅ Ключ рабочий (только чтение)" if ok else f"⚠️ {msg}")
+        elif data.startswith("acc_del:"):
+            ex = data[8:]
+            accounts.delete_key(ex)
+            await self.send("🗑 Ключ удалён")
+            t, kb = account_view(ex)
+            await self.send(t, markup=kb)
+        elif data.startswith("acc:"):
+            t, kb = account_view(data[4:])
+            await self.send(t, markup=kb)
 
     async def handle(self, text):
         if self.awaiting_amount:
@@ -434,6 +522,7 @@ class Bot:
             if text not in BUTTONS and not text.startswith("/"):
                 await self.set_custom_amount(text)
                 return
+        self.awaiting_key = None               # команда/кнопка прерывает ввод ключа биржи
         cmd, _, arg = BUTTONS.get(text, text).partition(" ")
         cmd = cmd.split("@")[0]
         if cmd == "/start":

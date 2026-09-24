@@ -15,6 +15,7 @@ from urllib.parse import urlencode
 KEYS_PATH = os.path.join("data", "keys.json")
 BYBIT_BASE = "https://api.bybit.com"
 MEXC_BASE = "https://api.mexc.com"
+CONNECTABLE = ("bybit", "mexc")   # биржи, для которых уже есть подпись запросов (HTX/KuCoin — позже)
 
 
 def _keys_file():
@@ -32,6 +33,31 @@ def keys(exchange):
     key = saved.get("key") or os.getenv(f"{exchange.upper()}_API_KEY")
     secret = saved.get("secret") or os.getenv(f"{exchange.upper()}_API_SECRET")
     return (key, secret) if key and secret else None
+
+
+def save_key(exchange, key, secret):
+    """Сохранить ключ биржи в data/keys.json (создаёт папку/файл при необходимости)."""
+    data = _keys_file()
+    data[exchange.lower()] = {"key": key, "secret": secret}
+    os.makedirs(os.path.dirname(KEYS_PATH), exist_ok=True)
+    with open(KEYS_PATH, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def delete_key(exchange):
+    """Удалить сохранённый ключ биржи из data/keys.json, если он там есть."""
+    data = _keys_file()
+    if data.pop(exchange.lower(), None) is None:
+        return False
+    os.makedirs(os.path.dirname(KEYS_PATH), exist_ok=True)
+    with open(KEYS_PATH, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    return True
+
+
+def mask(key):
+    """Ключ обратно не показываем — только последние 4 символа."""
+    return "•••" + key[-4:] if key and len(key) > 4 else "••••"
 
 
 def bybit_headers(api_key, api_secret, params=None, recv_window="5000", timestamp=None):
@@ -76,3 +102,26 @@ async def mexc_get(s, api_key, api_secret, path, params=None):
     signed = mexc_signed_params(api_secret, params)
     url = f"{MEXC_BASE}{path}?{urlencode(signed)}"
     return await _get_json(s, url, {"X-MEXC-APIKEY": api_key})
+
+
+async def verify(s, exchange):
+    """Проверить сохранённый ключ биржи запросом баланса: (ok, сообщение для пользователя)."""
+    ex = exchange.lower()
+    pair = keys(ex)
+    if not pair:
+        return False, "ключ не сохранён"
+    api_key, api_secret = pair
+    try:
+        if ex == "bybit":
+            j = await bybit_get(s, api_key, api_secret, "/v5/account/wallet-balance", {"accountType": "UNIFIED"})
+            if j.get("retCode") != 0:
+                return False, j.get("retMsg", "ошибка Bybit")
+        elif ex == "mexc":
+            j = await mexc_get(s, api_key, api_secret, "/api/v3/account")
+            if "balances" not in j:
+                return False, j.get("msg", "ошибка MEXC")
+        else:
+            return False, f"{exchange}: подпись запросов пока не реализована"
+    except Exception as e:
+        return False, str(e)
+    return True, "ключ рабочий, доступ только для чтения"
