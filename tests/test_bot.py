@@ -568,3 +568,57 @@ def test_balance_callback_refreshes(monkeypatch):
     bot = Stub(p2p.Config())
     asyncio.run(bot.on_callback({"id": "1", "data": "balance", "message": {"message_id": 1}}))
     assert any("Баланс" in p.get("text", "") for m, p in bot.out if m == "sendMessage")
+
+
+def test_hist_text_formats_each_kind():
+    dep = {"kind": "deposit", "asset": "USDT", "amount": 100.0, "ts": 1.0}
+    wd = {"kind": "withdraw", "asset": "USDT", "amount": 50.0, "ts": 1.0}
+    trade = {"kind": "trade", "asset": "TON", "side": "buy", "amount": 10.0, "price": 3.5, "ts": 1.0}
+    p2p_order = {"id": "1", "side": "sell", "asset": "USDT", "fiat": "RUB", "amount": 20.0, "price": 88.0, "ts": 1.0}
+    assert "пришёл депозит" in B.hist_text("mexc", dep) and "100" in B.hist_text("mexc", dep)
+    assert "исполнен вывод" in B.hist_text("mexc", wd)
+    assert "купил" in B.hist_text("mexc", trade) and "TON" in B.hist_text("mexc", trade)
+    assert "продал" in B.hist_text("bybit", p2p_order) and "RUB" in B.hist_text("bybit", p2p_order)
+
+
+def test_hist_key_uses_id_or_composite():
+    assert B.hist_key({"id": "42", "kind": "trade"}) == "42"
+    a = {"kind": "deposit", "asset": "USDT", "amount": 100.0, "ts": 1.0}
+    b = {"kind": "deposit", "asset": "USDT", "amount": 100.0, "ts": 2.0}
+    assert B.hist_key(a) != B.hist_key(b)
+
+
+def test_check_accounts_first_poll_is_silent_then_new_items_notify(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    accounts.save_key("mexc", "k", "s")
+    hist = [{"kind": "deposit", "asset": "USDT", "amount": 100.0, "ts": 1.0}]
+
+    async def fake_history(s, ex, limit=20):
+        return hist if ex == "mexc" else None
+
+    monkeypatch.setattr(B.accounts, "account_history", fake_history)
+    bot = Stub(p2p.Config())
+    asyncio.run(bot.check_accounts())
+    assert texts(bot) == []          # первый опрос — только запоминаем
+
+    hist.append({"kind": "withdraw", "asset": "USDT", "amount": 30.0, "ts": 2.0})
+    asyncio.run(bot.check_accounts())
+    msgs = texts(bot)
+    assert len(msgs) == 1 and "исполнен вывод" in msgs[0]
+
+    asyncio.run(bot.check_accounts())
+    assert len(texts(bot)) == 1       # повтор той же истории не шлём
+
+
+def test_check_accounts_skips_exchanges_without_saved_key(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    calls = []
+
+    async def fake_history(s, ex, limit=20):
+        calls.append(ex)
+        return None
+
+    monkeypatch.setattr(B.accounts, "account_history", fake_history)
+    bot = Stub(p2p.Config())
+    asyncio.run(bot.check_accounts())
+    assert calls == []

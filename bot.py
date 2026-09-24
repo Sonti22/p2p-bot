@@ -65,6 +65,7 @@ VENUE_DOWN_AFTER = 900      # сек: площадка отдаёт ошибку
 VENUE_FAIL_STREAK = 3       # или столько сканов подряд с ошибкой
 VENUE_ALERT_COOLDOWN = 3600  # не чаще раза в час на площадку
 EXCHANGE_NAMES = {"bybit": "Bybit", "mexc": "MEXC", "htx": "HTX", "kucoin": "KuCoin", "bitpapa": "BitPapa"}
+ACCOUNT_POLL_INTERVAL = int(os.getenv("ACCOUNT_POLL_INTERVAL", 60))  # опрос истории аккаунтов, сек
 KEY_HINT = {
     "bybit": ("Создай ключ на Bybit: Профиль → API → Create New Key → System-generated API Keys. "
               "Права — только «Read-Only» (сними «Trade» и «Withdrawal»), в IP access whitelist впиши IP своего ПК."),
@@ -107,6 +108,24 @@ def deal_markup(d, deal_id=None):
         rows.append([{"text": "✅ Сделал", "callback_data": f"did:{deal_id}"}])
     rows.append([{"text": "📊 Все связки", "callback_data": "top"}, {"text": "🔄 Обновить", "callback_data": "best"}])
     return {"inline_keyboard": rows}
+
+
+def hist_key(it):
+    """Уникальный ключ записи истории аккаунта для отсева повторов (id у Bybit P2P, иначе состав+время)."""
+    return it.get("id") or f"{it.get('kind')}:{it.get('asset')}:{it.get('amount')}:{it.get('ts')}"
+
+
+def hist_text(ex, it):
+    """Текст уведомления о новом движении по счёту: депозит/вывод, спот-сделка или P2P-ордер Bybit."""
+    name = EXCHANGE_NAMES.get(ex, ex)
+    if "fiat" in it:   # P2P-ордер Bybit: {id, side, asset, fiat, amount, price, ts}
+        arrow = "купил" if it["side"] == "buy" else "продал"
+        return f"💱 {name} P2P: {arrow} {it['amount']:g} {it['asset']} за {it['fiat']}"
+    if it.get("kind") == "trade":
+        arrow = "купил" if it["side"] == "buy" else "продал"
+        return f"💱 {name}: {arrow} {it['amount']:g} {it['asset']} по {it['price']:g}"
+    label = {"deposit": "пришёл депозит", "withdraw": "исполнен вывод"}.get(it.get("kind"), it.get("kind"))
+    return f"💰 {name}: {label} — {it['amount']:g} {it['asset']}"
 
 
 def accounts_view(cfg):
@@ -241,6 +260,7 @@ class Bot:
         self.venue = {}   # ex -> {"streak": сканов подряд с ошибкой, "down_since": ts, "alerted_at": ts}
         self.deals_by_id = {}   # id -> (d, сумма круга) для кнопки «✅ Сделал»; не переживает рестарт
         self.next_deal_id = 1
+        self.acc_seen = {}   # ex -> set известных ключей истории; None пока не было первого опроса
 
     async def call(self, method, **params):
         async with self.s.post(f"https://api.telegram.org/bot{self.token}/{method}", json=params,
@@ -485,6 +505,37 @@ class Bot:
             self.sent[key] = (now, profit)
             await self.send_deal(d, "🔔 ", snap=snap)
 
+    async def check_accounts(self):
+        """Уведомление о новых движениях по подключённым биржам: депозит, вывод, спот-сделка, P2P-ордер.
+
+        Первый опрос после старта только запоминает текущую историю (без сообщений, чтобы не спамить
+        старыми записями) — дальше в Telegram уходят только записи, которых не было в прошлый раз."""
+        for ex in accounts.ONBOARDABLE:
+            if accounts.keys(ex) is None:
+                continue
+            try:
+                hist = await accounts.account_history(self.s, ex)
+            except Exception as e:
+                print("account history error:", ex, e)
+                continue
+            if not hist:
+                continue
+            seen = self.acc_seen.get(ex)
+            if seen is not None:
+                for it in hist:
+                    if hist_key(it) not in seen:
+                        await self.send(hist_text(ex, it))
+            self.acc_seen[ex] = {hist_key(it) for it in hist}
+
+    async def accounts_loop(self):
+        while True:
+            if self.chat_id:
+                try:
+                    await self.check_accounts()
+                except Exception as e:
+                    print("accounts_loop error:", e)
+            await asyncio.sleep(ACCOUNT_POLL_INTERVAL)
+
     async def command_loop(self):
         offset = 0
         while True:
@@ -668,7 +719,7 @@ async def main():
         if bot.chat_id:
             await bot.check_key_safety()
         print(f"Бот запущен: каждые {cfg.interval}s, порог {cfg.min_profit:g}%, биржи {', '.join(cfg.exchanges)}")
-        await asyncio.gather(bot.scan_loop(), bot.command_loop())
+        await asyncio.gather(bot.scan_loop(), bot.command_loop(), bot.accounts_loop())
 
 
 if __name__ == "__main__":
