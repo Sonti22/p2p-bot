@@ -17,6 +17,7 @@ BUTTONS = {"🔥 Лучшая сейчас": "/best", "📊 Топ связок"
 COMMANDS = [{"command": "best", "description": "Лучшая связка сейчас"},
             {"command": "top", "description": "Топ связок графиком"},
             {"command": "settings", "description": "Порог, сумма, пауза"},
+            {"command": "status", "description": "Версия, аптайм, последний скан"},
             {"command": "help", "description": "Как работать с сигналами"}]
 DESCRIPTION = ("Сканирую P2P Bybit, MEXC, HTX, KuCoin, BitPapa и обменники BestChange. "
                "Присылаю связки USDT, USDC, BTC, ETH, TON за рубли: чистая прибыль, карточка, ссылки на площадки.")
@@ -48,6 +49,36 @@ LINKS = {"inline_keyboard": [
 WAIT = "Первый скан ещё идёт, подожди пару секунд."
 MIN_PRESETS = (1, 2, 3, 5)
 AMOUNT_PRESETS = (25000, 50000, 100000, 200000)
+
+
+def git_sha():
+    """Короткий SHA текущего коммита без subprocess: читаем .git/HEAD и ссылку на неё."""
+    root = os.path.dirname(os.path.abspath(__file__))
+    try:
+        head = open(os.path.join(root, ".git", "HEAD"), encoding="utf-8").read().strip()
+        if not head.startswith("ref:"):
+            return head[:7] or "unknown"
+        ref = head[5:].strip()
+        ref_path = os.path.join(root, ".git", ref)
+        if os.path.exists(ref_path):
+            sha = open(ref_path, encoding="utf-8").read().strip()
+        else:
+            packed = open(os.path.join(root, ".git", "packed-refs"), encoding="utf-8").read()
+            sha = next((l.split()[0] for l in packed.splitlines() if l.endswith(" " + ref)), "")
+        return sha[:7] if sha else "unknown"
+    except OSError:
+        return "unknown"
+
+
+def _duration(seconds):
+    seconds = max(0, int(seconds))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}ч {m}м"
+    if m:
+        return f"{m}м {s}с"
+    return f"{s}с"
 
 
 def save_env(key, value, path=ENV_PATH):
@@ -88,6 +119,9 @@ class Bot:
         self.last = None
         self.paused = False
         self.sent = {}
+        self.started = time.time()
+        self.scan_at = None       # время окончания последнего скана
+        self.scan_dur = None      # сколько скан длился, сек
 
     async def call(self, method, **params):
         async with self.s.post(f"https://api.telegram.org/bot{self.token}/{method}", json=params,
@@ -176,12 +210,31 @@ class Bot:
     async def scan_loop(self):
         while True:
             try:
+                t0 = time.time()
                 self.last = await scan(self.s, self.cfg)
+                self.scan_at, self.scan_dur = time.time(), time.time() - t0
                 if self.chat_id and not self.paused:
                     await self.notify(self.last)
             except Exception as e:
                 print("scan error:", e)
             await asyncio.sleep(self.cfg.interval)
+
+    async def show_status(self):
+        now = time.time()
+        lines = ["🩺 <b>Статус бота</b>", "", f"Версия: <code>{git_sha()}</code>",
+                 f"Аптайм: {_duration(now - self.started)}"]
+        if self.scan_at:
+            lines.append(f"Последний скан: {_duration(now - self.scan_at)} назад, длился {self.scan_dur:.1f} с")
+        else:
+            lines.append("Последний скан: ещё не выполнялся")
+        if self.last:
+            above = sum(1 for d in self.last.deals if d[0] >= self.cfg.min_profit)
+            lines.append(f"Связок ≥{self.cfg.min_profit:g}%: {above} из {len(self.last.deals)}")
+            lines.append("Ошибки площадок: " + ("; ".join(f"{k}: {v}" for k, v in self.last.errors.items())
+                                                 if self.last.errors else "нет"))
+        else:
+            lines.append("Связки: нет данных")
+        await self.send("\n".join(lines))
 
     async def notify(self, snap):
         now = time.time()
@@ -271,6 +324,8 @@ class Bot:
         elif cmd == "/settings":
             text, kb = self.settings_view()
             await self.send(text, markup=kb)
+        elif cmd == "/status":
+            await self.show_status()
         elif cmd in ("/min", "/amount") and arg:
             try:
                 v = float(arg.replace(",", ".").replace(" ", ""))

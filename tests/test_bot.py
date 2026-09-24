@@ -73,3 +73,34 @@ def test_deal_markup_links():
 def test_fmt_top_fits_telegram():
     ds = [deal(5 - i * 0.1) for i in range(30)]
     assert len(p2p.fmt_top(snap(ds), p2p.Config(), n=30)) <= 4000
+
+
+def test_duration_formats():
+    assert B._duration(45) == "45с"
+    assert B._duration(125) == "2м 5с"
+    assert B._duration(3725) == "1ч 2м"
+
+
+def test_git_sha_reads_current_commit():
+    import re
+    assert re.fullmatch(r"[0-9a-f]{7}", B.git_sha())
+
+
+def test_status_reports_scan_and_errors(monkeypatch):
+    monkeypatch.setattr(B.time, "time", lambda: 1010.0)
+    bot = Stub(p2p.Config(min_profit=2.0))
+    bot.started, bot.scan_at, bot.scan_dur = 900.0, 1000.0, 0.5
+    bot.last = snap([deal(5), deal(1)])
+    bot.last.errors["bybit/USDT"] = "TimeoutError: x"
+    asyncio.run(bot.show_status())
+    text = bot.out[-1][1]["text"]
+    assert "Связок ≥2%: 1 из 2" in text
+    assert "bybit/USDT: TimeoutError: x" in text
+    assert "10с назад, длился 0.5 с" in text
+    assert "Аптайм: 1м 50с" in text
+
+
+def test_status_before_first_scan():
+    bot = Stub(p2p.Config())
+    asyncio.run(bot.show_status())
+    assert "ещё не выполнялся" in bot.out[-1][1]["text"]
