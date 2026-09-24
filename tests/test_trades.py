@@ -1,3 +1,4 @@
+import sqlite3
 import time
 
 import trades
@@ -22,7 +23,8 @@ def test_log_and_stats_within_periods(tmp_path):
 
 def test_stats_empty_db_missing_file(tmp_path):
     st = trades.stats(path=str(tmp_path / "none.db"))
-    assert all(s == {"count": 0, "amount": 0.0, "avg_profit": 0.0} for s in st.values())
+    assert all(s == {"count": 0, "amount": 0.0, "avg_profit": 0.0,
+                     "fact_count": 0, "avg_fact": None, "avg_diff": None} for s in st.values())
 
 
 def test_sbp_bank_detects_known_names():
@@ -34,18 +36,19 @@ def test_sbp_bank_detects_known_names():
 def test_log_trade_warns_once_when_bank_crosses_limit(tmp_path):
     db = str(tmp_path / "trades.db")
     now = time.time()
-    _, total1, crossed1 = trades.log_trade(deal(), 60000, path=db, ts=now)      # 60к — ниже лимита
+    id1, _, total1, crossed1 = trades.log_trade(deal(), 60000, path=db, ts=now)      # 60к — ниже лимита
     assert total1 == 60000 and not crossed1
-    bank2, total2, crossed2 = trades.log_trade(deal(), 60000, path=db, ts=now)  # 120к — пересекли 100к
+    id2, bank2, total2, crossed2 = trades.log_trade(deal(), 60000, path=db, ts=now)  # 120к — пересекли 100к
     assert bank2 == "T-Bank" and total2 == 120000 and crossed2
-    _, total3, crossed3 = trades.log_trade(deal(), 10000, path=db, ts=now)      # уже выше лимита, не повторяем
+    assert id2 != id1                                                           # каждая сделка — свой id
+    _, _, total3, crossed3 = trades.log_trade(deal(), 10000, path=db, ts=now)   # уже выше лимита, не повторяем
     assert total3 == 130000 and not crossed3
 
 
 def test_log_trade_no_bank_when_pay_method_unknown(tmp_path):
     db = str(tmp_path / "trades.db")
     d = (2.0, make_ad("Bybit", "buy", 85.0, pays=("Payeer",)), make_ad("MEXC", "sell", 90.0), "маршрут")
-    bank, total, crossed = trades.log_trade(d, 500000, path=db, ts=time.time())
+    _, bank, total, crossed = trades.log_trade(d, 500000, path=db, ts=time.time())
     assert bank == "" and total == 500000 and not crossed
 
 
@@ -65,3 +68,60 @@ def test_bank_month_total_excludes_previous_month(tmp_path):
     assert trades.bank_month_total("T-Bank", path=db, now=now) == 0.0
     trades.log_trade(deal(), 40000, path=db, ts=now)
     assert trades.bank_month_total("T-Bank", path=db, now=now) == 40000
+
+
+def test_parse_fact_percent():
+    assert trades.parse_fact("+1.2%", 50000) == 1.2
+    assert trades.parse_fact("-0.5%", 50000) == -0.5
+    assert trades.parse_fact("1,2%", 50000) == 1.2       # запятая как разделитель
+    assert trades.parse_fact("2%", 50000) == 2.0
+
+
+def test_parse_fact_bare_number_is_percent_when_small():
+    assert trades.parse_fact("1.2", 50000) == 1.2
+    assert trades.parse_fact("-0.5", 50000) == -0.5
+    assert trades.parse_fact("50", 50000) == 50.0        # граница — ещё проценты
+
+
+def test_parse_fact_rubles_explicit_and_bare_large_number():
+    assert trades.parse_fact("650 ₽", 50000) == 650 / 50000 * 100
+    assert trades.parse_fact("650р", 50000) == 650 / 50000 * 100
+    assert trades.parse_fact("-300 руб", 50000) == -300 / 50000 * 100
+    assert trades.parse_fact("-300", 50000) == -300 / 50000 * 100   # без единицы, но крупное число — ₽
+
+
+def test_parse_fact_rubles_without_amount_is_none():
+    assert trades.parse_fact("650 ₽", 0) is None
+    assert trades.parse_fact("-300", None) is None
+
+
+def test_parse_fact_garbage_is_none():
+    for garbage in ("", "ерунда", "1.2.3", "%", "₽", "abc%", None):
+        assert trades.parse_fact(garbage, 50000) is None
+
+
+def test_get_trade_and_set_fact(tmp_path):
+    db = str(tmp_path / "trades.db")
+    trade_id, *_ = trades.log_trade(deal(2.5), 50000, path=db)
+    assert trades.get_trade(trade_id, path=db) == {"amount": 50000.0, "profit": 2.5}
+    assert trades.get_trade(999, path=db) is None
+    assert trades.set_fact(trade_id, 3.0, path=db) is True
+    assert trades.get_trade(trade_id, path=db)["profit"] == 2.5   # факт не трогает расчётный %
+    con = sqlite3.connect(db)
+    fact, = con.execute("SELECT fact FROM trades WHERE id = ?", (trade_id,)).fetchone()
+    con.close()
+    assert fact == 3.0
+    assert trades.set_fact(999, 1.0, path=db) is False
+
+
+def test_stats_reports_calc_vs_fact(tmp_path):
+    db = str(tmp_path / "trades.db")
+    now = time.time()
+    id1, *_ = trades.log_trade(deal(2.0), 50000, path=db, ts=now)
+    trades.log_trade(deal(4.0), 50000, path=db, ts=now)   # без факта
+    trades.set_fact(id1, 1.5, path=db)                    # факт хуже расчёта на 0.5 п.п.
+    st = trades.stats(path=db, now=now)
+    assert st["day"]["count"] == 2
+    assert st["day"]["fact_count"] == 1
+    assert st["day"]["avg_fact"] == 1.5
+    assert round(st["day"]["avg_diff"], 4) == -0.5

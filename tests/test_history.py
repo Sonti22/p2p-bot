@@ -140,3 +140,41 @@ def test_median_vs_bestchange_separates_groups_by_day(tmp_path):
 def test_median_vs_bestchange_empty_db():
     labels, p2p_med, bc_med = history.median_vs_bestchange("Z:/does/not/exist.db")
     assert labels == [] and p2p_med == [] and bc_med == []
+
+
+def test_backtest_counts_hits_and_computes_avg_median(tmp_path):
+    db = str(tmp_path / "history.db")
+    now = BASE + 40 * 86400
+    rows = [
+        (now - 1 * 86400, "Bybit", "MEXC", "USDT", "USDT", 3.0, 88.0),   # >= порога 2%
+        (now - 2 * 86400, "Bybit", "MEXC", "USDT", "USDT", 5.0, 88.0),   # >= порога
+        (now - 3 * 86400, "Bybit", "MEXC", "USDT", "USDT", 1.0, 88.0),   # < порога — не попадает в hits
+        (now - 1 * 86400, "HTX", "KuCoin", "USDT", "USDT", 10.0, 88.0),  # другая пара, 1 попадание за 7д
+        (now - 20 * 86400, "HTX", "KuCoin", "USDT", "USDT", 10.0, 88.0),  # видно только за 30д
+    ]
+    history._insert(rows, db)
+    data = history.backtest(2.0, 50000, path=db, now=now)
+    by_pair_7 = {(r["buy_ex"], r["sell_ex"]): r for r in data[7]}
+    bybit_mexc = by_pair_7[("Bybit", "MEXC")]
+    assert bybit_mexc["hits"] == 2 and bybit_mexc["total"] == 3
+    assert bybit_mexc["avg"] == 4.0 and bybit_mexc["median"] == 4.0
+    assert bybit_mexc["est_rub"] == 4.0 / 100 * 50000
+    assert by_pair_7[("HTX", "KuCoin")]["hits"] == 1   # только запись за последние 7 дней
+    by_pair_30 = {(r["buy_ex"], r["sell_ex"]): r for r in data[30]}
+    assert by_pair_30[("HTX", "KuCoin")]["hits"] == 2   # обе записи попадают в окно 30 дней
+    # топ отсортирован по числу попаданий, лучшая пара первой
+    assert data[7][0]["hits"] >= data[7][-1]["hits"]
+
+
+def test_backtest_pair_without_hits_is_excluded(tmp_path):
+    db = str(tmp_path / "history.db")
+    now = BASE + 40 * 86400
+    history._insert([(now - 1 * 86400, "Bybit", "MEXC", "USDT", "USDT", 0.5, 88.0)], db)   # ниже порога
+    data = history.backtest(2.0, 50000, path=db, now=now)
+    assert data[7] == [] and data[30] == []
+
+
+def test_backtest_empty_history_is_empty_lists(tmp_path):
+    db = str(tmp_path / "history.db")
+    data = history.backtest(1.0, 50000, path=db)
+    assert data == {7: [], 30: []}
