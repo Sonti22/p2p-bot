@@ -43,6 +43,25 @@ def test_spot_prices_survive_one_venue_down(offline, monkeypatch):
     assert "ETH" not in spot["HTX"] and spot["KuCoin"]["ETH"][0] > 0
 
 
+def test_spot_prices_survive_garbage_ticker(offline, monkeypatch):
+    """Один тикер с нечисловой ценой не должен ронять сбор спота всей площадки — только эту монету."""
+    real = p2p._json
+
+    async def garbage_bid(s, method, url, body=None):
+        j = await real(s, method, url, body)
+        if "api.bybit.com/v5/market/tickers" in url:
+            for x in j["result"]["list"]:
+                if x["symbol"] == "ETHUSDT":
+                    x["bid1Price"] = "n/a"
+        return j
+
+    monkeypatch.setattr(p2p, "_json", garbage_bid)
+    spot = asyncio.run(p2p.spot_prices(None, ["USDT", "BTC", "ETH"]))
+    assert "ETH" not in spot["Bybit"]           # битый тикер пропущен
+    assert spot["Bybit"]["BTC"][0] > 0          # остальные монеты той же площадки не задеты
+    assert spot["KuCoin"]["ETH"][0] > 0          # другие площадки не задеты вовсе
+
+
 def _bc_zip():
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w") as z:
