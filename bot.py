@@ -146,6 +146,7 @@ class Bot:
         self.max_signals = int(os.getenv("MAX_SIGNALS", 3))      # сигналим только из топ-N
         self.last = None
         self.paused = False
+        self.awaiting_amount = False  # ждём сумму текстом после «✏️ Своя сумма»
         self.sent = {}
         self.venue = {}   # ex -> {"streak": сканов подряд с ошибкой, "down_since": ts, "alerted_at": ts}
         self.deals_by_id = {}   # id -> (d, сумма круга) для кнопки «✅ Сделал»; не переживает рестарт
@@ -274,8 +275,22 @@ class Bot:
         mark = lambda on, t: ("✅ " if on else "") + t
         kb = [[{"text": mark(c.min_profit == v, f"{v}%"), "callback_data": f"min:{v}"} for v in MIN_PRESETS],
               [{"text": mark(c.amount == v, f"{v // 1000}к"), "callback_data": f"amt:{v}"} for v in AMOUNT_PRESETS],
+              [{"text": "✏️ Своя сумма", "callback_data": "amt_custom"}],
               [{"text": "▶️ Возобновить" if self.paused else "⏸ Пауза", "callback_data": "resume" if self.paused else "pause"}]]
         return text, {"inline_keyboard": kb}
+
+    async def set_custom_amount(self, text):
+        """Ввод суммы текстом после «✏️ Своя сумма»: сохранить AMOUNT и сразу пересканировать (как /calc)."""
+        amount = parse_amount(text)
+        if amount is None:
+            await self.send(f"Не понял сумму. Пример: 20000, 1,5 млн (от {_money(AMOUNT_MIN)} до {_money(AMOUNT_MAX)} ₽).")
+            return
+        self.cfg.amount = amount
+        save_env("AMOUNT", f"{amount:.0f}")
+        snap = await scan(self.s, self.cfg, force_alt=True)
+        self.last = snap
+        await self.show_top(snap)
+        await self.show_best(snap)
 
     def apply(self, data):
         if data.startswith("min:"):
@@ -382,6 +397,8 @@ class Bot:
 
     async def on_callback(self, cq):
         data = cq.get("data", "")
+        if data != "amt_custom":
+            self.awaiting_amount = False   # любая другая кнопка сбрасывает ожидание суммы
         toast = self.apply(data)
         await self.call("answerCallbackQuery", callback_query_id=cq["id"], text=toast)
         if toast:
@@ -402,8 +419,17 @@ class Bot:
             await self.send(text, markup=kb)
         elif data.startswith("did:"):
             await self.mark_done(cq, int(data[4:]))
+        elif data == "amt_custom":
+            self.awaiting_amount = True
+            await self.send(f"Введи сумму круга текстом, например 20000 или 1,5 млн "
+                            f"(от {_money(AMOUNT_MIN)} до {_money(AMOUNT_MAX)} ₽).")
 
     async def handle(self, text):
+        if self.awaiting_amount:
+            self.awaiting_amount = False       # любая другая команда/кнопка тоже сбрасывает ожидание
+            if text not in BUTTONS and not text.startswith("/"):
+                await self.set_custom_amount(text)
+                return
         cmd, _, arg = BUTTONS.get(text, text).partition(" ")
         cmd = cmd.split("@")[0]
         if cmd == "/start":
