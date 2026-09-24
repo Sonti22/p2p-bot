@@ -464,7 +464,8 @@ def usable(a, cfg, blocked=frozenset()):
 
 def _signal_ok(a, cfg, blocked=frozenset()):
     """Фильтр объявления для стакана глубины: мерчант/способ оплаты/условия, без требования, что объём
-    покрывает всю сумму в одиночку — это делает _stack, складывая несколько объявлений."""
+    покрывает всю сумму в одиночку — это делают _stack (покупка) и _stack_qty (продажа, под фактический
+    выход монеты маршрута), складывая несколько объявлений."""
     return bool(_pays(a, cfg)) and a.orders >= cfg.min_orders and a.rate >= cfg.min_rate \
         and (a.ex, a.nick) not in blocked and not terms_flags(a.terms)[0]
 
@@ -485,10 +486,38 @@ def _stack(ads, amount):
         used.append(a)
     if remaining > 0.01 or not used:
         return None
+    return _combined(used, amount / qty, amount, qty)
+
+
+def _stack_qty(ads, qty):
+    """Сложить объявления продажи (лучшая цена первой), пока они не примут qty монеты — фактический
+    выход маршрута, а не сумму круга в фиате: при прибыли монеты на выходе больше, чем сумма / цена.
+    Синтетическое Ad: цена — средневзвешенная по проданному объёму, min_amt — выручка в фиате;
+    None — если глубины не хватает."""
+    if qty is None or qty <= 0:
+        return None
+    remaining, fiat, used = qty, 0.0, []
+    for a in ads:
+        if remaining <= 0:
+            break
+        take = min(remaining, a.avail, a.max_amt / a.price)
+        if take * a.price < a.min_amt:
+            continue   # меньше минимума этого объявления — пропускаем, берём из следующего
+        remaining -= take
+        fiat += take * a.price
+        used.append(a)
+    if remaining > qty * 1e-9 or not used:
+        return None
+    return _combined(used, fiat / qty, fiat, qty)
+
+
+def _combined(used, price, total, qty):
+    """Синтетическое Ad из использованных объявлений стакана: total — объём в фиате, qty — в монете;
+    сеть сохраняем, если она у всех объявлений одна, условия мерчантов объединяем."""
     one = len(used) == 1
-    nets = {a.net for a in used}   # сеть сохраняем, если она у всех объявлений одна
+    nets = {a.net for a in used}
     terms = "; ".join(dict.fromkeys(a.terms.strip() for a in used if a.terms and a.terms.strip()))
-    return Ad(used[0].ex, used[0].side, amount / qty, amount, sum(a.max_amt for a in used), qty,
+    return Ad(used[0].ex, used[0].side, price, total, sum(a.max_amt for a in used), qty,
               sorted(set(p for a in used for p in a.pays)), used[0].nick if one else f"{len(used)} объявл.",
               min(a.orders for a in used), min(a.rate for a in used), used[0].url if one else "",
               used[0].asset, nets.pop() if len(nets) == 1 else "", terms=terms)
@@ -730,6 +759,21 @@ def _route(b, s, cfg, spot, over_banks=frozenset()):
     if qty is None:
         return None
     return (qty * s.price / cfg.amount - 1) * 100, " → ".join(steps)
+
+
+def _match(b, sell_ads, cfg, spot, over_banks=frozenset()):
+    """Связка покупки b со стаканом продажи (sell_ads отсортированы: лучшая цена первой). Продажа
+    собирается под фактический выход монеты маршрута: при прибыли его больше, чем сумма круга / цена,
+    и объявления, покрывающие сумму круга впритык, весь объём не примут.
+    (прибыль %, b, s, маршрут) или None — маршрут невозможен или глубины продажи не хватает."""
+    if not sell_ads:
+        return None
+    qty = _route_qty(b, sell_ads[0], cfg, spot, over_banks)   # от цены продажи выход не зависит
+    s = _stack_qty(sell_ads, qty)
+    if s is None:
+        return None
+    r = _route(b, s, cfg, spot, over_banks)
+    return (r[0], b, s, r[1]) if r else None
 
 
 def profit_breakdown(b, s, cfg, spot, over_banks=frozenset()):
@@ -987,8 +1031,8 @@ async def scan(s, cfg, force_alt=False):
         if a.net and a.asset == "USDT" and better(networks.setdefault(a.net, {}).get(a.side)):
             networks[a.net][a.side] = a
 
-    # для связок — стакан глубины: складываем объявления по цене, пока не наберётся сумма круга;
-    # связку, которую суммарный объём не покрывает, не сигналим (сюда она просто не попадёт);
+    # для связок — стакан глубины: покупку складываем по цене, пока не наберётся сумма круга, продажу —
+    # под фактический выход монеты маршрута (_match); связку, которую объём не покрывает, не сигналим;
     # обменники складываем только в пределах одной сети
     groups = {}
     for a in ads:
@@ -1002,19 +1046,22 @@ async def scan(s, cfg, force_alt=False):
     for key, grp in groups.items():
         grp.sort(key=lambda a: a.price, reverse=(key[1] == "sell"))
         for part in _net_parts(grp):
+            if key[1] == "sell":
+                sells.append(part)   # продажа собирается в _match под выход монеты конкретной связки
+                continue
             stacked = _stack(part, cfg.amount)
             if stacked:
-                (buys if key[1] == "buy" else sells).append(stacked)
+                buys.append(stacked)
 
     over_banks = trades.banks_over_limit({trades.sbp_bank(b.pays) for b in buys})
     deals = []
     for b in buys:
         for sl in sells:
-            if cfg.same_venue_only and not _same_venue(b, sl):
+            if cfg.same_venue_only and not _same_venue(b, sl[0]):
                 continue   # пресет «USDT без переводов»: только связки внутри одной площадки
-            r = _route(b, sl, cfg, spot, over_banks)
-            if r:
-                deals.append((r[0], b, sl, r[1]))
+            d = _match(b, sl, cfg, spot, over_banks)
+            if d:
+                deals.append(d)
     snap = Snapshot(ref or 0, ref_src, refs, best, [], networks, dropped, errors, groups, spot, over_banks)
     # сортировка «прибыль × надёжность»: каждая причина риска снимает risk_penalty п.п. с профита
     deals.sort(key=lambda d: d[0] - cfg.risk_penalty * len(reliability(d, cfg, snap)[1]), reverse=True)
@@ -1027,18 +1074,16 @@ DEPTH_AMOUNTS = (50_000, 100_000, 300_000)   # суммы круга для ра
 
 def deal_amounts(deal, cfg, snap, amounts=DEPTH_AMOUNTS):
     """Прибыль % той же связки на другие суммы круга: пересобрать те же объявления стакана
-    (snap.groups) через _stack под каждую сумму. None для суммы, на которую не хватает глубины."""
+    (snap.groups) под каждую сумму — покупку через _stack, продажу под выход монеты (_match).
+    None для суммы, на которую не хватает глубины."""
     _, b, s, _ = deal
     buy_ads = _same_net(snap.groups.get((b.ex, "buy", b.asset), []), b)
     sell_ads = _same_net(snap.groups.get((s.ex, "sell", s.asset), []), s)
     out = {}
     for amount in amounts:
-        bb, ss = _stack(buy_ads, amount), _stack(sell_ads, amount)
-        if not bb or not ss:
-            out[amount] = None
-            continue
-        r = _route(bb, ss, dataclasses.replace(cfg, amount=amount), snap.spot, snap.over_banks)
-        out[amount] = r[0] if r else None
+        bb = _stack(buy_ads, amount)
+        d = _match(bb, sell_ads, dataclasses.replace(cfg, amount=amount), snap.spot, snap.over_banks) if bb else None
+        out[amount] = d[0] if d else None
     return out
 
 
