@@ -12,7 +12,7 @@ import aiohttp
 import accounts
 import trades
 from cards import deal_card, portfolio_card, top_chart
-from p2p import AMOUNT_MAX, AMOUNT_MIN, ENV_PATH, Config, _money, deal_amounts, fmt_deal, fmt_top, load_env, \
+from p2p import AMOUNT_MAX, AMOUNT_MIN, ENV_PATH, Config, _money, _price, deal_amounts, fmt_deal, fmt_top, load_env, \
     parse_amount, profit_breakdown, reliability, scan, spot_url, venue_url
 
 MENU = {"keyboard": [[{"text": "🔥 Лучшая сейчас"}, {"text": "📊 Топ связок"}],
@@ -105,9 +105,32 @@ def deal_markup(d, deal_id=None):
     if m and spot_url(route):
         rows.append([{"text": f"🔁 Спот {m.group(1)}→{m.group(2)} · {m.group(3)}", "url": spot_url(route)}])
     if deal_id is not None:
-        rows.append([{"text": "✅ Сделал", "callback_data": f"did:{deal_id}"}])
+        rows.append([{"text": "📋 Шаги", "callback_data": f"steps:{deal_id}"},
+                     {"text": "✅ Сделал", "callback_data": f"did:{deal_id}"}])
     rows.append([{"text": "📊 Все связки", "callback_data": "top"}, {"text": "🔄 Обновить", "callback_data": "best"}])
     return {"inline_keyboard": rows}
+
+
+def steps_view(d, cfg, snap):
+    """Текст «📋 Шаги»: пошаговый чек-лист маршрута с ценами объявлений (на момент сигнала) и
+    разложением прибыли по стадиям; напоминание перепроверить цены перед сделкой."""
+    profit, b, s, route = d
+    lines = [f"📋 <b>Шаги связки</b> — {_money(cfg.amount)} {cfg.fiat}", "",
+             f"1) Купить {b.asset} на {b.ex} по {_price(b.price)} — {html.escape(b.nick)}"]
+    n = 1
+    for st in route.split(" → ") if route else []:
+        n += 1
+        m = re.search(r"спот (\w+)→(\w+) на (\w+)", st)
+        rate = snap.spot.get(m.group(3), {}).get(m.group(2) if m.group(1) == "USDT" else m.group(1)) \
+            if m and snap else None
+        lines.append(f"{n}) {st}" + (f" (курс {rate[0]:.4g}/{rate[1]:.4g})" if rate else ""))
+    n += 1
+    lines.append(f"{n}) Продать {s.asset} на {s.ex} по {_price(s.price)} — {html.escape(s.nick)}")
+    breakdown = profit_breakdown(b, s, cfg, snap.spot, snap.over_banks) if snap else None
+    if breakdown:
+        lines += ["", "Прибыль по стадиям:"] + [f"  {label}: {p:+.2f}%" for label, p in breakdown]
+    lines += ["", "⚠️ Цены объявлений и курс спота — на момент сигнала, перепроверь перед сделкой."]
+    return "\n".join(lines)
 
 
 def hist_key(it):
@@ -258,7 +281,7 @@ class Bot:
         self.awaiting_key = None      # {"ex":.., "step": "key"/"secret", "key":..} — ждём ключ биржи
         self.sent = {}
         self.venue = {}   # ex -> {"streak": сканов подряд с ошибкой, "down_since": ts, "alerted_at": ts}
-        self.deals_by_id = {}   # id -> (d, сумма круга) для кнопки «✅ Сделал»; не переживает рестарт
+        self.deals_by_id = {}   # id -> (d, cfg, snap на момент сигнала) для кнопок «✅ Сделал»/«📋 Шаги»; не переживает рестарт
         self.next_deal_id = 1
         self.acc_seen = {}   # ex -> set известных ключей истории; None пока не было первого опроса
 
@@ -297,11 +320,12 @@ class Bot:
                 print("card error:", e)
         await self.send(caption, markup=markup)
 
-    def remember_deal(self, d, cfg=None):
-        """Запомнить связку под кнопкой «✅ Сделал»; хранится ограниченное число последних."""
+    def remember_deal(self, d, cfg=None, snap=None):
+        """Запомнить связку под кнопками «✅ Сделал»/«📋 Шаги»; хранится ограниченное число последних."""
         cfg = cfg or self.cfg
+        snap = snap if snap is not None else self.last
         deal_id, self.next_deal_id = self.next_deal_id, self.next_deal_id + 1
-        self.deals_by_id[deal_id] = (d, cfg.amount)
+        self.deals_by_id[deal_id] = (d, cfg, snap)
         if len(self.deals_by_id) > 200:
             del self.deals_by_id[min(self.deals_by_id)]
         return deal_id
@@ -309,12 +333,22 @@ class Bot:
     async def send_deal(self, d, prefix="", cfg=None, snap=None):
         cfg = cfg or self.cfg
         snap = snap if snap is not None else self.last
-        deal_id = self.remember_deal(d, cfg)
+        deal_id = self.remember_deal(d, cfg, snap)
         amounts = deal_amounts(d, cfg, snap) if snap else None
         rel = reliability(d, cfg, snap) if snap else None
         breakdown = profit_breakdown(d[1], d[2], cfg, snap.spot, snap.over_banks) if snap else None
         await self.photo_or_text(lambda: deal_card(d, cfg, amounts, rel, breakdown), prefix + fmt_deal(d, cfg, snap),
                                  deal_markup(d, deal_id))
+
+    async def show_steps(self, cq, deal_id):
+        """Кнопка «📋 Шаги»: отдельным сообщением пошаговый чек-лист маршрута."""
+        entry = self.deals_by_id.get(deal_id)
+        if not entry:
+            await self.call("answerCallbackQuery", callback_query_id=cq["id"], text="Сигнал устарел")
+            return
+        d, cfg, snap = entry
+        await self.call("answerCallbackQuery", callback_query_id=cq["id"])
+        await self.send(steps_view(d, cfg, snap))
 
     async def mark_done(self, cq, deal_id):
         """Кнопка «✅ Сделал»: записать сделку в журнал (data/trades.db) и убрать кнопку."""
@@ -322,8 +356,8 @@ class Bot:
         if not entry:
             await self.call("answerCallbackQuery", callback_query_id=cq["id"], text="Сигнал устарел, не записан")
             return
-        d, amount = entry
-        bank, total, crossed = trades.log_trade(d, amount)
+        d, cfg, snap = entry
+        bank, total, crossed = trades.log_trade(d, cfg.amount)
         await self.call("answerCallbackQuery", callback_query_id=cq["id"], text="Записано в журнал ✅")
         await self.call("editMessageReplyMarkup", chat_id=self.chat_id, message_id=cq["message"]["message_id"],
                         reply_markup=deal_markup(d))
@@ -615,6 +649,8 @@ class Bot:
             await self.balance()
         elif data.startswith("did:"):
             await self.mark_done(cq, int(data[4:]))
+        elif data.startswith("steps:"):
+            await self.show_steps(cq, int(data[6:]))
         elif data == "amt_custom":
             self.awaiting_amount = True
             await self.send(f"Введи сумму круга текстом, например 20000 или 1,5 млн "
