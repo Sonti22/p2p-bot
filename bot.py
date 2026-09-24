@@ -580,6 +580,18 @@ class Bot:
         else:
             await self.send(GUIDE, markup=LINKS)
 
+    async def check_key_safety(self):
+        """При старте: если сохранённый ключ биржи даёт торговать/выводить — удалить его и попросить read-only."""
+        for ex in accounts.ONBOARDABLE:
+            if accounts.keys(ex) is None:
+                continue
+            safe, detail = await accounts.api_permissions(self.s, ex)
+            if not safe:
+                accounts.delete_key(ex)
+                name = EXCHANGE_NAMES.get(ex, ex)
+                await self.send(f"⚠️ {name}: ключ даёт больше, чем чтение ({detail}) — удалил его из бота.\n"
+                                f"Создай новый ключ ТОЛЬКО для чтения и подключи заново: «⚙️ Настройки → 🔑 Мои биржи».")
+
     async def setup(self):
         for method, params in (("setMyCommands", {"commands": COMMANDS}),
                                ("setMyDescription", {"description": DESCRIPTION}),
@@ -601,6 +613,8 @@ async def main():
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as s:
         bot = Bot(s, token, os.getenv("TG_CHAT_ID", "").strip(), cfg)
         await bot.setup()
+        if bot.chat_id:
+            await bot.check_key_safety()
         print(f"Бот запущен: каждые {cfg.interval}s, порог {cfg.min_profit:g}%, биржи {', '.join(cfg.exchanges)}")
         await asyncio.gather(bot.scan_loop(), bot.command_loop())
 

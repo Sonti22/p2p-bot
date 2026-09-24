@@ -167,6 +167,58 @@ async def kucoin_get(s, api_key, api_secret, passphrase_value, path, params=None
     return await _get_json(s, f"{KUCOIN_BASE}{full_path}", headers)
 
 
+KUCOIN_READONLY_PERMS = {"General"}    # остальные значения permission у KuCoin дают торговлю/вывод/переводы
+
+
+async def api_permissions(s, exchange):
+    """Права сохранённого ключа биржи по данным самого API: (safe, detail).
+
+    safe=False — ключ даёт торговать или выводить (не read-only), detail — что именно нашли.
+    safe=True — либо ключ read-only, либо права проверить не удалось (не блокируем по недоступности API)."""
+    ex = exchange.lower()
+    pair = keys(ex)
+    if not pair:
+        return True, ""
+    api_key, api_secret = pair
+    try:
+        if ex == "bybit":
+            j = await bybit_get(s, api_key, api_secret, "/v5/user/query-api")
+            if j.get("retCode") != 0:
+                return True, ""
+            result = j.get("result", {})
+            if result.get("readOnly") == 1:
+                return True, ""
+            extra = [name for name, perms in (result.get("permissions") or {}).items() if perms]
+            return False, "торговля/переводы (" + ", ".join(extra) + ")" if extra else "ключ не read-only"
+        elif ex == "mexc":
+            j = await mexc_get(s, api_key, api_secret, "/api/v3/account")
+            bad = [name for name, granted in (("торговля", j.get("canTrade")), ("вывод", j.get("canWithdraw"))) if granted]
+            return not bad, ", ".join(bad)
+        elif ex == "htx":
+            j = await htx_get(s, api_key, api_secret, "/v2/user/api-key")
+            if j.get("code") != 200:
+                return True, ""
+            entry = next((e for e in j.get("data") or [] if e.get("accessKey") == api_key), None)
+            if not entry:
+                return True, ""
+            perms = {p.strip().lower() for p in (entry.get("permission") or "").split(",")}
+            bad = sorted(perms & {"trade", "withdraw"})
+            return not bad, ", ".join(bad)
+        elif ex == "kucoin":
+            pp = passphrase(ex)
+            if not pp:
+                return True, ""
+            j = await kucoin_get(s, api_key, api_secret, pp, "/api/v1/user/api-key")
+            if j.get("code") != "200000":
+                return True, ""
+            perms = {p.strip() for p in (j.get("data", {}).get("permission") or "").split(",") if p.strip()}
+            bad = sorted(perms - KUCOIN_READONLY_PERMS)
+            return not bad, ", ".join(bad)
+    except Exception:
+        return True, ""
+    return True, ""
+
+
 async def verify(s, exchange):
     """Проверить сохранённый ключ биржи запросом баланса: (ok, сообщение для пользователя)."""
     ex = exchange.lower()

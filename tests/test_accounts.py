@@ -305,3 +305,86 @@ def test_verify_kucoin_bad_key(tmp_path, monkeypatch):
     accounts.save_key("kucoin", "k", "s", "pp")
     ok, msg = asyncio.run(accounts.verify(_JsonSession({"code": "400003", "msg": "KC-API-KEY not exists"}), "kucoin"))
     assert not ok and "KC-API-KEY not exists" in msg
+
+
+def test_api_permissions_no_key_is_safe(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    safe, detail = asyncio.run(accounts.api_permissions(_JsonSession({}), "bybit"))
+    assert safe and detail == ""
+
+
+def test_api_permissions_bybit_readonly_is_safe(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    accounts.save_key("bybit", "k", "s")
+    body = {"retCode": 0, "result": {"readOnly": 1, "permissions": {"Spot": [], "Wallet": []}}}
+    safe, detail = asyncio.run(accounts.api_permissions(_JsonSession(body), "bybit"))
+    assert safe and detail == ""
+
+
+def test_api_permissions_bybit_trade_key_is_unsafe(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    accounts.save_key("bybit", "k", "s")
+    body = {"retCode": 0, "result": {"readOnly": 0, "permissions": {"Spot": ["SpotTrade"], "Wallet": []}}}
+    safe, detail = asyncio.run(accounts.api_permissions(_JsonSession(body), "bybit"))
+    assert not safe and "Spot" in detail
+
+
+def test_api_permissions_mexc_readonly_is_safe(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    accounts.save_key("mexc", "k", "s")
+    body = {"canTrade": False, "canWithdraw": False, "balances": []}
+    safe, detail = asyncio.run(accounts.api_permissions(_JsonSession(body), "mexc"))
+    assert safe and detail == ""
+
+
+def test_api_permissions_mexc_withdraw_key_is_unsafe(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    accounts.save_key("mexc", "k", "s")
+    body = {"canTrade": False, "canWithdraw": True, "balances": []}
+    safe, detail = asyncio.run(accounts.api_permissions(_JsonSession(body), "mexc"))
+    assert not safe and "вывод" in detail
+
+
+def test_api_permissions_htx_readonly_is_safe(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    accounts.save_key("htx", "k", "s")
+    body = {"code": 200, "data": [{"accessKey": "k", "permission": "readOnly"}]}
+    safe, detail = asyncio.run(accounts.api_permissions(_JsonSession(body), "htx"))
+    assert safe and detail == ""
+
+
+def test_api_permissions_htx_trade_key_is_unsafe(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    accounts.save_key("htx", "k", "s")
+    body = {"code": 200, "data": [{"accessKey": "k", "permission": "readOnly,trade"}]}
+    safe, detail = asyncio.run(accounts.api_permissions(_JsonSession(body), "htx"))
+    assert not safe and "trade" in detail
+
+
+def test_api_permissions_kucoin_general_only_is_safe(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    accounts.save_key("kucoin", "k", "s", "pp")
+    body = {"code": "200000", "data": {"permission": "General"}}
+    safe, detail = asyncio.run(accounts.api_permissions(_JsonSession(body), "kucoin"))
+    assert safe and detail == ""
+
+
+def test_api_permissions_kucoin_spot_key_is_unsafe(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    accounts.save_key("kucoin", "k", "s", "pp")
+    body = {"code": "200000", "data": {"permission": "General,Spot,Withdraw"}}
+    safe, detail = asyncio.run(accounts.api_permissions(_JsonSession(body), "kucoin"))
+    assert not safe and "Spot" in detail and "Withdraw" in detail
+
+
+def test_api_permissions_fails_open_when_api_errors(tmp_path, monkeypatch):
+    """Если проверку прав нельзя выполнить (ошибка сети/формата) — не блокируем уже сохранённый ключ."""
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    accounts.save_key("bybit", "k", "s")
+
+    class _Boom:
+        def get(self, url, headers=None):
+            raise RuntimeError("network down")
+
+    safe, detail = asyncio.run(accounts.api_permissions(_Boom(), "bybit"))
+    assert safe and detail == ""

@@ -444,6 +444,49 @@ def test_acc_del_callback_removes_key(tmp_path, monkeypatch):
     assert any("удалён" in t for t in texts(bot))
 
 
+def test_check_key_safety_removes_unsafe_key_and_warns(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    accounts.save_key("bybit", "k", "s")
+
+    async def fake_permissions(s, ex):
+        return False, "торговля"
+
+    monkeypatch.setattr(B.accounts, "api_permissions", fake_permissions)
+    bot = Stub(p2p.Config())
+    asyncio.run(bot.check_key_safety())
+    assert accounts.keys("bybit") is None
+    warning = texts(bot)[-1]
+    assert "торговля" in warning and "ТОЛЬКО для чтения" in warning
+
+
+def test_check_key_safety_keeps_readonly_key_and_stays_silent(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    accounts.save_key("mexc", "k", "s")
+
+    async def fake_permissions(s, ex):
+        return True, ""
+
+    monkeypatch.setattr(B.accounts, "api_permissions", fake_permissions)
+    bot = Stub(p2p.Config())
+    asyncio.run(bot.check_key_safety())
+    assert accounts.keys("mexc") == ("k", "s")
+    assert texts(bot) == []
+
+
+def test_check_key_safety_skips_exchanges_without_saved_key(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    calls = []
+
+    async def fake_permissions(s, ex):
+        calls.append(ex)
+        return True, ""
+
+    monkeypatch.setattr(B.accounts, "api_permissions", fake_permissions)
+    bot = Stub(p2p.Config())
+    asyncio.run(bot.check_key_safety())
+    assert calls == []
+
+
 def test_stats_view_reports_counts(tmp_path, monkeypatch):
     db = str(tmp_path / "trades.db")
     monkeypatch.setattr(B.trades, "stats", functools.partial(B.trades.stats, path=db))
