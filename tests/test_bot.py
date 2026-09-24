@@ -1249,3 +1249,129 @@ def test_history_callback_routes_to_show_history(tmp_path, monkeypatch):
     bot = Stub(p2p.Config())
     asyncio.run(bot.on_callback({"id": "1", "data": "history", "message": {"message_id": 1}}))
     assert "пуста" in texts(bot)[-1]
+
+
+def _fact_prompt_trade_id(bot):
+    """Достать id сделки из кнопок факта, отправленных «✅ Сделал»."""
+    msg = next(p for m, p in bot.out if m == "sendMessage" and "факт" in p["text"].lower())
+    return int(msg["reply_markup"]["inline_keyboard"][0][0]["callback_data"].split(":")[1])
+
+
+def test_mark_done_offers_fact_quick_buttons(tmp_path, monkeypatch):
+    db = str(tmp_path / "trades.db")
+    monkeypatch.setattr(B.trades, "log_trade", functools.partial(B.trades.log_trade, path=db))
+    bot = Stub(p2p.Config(amount=70000))
+    deal_id = bot.remember_deal(deal(5.0))
+    asyncio.run(bot.mark_done({"id": "1", "message": {"message_id": 9}}, deal_id))
+    msg = next(p for m, p in bot.out if m == "sendMessage" and "факт" in p["text"].lower())
+    buttons = [b for row in msg["reply_markup"]["inline_keyboard"] for b in row]
+    modes = {b["callback_data"].rsplit(":", 1)[-1] for b in buttons}
+    assert modes == {"calc", "minus", "plus", "manual"}
+    # editMessageReplyMarkup (снятие «✅ Сделал») по-прежнему последним вызовом, как раньше
+    method, _ = bot.out[-1]
+    assert method == "editMessageReplyMarkup"
+
+
+def test_fact_button_calc_records_calc_profit(tmp_path, monkeypatch):
+    db = str(tmp_path / "trades.db")
+    monkeypatch.setattr(B.trades, "log_trade", functools.partial(B.trades.log_trade, path=db))
+    monkeypatch.setattr(B.trades, "get_trade", functools.partial(B.trades.get_trade, path=db))
+    monkeypatch.setattr(B.trades, "set_fact", functools.partial(B.trades.set_fact, path=db))
+    monkeypatch.setattr(B.trades, "stats", functools.partial(B.trades.stats, path=db))
+    bot = Stub(p2p.Config(amount=70000))
+    deal_id = bot.remember_deal(deal(5.0))
+    asyncio.run(bot.mark_done({"id": "1", "message": {"message_id": 9}}, deal_id))
+    trade_id = _fact_prompt_trade_id(bot)
+    asyncio.run(bot.on_callback({"id": "2", "data": f"fact:{trade_id}:calc", "message": {"message_id": 10}}))
+    assert "Факт: +5.00%" in texts(bot)[-1]
+    assert "факт указан у 1 из 1" in bot.stats_view()
+
+
+def test_fact_button_plus_minus_offsets_calc(tmp_path, monkeypatch):
+    db = str(tmp_path / "trades.db")
+    monkeypatch.setattr(B.trades, "log_trade", functools.partial(B.trades.log_trade, path=db))
+    monkeypatch.setattr(B.trades, "get_trade", functools.partial(B.trades.get_trade, path=db))
+    monkeypatch.setattr(B.trades, "set_fact", functools.partial(B.trades.set_fact, path=db))
+    bot = Stub(p2p.Config(amount=70000))
+    deal_id = bot.remember_deal(deal(5.0))
+    asyncio.run(bot.mark_done({"id": "1", "message": {"message_id": 9}}, deal_id))
+    trade_id = _fact_prompt_trade_id(bot)
+    asyncio.run(bot.on_callback({"id": "2", "data": f"fact:{trade_id}:minus", "message": {"message_id": 10}}))
+    assert "Факт: +4.50%" in texts(bot)[-1]
+
+
+def test_fact_manual_button_arms_awaiting_then_parses_text(tmp_path, monkeypatch):
+    db = str(tmp_path / "trades.db")
+    monkeypatch.setattr(B.trades, "log_trade", functools.partial(B.trades.log_trade, path=db))
+    monkeypatch.setattr(B.trades, "get_trade", functools.partial(B.trades.get_trade, path=db))
+    monkeypatch.setattr(B.trades, "set_fact", functools.partial(B.trades.set_fact, path=db))
+    bot = Stub(p2p.Config(amount=70000))
+    deal_id = bot.remember_deal(deal(5.0))
+    asyncio.run(bot.mark_done({"id": "1", "message": {"message_id": 9}}, deal_id))
+    trade_id = _fact_prompt_trade_id(bot)
+    asyncio.run(bot.on_callback({"id": "2", "data": f"fact:{trade_id}:manual", "message": {"message_id": 10}}))
+    assert bot.awaiting_fact == trade_id
+    asyncio.run(bot.handle("650 ₽"))
+    assert bot.awaiting_fact is None
+    assert "Факт:" in texts(bot)[-1]
+
+
+def test_fact_manual_garbage_reports_error_and_resets_awaiting(tmp_path, monkeypatch):
+    db = str(tmp_path / "trades.db")
+    monkeypatch.setattr(B.trades, "log_trade", functools.partial(B.trades.log_trade, path=db))
+    monkeypatch.setattr(B.trades, "get_trade", functools.partial(B.trades.get_trade, path=db))
+    bot = Stub(p2p.Config(amount=70000))
+    deal_id = bot.remember_deal(deal(5.0))
+    asyncio.run(bot.mark_done({"id": "1", "message": {"message_id": 9}}, deal_id))
+    trade_id = _fact_prompt_trade_id(bot)
+    bot.awaiting_fact = trade_id
+    asyncio.run(bot.handle("ерунда"))
+    assert bot.awaiting_fact is None
+    assert "не понял" in texts(bot)[-1].lower()
+
+
+def test_awaiting_fact_reset_by_other_button():
+    bot = Stub(p2p.Config())
+    bot.awaiting_fact = 42
+    asyncio.run(bot.on_callback({"id": "1", "data": "best", "message": {"message_id": 1}}))
+    assert bot.awaiting_fact is None
+
+
+def test_awaiting_fact_reset_by_other_command():
+    bot = Stub(p2p.Config())
+    bot.awaiting_fact = 42
+    asyncio.run(bot.handle("/best"))
+    assert bot.awaiting_fact is None
+
+
+def test_backtest_command_reports_top_pairs_and_disclaimer(tmp_path, monkeypatch):
+    db = str(tmp_path / "history.db")
+    monkeypatch.setattr(B.history, "is_empty", functools.partial(B.history.is_empty, path=db))
+    monkeypatch.setattr(B.history, "backtest", functools.partial(B.history.backtest, path=db))
+    history._insert([(time.time(), "Bybit", "MEXC", "USDT", "USDT", 3.0, 88.0)], db)
+    bot = Stub(p2p.Config(min_profit=2.0, amount=50000))
+    asyncio.run(bot.handle("/backtest"))
+    text = texts(bot)[-1]
+    assert "Bybit" in text and "MEXC" in text
+    assert "прошлое — не прогноз" in text.lower()
+
+
+def test_backtest_command_empty_history_message(tmp_path, monkeypatch):
+    db = str(tmp_path / "history.db")
+    monkeypatch.setattr(B.history, "is_empty", functools.partial(B.history.is_empty, path=db))
+    bot = Stub(p2p.Config())
+    asyncio.run(bot.handle("/backtest"))
+    assert "пуста" in texts(bot)[-1]
+
+
+def test_backtest_callback_routes_same_as_command(tmp_path, monkeypatch):
+    db = str(tmp_path / "history.db")
+    monkeypatch.setattr(B.history, "is_empty", functools.partial(B.history.is_empty, path=db))
+    bot = Stub(p2p.Config())
+    asyncio.run(bot.on_callback({"id": "1", "data": "backtest", "message": {"message_id": 1}}))
+    assert "пуста" in texts(bot)[-1]
+
+
+def test_history_markup_has_backtest_button():
+    buttons = [b for row in B.HISTORY_MARKUP["inline_keyboard"] for b in row]
+    assert any(b.get("callback_data") == "backtest" for b in buttons)

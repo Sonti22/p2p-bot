@@ -32,8 +32,9 @@ BUTTONS = {"🔥 Лучшая сейчас": "/best", "📊 Топ связок"
 COMMANDS = [{"command": "best", "description": "Лучшая связка сейчас"},
             {"command": "top", "description": "Топ связок графиком"},
             {"command": "history", "description": "История спредов: время суток, дни недели, BestChange"},
+            {"command": "backtest", "description": "Бэктест маршрута по истории спредов (7/30 дней)"},
             {"command": "calc", "description": "Разовый расчёт под сумму, напр. /calc 20000"},
-            {"command": "stats", "description": "Журнал сделок: день/неделя/месяц"},
+            {"command": "stats", "description": "Журнал сделок: день/неделя/месяц, расчёт vs факт"},
             {"command": "alert", "description": "Алерт на курс, напр. /alert USDT sell 92 7d"},
             {"command": "alerts", "description": "Список алертов на курс"},
             {"command": "blacklist", "description": "Скрытые мерчанты и обменники"},
@@ -435,7 +436,41 @@ TOP_MARKUP = {"inline_keyboard": [
     [{"text": "🔥 Лучшая", "callback_data": "best"}, {"text": "⚙️ Настройки", "callback_data": "settings"}],
     [{"text": "📈 История", "callback_data": "history"}]]}
 HISTORY_MARKUP = {"inline_keyboard": [
-    [{"text": "🔄 Обновить", "callback_data": "history"}, {"text": "📊 Топ", "callback_data": "top"}]]}
+    [{"text": "🔄 Обновить", "callback_data": "history"}, {"text": "📊 Топ", "callback_data": "top"}],
+    [{"text": "📉 Бэктест", "callback_data": "backtest"}]]}
+
+
+def fact_markup(trade_id):
+    """Кнопки быстрого фактического результата под подтверждением «✅ Сделал»."""
+    return {"inline_keyboard": [
+        [{"text": "как расчёт", "callback_data": f"fact:{trade_id}:calc"}],
+        [{"text": "−0.5 п.п.", "callback_data": f"fact:{trade_id}:minus"},
+         {"text": "+0.5 п.п.", "callback_data": f"fact:{trade_id}:plus"}],
+        [{"text": "✏️ ввести число", "callback_data": f"fact:{trade_id}:manual"}]]}
+
+
+def backtest_view(cfg):
+    """Текст «/backtest»: по history.db — для каждой пары площадок за 7/30 дней сколько раз лучший %
+    был >= порога, средний/медианный % в такие моменты и оценка результата в ₽ (профит из истории уже
+    чистый, с текущими комиссиями). Пустая история — понятное сообщение вместо таблицы."""
+    if history.is_empty():
+        return ("📉 История спредов пока пуста — бэктест не на чем считать. Бот пишет лучший % по площадкам "
+                "раз в 5 минут, зайди позже, когда наберётся хотя бы несколько дней данных.")
+    data = history.backtest(cfg.min_profit, cfg.amount)
+    lines = [f"📉 <b>Бэктест маршрута</b> — порог {cfg.min_profit:g}%, круг {_money(cfg.amount)} {cfg.fiat}", ""]
+    for days, label in ((7, "7 дней"), (30, "30 дней")):
+        rows = data[days][:5]
+        lines.append(f"<b>Топ-5 пар за {label}:</b>")
+        if not rows:
+            lines.append(f"  за этот срок порог {cfg.min_profit:g}% не достигался ни разу.")
+        else:
+            for r in rows:
+                lines.append(f"  {r['buy_ex']} → {r['sell_ex']}: {r['hits']}/{r['total']} раз ≥ порога, "
+                             f"средний {r['avg']:+.2f}%, медиана {r['median']:+.2f}%, "
+                             f"≈{_money(r['est_rub'])} {cfg.fiat} за круг")
+        lines.append("")
+    lines.append("⚠️ Прошлое — не прогноз: реальные объявления, курс и комиссии к моменту сделки могут отличаться.")
+    return "\n".join(lines)
 
 
 class Bot:
@@ -454,6 +489,7 @@ class Bot:
         self.awaiting_amount = False  # ждём сумму текстом после «✏️ Своя сумма»
         self.awaiting_preset_name = False  # ждём имя пресета текстом после «💾 Сохранить как пресет»
         self.awaiting_key = None      # {"ex":.., "step": "key"/"secret", "key":..} — ждём ключ биржи
+        self.awaiting_fact = None     # id сделки — ждём фактический результат текстом после «✏️ ввести число»
         self.sent = {}
         self.live = {}                                            # (ex,asset,ex,asset) -> {"first": ts, "streak": n}
         self.live_scans = int(os.getenv("LIVE_SCANS", 2))        # сигнал, только если связка держится ≥ N сканов
@@ -528,20 +564,59 @@ class Bot:
         await self.send(steps_view(d, cfg, snap))
 
     async def mark_done(self, cq, deal_id):
-        """Кнопка «✅ Сделал»: записать сделку в журнал (data/trades.db) и убрать кнопку."""
+        """Кнопка «✅ Сделал»: записать сделку в журнал (data/trades.db), убрать кнопку и предложить
+        указать фактический результат сделки (расчёт vs факт для /stats)."""
         entry = self.deals_by_id.pop(deal_id, None)
         if not entry:
             await self.call("answerCallbackQuery", callback_query_id=cq["id"], text="Сигнал устарел, не записан")
             return
         d, cfg, snap = entry
-        bank, total, crossed = trades.log_trade(d, cfg.amount)
+        trade_id, bank, total, crossed = trades.log_trade(d, cfg.amount)
         await self.call("answerCallbackQuery", callback_query_id=cq["id"], text="Записано в журнал ✅")
+        await self.send(f"Расчёт был {d[0]:+.2f}%. Какой вышел факт?", markup=fact_markup(trade_id))
         await self.call("editMessageReplyMarkup", chat_id=self.chat_id, message_id=cq["message"]["message_id"],
                         reply_markup=deal_markup(d))
         if crossed:
             await self.send(f"⚠️ Через {bank} по СБП в этом месяце отправлено {_money(total)} ₽ — выше "
                             f"бесплатного лимита 100 000 ₽, дальше банк может взять комиссию до 0.5%. "
                             f"Для следующих сделок с этим мерчантом лучше выбрать другой банк.")
+
+    async def handle_fact_button(self, cq, data):
+        """Кнопка быстрого факта («как расчёт»/«±0.5 п.п.»/«✏️ ввести число») под подтверждением сделки."""
+        _, trade_id_s, mode = data.split(":", 2)
+        trade_id = int(trade_id_s)
+        if mode == "manual":
+            self.awaiting_fact = trade_id
+            await self.call("answerCallbackQuery", callback_query_id=cq["id"])
+            await self.send("Введи фактический результат числом: проценты (например +1.2% или 1.2) "
+                            "или сумма в ₽ (например 650 ₽ или -300).")
+            return
+        row = trades.get_trade(trade_id)
+        if not row:
+            await self.call("answerCallbackQuery", callback_query_id=cq["id"], text="Сделка не найдена")
+            return
+        fact = {"calc": row["profit"], "minus": row["profit"] - 0.5, "plus": row["profit"] + 0.5}[mode]
+        await self.save_fact(cq, trade_id, row, fact)
+
+    async def save_fact(self, cq, trade_id, row, fact):
+        trades.set_fact(trade_id, fact)
+        if cq is not None:
+            await self.call("answerCallbackQuery", callback_query_id=cq["id"], text="Факт записан")
+            await self.call("editMessageReplyMarkup", chat_id=self.chat_id, message_id=cq["message"]["message_id"],
+                            reply_markup={"inline_keyboard": []})
+        await self.send(f"✅ Факт: {fact:+.2f}% (расчёт был {row['profit']:+.2f}%)")
+
+    async def set_fact_from_text(self, trade_id, text):
+        """Ввод факта текстом после «✏️ ввести число»: проценты или сумма в ₽ — `trades.parse_fact`."""
+        row = trades.get_trade(trade_id)
+        if not row:
+            await self.send("Сделка уже не найдена, факт не записан.")
+            return
+        fact = trades.parse_fact(text, row["amount"])
+        if fact is None:
+            await self.send("Не понял результат. Пример: +1.2%, 1.2, 650 ₽, -300.")
+            return
+        await self.save_fact(None, trade_id, row, fact)
 
     async def hide_deal(self, cq, deal_id):
         """Кнопка «🚫 Не показывать»: занести обе стороны связки в блэклист, скан их больше не покажет."""
@@ -628,11 +703,16 @@ class Bot:
         for key, label in labels:
             s = st[key]
             if s["count"]:
-                lines.append(f"{label}: {s['count']} сделок, оборот {_money(s['amount'])} ₽, "
-                             f"средний профит {s['avg_profit']:+.2f}%")
+                line = (f"{label}: {s['count']} сделок, оборот {_money(s['amount'])} ₽, "
+                       f"средний профит {s['avg_profit']:+.2f}%")
+                if s["fact_count"]:
+                    line += (f"; факт указан у {s['fact_count']} из {s['count']}, средний факт "
+                            f"{s['avg_fact']:+.2f}%, расхождение расчёт→факт {s['avg_diff']:+.2f} п.п.")
+                lines.append(line)
             else:
                 lines.append(f"{label}: сделок нет")
-        lines.append("\nОтмечай связку кнопкой «✅ Сделал» под сигналом — так она попадёт в журнал.")
+        lines.append("\nОтмечай связку кнопкой «✅ Сделал» под сигналом — так она попадёт в журнал, "
+                     "затем укажи факт кнопкой или числом, чтобы сравнить расчёт с реальным результатом.")
         return "\n".join(lines)
 
     async def show_best(self, snap=None, cfg=None):
@@ -1065,6 +1145,8 @@ class Bot:
             self.awaiting_key = None       # любая другая кнопка прерывает ввод ключа
         if data != "preset_save":
             self.awaiting_preset_name = False   # любая другая кнопка прерывает ввод имени пресета
+        if not data.endswith(":manual") or not data.startswith("fact:"):
+            self.awaiting_fact = None      # любая другая кнопка прерывает ввод факта числом
         toast = self.apply(data)
         await self.call("answerCallbackQuery", callback_query_id=cq["id"], text=toast)
         if data.startswith(("flt_a:", "flt_e:", "preset_apply:")):
@@ -1081,6 +1163,8 @@ class Bot:
             await self.show_top()
         elif data == "history":
             await self.show_history()
+        elif data == "backtest":
+            await self.send(backtest_view(self.cfg))
         elif data == "detail":
             await self.send(fmt_top(self.last, self.cfg) if self.last else WAIT)
         elif data == "settings":
@@ -1093,6 +1177,8 @@ class Bot:
             await self.balance()
         elif data.startswith("did:"):
             await self.mark_done(cq, int(data[4:]))
+        elif data.startswith("fact:"):
+            await self.handle_fact_button(cq, data)
         elif data.startswith("steps:"):
             await self.show_steps(cq, int(data[6:]))
         elif data.startswith("bl:"):
@@ -1162,6 +1248,11 @@ class Bot:
             if text not in BUTTONS and not text.startswith("/"):
                 await self.set_custom_amount(text)
                 return
+        if self.awaiting_fact is not None:
+            trade_id, self.awaiting_fact = self.awaiting_fact, None   # любая другая команда/кнопка сбрасывает
+            if text not in BUTTONS and not text.startswith("/"):
+                await self.set_fact_from_text(trade_id, text)
+                return
         self.awaiting_key = None               # команда/кнопка прерывает ввод ключа биржи
         cmd, _, arg = BUTTONS.get(text, text).partition(" ")
         cmd = cmd.split("@")[0]
@@ -1173,6 +1264,8 @@ class Bot:
             await self.show_top()
         elif cmd == "/history":
             await self.show_history()
+        elif cmd == "/backtest":
+            await self.send(backtest_view(self.cfg))
         elif cmd == "/calc":
             if arg:
                 await self.calc(arg)

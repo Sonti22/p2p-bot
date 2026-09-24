@@ -105,6 +105,31 @@ def heatmap(path=DB_PATH, days=7, now=None):
     return grid
 
 
+def backtest(min_profit, amount, path=DB_PATH, now=None):
+    """Бэктест маршрута по истории спредов за 7 и 30 дней: для каждой пары площадок — сколько раз
+    записанный лучший % (уже чистый, с комиссиями) был >= порога `min_profit`, средний и медианный %
+    в такие моменты, оценка результата в ₽ на сумму круга `amount`. Возвращает {7: [...], 30: [...]},
+    списки словарей отсортированы по числу попаданий (для топ-N); пары без ни одного попадания не
+    включаются."""
+    now = time.time() if now is None else now
+    out = {}
+    for days in (7, 30):
+        by_pair = {}
+        for ts, buy_ex, sell_ex, profit in _rows(path, now - days * 86400):
+            by_pair.setdefault((buy_ex, sell_ex), []).append(profit)
+        rows = []
+        for (buy_ex, sell_ex), profits in by_pair.items():
+            hits = [p for p in profits if p >= min_profit]
+            if not hits:
+                continue
+            avg = statistics.mean(hits)
+            rows.append({"buy_ex": buy_ex, "sell_ex": sell_ex, "hits": len(hits), "total": len(profits),
+                        "avg": avg, "median": statistics.median(hits), "est_rub": avg / 100 * amount})
+        rows.sort(key=lambda r: r["hits"], reverse=True)
+        out[days] = rows
+    return out
+
+
 def median_vs_bestchange(path=DB_PATH, days=30, now=None):
     """Медиана лучшего % по дням (МСК): связки между площадками P2P против связок, где buy_ex
     или sell_ex — BestChange. Окно 7-30 дней (RETENTION = 30 дней, меньше данных — меньше дней).
