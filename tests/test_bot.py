@@ -72,6 +72,38 @@ def test_below_threshold_not_sent(monkeypatch):
     assert not bot.out
 
 
+def test_notify_threshold_before_top_n(monkeypatch):
+    """Сканер ставит надёжную 1.5% выше рискованной 3%: связка выше порога за ней всё равно уходит."""
+    monkeypatch.setattr(B, "deal_card", lambda d, c, a=None, r=None, breakdown=None: b"png")
+    bot = Stub(p2p.Config(min_profit=2.0))
+    bot.live_scans = 1
+    bot.max_signals = 3
+    asyncio.run(bot.notify(snap([deal(1.5, "MEXC"), deal(3, "KuCoin")])))
+    caps = [p["caption"] for m, p in photos(bot)]
+    assert len(caps) == 1 and "KuCoin" in caps[0] and "+3.00%" in caps[0]
+
+
+def test_notify_slices_after_threshold(monkeypatch):
+    """Топ-N режется уже после порога: три надёжные связки ниже порога не съедают MAX_SIGNALS."""
+    monkeypatch.setattr(B, "deal_card", lambda d, c, a=None, r=None, breakdown=None: b"png")
+    bot = Stub(p2p.Config(min_profit=2.0))
+    bot.live_scans = 1
+    bot.max_signals = 3
+    asyncio.run(bot.notify(snap([deal(1.5, "MEXC"), deal(1.5, "HTX"), deal(1.5, "Bitpapa"), deal(3, "KuCoin")])))
+    caps = [p["caption"] for m, p in photos(bot)]
+    assert len(caps) == 1 and "KuCoin" in caps[0]
+
+
+def test_notify_top_n_counts_only_above_threshold(monkeypatch):
+    monkeypatch.setattr(B, "deal_card", lambda d, c, a=None, r=None, breakdown=None: b"png")
+    bot = Stub(p2p.Config(min_profit=2.0))
+    bot.live_scans = 1
+    bot.max_signals = 2
+    asyncio.run(bot.notify(snap([deal(1.5, "MEXC"), deal(5, "KuCoin"), deal(4, "HTX"), deal(3, "Bitpapa")])))
+    caps = [p["caption"] for m, p in photos(bot)]
+    assert len(caps) == 2 and "KuCoin" in caps[0] and "HTX" in caps[1]
+
+
 def test_settings_apply_persists(tmp_path, monkeypatch):
     env = tmp_path / ".env"
     env.write_text("MIN_PROFIT=2\n", encoding="utf-8")
@@ -82,6 +114,57 @@ def test_settings_apply_persists(tmp_path, monkeypatch):
     text = env.read_text(encoding="utf-8")
     assert "MIN_PROFIT=3" in text and "AMOUNT=100000" in text
     assert bot.cfg.min_profit == 3 and bot.cfg.amount == 100000
+
+
+def _env_bot(tmp_path, monkeypatch, **cfg):
+    env = tmp_path / ".env"
+    env.write_text("TG_CHAT_ID=1\n", encoding="utf-8")
+    monkeypatch.setattr(B, "save_env", functools.partial(B.save_env, path=str(env)))
+    return Stub(p2p.Config(**cfg)), env
+
+
+def test_amount_command_rejects_bad_values(tmp_path, monkeypatch):
+    bot, env = _env_bot(tmp_path, monkeypatch, amount=50000)
+    for arg in ("0", "-5", "nan", "inf", "1e999", "99999999"):
+        asyncio.run(bot.handle(f"/amount {arg}"))
+        assert "от 1 000 до 5 000 000" in texts(bot)[-1], arg
+        assert bot.cfg.amount == 50000, arg
+    assert "AMOUNT" not in env.read_text(encoding="utf-8")
+
+
+def test_amount_command_accepts_units(tmp_path, monkeypatch):
+    bot, env = _env_bot(tmp_path, monkeypatch, amount=50000)
+    asyncio.run(bot.handle("/amount 20к"))
+    assert bot.cfg.amount == 20000
+    assert "AMOUNT=20000" in env.read_text(encoding="utf-8")
+    assert "20 000" in texts(bot)[-1]
+
+
+def test_min_command_rejects_bad_values(tmp_path, monkeypatch):
+    bot, env = _env_bot(tmp_path, monkeypatch, min_profit=2.0)
+    for arg in ("nan", "-100", "inf", "1e308", "0"):
+        asyncio.run(bot.handle(f"/min {arg}"))
+        assert "Не понял порог" in texts(bot)[-1], arg
+        assert bot.cfg.min_profit == 2.0, arg
+    assert "MIN_PROFIT" not in env.read_text(encoding="utf-8")
+
+
+def test_min_command_accepts_comma(tmp_path, monkeypatch):
+    bot, env = _env_bot(tmp_path, monkeypatch, min_profit=2.0)
+    asyncio.run(bot.handle("/min 1,5"))
+    assert bot.cfg.min_profit == 1.5
+    assert "MIN_PROFIT=1.5" in env.read_text(encoding="utf-8")
+    assert "Порог 1.5%" in texts(bot)[-1]
+
+
+def test_apply_callback_rejects_forged_values(tmp_path, monkeypatch):
+    """callback_data «amt:»/«min:» можно подделать клиентом — apply проверяет значение тем же парсером."""
+    bot, env = _env_bot(tmp_path, monkeypatch, amount=50000, min_profit=2.0)
+    for data in ("amt:nan", "amt:0", "min:inf", "min:-1"):
+        asyncio.run(bot.on_callback({"id": "1", "data": data, "message": {"message_id": 3}}))
+        assert ("answerCallbackQuery", {"callback_query_id": "1", "text": "Некорректное значение"}) in bot.out, data
+    assert bot.cfg.amount == 50000 and bot.cfg.min_profit == 2.0
+    assert env.read_text(encoding="utf-8") == "TG_CHAT_ID=1\n"
 
 
 def test_send_deal_passes_amount_breakdown_from_snap(monkeypatch):
@@ -246,6 +329,155 @@ def test_mark_done_logs_trade_and_clears_button(tmp_path, monkeypatch):
     assert not any(b.get("callback_data", "").startswith("did:") for b in buttons)
 
 
+def test_mark_done_uses_amount_at_signal_time(tmp_path, monkeypatch):
+    """Сумму сменили после сигнала — «✅ Сделал» старой карточки пишет сумму, под которую считали %."""
+    db = str(tmp_path / "trades.db")
+    monkeypatch.setattr(B.trades, "log_trade", functools.partial(B.trades.log_trade, path=db))
+    bot = Stub(p2p.Config(amount=50000))
+    deal_id = bot.remember_deal(deal(5.0))
+    bot.cfg.amount = 200000
+    asyncio.run(bot.mark_done({"id": "1", "message": {"message_id": 9}}, deal_id))
+    assert trades.stats(path=db)["day"]["amount"] == 50000
+
+
+def test_show_steps_uses_cfg_at_signal_time():
+    bot = Stub(p2p.Config(amount=50000))
+    d = deal(5.0)
+    deal_id = bot.remember_deal(d, snap=snap([d]))
+    bot.cfg.amount = 200000
+    asyncio.run(bot.show_steps({"id": "1"}, deal_id))
+    head = texts(bot)[-1].splitlines()[0]
+    assert "50 000" in head and "200 000" not in head
+
+
+def test_amount_change_via_settings_keeps_old_card_amount(tmp_path, monkeypatch):
+    """Сценарий целиком: сигнал на 50 000 → «amt:200000» в настройках → «✅ Сделал» старой карточки."""
+    monkeypatch.setattr(B, "deal_card", lambda d, c, a=None, r=None, breakdown=None: b"png")
+    monkeypatch.setattr(B, "save_env", lambda *a, **k: None)
+    db = str(tmp_path / "trades.db")
+    monkeypatch.setattr(B.trades, "log_trade", functools.partial(B.trades.log_trade, path=db))
+    bot = Stub(p2p.Config(amount=50000, min_profit=2.0))
+    bot.live_scans = 1
+    asyncio.run(bot.notify(snap([deal(5.0)])))
+    deal_id = next(iter(bot.deals_by_id))
+    assert bot.deals_by_id[deal_id][1] is not bot.cfg
+    bot.apply("amt:200000")
+    asyncio.run(bot.on_callback({"id": "1", "data": f"did:{deal_id}", "message": {"message_id": 9}}))
+    assert trades.stats(path=db)["day"]["amount"] == 50000
+
+
+def test_live_card_edit_moves_buttons_to_edited_amount(tmp_path, monkeypatch):
+    """Сигнал на 50 000 → «amt:200000» → живая карточка переписана «на 200 000»: кнопки того же сообщения
+    («📋 Шаги», «✅ Сделал») — по той же сумме и связке, что теперь в подписи."""
+    monkeypatch.setattr(B, "deal_card", lambda d, c, a=None, r=None, breakdown=None: b"png")
+    monkeypatch.setattr(B, "save_env", lambda *a, **k: None)
+    db = str(tmp_path / "trades.db")
+    monkeypatch.setattr(B.trades, "log_trade", functools.partial(B.trades.log_trade, path=db))
+    bot = Stub(p2p.Config(amount=50000, min_profit=2.0))
+    bot.live_scans = 1
+
+    async def fake_send_photo(png, caption, markup=None):
+        bot.out.append(("sendPhoto", {"caption": caption, "markup": markup}))
+        return {"ok": True, "result": {"message_id": 555}}
+
+    bot.send_photo = fake_send_photo
+    asyncio.run(bot.notify(snap([deal(5.0)])))
+    buttons = _callbacks(photos(bot)[0][1]["markup"])
+    bot.apply("amt:200000")
+    bot.live_msg[next(iter(bot.live_msg))]["last_edit"] -= B.LIVE_EDIT_INTERVAL + 1
+    asyncio.run(bot.notify(snap([deal(5.1)])))   # в пределах cooldown — правка вместо нового сообщения
+    edits = [p for m, p in bot.out if m == "editMessageCaption"]
+    assert len(photos(bot)) == 1 and len(edits) == 1 and "200 000" in edits[0]["caption"]
+
+    asyncio.run(bot.on_callback({"id": "1", "data": buttons["steps"], "message": {"message_id": 555}}))
+    head = texts(bot)[-1].splitlines()[0]
+    assert "200 000" in head and "50 000" not in head
+    asyncio.run(bot.on_callback({"id": "2", "data": buttons["did"], "message": {"message_id": 555}}))
+    assert trades.stats(path=db)["day"]["amount"] == 200000
+    assert any(t.startswith("Расчёт был +5.10%") for t in texts(bot))   # по связке из правки
+
+
+def test_live_card_edit_failed_keeps_buttons_on_old_snapshot(tmp_path, monkeypatch):
+    """Telegram не принял правку — на карточке старая подпись, кнопки остаются на старом снимке."""
+    monkeypatch.setattr(B, "deal_card", lambda d, c, a=None, r=None, breakdown=None: b"png")
+    monkeypatch.setattr(B, "save_env", lambda *a, **k: None)
+    db = str(tmp_path / "trades.db")
+    monkeypatch.setattr(B.trades, "log_trade", functools.partial(B.trades.log_trade, path=db))
+    bot = Stub(p2p.Config(amount=50000, min_profit=2.0))
+    bot.live_scans = 1
+
+    async def fake_send_photo(png, caption, markup=None):
+        bot.out.append(("sendPhoto", {"caption": caption, "markup": markup}))
+        return {"ok": True, "result": {"message_id": 555}}
+
+    async def call(method, **p):
+        bot.out.append((method, p))
+        return {"ok": False, "error_code": 400} if method == "editMessageCaption" else {"ok": True}
+
+    bot.send_photo, bot.call = fake_send_photo, call
+    asyncio.run(bot.notify(snap([deal(5.0)])))
+    buttons = _callbacks(photos(bot)[0][1]["markup"])
+    bot.apply("amt:200000")
+    bot.live_msg[next(iter(bot.live_msg))]["last_edit"] -= B.LIVE_EDIT_INTERVAL + 1
+    asyncio.run(bot.notify(snap([deal(5.1)])))
+    asyncio.run(bot.on_callback({"id": "2", "data": buttons["did"], "message": {"message_id": 555}}))
+    assert trades.stats(path=db)["day"]["amount"] == 50000
+
+
+def test_deal_snapshot_does_not_share_filter_lists():
+    """Снимок настроек — глубокая копия: _toggle меняет списки self.cfg на месте, снимок это не задевает."""
+    bot = Stub(p2p.Config(assets=["USDT"]))
+    deal_id = bot.remember_deal(deal(5.0))
+    bot.cfg.assets.append("BTC")
+    assert bot.deals_by_id[deal_id][1].assets == ["USDT"]
+
+
+def _callbacks(markup):
+    return {b["callback_data"].split(":", 1)[0]: b["callback_data"]
+            for row in markup["inline_keyboard"] for b in row if ":" in b.get("callback_data", "")}
+
+
+def _restarted_bots(monkeypatch):
+    """Бот до рестарта отправил связку в MEXC, бот после рестарта — в KuCoin; кнопки первой карточки."""
+    monkeypatch.setattr(B, "deal_card", lambda d, c, a=None, r=None, breakdown=None: b"png")
+    monkeypatch.setattr(B.time, "time", lambda: 1_790_000_000.0)
+    old = Stub(p2p.Config())
+    asyncio.run(old.send_deal(deal(5.0, "MEXC")))
+    monkeypatch.setattr(B.time, "time", lambda: 1_790_000_600.0)   # рестарт через 10 минут
+    new = Stub(p2p.Config())
+    asyncio.run(new.send_deal(deal(5.0, "KuCoin")))
+    new.out.clear()
+    return new, _callbacks(photos(old)[0][1]["markup"])
+
+
+def test_deal_ids_unique_across_restarts(monkeypatch):
+    new, old_buttons = _restarted_bots(monkeypatch)
+    assert int(old_buttons["did"][4:]) not in new.deals_by_id
+
+
+def test_old_did_button_after_restart_is_stale(tmp_path, monkeypatch):
+    db = str(tmp_path / "trades.db")
+    monkeypatch.setattr(B.trades, "log_trade", functools.partial(B.trades.log_trade, path=db))
+    new, old_buttons = _restarted_bots(monkeypatch)
+    for data in (old_buttons["did"], "did:1"):   # кнопка прошлого запуска и кнопка до этой правки
+        asyncio.run(new.on_callback({"id": "1", "data": data, "message": {"message_id": 9}}))
+        assert new.out[-1] == ("answerCallbackQuery", {"callback_query_id": "1", "text": "Сигнал устарел, не записан"})
+    assert trades.stats(path=db)["day"]["count"] == 0
+    assert not [m for m, p in new.out if m == "editMessageReplyMarkup"]
+
+
+def test_old_bl_and_steps_buttons_after_restart_are_stale(tmp_path, monkeypatch):
+    db = str(tmp_path / "blacklist.db")
+    monkeypatch.setattr(B.blacklist, "add", functools.partial(B.blacklist.add, path=db))
+    new, old_buttons = _restarted_bots(monkeypatch)
+    asyncio.run(new.on_callback({"id": "1", "data": old_buttons["bl"], "message": {"message_id": 9}}))
+    assert "устарел" in new.out[-1][1]["text"]
+    assert blacklist.blocked(path=db) == set()
+    asyncio.run(new.on_callback({"id": "1", "data": old_buttons["steps"], "message": {"message_id": 9}}))
+    assert "устарел" in new.out[-1][1]["text"]
+    assert not any("Шаги связки" in t for t in texts(new))
+
+
 def test_deal_markup_has_hide_button():
     kb = B.deal_markup(deal(), deal_id=7)["inline_keyboard"]
     buttons = [b for row in kb for b in row]
@@ -404,9 +636,161 @@ def test_delalert_callback_removes_entry(tmp_path, monkeypatch):
 def test_check_alerts_sends_message(monkeypatch):
     ad = make_ad("MEXC", "sell", 93.0)
     monkeypatch.setattr(B.alerts, "due", lambda snap, cfg: [(1, "1", "USDT", "sell", 92.0, 93.0, ad)])
+    marked = []
+    monkeypatch.setattr(B.alerts, "mark_fired", marked.append)
     bot = Stub(p2p.Config())
     asyncio.run(bot.check_alerts(snap([])))
     assert "Алерт сработал" in texts(bot)[-1]
+    assert marked == [1]   # доставлено — помечаем сработавшим
+
+
+class Flaky(Stub):
+    """Telegram не принимает сообщения, пока fail задан: «raise» — сбой сети, число — ответ ok=False с этим
+    error_code, иначе ok=False (429). Попытки отправки — в self.tries."""
+    def __init__(self, cfg, fail="raise"):
+        super().__init__(cfg)
+        self.fail = fail
+        self.tries = 0
+        self.fancy = False   # без разового повтора с обычными кнопками (_fancy_failed)
+
+    def _failure(self):
+        self.tries += 1
+        if self.fail == "raise":
+            raise aiohttp.ClientConnectionError("telegram down")
+        code = self.fail if isinstance(self.fail, int) else 429
+        return {"ok": False, "error_code": code, "description": f"error {code}"}
+
+    async def call(self, method, **p):
+        if self.fail and method == "sendMessage":
+            return self._failure()
+        return await super().call(method, **p)
+
+    async def send_photo(self, png, caption, markup=None):
+        if self.fail:
+            return self._failure()
+        return await super().send_photo(png, caption, markup)
+
+
+def test_notify_not_marked_sent_when_telegram_raises(monkeypatch):
+    monkeypatch.setattr(B, "deal_card", lambda d, c, a=None, r=None, breakdown=None: b"png")
+    bot = Flaky(p2p.Config(min_profit=2.0))
+    bot.live_scans = 1
+    ds = [deal(5, "MEXC"), deal(4, "KuCoin")]
+    asyncio.run(bot.notify(snap(ds)))
+    assert bot.sent == {} and not photos(bot)
+    bot.fail = None                      # сеть вернулась — обе связки уходят в следующем скане
+    asyncio.run(bot.notify(snap(ds)))
+    assert len(photos(bot)) == 2 and len(bot.sent) == 2
+
+
+def test_notify_not_marked_sent_when_not_ok(monkeypatch):
+    monkeypatch.setattr(B, "deal_card", lambda d, c, a=None, r=None, breakdown=None: b"png")
+    bot = Flaky(p2p.Config(min_profit=2.0), fail="not_ok")
+    bot.live_scans = 1
+    asyncio.run(bot.notify(snap([deal(5)])))
+    assert bot.sent == {}
+    bot.fail = None
+    asyncio.run(bot.notify(snap([deal(5)])))
+    assert len(photos(bot)) == 1 and len(bot.sent) == 1
+
+
+def test_notify_permanent_refusal_consumes_signal(monkeypatch):
+    """400/403 повтор не исправит: связка считается отправленной и не долбит Telegram каждый скан."""
+    monkeypatch.setattr(B, "deal_card", lambda d, c, a=None, r=None, breakdown=None: b"png")
+    for code in (400, 403):
+        bot = Flaky(p2p.Config(min_profit=2.0), fail=code)
+        bot.live_scans = 1
+        asyncio.run(bot.notify(snap([deal(5)])))
+        tries = bot.tries
+        assert tries and bot._deal_key(deal(5)) in bot.sent, code
+        asyncio.run(bot.notify(snap([deal(5)])))
+        assert bot.tries == tries, code
+
+
+def test_notify_rate_limit_retries_next_scan(monkeypatch):
+    monkeypatch.setattr(B, "deal_card", lambda d, c, a=None, r=None, breakdown=None: b"png")
+    bot = Flaky(p2p.Config(min_profit=2.0), fail=429)
+    bot.live_scans = 1
+    asyncio.run(bot.notify(snap([deal(5)])))
+    tries = bot.tries
+    asyncio.run(bot.notify(snap([deal(5)])))
+    assert bot.sent == {} and bot.tries > tries
+
+
+def test_telegram_send_errors_logged_without_bot_token(monkeypatch, caplog):
+    """str() ошибки aiohttp содержит URL запроса, а в нём токен бота — в лог только код и причина."""
+    url = URL("https://api.telegram.org/bot123456:TEST-BOT-TOKEN/sendMessage")
+    err = aiohttp.ClientResponseError(aiohttp.RequestInfo(url, "POST", CIMultiDictProxy(CIMultiDict()), url), (),
+                                      status=502, message="Bad Gateway")
+    monkeypatch.setattr(B, "deal_card", lambda d, c, a=None, r=None, breakdown=None: b"png")
+    ad = make_ad("MEXC", "sell", 93.0)
+    monkeypatch.setattr(B.alerts, "due", lambda snap, cfg: [(1, "1", "USDT", "sell", 92.0, 93.0, ad)])
+    bot = Stub(p2p.Config(min_profit=2.0))
+    bot.live_scans, bot.fancy = 1, False
+
+    async def call(method, **p):
+        raise err
+
+    async def send_photo(png, caption, markup=None):
+        return {"ok": False, "description": "no photo"}
+
+    bot.call, bot.send_photo = call, send_photo
+    caplog.set_level(logging.WARNING)
+    assert asyncio.run(bot.delete_message(5)) is False
+    asyncio.run(bot.notify(snap([deal(5)])))
+    asyncio.run(bot.check_alerts(snap([])))
+    assert caplog.text.count("HTTP 502") == 3
+    assert "TEST-BOT-TOKEN" not in caplog.text
+
+
+def _alerts_db(tmp_path, monkeypatch):
+    db = str(tmp_path / "alerts.db")
+    for name in ("add", "due", "mark_fired", "list_all"):
+        monkeypatch.setattr(B.alerts, name, functools.partial(getattr(B.alerts, name), path=db))
+    return {("MEXC", "sell", "USDT"): make_ad("MEXC", "sell", 93.0)}
+
+
+def test_check_alerts_keeps_alert_when_send_fails(tmp_path, monkeypatch):
+    best = _alerts_db(tmp_path, monkeypatch)
+    B.alerts.add("1", "USDT", "sell", 92.0, time.time() + 86400)
+    s = p2p.Snapshot(88.0, "test", {}, best, [], {}, {}, {})
+    bot = Flaky(p2p.Config())
+    asyncio.run(bot.check_alerts(s))
+    assert len(B.alerts.list_all("1")) == 1          # одноразовый не удалён: сообщение не дошло
+    bot.fail = None
+    asyncio.run(bot.check_alerts(s))
+    assert "Алерт сработал" in texts(bot)[-1]
+    assert B.alerts.list_all("1") == []
+
+
+def test_check_alerts_marks_only_delivered(tmp_path, monkeypatch):
+    best = _alerts_db(tmp_path, monkeypatch)
+    B.alerts.add("2", "USDT", "sell", 92.0, time.time() + 86400)   # чат, куда Telegram не доставил
+    B.alerts.add("1", "USDT", "sell", 91.0, time.time() + 86400)
+    s = p2p.Snapshot(88.0, "test", {}, best, [], {}, {}, {})
+    bot = Stub(p2p.Config())
+
+    async def call(method, **p):
+        bot.out.append((method, p))
+        return {"ok": p.get("chat_id") != "2", "description": "Bad Request: chat not found"}
+
+    bot.call = call
+    asyncio.run(bot.check_alerts(s))
+    assert len(texts(bot)) == 2
+    assert len(B.alerts.list_all("2")) == 1 and B.alerts.list_all("1") == []
+
+
+def test_check_alerts_permanent_refusal_marks_fired(tmp_path, monkeypatch):
+    """429 — алерт ждёт следующего скана; 403 (бот заблокирован) — повтор не поможет, одноразовый израсходован."""
+    best = _alerts_db(tmp_path, monkeypatch)
+    B.alerts.add("1", "USDT", "sell", 92.0, time.time() + 86400)
+    s = p2p.Snapshot(88.0, "test", {}, best, [], {}, {}, {})
+    bot = Flaky(p2p.Config(), fail=429)
+    asyncio.run(bot.check_alerts(s))
+    assert len(B.alerts.list_all("1")) == 1
+    bot.fail = 403
+    asyncio.run(bot.check_alerts(s))
+    assert B.alerts.list_all("1") == []
 
 
 def test_mark_done_unknown_id_not_logged(monkeypatch):
@@ -552,6 +936,11 @@ def test_account_view_kucoin_offers_connect_button(tmp_path, monkeypatch):
     assert "acc_add:kucoin" in callbacks
 
 
+async def _perms_readonly(s, ex):
+    """key_permissions: биржа подтвердила «только чтение»."""
+    return True, ""
+
+
 def test_acc_add_kucoin_arms_awaiting_key_three_step_flow(tmp_path, monkeypatch):
     monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
 
@@ -559,6 +948,7 @@ def test_acc_add_kucoin_arms_awaiting_key_three_step_flow(tmp_path, monkeypatch)
         return False, "kucoin: подпись запросов пока не реализована"
 
     monkeypatch.setattr(B.accounts, "verify", fake_verify)
+    monkeypatch.setattr(B.accounts, "key_permissions", _perms_readonly)
     bot = Stub(p2p.Config())
     asyncio.run(bot.on_callback({"id": "1", "data": "acc_add:kucoin", "message": {"message_id": 1}}))
     assert bot.awaiting_key == {"ex": "kucoin", "step": "key"}
@@ -597,6 +987,7 @@ def test_handle_key_input_flow_saves_and_verifies(tmp_path, monkeypatch):
         return True, "ключ рабочий, доступ только для чтения"
 
     monkeypatch.setattr(B.accounts, "verify", fake_verify)
+    monkeypatch.setattr(B.accounts, "key_permissions", _perms_readonly)
     bot = Stub(p2p.Config())
     bot.awaiting_key = {"ex": "bybit", "step": "key"}
     asyncio.run(bot.handle_key_input("APIKEY123", 55))
@@ -616,6 +1007,7 @@ def test_handle_key_input_reports_failed_verification(tmp_path, monkeypatch):
         return False, "Invalid api_key"
 
     monkeypatch.setattr(B.accounts, "verify", fake_verify)
+    monkeypatch.setattr(B.accounts, "key_permissions", _perms_readonly)
     bot = Stub(p2p.Config())
     bot.awaiting_key = {"ex": "bybit", "step": "secret", "key": "APIKEY123"}
     asyncio.run(bot.handle_key_input("SECRET456", 56))
@@ -654,11 +1046,14 @@ def test_command_resets_awaiting_key():
     assert bot.awaiting_key is None
 
 
-def test_acc_check_callback_reports_status(monkeypatch):
+def test_acc_check_callback_reports_status(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+
     async def fake_verify(s, ex):
         return False, "bad key"
 
     monkeypatch.setattr(B.accounts, "verify", fake_verify)
+    monkeypatch.setattr(B.accounts, "key_permissions", _perms_readonly)
     bot = Stub(p2p.Config())
     asyncio.run(bot.on_callback({"id": "1", "data": "acc_check:bybit", "message": {"message_id": 1}}))
     assert "bad key" in texts(bot)[-1]
@@ -806,6 +1201,292 @@ def test_check_key_safety_skips_exchanges_without_saved_key(tmp_path, monkeypatc
     assert calls == []
 
 
+# --- #10: права ключа проверяются при подключении и по «🔄 Проверить», а не только при старте ---
+
+def _perms(result, calls=None):
+    async def fake(s, ex):
+        if calls is not None:
+            calls.append("perm")
+        return result
+    return fake
+
+
+def _verify_ok(calls=None):
+    async def fake(s, ex):
+        if calls is not None:
+            calls.append("verify")
+        return True, "ключ рабочий"
+    return fake
+
+
+def test_handle_key_input_drops_trade_key_and_never_says_readonly(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    calls = []
+    monkeypatch.setattr(B.accounts, "key_permissions", _perms((False, "торговля"), calls))
+    monkeypatch.setattr(B.accounts, "verify", _verify_ok(calls))
+    bot = Stub(p2p.Config())
+    bot.awaiting_key = {"ex": "bybit", "step": "key"}
+    asyncio.run(bot.handle_key_input("APIKEY123", 55))
+    asyncio.run(bot.handle_key_input("SECRET456", 56))
+    assert accounts.keys("bybit") is None
+    assert calls == ["perm"]                    # баланс торгового ключа даже не запрашивали
+    assert any("больше, чем чтение" in t and "торговля" in t for t in texts(bot))
+    assert not any("✅ Подключено" in t for t in texts(bot))
+    assert "не подключён" in texts(bot)[-1]     # карточка биржи — уже без ключа
+
+
+def test_handle_key_input_checks_permissions_before_verify(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    calls = []
+    monkeypatch.setattr(B.accounts, "key_permissions", _perms((True, ""), calls))
+    monkeypatch.setattr(B.accounts, "verify", _verify_ok(calls))
+    bot = Stub(p2p.Config())
+    bot.awaiting_key = {"ex": "bybit", "step": "secret", "key": "APIKEY123"}
+    asyncio.run(bot.handle_key_input("SECRET456", 56))
+    assert calls == ["perm", "verify"]
+    assert accounts.keys("bybit") == ("APIKEY123", "SECRET456")
+    assert "✅ Подключено (только чтение)" in texts(bot)
+
+
+def test_handle_key_input_unverified_permissions_not_called_readonly(tmp_path, monkeypatch):
+    """Биржа не ответила на запрос прав — ключ остаётся, но «только чтение» не обещаем."""
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    monkeypatch.setattr(B.accounts, "key_permissions", _perms((None, "")))
+    monkeypatch.setattr(B.accounts, "verify", _verify_ok())
+    bot = Stub(p2p.Config())
+    bot.awaiting_key = {"ex": "bybit", "step": "secret", "key": "APIKEY123"}
+    asyncio.run(bot.handle_key_input("SECRET456", 56))
+    assert accounts.keys("bybit") == ("APIKEY123", "SECRET456")
+    connected = [t for t in texts(bot) if t.startswith("✅ Подключено")]
+    assert connected and "проверить не удалось" in connected[0]
+    assert not any("только чтение" in t for t in texts(bot))
+
+
+def test_acc_check_drops_trade_key(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    accounts.save_key("bybit", "k", "s")
+    calls = []
+    monkeypatch.setattr(B.accounts, "key_permissions", _perms((False, "вывод"), calls))
+    monkeypatch.setattr(B.accounts, "verify", _verify_ok(calls))
+    bot = Stub(p2p.Config())
+    asyncio.run(bot.on_callback({"id": "1", "data": "acc_check:bybit", "message": {"message_id": 1}}))
+    assert accounts.keys("bybit") is None
+    assert calls == ["perm"]
+    assert any("больше, чем чтение" in t and "вывод" in t for t in texts(bot))
+    assert not any("✅ Ключ рабочий" in t for t in texts(bot))
+
+
+def test_acc_check_readonly_key_confirmed(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    accounts.save_key("bybit", "k", "s")
+    monkeypatch.setattr(B.accounts, "key_permissions", _perms((True, "")))
+    monkeypatch.setattr(B.accounts, "verify", _verify_ok())
+    bot = Stub(p2p.Config())
+    asyncio.run(bot.on_callback({"id": "1", "data": "acc_check:bybit", "message": {"message_id": 1}}))
+    assert accounts.keys("bybit") == ("k", "s")
+    assert texts(bot)[-1] == "✅ Ключ рабочий (только чтение)"
+
+
+def test_acc_check_unverified_permissions_not_called_readonly(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    accounts.save_key("bybit", "k", "s")
+    monkeypatch.setattr(B.accounts, "key_permissions", _perms((None, "")))
+    monkeypatch.setattr(B.accounts, "verify", _verify_ok())
+    bot = Stub(p2p.Config())
+    asyncio.run(bot.on_callback({"id": "1", "data": "acc_check:bybit", "message": {"message_id": 1}}))
+    assert accounts.keys("bybit") == ("k", "s")
+    assert texts(bot)[-1].startswith("✅ Ключ рабочий") and "проверить не удалось" in texts(bot)[-1]
+    assert "(только чтение)" not in texts(bot)[-1]
+
+
+def test_unverified_key_never_claimed_readonly_in_any_message(tmp_path, monkeypatch):
+    """Права не проверены (safe=None): ни «Подключено», ни карточка биржи после него, ни «🔄 Проверить»,
+    ни открытая заново карточка не утверждают «только чтение»."""
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    monkeypatch.setattr(B.accounts, "key_permissions", _perms((None, "")))
+    monkeypatch.setattr(B.accounts, "verify", _verify_ok())
+    bot = Stub(p2p.Config())
+    bot.awaiting_key = {"ex": "bybit", "step": "secret", "key": "APIKEY123"}
+    asyncio.run(bot.handle_key_input("SECRET456", 56))
+    asyncio.run(bot.on_callback({"id": "1", "data": "acc_check:bybit", "message": {"message_id": 1}}))
+    asyncio.run(bot.on_callback({"id": "2", "data": "acc:bybit", "message": {"message_id": 1}}))
+    assert accounts.keys("bybit") == ("APIKEY123", "SECRET456")
+    assert len(texts(bot)) >= 4 and "Ключ подключён" in texts(bot)[-1]
+    assert not any("только чтение" in t for t in texts(bot))
+
+
+def test_account_view_does_not_claim_readonly(tmp_path, monkeypatch):
+    """Карточка биржи не знает, проверены ли права, — «Доступ: только чтение» не пишет."""
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    accounts.save_key("bybit", "APIKEY123", "SECRET456")
+    text, kb = B.account_view("bybit")
+    assert "Ключ подключён" in text and "только чтение" not in text
+    assert any(b.get("callback_data") == "acc_check:bybit" for row in kb["inline_keyboard"] for b in row)
+
+
+# те же сценарии с настоящими key_permissions/verify — подменён только транспорт к бирже
+BYBIT_TRADE_KEY = {"retCode": 0, "result": {"readOnly": 0, "permissions": {
+    "ContractTrade": ["Order", "Position"], "Wallet": ["AccountTransfer"], "Spot": ["SpotTrade"]}}}
+BYBIT_READONLY_KEY = {"retCode": 0, "result": {"readOnly": 1, "permissions": {"Spot": [], "Wallet": []}}}
+
+
+def _bybit_transport(monkeypatch, query_api):
+    paths = []
+
+    async def fake_bybit_get(s, api_key, api_secret, path, params=None):
+        paths.append(path)
+        if path == "/v5/user/query-api":
+            return query_api
+        if path == "/v5/account/wallet-balance":
+            return {"retCode": 0, "result": {"list": []}}
+        raise AssertionError(f"unexpected bybit path {path}")
+
+    monkeypatch.setattr(accounts, "bybit_get", fake_bybit_get)
+    return paths
+
+
+def test_connect_bybit_trade_key_via_api_is_dropped(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    paths = _bybit_transport(monkeypatch, BYBIT_TRADE_KEY)
+    bot = Stub(p2p.Config())
+    bot.awaiting_key = {"ex": "bybit", "step": "key"}
+    asyncio.run(bot.handle_key_input("APIKEY123", 55))
+    asyncio.run(bot.handle_key_input("SECRET456", 56))
+    assert accounts.keys("bybit") is None
+    assert paths == ["/v5/user/query-api"]
+    assert not any("только чтение)" in t for t in texts(bot))
+    assert any("больше, чем чтение" in t for t in texts(bot))
+
+
+def test_connect_bybit_readonly_key_via_api_says_readonly(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    paths = _bybit_transport(monkeypatch, BYBIT_READONLY_KEY)
+    bot = Stub(p2p.Config())
+    bot.awaiting_key = {"ex": "bybit", "step": "secret", "key": "APIKEY123"}
+    asyncio.run(bot.handle_key_input("SECRET456", 56))
+    assert paths == ["/v5/user/query-api", "/v5/account/wallet-balance"]
+    assert accounts.keys("bybit") == ("APIKEY123", "SECRET456")
+    assert "✅ Подключено (только чтение)" in texts(bot)
+
+
+def test_connect_bybit_permissions_api_error_not_called_readonly(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    _bybit_transport(monkeypatch, {"retCode": 10005, "retMsg": "Permission denied"})
+    bot = Stub(p2p.Config())
+    bot.awaiting_key = {"ex": "bybit", "step": "secret", "key": "APIKEY123"}
+    asyncio.run(bot.handle_key_input("SECRET456", 56))
+    assert accounts.keys("bybit") == ("APIKEY123", "SECRET456")
+    assert any(t.startswith("✅ Подключено") and "проверить не удалось" in t for t in texts(bot))
+    assert not any("только чтение" in t for t in texts(bot))   # и в карточке биржи после «Подключено»
+
+
+def test_acc_check_bybit_trade_key_via_api_is_dropped(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    accounts.save_key("bybit", "APIKEY123", "SECRET456")
+    _bybit_transport(monkeypatch, BYBIT_TRADE_KEY)
+    bot = Stub(p2p.Config())
+    asyncio.run(bot.on_callback({"id": "1", "data": "acc_check:bybit", "message": {"message_id": 1}}))
+    assert accounts.keys("bybit") is None
+    assert not any("✅ Ключ рабочий" in t for t in texts(bot))
+
+
+def test_connect_mexc_trade_withdraw_key_via_api_is_dropped(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+
+    async def fake_mexc_get(s, api_key, api_secret, path, params=None):
+        assert path == "/api/v3/account"
+        return {"canTrade": True, "canWithdraw": True, "balances": []}
+
+    monkeypatch.setattr(accounts, "mexc_get", fake_mexc_get)
+    bot = Stub(p2p.Config())
+    bot.awaiting_key = {"ex": "mexc", "step": "secret", "key": "k"}
+    asyncio.run(bot.handle_key_input("s", 56))
+    assert accounts.keys("mexc") is None
+    assert any("больше, чем чтение" in t and "торговля, вывод" in t for t in texts(bot))
+    assert not any("✅ Подключено" in t for t in texts(bot))
+
+
+# --- #11: «сообщение удалено» — только если Telegram подтвердил deleteMessage ---
+
+class RefusingDelete(Stub):
+    """Telegram отказывает в deleteMessage (группа без прав админа и т.п.)."""
+    async def call(self, method, **p):
+        r = await super().call(method, **p)
+        if method == "deleteMessage":
+            return {"ok": False, "error_code": 400, "description": "Bad Request: message can't be deleted"}
+        return r
+
+
+class RaisingDelete(Stub):
+    """deleteMessage падает сетевой ошибкой."""
+    async def call(self, method, **p):
+        if method == "deleteMessage":
+            raise aiohttp.ClientConnectionError("network down")
+        return await super().call(method, **p)
+
+
+def test_handle_key_input_warns_when_delete_refused(caplog):
+    bot = RefusingDelete(p2p.Config())
+    bot.awaiting_key = {"ex": "bybit", "step": "key"}
+    asyncio.run(bot.handle_key_input("APIKEY123", 55))
+    assert ("deleteMessage", {"chat_id": "1", "message_id": 55}) in bot.out
+    assert not any("удалено" in t for t in texts(bot))
+    assert any("вручную" in t for t in texts(bot))
+    assert bot.awaiting_key == {"ex": "bybit", "step": "secret", "key": "APIKEY123"}   # ввод продолжается
+    assert "APIKEY123" not in caplog.text                                               # ключ не в логах
+
+
+def test_handle_key_input_warns_when_delete_raises():
+    bot = RaisingDelete(p2p.Config())
+    bot.awaiting_key = {"ex": "bybit", "step": "key"}
+    asyncio.run(bot.handle_key_input("APIKEY123", 55))     # исключение не вылетает наружу
+    assert not any("удалено" in t for t in texts(bot))
+    assert any("вручную" in t for t in texts(bot))
+    assert bot.awaiting_key == {"ex": "bybit", "step": "secret", "key": "APIKEY123"}
+
+
+def test_handle_key_input_final_step_warns_when_delete_refused(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    calls = []
+    monkeypatch.setattr(B.accounts, "key_permissions", _perms((True, ""), calls))
+    monkeypatch.setattr(B.accounts, "verify", _verify_ok(calls))
+    bot = RefusingDelete(p2p.Config())
+    bot.awaiting_key = {"ex": "bybit", "step": "secret", "key": "APIKEY123"}
+    asyncio.run(bot.handle_key_input("SECRET456", 56))
+    assert accounts.keys("bybit") == ("APIKEY123", "SECRET456")
+    assert calls == ["perm", "verify"]
+    assert any("вручную" in t for t in texts(bot))
+    assert "✅ Подключено (только чтение)" in texts(bot)
+
+
+def test_handle_key_input_kucoin_every_step_warns_when_delete_refused(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    monkeypatch.setattr(B.accounts, "key_permissions", _perms((True, "")))
+    monkeypatch.setattr(B.accounts, "verify", _verify_ok())
+    bot = RefusingDelete(p2p.Config())
+    bot.awaiting_key = {"ex": "kucoin", "step": "key"}
+    for n, (text, mid) in enumerate((("APIKEY123", 55), ("SECRET456", 56), ("PASS789", 57)), 1):
+        asyncio.run(bot.handle_key_input(text, mid))
+        assert sum("вручную" in t for t in texts(bot)) == n    # предупреждение на каждом шаге
+    assert not any("удалено" in t for t in texts(bot))
+    assert accounts.passphrase("kucoin") == "PASS789"
+
+
+def test_handle_key_input_delete_ok_still_says_deleted():
+    bot = Stub(p2p.Config())
+    bot.awaiting_key = {"ex": "bybit", "step": "key"}
+    asyncio.run(bot.handle_key_input("APIKEY123", 55))
+    assert texts(bot) == ["Ключ получен, сообщение удалено. Теперь пришли <b>secret</b> для Bybit."]
+
+
+def test_handle_key_input_without_message_id_claims_nothing():
+    bot = Stub(p2p.Config())
+    bot.awaiting_key = {"ex": "bybit", "step": "key"}
+    asyncio.run(bot.handle_key_input("APIKEY123", None))
+    assert not any(m == "deleteMessage" for m, _ in bot.out)
+    assert not any("удалено" in t or "вручную" in t for t in texts(bot))
+
+
 def test_stats_view_reports_counts(tmp_path, monkeypatch):
     db = str(tmp_path / "trades.db")
     monkeypatch.setattr(B.trades, "stats", functools.partial(B.trades.stats, path=db))
@@ -947,6 +1628,37 @@ def test_portfolio_rows_matches_totals_from_view():
     assert rows[0][1] == [("BTC", 0.01, 50_000.0), ("USDT", 10.0, 880.0)]
 
 
+def test_portfolio_rows_without_snapshot_has_no_rub_values():
+    port = {"bybit": {"USDT": 100.0, "USDC": 50.0}}
+    rows, total = B.portfolio_rows(port, None)
+    assert rows == [("Bybit", [("USDC", 50.0, None), ("USDT", 100.0, None)])]
+    assert total == 0.0
+
+
+def test_portfolio_view_without_snapshot_says_rate_not_received():
+    text = B.portfolio_view({"bybit": {"USDT": 100.0, "USDC": 50.0}}, None)
+    assert "100 USDT" in text and "курс ещё не получен" in text
+    assert "≈ 100 ₽" not in text and "Итого:</b> ≈" not in text and "нет ориентира" not in text
+
+
+def test_balance_before_first_scan_sends_text_without_card(monkeypatch):
+    async def fake_portfolio(s):
+        return {"bybit": {"USDT": 100.0}}
+
+    def boom(rows, total):
+        raise AssertionError("карточка до первого скана не нужна")
+
+    monkeypatch.setattr(B.accounts, "portfolio", fake_portfolio)
+    monkeypatch.setattr(B, "portfolio_card", boom)
+    bot = Stub(p2p.Config())
+    assert bot.last is None
+    asyncio.run(bot.handle("/balance"))
+    assert not photos(bot)
+    (method, params), = bot.out
+    assert method == "sendMessage" and "курс ещё не получен" in params["text"] and "≈ 100 ₽" not in params["text"]
+    assert params["reply_markup"]["inline_keyboard"][0][0]["callback_data"] == "balance"
+
+
 def test_balance_command_sends_card_with_refresh_button(monkeypatch):
     async def fake_portfolio(s):
         return {"mexc": {"USDT": 1.0}}
@@ -1026,6 +1738,51 @@ def test_check_accounts_first_poll_is_silent_then_new_items_notify(tmp_path, mon
 
     asyncio.run(bot.check_accounts())
     assert len(texts(bot)) == 1       # повтор той же истории не шлём
+
+
+def _history_bot(tmp_path, monkeypatch, answers):
+    """Бот с ключом MEXC; account_history отдаёт по очереди ответы из answers."""
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    accounts.save_key("mexc", "k", "s")
+    answers = list(answers)
+
+    async def fake_history(s, ex, limit=20):
+        return answers.pop(0) if ex == "mexc" else None
+
+    monkeypatch.setattr(B.accounts, "account_history", fake_history)
+    return Stub(p2p.Config())
+
+
+def test_check_accounts_empty_history_then_first_deposit_notifies(tmp_path, monkeypatch):
+    dep = {"kind": "deposit", "asset": "USDT", "amount": 100.0, "ts": 1.0}
+    bot = _history_bot(tmp_path, monkeypatch, [[], [dep], [dep]])
+    asyncio.run(bot.check_accounts())
+    assert bot.acc_seen["mexc"] == set() and texts(bot) == []   # пустой успешный ответ — это первый опрос
+    asyncio.run(bot.check_accounts())
+    msgs = texts(bot)
+    assert len(msgs) == 1 and "пришёл депозит" in msgs[0]
+    asyncio.run(bot.check_accounts())
+    assert len(texts(bot)) == 1
+
+
+def test_check_accounts_none_history_does_not_seed_baseline(tmp_path, monkeypatch):
+    dep = {"kind": "deposit", "asset": "USDT", "amount": 100.0, "ts": 1.0}
+    bot = _history_bot(tmp_path, monkeypatch, [None, [dep]])
+    asyncio.run(bot.check_accounts())
+    assert bot.acc_seen.get("mexc") is None                   # ошибка — не первый опрос
+    asyncio.run(bot.check_accounts())
+    assert texts(bot) == [] and bot.acc_seen["mexc"] == {B.hist_key(dep)}
+
+
+def test_check_accounts_partial_failure_does_not_forget_items(tmp_path, monkeypatch):
+    """Источник депозитов на один опрос не ответил (в ленте только вывод): его записи не забываем —
+    после восстановления старый депозит не приходит как новый."""
+    dep = {"kind": "deposit", "asset": "USDT", "amount": 100.0, "ts": 1.0}
+    wd = {"kind": "withdraw", "asset": "USDT", "amount": 30.0, "ts": 2.0}
+    bot = _history_bot(tmp_path, monkeypatch, [[wd, dep], [wd], [wd, dep]])
+    for _ in range(3):
+        asyncio.run(bot.check_accounts())
+    assert texts(bot) == []
 
 
 def test_deal_markup_has_steps_button():
@@ -1127,6 +1884,16 @@ def test_quiet_hours_blocks_signal_and_stores_for_digest(monkeypatch):
     asyncio.run(bot.quiet_and_pause_tick(snap([d])))
     assert not bot.out                              # сигнал не отправлен
     assert list(bot.night_deals.values()) == [d]     # но накоплен для утреннего дайджеста
+
+
+def test_night_digest_collects_after_low_deal(monkeypatch):
+    """Ночной дайджест тоже не обрывается на связке ниже порога, стоящей выше в списке сканера."""
+    monkeypatch.setattr(B.time, "time", lambda: msk_ts(2, 0))
+    bot = Stub(p2p.Config(min_profit=2.0))
+    bot.quiet_on = True
+    asyncio.run(bot.quiet_and_pause_tick(snap([deal(1.5, "MEXC"), deal(3, "KuCoin")])))
+    assert not bot.out
+    assert [d[0] for d in bot.night_deals.values()] == [3]
 
 
 def test_quiet_hours_off_sends_signal_as_usual(monkeypatch):
@@ -1370,6 +2137,20 @@ def test_flt_callback_rerenders_filters_view(tmp_path, monkeypatch):
     assert method == "editMessageText" and "Фильтры" in params["text"]
 
 
+def use_presets_file(monkeypatch, pfile):
+    """Весь ввод-вывод presets — в файл из tmp_path (data/ в тестах не трогаем)."""
+    load, save = presets._load, presets._save
+    monkeypatch.setattr(presets, "_load", lambda path=None: load(str(pfile)))
+    monkeypatch.setattr(presets, "_save", lambda data, path=None: save(data, str(pfile)))
+
+
+def env_file(tmp_path, monkeypatch):
+    env = tmp_path / ".env"
+    env.write_text("", encoding="utf-8")
+    monkeypatch.setattr(B, "save_env", functools.partial(B.save_env, path=str(env)))
+    return env
+
+
 def test_preset_save_flow_writes_current_filters(tmp_path, monkeypatch):
     pfile = tmp_path / "presets.json"
     monkeypatch.setattr(B.presets, "save_preset", functools.partial(B.presets.save_preset, path=str(pfile)))
@@ -1398,12 +2179,10 @@ def test_apply_saved_preset_updates_cfg_and_env(tmp_path, monkeypatch):
     pfile = tmp_path / "presets.json"
     presets.save_preset("Быстрый", p2p.Config(assets=["USDT"], exchanges=["bybit", "mexc"],
                                               min_profit=3.0, amount=70000), path=str(pfile))
-    monkeypatch.setattr(B.presets, "get_preset", functools.partial(B.presets.get_preset, path=str(pfile)))
-    env = tmp_path / ".env"
-    env.write_text("", encoding="utf-8")
-    monkeypatch.setattr(B, "save_env", functools.partial(B.save_env, path=str(env)))
+    use_presets_file(monkeypatch, pfile)
+    env = env_file(tmp_path, monkeypatch)
     bot = Stub(p2p.Config())
-    toast = bot.apply("preset_apply:Быстрый")
+    toast = bot.apply("preset_apply:" + presets.preset_id("Быстрый"))
     assert "Быстрый" in toast
     assert bot.cfg.assets == ["USDT"] and bot.cfg.exchanges == ["bybit", "mexc"]
     assert bot.cfg.min_profit == 3.0 and bot.cfg.amount == 70000
@@ -1415,8 +2194,9 @@ def test_apply_builtin_preset_usdt_no_transfer(tmp_path, monkeypatch):
     env = tmp_path / ".env"
     env.write_text("", encoding="utf-8")
     monkeypatch.setattr(B, "save_env", functools.partial(B.save_env, path=str(env)))
+    use_presets_file(monkeypatch, tmp_path / "presets.json")
     bot = Stub(p2p.Config())
-    bot.apply("preset_apply:USDT без переводов")
+    bot.apply("preset_apply:" + presets.preset_id("USDT без переводов"))
     assert bot.cfg.assets == ["USDT"] and bot.cfg.same_venue_only is True
     assert "SAME_VENUE_ONLY=1" in env.read_text(encoding="utf-8")
 
@@ -1425,16 +2205,19 @@ def test_apply_builtin_preset_all_venues_resets(tmp_path, monkeypatch):
     env = tmp_path / ".env"
     env.write_text("", encoding="utf-8")
     monkeypatch.setattr(B, "save_env", functools.partial(B.save_env, path=str(env)))
+    use_presets_file(monkeypatch, tmp_path / "presets.json")
     bot = Stub(p2p.Config(assets=["USDT"], exchanges=["bybit"], same_venue_only=True))
-    bot.apply("preset_apply:Все площадки")
+    bot.apply("preset_apply:" + presets.preset_id("Все площадки"))
     assert set(bot.cfg.exchanges) == set(p2p.ALL_EXCHANGES.split(","))
     assert set(bot.cfg.assets) == set(p2p.DEFAULT_ASSETS.split(","))
     assert bot.cfg.same_venue_only is False
 
 
-def test_apply_unknown_preset_reports_not_found():
+def test_apply_unknown_preset_reports_not_found(tmp_path, monkeypatch):
+    use_presets_file(monkeypatch, tmp_path / "presets.json")
     bot = Stub(p2p.Config())
     assert "не найден" in bot.apply("preset_apply:нет такого").lower()
+    assert "не найден" in bot.apply("preset_apply:" + presets.preset_id("нет такого")).lower()
 
 
 def test_presets_view_lists_builtin_and_custom(tmp_path, monkeypatch):
@@ -1444,21 +2227,129 @@ def test_presets_view_lists_builtin_and_custom(tmp_path, monkeypatch):
     text, kb = B.presets_view(p2p.Config())
     assert "USDT без переводов" in text and "Мой" in text
     buttons = [b for row in kb["inline_keyboard"] for b in row]
-    assert any(b.get("callback_data") == "preset_apply:Мой" for b in buttons)
-    assert any(b.get("callback_data") == "preset_del:Мой" for b in buttons)
-    assert not any(b.get("callback_data") == "preset_del:USDT без переводов" for b in buttons)
+    assert any(b.get("callback_data") == "preset_apply:" + presets.preset_id("Мой") for b in buttons)
+    assert any(b.get("callback_data") == "preset_del:" + presets.preset_id("Мой") for b in buttons)
+    assert any(b.get("callback_data") == "preset_apply:" + presets.preset_id("USDT без переводов") for b in buttons)
+    assert not any(b.get("callback_data") == "preset_del:" + presets.preset_id("USDT без переводов")
+                   for b in buttons)
 
 
 def test_preset_del_callback_removes_and_rerenders(tmp_path, monkeypatch):
     pfile = tmp_path / "presets.json"
     presets.save_preset("Старый", p2p.Config(), path=str(pfile))
-    monkeypatch.setattr(B.presets, "delete_preset", functools.partial(B.presets.delete_preset, path=str(pfile)))
-    monkeypatch.setattr(B.presets, "list_custom", functools.partial(B.presets.list_custom, path=str(pfile)))
+    use_presets_file(monkeypatch, pfile)
     bot = Stub(p2p.Config())
-    asyncio.run(bot.on_callback({"id": "1", "data": "preset_del:Старый", "message": {"message_id": 1}}))
+    data = "preset_del:" + presets.preset_id("Старый")
+    asyncio.run(bot.on_callback({"id": "1", "data": data, "message": {"message_id": 1}}))
     assert "Старый" not in presets.list_custom(path=str(pfile))
     method, params = bot.out[-1]
     assert method == "editMessageText" and "Пресеты" in params["text"]
+
+
+# callback_data у Telegram — не больше 64 байт: пресет в кнопке — коротким id, не именем
+
+def callbacks(markup):
+    return [b["callback_data"] for row in markup["inline_keyboard"] for b in row if "callback_data" in b]
+
+
+def test_presets_view_callback_data_fits_64_bytes_for_long_names(tmp_path, monkeypatch):
+    pfile = tmp_path / "presets.json"
+    for name in ("г" * 40, "Мои любимые банки и площадки на все дни", "🔥💰🚀 ночные связки без переводов 🌙"):
+        presets.save_preset(name, p2p.Config(), path=str(pfile))
+    use_presets_file(monkeypatch, pfile)
+    _, kb = B.presets_view(p2p.Config(include_pay=["sberbank"]))
+    data = callbacks(kb)
+    assert len(data) == 3 + 2 * 3 + 1   # 3 встроенных, по 2 кнопки на 3 своих, «⬅️ Фильтры»
+    assert all(len(d.encode("utf-8")) <= 64 for d in data)
+
+
+def test_preset_long_cyrillic_name_save_apply_delete_via_buttons(tmp_path, monkeypatch):
+    """Полный путь из меню: сохранить длинное русское имя → кнопки валидны → ▶️ применяет, 🗑 удаляет."""
+    pfile = tmp_path / "presets.json"
+    use_presets_file(monkeypatch, pfile)
+    env_file(tmp_path, monkeypatch)
+    name = "Мои любимые банки и площадки на все дни"   # 39 букв: с префиксом по имени было 91 байт
+    bot = Stub(p2p.Config(assets=["USDT"], exchanges=["bybit"], min_profit=3.0, amount=70000))
+    asyncio.run(bot.on_callback({"id": "1", "data": "preset_save", "message": {"message_id": 1}}))
+    asyncio.run(bot.handle(name))
+    method, params = bot.out[-1]
+    assert method == "sendMessage" and "Пресеты" in params["text"]
+    data = callbacks(params["reply_markup"])
+    assert all(len(d.encode("utf-8")) <= 64 for d in data)
+    apply_btn = "preset_apply:" + presets.preset_id(name)
+    del_btn = "preset_del:" + presets.preset_id(name)
+    assert apply_btn in data and del_btn in data
+    bot.cfg = p2p.Config(assets=["BTC"], exchanges=["mexc"], min_profit=1.0, amount=20000)
+    asyncio.run(bot.on_callback({"id": "2", "data": apply_btn, "message": {"message_id": 1}}))
+    assert bot.cfg.assets == ["USDT"] and bot.cfg.exchanges == ["bybit"]
+    assert bot.cfg.min_profit == 3.0 and bot.cfg.amount == 70000
+    toast = next(p["text"] for m, p in bot.out if m == "answerCallbackQuery" and p["callback_query_id"] == "2")
+    assert name in toast
+    asyncio.run(bot.on_callback({"id": "3", "data": del_btn, "message": {"message_id": 1}}))
+    assert name not in presets.list_custom(path=str(pfile))
+
+
+def test_preset_name_is_html_escaped_in_messages(tmp_path, monkeypatch):
+    """Имя пресета в HTML-сообщениях экранируется, иначе Telegram не разберёт разметку всего сообщения."""
+    pfile = tmp_path / "presets.json"
+    use_presets_file(monkeypatch, pfile)
+    env_file(tmp_path, monkeypatch)
+    name = "<b>Банки</b> & <i>x"
+    bot = Stub(p2p.Config())
+    bot.awaiting_preset_name = True
+    asyncio.run(bot.handle(name))
+    saved_msg, view = texts(bot)[-2:]
+    escaped = "&lt;b&gt;Банки&lt;/b&gt; &amp; &lt;i&gt;x"
+    assert escaped in saved_msg and "<i>" not in saved_msg
+    assert escaped in view and "<i>" not in view
+    kb = bot.out[-1][1]["reply_markup"]
+    assert any(b["text"] == f"▶️ {name}" for row in kb["inline_keyboard"] for b in row)   # текст кнопки — как есть
+    toast = bot.apply("preset_apply:" + presets.preset_id(name))   # тост answerCallbackQuery — простой текст
+    assert name in toast
+
+
+def test_old_preset_buttons_with_name_still_work(tmp_path, monkeypatch):
+    """Кнопки из сообщений до перехода на id несли имя — применяются и удаляют как раньше."""
+    pfile = tmp_path / "presets.json"
+    presets.save_preset("Мой", p2p.Config(assets=["USDT"]), path=str(pfile))
+    use_presets_file(monkeypatch, pfile)
+    env_file(tmp_path, monkeypatch)
+    bot = Stub(p2p.Config(assets=["BTC"]))
+    assert "Мой" in bot.apply("preset_apply:Мой") and bot.cfg.assets == ["USDT"]
+    bot.apply("preset_apply:USDT без переводов")
+    assert bot.cfg.same_venue_only is True
+    asyncio.run(bot.on_callback({"id": "1", "data": "preset_del:Мой", "message": {"message_id": 1}}))
+    assert "Мой" not in presets.list_custom(path=str(pfile))
+
+
+# пользовательский пресет — полный снимок фильтров, включая «без переводов» (same_venue_only)
+
+def test_custom_preset_restores_same_venue_only(tmp_path, monkeypatch):
+    pfile = tmp_path / "presets.json"
+    use_presets_file(monkeypatch, pfile)
+    env = env_file(tmp_path, monkeypatch)
+    bot = Stub(p2p.Config())
+    bot.apply("preset_apply:" + presets.preset_id("USDT без переводов"))
+    assert bot.cfg.same_venue_only is True
+    B.presets.save_preset("Мой", bot.cfg)
+    bot.apply("preset_apply:" + presets.preset_id("Все площадки"))
+    assert bot.cfg.same_venue_only is False
+    bot.apply("preset_apply:" + presets.preset_id("Мой"))
+    assert bot.cfg.same_venue_only is True and bot.cfg.assets == ["USDT"]
+    assert "SAME_VENUE_ONLY=1" in env.read_text(encoding="utf-8")
+
+
+def test_legacy_custom_preset_without_same_venue_only_keeps_flag(tmp_path, monkeypatch):
+    """Пресет, сохранённый до правки (без same_venue_only), применяется без ошибок и флаг не трогает."""
+    pfile = tmp_path / "presets.json"
+    pfile.write_text('{"Старый": {"assets": ["USDT"], "exchanges": ["bybit"], "include_pay": [], '
+                     '"min_profit": 2.0, "amount": 50000}}', encoding="utf-8")
+    use_presets_file(monkeypatch, pfile)
+    env = env_file(tmp_path, monkeypatch)
+    bot = Stub(p2p.Config(same_venue_only=True))
+    assert "Старый" in bot.apply("preset_apply:" + presets.preset_id("Старый"))
+    assert bot.cfg.assets == ["USDT"] and bot.cfg.same_venue_only is True
+    assert "SAME_VENUE_ONLY" not in env.read_text(encoding="utf-8")
 
 
 def test_history_command_empty_sends_message_no_photos(tmp_path, monkeypatch):

@@ -35,6 +35,46 @@ def test_parse_amount_rejects_out_of_range():
     assert p2p.parse_amount("10 млн") is None         # выше 5 000 000
 
 
+def test_parse_amount_rejects_nan_inf_and_zero():
+    for text in ("nan", "inf", "1e999", "0", "99999999"):
+        assert p2p.parse_amount(text) is None, text
+
+
+def test_parse_min_profit_ok():
+    assert p2p.parse_min_profit("1") == 1.0
+    assert p2p.parse_min_profit("1,5") == 1.5
+    assert p2p.parse_min_profit("0.5") == 0.5
+    assert p2p.parse_min_profit(" 2 % ") == 2.0
+    assert p2p.parse_min_profit("100") == 100.0
+
+
+def test_parse_min_profit_rejects():
+    for text in ("nan", "inf", "-1", "-100", "0", "1e308", "101", "", "много", "1.2.3", None):
+        assert p2p.parse_min_profit(text) is None, text
+
+
+def test_config_from_env_falls_back_on_bad_amount_and_min(monkeypatch, caplog):
+    """Испорченный .env (nan, минус, ноль) не переживает рестарт: значения по умолчанию и warning в логе."""
+    monkeypatch.setenv("AMOUNT", "nan")
+    monkeypatch.setenv("MIN_PROFIT", "-1")
+    with caplog.at_level("WARNING"):
+        cfg = p2p.Config.from_env()
+    assert cfg.amount == 50000 and cfg.min_profit == 1.0
+    assert "AMOUNT=nan" in caplog.text and "MIN_PROFIT=-1" in caplog.text
+
+    monkeypatch.setenv("AMOUNT", "0")
+    monkeypatch.setenv("MIN_PROFIT", "inf")
+    cfg = p2p.Config.from_env()
+    assert cfg.amount == 50000 and cfg.min_profit == 1.0
+
+
+def test_config_from_env_reads_valid_amount_and_min(monkeypatch):
+    monkeypatch.setenv("AMOUNT", "20000")
+    monkeypatch.setenv("MIN_PROFIT", "2.0")
+    cfg = p2p.Config.from_env()
+    assert cfg.amount == 20000 and cfg.min_profit == 2.0
+
+
 def test_scan_amount_limits_ad_usability(offline, monkeypatch):
     async def fake_fetch(s, cfg, side, asset):
         return [make_ad("Fake", side, 85.0 if side == "buy" else 90.0, pays=("T-Bank",),

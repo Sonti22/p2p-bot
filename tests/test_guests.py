@@ -117,6 +117,28 @@ def test_signal_goes_to_owner_and_guests(monkeypatch):
     assert len(bot.deals_by_id) == 1                       # одна запись — для кнопок владельца
 
 
+def test_guest_signal_not_duplicated_while_owner_delivery_retries(monkeypatch):
+    """Владельцу не доставили (429) — сигнал повторится на следующем скане; гостю он уходит один раз,
+    вместе с доставкой владельцу, а не на каждой попытке."""
+    monkeypatch.setattr(B, "deal_card", lambda *a, **k: b"png")
+    bot = Stub(p2p.Config(min_profit=2.0), guests=["42"])
+    bot.live_scans, bot.fancy = 1, False
+    owner_fails = {"on": True}
+    real_call = bot.call
+
+    async def call(method, **p):
+        if owner_fails["on"] and p.get("chat_id") in ("1", None):
+            return {"ok": False, "error_code": 429, "description": "Too Many Requests"}
+        return await real_call(method, **p)
+
+    bot.call = call
+    asyncio.run(bot.notify(snap([deal()])))
+    assert not sent(bot, "sendPhoto") and not bot.sent
+    owner_fails["on"] = False
+    asyncio.run(bot.notify(snap([deal()])))
+    assert [p["chat_id"] for p in sent(bot, "sendPhoto")] == ["1", "42"]
+
+
 def test_guest_callbacks(monkeypatch):
     monkeypatch.setattr(B, "deal_card", lambda *a, **k: b"png")
     bot = Stub(p2p.Config(), guests=["42"])
