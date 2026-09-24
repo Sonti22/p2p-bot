@@ -22,12 +22,28 @@ STABLE_AFTER = 600            # сек работы, после которых �
 CRASH_WINDOW, CRASH_LIMIT = 60, 3
 
 
+LOG_PATH = os.path.join(HERE, "logs", "launcher.log")
+
+
 def log(msg):
-    print(time.strftime("%d.%m %H:%M:%S"), "[launcher]", msg, flush=True)
+    line = f"{time.strftime('%d.%m %H:%M:%S')} [launcher] {msg}"
+    print(line, flush=True)
+    try:   # журнал на диске: чтобы после зависания/падения было видно, где остановились
+        os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
+        if os.path.exists(LOG_PATH) and os.path.getsize(LOG_PATH) > 1_000_000:
+            os.replace(LOG_PATH, LOG_PATH + ".1")
+        with open(LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass
 
 
 def git(*args, check=True):
-    r = subprocess.run(["git", *args], cwd=HERE, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    try:   # без таймаута одна зависшая команда останавливает весь цикл обновлений
+        r = subprocess.run(["git", *args], cwd=HERE, capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", timeout=120)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"git {' '.join(args)}: timeout")
     if check and r.returncode:
         raise RuntimeError(f"git {' '.join(args)}: {r.stderr.strip()[:200]}")
     return r.stdout.strip()
@@ -95,10 +111,15 @@ def smoke():
     """Компиляция и тесты новой версии до перезапуска бота."""
     py = [sys.executable, "-m"]
     files = [f for f in os.listdir(HERE) if f.endswith(".py")]
-    r = subprocess.run(py + ["py_compile", *files], cwd=HERE, capture_output=True, text=True, errors="replace")
-    if r.returncode:
-        return False, r.stderr[-500:]
-    r = subprocess.run(py + ["pytest", "-q", "-x"], cwd=HERE, capture_output=True, text=True, errors="replace")
+    try:
+        r = subprocess.run(py + ["py_compile", *files], cwd=HERE, capture_output=True, text=True, errors="replace",
+                           timeout=120)
+        if r.returncode:
+            return False, r.stderr[-500:]
+        r = subprocess.run(py + ["pytest", "-q", "-x", "-p", "no:cacheprovider"], cwd=HERE, capture_output=True,
+                           text=True, errors="replace", timeout=600)
+    except subprocess.TimeoutExpired:
+        return False, "смоук-тест не завершился за отведённое время"
     if "No module named pytest" in r.stderr:
         return True, ""
     return r.returncode in (0, 5), (r.stdout + r.stderr)[-500:]   # 5 = тестов нет
@@ -114,8 +135,12 @@ class Launcher:
         """Открытые PR = автомерж не прошёл (тесты/guard) — сообщить один раз со ссылкой."""
         if not shutil.which("gh"):
             return
-        r = subprocess.run(["gh", "pr", "list", "--state", "open", "--json", "number,title,url"], cwd=HERE,
-                           capture_output=True, text=True, encoding="utf-8", errors="replace")
+        try:
+            r = subprocess.run(["gh", "pr", "list", "--state", "open", "--json", "number,title,url"], cwd=HERE,
+                               capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
+        except subprocess.TimeoutExpired:
+            log("gh pr list: timeout")
+            return
         if r.returncode:
             return
         for pr in json.loads(r.stdout or "[]"):
@@ -172,13 +197,16 @@ class Launcher:
 
     def run(self):
         every = int(env_value("UPDATE_EVERY", "300"))
-        self.try_update()
+        try:
+            self.try_update()
+        except Exception as e:
+            log(f"ошибка первой проверки: {type(e).__name__}: {e}")
         crashes, last_check = 0, time.time()
         while True:
             started = time.time()
             write_dev_status()
             proc = subprocess.Popen([sys.executable, "bot.py"], cwd=HERE)
-            log(f"бот запущен (pid {proc.pid}, версия {git('rev-parse', '--short', 'HEAD')})")
+            log(f"бот запущен (pid {proc.pid}, версия {git('rev-parse', '--short', 'HEAD', check=False)})")
             good_marked, updated = False, False
             while proc.poll() is None:
                 time.sleep(5)
@@ -188,8 +216,14 @@ class Launcher:
                     good_marked, crashes = True, 0
                 if time.time() - last_check > every:
                     last_check = time.time()
-                    self.check_prs()
-                    if self.try_update():
+                    log("проверка обновлений")
+                    try:
+                        self.check_prs()
+                        updated = self.try_update()
+                    except Exception as e:   # любая неожиданная ошибка не должна убивать цикл
+                        log(f"ошибка проверки: {type(e).__name__}: {e}")
+                        updated = False
+                    if updated:
                         proc.terminate()
                         try:
                             proc.wait(30)
