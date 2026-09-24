@@ -6,6 +6,7 @@ from datetime import datetime
 import accounts
 import bot as B
 import blacklist
+import history
 import p2p
 import presets
 import trades
@@ -1205,3 +1206,30 @@ def test_preset_del_callback_removes_and_rerenders(tmp_path, monkeypatch):
     assert "Старый" not in presets.list_custom(path=str(pfile))
     method, params = bot.out[-1]
     assert method == "editMessageText" and "Пресеты" in params["text"]
+
+
+def test_history_command_empty_sends_message_no_photos(tmp_path, monkeypatch):
+    db = str(tmp_path / "history.db")
+    monkeypatch.setattr(B.history, "is_empty", functools.partial(B.history.is_empty, path=db))
+    bot = Stub(p2p.Config())
+    asyncio.run(bot.handle("/history"))
+    assert "пуста" in texts(bot)[-1]
+    assert not photos(bot)
+
+
+def test_history_command_renders_two_photos(tmp_path, monkeypatch):
+    db = str(tmp_path / "history.db")
+    for name in ("is_empty", "hourly_avg", "heatmap", "median_vs_bestchange"):
+        monkeypatch.setattr(B.history, name, functools.partial(getattr(B.history, name), path=db))
+    history._insert([(time.time(), "Bybit", "MEXC", "USDT", "USDT", 3.0, 88.0)], db)
+    bot = Stub(p2p.Config())
+    asyncio.run(bot.handle("/history"))
+    assert len(photos(bot)) == 2
+
+
+def test_history_callback_routes_to_show_history(tmp_path, monkeypatch):
+    db = str(tmp_path / "history.db")
+    monkeypatch.setattr(B.history, "is_empty", functools.partial(B.history.is_empty, path=db))
+    bot = Stub(p2p.Config())
+    asyncio.run(bot.on_callback({"id": "1", "data": "history", "message": {"message_id": 1}}))
+    assert "пуста" in texts(bot)[-1]

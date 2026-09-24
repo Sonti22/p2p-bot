@@ -210,6 +210,144 @@ def top_chart(snap, cfg, n=8):
     return _png(img)
 
 
+def _rgb(hexc):
+    hexc = hexc.lstrip("#")
+    return tuple(int(hexc[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def _lerp_rgb(c1, c2, t):
+    return tuple(round(c1[i] + (c2[i] - c1[i]) * t) for i in range(3))
+
+
+def _heat_color(v, vmax):
+    """Цвет ячейки хитмапа: нет данных — панель, дальше градиент BORDER → GREEN → AMBER."""
+    if v is None:
+        return PANEL
+    t = max(0.0, min(1.0, v / vmax)) if vmax > 0 else 0.0
+    c1, c2, c3 = _rgb(BORDER), _rgb(GREEN), _rgb(AMBER)
+    rgb = _lerp_rgb(c1, c2, t * 2) if t < 0.5 else _lerp_rgb(c2, c3, (t - 0.5) * 2)
+    return "#%02X%02X%02X" % rgb
+
+
+def _profit_color(v):
+    return AMBER if v >= 5 else GREEN if v >= 2 else BLUE if v > 0 else RED
+
+
+HOUR_LABELS = tuple(range(0, 24, 3))
+DOW_NAMES = ("Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс")
+
+
+def history_card(hourly, grid):
+    """«Лучшее время суток» (средний % по часам МСК, 7 дней) + хитмап час × день недели."""
+    W, H = 1080, 720
+    img = Image.new("RGB", (W, H), BG)
+    d = ImageDraw.Draw(img)
+    d.text((40, 30), "📈 Лучшее время суток (МСК, 7 дней)", font=_font(34, "bold"), fill=TEXT)
+    known = {h: v for h, v in hourly.items() if v is not None}
+    if known:
+        best_h = max(known, key=known.get)
+        worst_h = min(known, key=known.get)
+        d.text((40, 74), f"Лучший час: {best_h:02d}:00 ({known[best_h]:+.2f}%) · "
+                         f"худший: {worst_h:02d}:00 ({known[worst_h]:+.2f}%)", font=_font(22), fill=MUTED)
+    else:
+        d.text((40, 74), "Данных пока мало — история копится раз в 5 минут.", font=_font(22), fill=MUTED)
+
+    x0, x1, y_top, y_bot = 60, 1040, 140, 340
+    vals = [v for v in hourly.values() if v is not None]
+    vmin, vmax = min(vals + [0.0]), max(vals + [0.1])
+    if vmax == vmin:
+        vmax = vmin + 0.1
+    zero_y = y_bot - (0 - vmin) / (vmax - vmin) * (y_bot - y_top)
+    d.line((x0, zero_y, x1, zero_y), fill=BORDER, width=2)
+    gap, bw = 4, (x1 - x0 - 23 * 4) / 24
+    for h in range(24):
+        x = x0 + h * (bw + gap)
+        v = hourly.get(h)
+        if v is None:
+            d.ellipse((x + bw / 2 - 3, zero_y - 3, x + bw / 2 + 3, zero_y + 3), fill=BORDER)
+        else:
+            y = y_bot - (v - vmin) / (vmax - vmin) * (y_bot - y_top)
+            top, bot = min(y, zero_y), max(y, zero_y)
+            d.rectangle((x, top, x + bw, max(bot, top + 2)), fill=_profit_color(v))
+        if h in HOUR_LABELS:
+            d.text((x, y_bot + 8), f"{h:02d}", font=_font(16), fill=MUTED)
+
+    gy0 = 390
+    d.text((40, gy0), "Хитмап: лучший % по часам и дням недели (7 дней)", font=_font(26, "semi"), fill=TEXT)
+    grid_x0, grid_y0, cell_h = 112, gy0 + 40, 26
+    cw = (x1 - grid_x0) / 24
+    gvals = [v for v in grid.values()]
+    gvmax = max(gvals + [2.0])
+    for dow in range(7):
+        ry = grid_y0 + dow * cell_h
+        d.text((40, ry + 4), DOW_NAMES[dow], font=_font(18, "semi"), fill=MUTED)
+        for h in range(24):
+            v = grid.get((dow, h))
+            x = grid_x0 + h * cw
+            d.rectangle((x, ry, x + cw, ry + cell_h - 2), fill=_heat_color(v, gvmax))
+    hy = grid_y0 + 7 * cell_h + 6
+    for h in HOUR_LABELS:
+        d.text((grid_x0 + h * cw, hy), f"{h:02d}", font=_font(16), fill=MUTED)
+
+    ly = H - 60
+    for x, color, label in ((40, BORDER, "нет данных"), (280, GREEN, "прибыльно"), (500, AMBER, "лучшие часы")):
+        d.rounded_rectangle((x, ly + 4, x + 22, ly + 24), radius=5, fill=color)
+        d.text((x + 32, ly), label, font=_font(20), fill=MUTED)
+    return _png(img)
+
+
+def history_compare_card(labels, p2p, bc):
+    """Медиана лучшего % по дням: связки P2P против связок через BestChange."""
+    W, H = 1080, 480
+    img = Image.new("RGB", (W, H), BG)
+    d = ImageDraw.Draw(img)
+    d.text((40, 30), "📉 P2P против BestChange", font=_font(34, "bold"), fill=TEXT)
+    if not labels:
+        d.text((40, 90), "История пока пуста — данные появятся после первых сканов.", font=_font(26), fill=MUTED)
+        return _png(img)
+    d.text((40, 74), f"Медиана лучшего % по дням, {len(labels)} дн.", font=_font(22), fill=MUTED)
+
+    x0, x1, y_top, y_bot = 70, 1040, 160, 400
+    vals = [v for v in p2p + bc if v is not None]
+    vmin, vmax = min(vals + [0.0]), max(vals + [0.1])
+    if vmax == vmin:
+        vmax = vmin + 0.1
+    pad = (vmax - vmin) * 0.1
+    vmin, vmax = vmin - pad, vmax + pad
+
+    def y_of(v):
+        return y_bot - (v - vmin) / (vmax - vmin) * (y_bot - y_top)
+
+    if vmin < 0 < vmax:
+        d.line((x0, y_of(0), x1, y_of(0)), fill=BORDER, width=2)
+    n = len(labels)
+    step = (x1 - x0) / max(n - 1, 1)
+    label_step = max(1, n // 10)
+
+    def draw_series(vals, color, name):
+        pts = [(x0 + i * step, y_of(v)) if v is not None else None for i, v in enumerate(vals)]
+        for i in range(len(pts) - 1):
+            if pts[i] and pts[i + 1]:
+                d.line((*pts[i], *pts[i + 1]), fill=color, width=4)
+        for p in pts:
+            if p:
+                d.ellipse((p[0] - 5, p[1] - 5, p[0] + 5, p[1] + 5), fill=color)
+        last = next((v for v in reversed(vals) if v is not None), None)
+        return f"{name} {last:+.2f}%" if last is not None else f"{name} —"
+
+    p2p_lbl = draw_series(p2p, GREEN, "P2P")
+    bc_lbl = draw_series(bc, BLUE, "BestChange")
+    for i, lbl in enumerate(labels):
+        if i % label_step == 0:
+            d.text((x0 + i * step - 16, y_bot + 10), lbl, font=_font(16), fill=MUTED)
+
+    ly = H - 40
+    for x, color, label in ((40, GREEN, p2p_lbl), (280, BLUE, bc_lbl)):
+        d.rounded_rectangle((x, ly + 2, x + 22, ly + 22), radius=5, fill=color)
+        d.text((x + 32, ly - 2), label, font=_font(22, "semi"), fill=TEXT)
+    return _png(img)
+
+
 def _hex(c, a=255):
     c = c.lstrip("#")
     return tuple(int(c[i:i + 2], 16) for i in (0, 2, 4)) + (a,)

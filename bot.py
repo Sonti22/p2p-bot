@@ -14,10 +14,11 @@ import accounts
 import alerts
 import blacklist
 import fees
+import history
 import netstatus
 import presets
 import trades
-from cards import deal_card, portfolio_card, top_chart
+from cards import deal_card, history_card, history_compare_card, portfolio_card, top_chart
 from p2p import ALL_EXCHANGES, AMOUNT_MAX, AMOUNT_MIN, DEFAULT_ASSETS, ENV_PATH, Config, _money, _price, \
     deal_amounts, fmt_ad, fmt_deal, fmt_top, load_env, parse_amount, profit_breakdown, reliability, scan, spot_url, \
     venue_url
@@ -30,6 +31,7 @@ BUTTONS = {"🔥 Лучшая сейчас": "/best", "📊 Топ связок"
            "🛠 Разработка": "/dev", "❓ Как работать": "/help"}
 COMMANDS = [{"command": "best", "description": "Лучшая связка сейчас"},
             {"command": "top", "description": "Топ связок графиком"},
+            {"command": "history", "description": "История спредов: время суток, дни недели, BestChange"},
             {"command": "calc", "description": "Разовый расчёт под сумму, напр. /calc 20000"},
             {"command": "stats", "description": "Журнал сделок: день/неделя/месяц"},
             {"command": "alert", "description": "Алерт на курс, напр. /alert USDT sell 92 7d"},
@@ -414,7 +416,10 @@ def dev_view(status_path=DEV_STATUS, roadmap_path=os.path.join(HERE, "ROADMAP.md
 
 TOP_MARKUP = {"inline_keyboard": [
     [{"text": "🔄 Обновить", "callback_data": "top"}, {"text": "📄 Подробно", "callback_data": "detail"}],
-    [{"text": "🔥 Лучшая", "callback_data": "best"}, {"text": "⚙️ Настройки", "callback_data": "settings"}]]}
+    [{"text": "🔥 Лучшая", "callback_data": "best"}, {"text": "⚙️ Настройки", "callback_data": "settings"}],
+    [{"text": "📈 История", "callback_data": "history"}]]}
+HISTORY_MARKUP = {"inline_keyboard": [
+    [{"text": "🔄 Обновить", "callback_data": "history"}, {"text": "📊 Топ", "callback_data": "top"}]]}
 
 
 class Bot:
@@ -635,6 +640,23 @@ class Bot:
                    + f"{sum(1 for d in snap.deals if d[0] >= cfg.min_profit)}")
         await self.photo_or_text(lambda: top_chart(snap, cfg), caption, TOP_MARKUP)
 
+    async def show_history(self):
+        """«/history»: лучшее время суток + хитмап час×день недели (7 дней), медиана P2P vs BestChange
+        (окно до 30 дней). Пустая история — понятное сообщение вместо картинок."""
+        if history.is_empty():
+            await self.send("📈 История спредов пока пуста. Бот пишет лучший % по площадкам раз в 5 минут — "
+                            "зайди позже, когда наберётся хотя бы несколько часов данных.")
+            return
+        hourly = history.hourly_avg()
+        grid = history.heatmap()
+        await self.photo_or_text(lambda: history_card(hourly, grid),
+                                 "📈 <b>История спредов</b> — лучшее время суток и дни недели за 7 дней (МСК)",
+                                 HISTORY_MARKUP)
+        labels, p2p_med, bc_med = history.median_vs_bestchange()
+        await self.photo_or_text(lambda: history_compare_card(labels, p2p_med, bc_med),
+                                 "📉 Медиана лучшего % по дням: P2P-связки против связок через BestChange",
+                                 HISTORY_MARKUP)
+
     async def calc(self, arg):
         """Разовый расчёт под сумму (`/calc 20000`): скан с копией Config, без смены настроек."""
         amount = parse_amount(arg)
@@ -797,6 +819,8 @@ class Bot:
         while True:
             try:
                 self.last = await scan(self.s, self.cfg)
+                if history.record(self.last):   # не чаще раза в 5 минут, независимо от чата
+                    history.cleanup()
                 if self.chat_id:
                     await self.check_venues(self.last)
                     await self.check_alerts(self.last)
@@ -1007,6 +1031,8 @@ class Bot:
             await self.show_best()
         elif data == "top":
             await self.show_top()
+        elif data == "history":
+            await self.show_history()
         elif data == "detail":
             await self.send(fmt_top(self.last, self.cfg) if self.last else WAIT)
         elif data == "settings":
@@ -1097,6 +1123,8 @@ class Bot:
             await self.show_best()
         elif cmd == "/top":
             await self.show_top()
+        elif cmd == "/history":
+            await self.show_history()
         elif cmd == "/calc":
             if arg:
                 await self.calc(arg)
