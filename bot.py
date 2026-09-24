@@ -64,6 +64,19 @@ VENUE_DOWN_AFTER = 900      # сек: площадка отдаёт ошибку
 VENUE_FAIL_STREAK = 3       # или столько сканов подряд с ошибкой
 VENUE_ALERT_COOLDOWN = 3600  # не чаще раза в час на площадку
 EXCHANGE_NAMES = {"bybit": "Bybit", "mexc": "MEXC", "htx": "HTX", "kucoin": "KuCoin", "bitpapa": "BitPapa"}
+KEY_HINT = {
+    "bybit": ("Создай ключ на Bybit: Профиль → API → Create New Key → System-generated API Keys. "
+              "Права — только «Read-Only» (сними «Trade» и «Withdrawal»), в IP access whitelist впиши IP своего ПК."),
+    "mexc": ("Создай ключ на MEXC: Профиль → API Management → Create API. "
+             "Права — только «Read Info» (сними «Spot & Contract Trading» и «Withdrawals»), "
+             "в Bind IP Address впиши IP своего ПК."),
+}
+
+
+def key_hint(ex, name):
+    """Подсказка, как создать ключ «только чтение» с IP-whitelist — своя для каждой биржи, иначе общая фраза."""
+    return KEY_HINT.get(ex, f"Создай в личном кабинете {name} API-ключ <b>только для чтения</b> "
+                             f"(без торговли и выводов), по возможности ограничь его по IP.")
 
 
 def save_env(key, value, path=ENV_PATH):
@@ -119,9 +132,7 @@ def account_view(ex):
         kb = [[{"text": "🔄 Проверить", "callback_data": f"acc_check:{ex}"}],
               [{"text": "🗑 Удалить ключ", "callback_data": f"acc_del:{ex}"}], [back]]
     elif ex in accounts.CONNECTABLE:
-        text = (f"🔑 <b>{name}</b>\n\nКлюч не подключён.\n\n"
-                f"Создай в личном кабинете {name} API-ключ <b>только для чтения</b> (без торговли и выводов), "
-                f"по возможности ограничь его по IP.")
+        text = f"🔑 <b>{name}</b>\n\nКлюч не подключён.\n\n{key_hint(ex, name)}"
         kb = [[{"text": "➕ Подключить", "callback_data": f"acc_add:{ex}"}], [back]]
     else:
         text = f"🔑 <b>{name}</b>\n\nПодключение ключа пока не реализовано."
@@ -499,8 +510,7 @@ class Bot:
             ex = data[8:]
             name = EXCHANGE_NAMES.get(ex, ex)
             self.awaiting_key = {"ex": ex, "step": "key"}
-            await self.send(f"Создай в личном кабинете {name} API-ключ <b>только для чтения</b> "
-                            f"(без торговли и выводов), по возможности ограничь его по IP.\n"
+            await self.send(f"{key_hint(ex, name)}\n"
                             f"Пришли <b>API key</b> — сообщение с ним сразу удалю из чата.")
         elif data.startswith("acc_check:"):
             ex = data[10:]
