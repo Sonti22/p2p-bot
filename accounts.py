@@ -214,7 +214,11 @@ async def api_permissions(s, exchange):
             bad = [name for name, granted in (("торговля", j.get("canTrade")), ("вывод", j.get("canWithdraw"))) if granted]
             return not bad, ", ".join(bad)
         elif ex == "htx":
-            j = await htx_get(s, api_key, api_secret, "/v2/user/api-key")
+            # /v2/user/api-key требует обязательный uid владельца ключа — сначала узнаём его
+            u = await htx_get(s, api_key, api_secret, "/v2/user/uid")
+            if u.get("code") != 200 or not u.get("data"):
+                return True, ""
+            j = await htx_get(s, api_key, api_secret, "/v2/user/api-key", {"uid": u["data"]})
             if j.get("code") != 200:
                 return True, ""
             entry = next((e for e in j.get("data") or [] if e.get("accessKey") == api_key), None)

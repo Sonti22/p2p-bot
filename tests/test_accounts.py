@@ -346,20 +346,50 @@ def test_api_permissions_mexc_withdraw_key_is_unsafe(tmp_path, monkeypatch):
     assert not safe and "вывод" in detail
 
 
+class _HtxKeySession:
+    """Заглушка HTX: /v2/user/uid -> uid; /v2/user/api-key без uid отвечает ошибкой параметра, как биржа."""
+    def __init__(self, permission, uid_body=None):
+        self.permission, self.urls = permission, []
+        self.uid_body = uid_body or {"code": 200, "data": 123456}
+
+    def get(self, url, headers=None):
+        self.urls.append(url)
+        if "/v2/user/uid?" in url:
+            return _JsonResp(self.uid_body)
+        if "/v2/user/api-key?" in url:
+            if "uid=123456" not in url:
+                return _JsonResp({"code": 2002, "message": "invalid.parameter"})
+            return _JsonResp({"code": 200, "data": [{"accessKey": "k", "permission": self.permission}]})
+        raise AssertionError(f"unexpected url: {url}")
+
+
 def test_api_permissions_htx_readonly_is_safe(tmp_path, monkeypatch):
     monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
     accounts.save_key("htx", "k", "s")
-    body = {"code": 200, "data": [{"accessKey": "k", "permission": "readOnly"}]}
-    safe, detail = asyncio.run(accounts.api_permissions(_JsonSession(body), "htx"))
+    safe, detail = asyncio.run(accounts.api_permissions(_HtxKeySession("readOnly"), "htx"))
     assert safe and detail == ""
 
 
 def test_api_permissions_htx_trade_key_is_unsafe(tmp_path, monkeypatch):
     monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
     accounts.save_key("htx", "k", "s")
-    body = {"code": 200, "data": [{"accessKey": "k", "permission": "readOnly,trade"}]}
-    safe, detail = asyncio.run(accounts.api_permissions(_JsonSession(body), "htx"))
-    assert not safe and "trade" in detail
+    s = _HtxKeySession("readOnly,trade,withdraw")
+    safe, detail = asyncio.run(accounts.api_permissions(s, "htx"))
+    # сначала uid, затем api-key с uid в подписанной query
+    assert [u.split("?")[0] for u in s.urls] == ["https://api.htx.com/v2/user/uid",
+                                                  "https://api.htx.com/v2/user/api-key"]
+    assert "uid=123456" in s.urls[1] and "Signature=" in s.urls[1]
+    assert not safe and detail == "trade, withdraw"
+
+
+def test_api_permissions_htx_uid_error_fails_open(tmp_path, monkeypatch):
+    """Не удалось узнать uid (сбой/нет прав) — ключ не блокируем, как и при других ошибках проверки."""
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    accounts.save_key("htx", "k", "s")
+    s = _HtxKeySession("readOnly,trade", uid_body={"code": 1002, "message": "unauthorized"})
+    safe, detail = asyncio.run(accounts.api_permissions(s, "htx"))
+    assert safe and detail == ""
+    assert len(s.urls) == 1   # api-key без uid не запрашиваем
 
 
 def test_api_permissions_kucoin_general_only_is_safe(tmp_path, monkeypatch):
