@@ -223,21 +223,21 @@ async def kucoin_get(s, api_key, api_secret, passphrase_value, path, params=None
 KUCOIN_READONLY_PERMS = {"General"}    # остальные значения permission у KuCoin дают торговлю/вывод/переводы
 
 
-async def api_permissions(s, exchange):
+async def key_permissions(s, exchange):
     """Права сохранённого ключа биржи по данным самого API: (safe, detail).
 
-    safe=False — ключ даёт торговать или выводить (не read-only), detail — что именно нашли.
-    safe=True — либо ключ read-only, либо права проверить не удалось (не блокируем по недоступности API)."""
+    safe=True — биржа подтвердила: только чтение; safe=False — ключ даёт торговать или выводить,
+    detail — что именно нашли; safe=None — права проверить не удалось (нет ключа, ошибка сети/API/формата)."""
     ex = exchange.lower()
     pair = keys(ex)
     if not pair:
-        return True, ""
+        return None, ""
     api_key, api_secret = pair
     try:
         if ex == "bybit":
             j = await bybit_get(s, api_key, api_secret, "/v5/user/query-api")
             if j.get("retCode") != 0:
-                return True, ""
+                return None, ""
             result = j.get("result", {})
             if result.get("readOnly") == 1:
                 return True, ""
@@ -245,35 +245,46 @@ async def api_permissions(s, exchange):
             return False, "торговля/переводы (" + ", ".join(extra) + ")" if extra else "ключ не read-only"
         elif ex == "mexc":
             j = await mexc_get(s, api_key, api_secret, "/api/v3/account")
+            if "canTrade" not in j and "canWithdraw" not in j:   # ответ с ошибкой — прав в нём нет
+                return None, ""
             bad = [name for name, granted in (("торговля", j.get("canTrade")), ("вывод", j.get("canWithdraw"))) if granted]
             return not bad, ", ".join(bad)
         elif ex == "htx":
             # /v2/user/api-key требует обязательный uid владельца ключа — сначала узнаём его
             u = await htx_get(s, api_key, api_secret, "/v2/user/uid")
             if u.get("code") != 200 or not u.get("data"):
-                return True, ""
+                return None, ""
             j = await htx_get(s, api_key, api_secret, "/v2/user/api-key", {"uid": u["data"]})
             if j.get("code") != 200:
-                return True, ""
+                return None, ""
             entry = next((e for e in j.get("data") or [] if e.get("accessKey") == api_key), None)
             if not entry:
-                return True, ""
+                return None, ""
             perms = {p.strip().lower() for p in (entry.get("permission") or "").split(",")}
             bad = sorted(perms & {"trade", "withdraw"})
             return not bad, ", ".join(bad)
         elif ex == "kucoin":
             pp = passphrase(ex)
             if not pp:
-                return True, ""
+                return None, ""
             j = await kucoin_get(s, api_key, api_secret, pp, "/api/v1/user/api-key")
             if j.get("code") != "200000":
-                return True, ""
+                return None, ""
             perms = {p.strip() for p in (j.get("data", {}).get("permission") or "").split(",") if p.strip()}
             bad = sorted(perms - KUCOIN_READONLY_PERMS)
             return not bad, ", ".join(bad)
     except Exception:
-        return True, ""
-    return True, ""
+        return None, ""
+    return None, ""
+
+
+async def api_permissions(s, exchange):
+    """Проверка прав при старте бота: (safe, detail), как key_permissions, но «не удалось проверить» = safe.
+
+    safe=False — ключ даёт торговать или выводить (не read-only), detail — что именно нашли.
+    safe=True — либо ключ read-only, либо права проверить не удалось (не блокируем по недоступности API)."""
+    safe, detail = await key_permissions(s, exchange)
+    return safe is not False, detail
 
 
 BALANCE_COINS = ("USDT", "USDC", "BTC", "ETH", "TON")   # монеты, которые показывает /balance

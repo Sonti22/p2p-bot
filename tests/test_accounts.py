@@ -972,3 +972,63 @@ def test_api_permissions_fails_open_when_api_errors(tmp_path, monkeypatch):
 
     safe, detail = asyncio.run(accounts.api_permissions(_Boom(), "bybit"))
     assert safe and detail == ""
+
+
+# key_permissions: «не удалось проверить» (None) отличается от подтверждённого «только чтение» (True)
+
+def test_key_permissions_no_key_is_unknown(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    assert asyncio.run(accounts.key_permissions(_JsonSession({}), "bybit")) == (None, "")
+
+
+def test_key_permissions_bybit_readonly_is_confirmed(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    accounts.save_key("bybit", "k", "s")
+    body = {"retCode": 0, "result": {"readOnly": 1, "permissions": {"Spot": [], "Wallet": []}}}
+    assert asyncio.run(accounts.key_permissions(_JsonSession(body), "bybit")) == (True, "")
+
+
+def test_key_permissions_bybit_api_error_is_unknown(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    accounts.save_key("bybit", "k", "s")
+    body = {"retCode": 10005, "retMsg": "Permission denied"}
+    assert asyncio.run(accounts.key_permissions(_JsonSession(body), "bybit")) == (None, "")
+    assert asyncio.run(accounts.api_permissions(_JsonSession(body), "bybit")) == (True, "")   # старт — fail-open
+
+
+def test_key_permissions_network_error_is_unknown(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    accounts.save_key("bybit", "k", "s")
+
+    class _Boom:
+        def get(self, url, headers=None):
+            raise RuntimeError("network down")
+
+    assert asyncio.run(accounts.key_permissions(_Boom(), "bybit")) == (None, "")
+
+
+def test_key_permissions_mexc_error_body_is_unknown(tmp_path, monkeypatch):
+    """Ответ MEXC с ошибкой подписи не содержит canTrade/canWithdraw — это не «только чтение»."""
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    accounts.save_key("mexc", "k", "s")
+    body = {"code": 700002, "msg": "Signature for this request is not valid."}
+    assert asyncio.run(accounts.key_permissions(_JsonSession(body), "mexc")) == (None, "")
+    assert asyncio.run(accounts.api_permissions(_JsonSession(body), "mexc")) == (True, "")
+
+
+def test_key_permissions_mexc_readonly_and_trade(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    accounts.save_key("mexc", "k", "s")
+    ro = {"canTrade": False, "canWithdraw": False, "balances": []}
+    trade = {"canTrade": True, "canWithdraw": True, "balances": []}
+    assert asyncio.run(accounts.key_permissions(_JsonSession(ro), "mexc")) == (True, "")
+    assert asyncio.run(accounts.key_permissions(_JsonSession(trade), "mexc")) == (False, "торговля, вывод")
+
+
+def test_key_permissions_htx_unknown_key_and_kucoin_no_passphrase_are_unknown(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    accounts.save_key("htx", "k", "s")
+    accounts.save_key("kucoin", "k", "s")   # без passphrase
+    other = {"code": 200, "data": [{"accessKey": "другой", "permission": "readOnly"}]}
+    assert asyncio.run(accounts.key_permissions(_JsonSession(other), "htx")) == (None, "")
+    assert asyncio.run(accounts.key_permissions(_JsonSession({}), "kucoin")) == (None, "")

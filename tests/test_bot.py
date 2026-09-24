@@ -804,6 +804,11 @@ def test_account_view_kucoin_offers_connect_button(tmp_path, monkeypatch):
     assert "acc_add:kucoin" in callbacks
 
 
+async def _perms_readonly(s, ex):
+    """key_permissions: биржа подтвердила «только чтение»."""
+    return True, ""
+
+
 def test_acc_add_kucoin_arms_awaiting_key_three_step_flow(tmp_path, monkeypatch):
     monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
 
@@ -811,6 +816,7 @@ def test_acc_add_kucoin_arms_awaiting_key_three_step_flow(tmp_path, monkeypatch)
         return False, "kucoin: подпись запросов пока не реализована"
 
     monkeypatch.setattr(B.accounts, "verify", fake_verify)
+    monkeypatch.setattr(B.accounts, "key_permissions", _perms_readonly)
     bot = Stub(p2p.Config())
     asyncio.run(bot.on_callback({"id": "1", "data": "acc_add:kucoin", "message": {"message_id": 1}}))
     assert bot.awaiting_key == {"ex": "kucoin", "step": "key"}
@@ -849,6 +855,7 @@ def test_handle_key_input_flow_saves_and_verifies(tmp_path, monkeypatch):
         return True, "ключ рабочий, доступ только для чтения"
 
     monkeypatch.setattr(B.accounts, "verify", fake_verify)
+    monkeypatch.setattr(B.accounts, "key_permissions", _perms_readonly)
     bot = Stub(p2p.Config())
     bot.awaiting_key = {"ex": "bybit", "step": "key"}
     asyncio.run(bot.handle_key_input("APIKEY123", 55))
@@ -868,6 +875,7 @@ def test_handle_key_input_reports_failed_verification(tmp_path, monkeypatch):
         return False, "Invalid api_key"
 
     monkeypatch.setattr(B.accounts, "verify", fake_verify)
+    monkeypatch.setattr(B.accounts, "key_permissions", _perms_readonly)
     bot = Stub(p2p.Config())
     bot.awaiting_key = {"ex": "bybit", "step": "secret", "key": "APIKEY123"}
     asyncio.run(bot.handle_key_input("SECRET456", 56))
@@ -906,11 +914,14 @@ def test_command_resets_awaiting_key():
     assert bot.awaiting_key is None
 
 
-def test_acc_check_callback_reports_status(monkeypatch):
+def test_acc_check_callback_reports_status(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+
     async def fake_verify(s, ex):
         return False, "bad key"
 
     monkeypatch.setattr(B.accounts, "verify", fake_verify)
+    monkeypatch.setattr(B.accounts, "key_permissions", _perms_readonly)
     bot = Stub(p2p.Config())
     asyncio.run(bot.on_callback({"id": "1", "data": "acc_check:bybit", "message": {"message_id": 1}}))
     assert "bad key" in texts(bot)[-1]
@@ -1056,6 +1067,267 @@ def test_check_key_safety_skips_exchanges_without_saved_key(tmp_path, monkeypatc
     bot = Stub(p2p.Config())
     asyncio.run(bot.check_key_safety())
     assert calls == []
+
+
+# --- #10: права ключа проверяются при подключении и по «🔄 Проверить», а не только при старте ---
+
+def _perms(result, calls=None):
+    async def fake(s, ex):
+        if calls is not None:
+            calls.append("perm")
+        return result
+    return fake
+
+
+def _verify_ok(calls=None):
+    async def fake(s, ex):
+        if calls is not None:
+            calls.append("verify")
+        return True, "ключ рабочий"
+    return fake
+
+
+def test_handle_key_input_drops_trade_key_and_never_says_readonly(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    calls = []
+    monkeypatch.setattr(B.accounts, "key_permissions", _perms((False, "торговля"), calls))
+    monkeypatch.setattr(B.accounts, "verify", _verify_ok(calls))
+    bot = Stub(p2p.Config())
+    bot.awaiting_key = {"ex": "bybit", "step": "key"}
+    asyncio.run(bot.handle_key_input("APIKEY123", 55))
+    asyncio.run(bot.handle_key_input("SECRET456", 56))
+    assert accounts.keys("bybit") is None
+    assert calls == ["perm"]                    # баланс торгового ключа даже не запрашивали
+    assert any("больше, чем чтение" in t and "торговля" in t for t in texts(bot))
+    assert not any("✅ Подключено" in t for t in texts(bot))
+    assert "не подключён" in texts(bot)[-1]     # карточка биржи — уже без ключа
+
+
+def test_handle_key_input_checks_permissions_before_verify(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    calls = []
+    monkeypatch.setattr(B.accounts, "key_permissions", _perms((True, ""), calls))
+    monkeypatch.setattr(B.accounts, "verify", _verify_ok(calls))
+    bot = Stub(p2p.Config())
+    bot.awaiting_key = {"ex": "bybit", "step": "secret", "key": "APIKEY123"}
+    asyncio.run(bot.handle_key_input("SECRET456", 56))
+    assert calls == ["perm", "verify"]
+    assert accounts.keys("bybit") == ("APIKEY123", "SECRET456")
+    assert "✅ Подключено (только чтение)" in texts(bot)
+
+
+def test_handle_key_input_unverified_permissions_not_called_readonly(tmp_path, monkeypatch):
+    """Биржа не ответила на запрос прав — ключ остаётся, но «только чтение» не обещаем."""
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    monkeypatch.setattr(B.accounts, "key_permissions", _perms((None, "")))
+    monkeypatch.setattr(B.accounts, "verify", _verify_ok())
+    bot = Stub(p2p.Config())
+    bot.awaiting_key = {"ex": "bybit", "step": "secret", "key": "APIKEY123"}
+    asyncio.run(bot.handle_key_input("SECRET456", 56))
+    assert accounts.keys("bybit") == ("APIKEY123", "SECRET456")
+    connected = [t for t in texts(bot) if t.startswith("✅ Подключено")]
+    assert connected and "проверить не удалось" in connected[0]
+    assert not any("(только чтение)" in t for t in texts(bot))
+
+
+def test_acc_check_drops_trade_key(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    accounts.save_key("bybit", "k", "s")
+    calls = []
+    monkeypatch.setattr(B.accounts, "key_permissions", _perms((False, "вывод"), calls))
+    monkeypatch.setattr(B.accounts, "verify", _verify_ok(calls))
+    bot = Stub(p2p.Config())
+    asyncio.run(bot.on_callback({"id": "1", "data": "acc_check:bybit", "message": {"message_id": 1}}))
+    assert accounts.keys("bybit") is None
+    assert calls == ["perm"]
+    assert any("больше, чем чтение" in t and "вывод" in t for t in texts(bot))
+    assert not any("✅ Ключ рабочий" in t for t in texts(bot))
+
+
+def test_acc_check_readonly_key_confirmed(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    accounts.save_key("bybit", "k", "s")
+    monkeypatch.setattr(B.accounts, "key_permissions", _perms((True, "")))
+    monkeypatch.setattr(B.accounts, "verify", _verify_ok())
+    bot = Stub(p2p.Config())
+    asyncio.run(bot.on_callback({"id": "1", "data": "acc_check:bybit", "message": {"message_id": 1}}))
+    assert accounts.keys("bybit") == ("k", "s")
+    assert texts(bot)[-1] == "✅ Ключ рабочий (только чтение)"
+
+
+def test_acc_check_unverified_permissions_not_called_readonly(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    accounts.save_key("bybit", "k", "s")
+    monkeypatch.setattr(B.accounts, "key_permissions", _perms((None, "")))
+    monkeypatch.setattr(B.accounts, "verify", _verify_ok())
+    bot = Stub(p2p.Config())
+    asyncio.run(bot.on_callback({"id": "1", "data": "acc_check:bybit", "message": {"message_id": 1}}))
+    assert accounts.keys("bybit") == ("k", "s")
+    assert texts(bot)[-1].startswith("✅ Ключ рабочий") and "проверить не удалось" in texts(bot)[-1]
+    assert "(только чтение)" not in texts(bot)[-1]
+
+
+# те же сценарии с настоящими key_permissions/verify — подменён только транспорт к бирже
+BYBIT_TRADE_KEY = {"retCode": 0, "result": {"readOnly": 0, "permissions": {
+    "ContractTrade": ["Order", "Position"], "Wallet": ["AccountTransfer"], "Spot": ["SpotTrade"]}}}
+BYBIT_READONLY_KEY = {"retCode": 0, "result": {"readOnly": 1, "permissions": {"Spot": [], "Wallet": []}}}
+
+
+def _bybit_transport(monkeypatch, query_api):
+    paths = []
+
+    async def fake_bybit_get(s, api_key, api_secret, path, params=None):
+        paths.append(path)
+        if path == "/v5/user/query-api":
+            return query_api
+        if path == "/v5/account/wallet-balance":
+            return {"retCode": 0, "result": {"list": []}}
+        raise AssertionError(f"unexpected bybit path {path}")
+
+    monkeypatch.setattr(accounts, "bybit_get", fake_bybit_get)
+    return paths
+
+
+def test_connect_bybit_trade_key_via_api_is_dropped(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    paths = _bybit_transport(monkeypatch, BYBIT_TRADE_KEY)
+    bot = Stub(p2p.Config())
+    bot.awaiting_key = {"ex": "bybit", "step": "key"}
+    asyncio.run(bot.handle_key_input("APIKEY123", 55))
+    asyncio.run(bot.handle_key_input("SECRET456", 56))
+    assert accounts.keys("bybit") is None
+    assert paths == ["/v5/user/query-api"]
+    assert not any("только чтение)" in t for t in texts(bot))
+    assert any("больше, чем чтение" in t for t in texts(bot))
+
+
+def test_connect_bybit_readonly_key_via_api_says_readonly(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    paths = _bybit_transport(monkeypatch, BYBIT_READONLY_KEY)
+    bot = Stub(p2p.Config())
+    bot.awaiting_key = {"ex": "bybit", "step": "secret", "key": "APIKEY123"}
+    asyncio.run(bot.handle_key_input("SECRET456", 56))
+    assert paths == ["/v5/user/query-api", "/v5/account/wallet-balance"]
+    assert accounts.keys("bybit") == ("APIKEY123", "SECRET456")
+    assert "✅ Подключено (только чтение)" in texts(bot)
+
+
+def test_connect_bybit_permissions_api_error_not_called_readonly(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    _bybit_transport(monkeypatch, {"retCode": 10005, "retMsg": "Permission denied"})
+    bot = Stub(p2p.Config())
+    bot.awaiting_key = {"ex": "bybit", "step": "secret", "key": "APIKEY123"}
+    asyncio.run(bot.handle_key_input("SECRET456", 56))
+    assert accounts.keys("bybit") == ("APIKEY123", "SECRET456")
+    assert any(t.startswith("✅ Подключено") and "проверить не удалось" in t for t in texts(bot))
+    assert not any("(только чтение)" in t for t in texts(bot))
+
+
+def test_acc_check_bybit_trade_key_via_api_is_dropped(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    accounts.save_key("bybit", "APIKEY123", "SECRET456")
+    _bybit_transport(monkeypatch, BYBIT_TRADE_KEY)
+    bot = Stub(p2p.Config())
+    asyncio.run(bot.on_callback({"id": "1", "data": "acc_check:bybit", "message": {"message_id": 1}}))
+    assert accounts.keys("bybit") is None
+    assert not any("✅ Ключ рабочий" in t for t in texts(bot))
+
+
+def test_connect_mexc_trade_withdraw_key_via_api_is_dropped(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+
+    async def fake_mexc_get(s, api_key, api_secret, path, params=None):
+        assert path == "/api/v3/account"
+        return {"canTrade": True, "canWithdraw": True, "balances": []}
+
+    monkeypatch.setattr(accounts, "mexc_get", fake_mexc_get)
+    bot = Stub(p2p.Config())
+    bot.awaiting_key = {"ex": "mexc", "step": "secret", "key": "k"}
+    asyncio.run(bot.handle_key_input("s", 56))
+    assert accounts.keys("mexc") is None
+    assert any("больше, чем чтение" in t and "торговля, вывод" in t for t in texts(bot))
+    assert not any("✅ Подключено" in t for t in texts(bot))
+
+
+# --- #11: «сообщение удалено» — только если Telegram подтвердил deleteMessage ---
+
+class RefusingDelete(Stub):
+    """Telegram отказывает в deleteMessage (группа без прав админа и т.п.)."""
+    async def call(self, method, **p):
+        r = await super().call(method, **p)
+        if method == "deleteMessage":
+            return {"ok": False, "error_code": 400, "description": "Bad Request: message can't be deleted"}
+        return r
+
+
+class RaisingDelete(Stub):
+    """deleteMessage падает сетевой ошибкой."""
+    async def call(self, method, **p):
+        if method == "deleteMessage":
+            raise aiohttp.ClientConnectionError("network down")
+        return await super().call(method, **p)
+
+
+def test_handle_key_input_warns_when_delete_refused(caplog):
+    bot = RefusingDelete(p2p.Config())
+    bot.awaiting_key = {"ex": "bybit", "step": "key"}
+    asyncio.run(bot.handle_key_input("APIKEY123", 55))
+    assert ("deleteMessage", {"chat_id": "1", "message_id": 55}) in bot.out
+    assert not any("удалено" in t for t in texts(bot))
+    assert any("вручную" in t for t in texts(bot))
+    assert bot.awaiting_key == {"ex": "bybit", "step": "secret", "key": "APIKEY123"}   # ввод продолжается
+    assert "APIKEY123" not in caplog.text                                               # ключ не в логах
+
+
+def test_handle_key_input_warns_when_delete_raises():
+    bot = RaisingDelete(p2p.Config())
+    bot.awaiting_key = {"ex": "bybit", "step": "key"}
+    asyncio.run(bot.handle_key_input("APIKEY123", 55))     # исключение не вылетает наружу
+    assert not any("удалено" in t for t in texts(bot))
+    assert any("вручную" in t for t in texts(bot))
+    assert bot.awaiting_key == {"ex": "bybit", "step": "secret", "key": "APIKEY123"}
+
+
+def test_handle_key_input_final_step_warns_when_delete_refused(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    calls = []
+    monkeypatch.setattr(B.accounts, "key_permissions", _perms((True, ""), calls))
+    monkeypatch.setattr(B.accounts, "verify", _verify_ok(calls))
+    bot = RefusingDelete(p2p.Config())
+    bot.awaiting_key = {"ex": "bybit", "step": "secret", "key": "APIKEY123"}
+    asyncio.run(bot.handle_key_input("SECRET456", 56))
+    assert accounts.keys("bybit") == ("APIKEY123", "SECRET456")
+    assert calls == ["perm", "verify"]
+    assert any("вручную" in t for t in texts(bot))
+    assert "✅ Подключено (только чтение)" in texts(bot)
+
+
+def test_handle_key_input_kucoin_every_step_warns_when_delete_refused(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    monkeypatch.setattr(B.accounts, "key_permissions", _perms((True, "")))
+    monkeypatch.setattr(B.accounts, "verify", _verify_ok())
+    bot = RefusingDelete(p2p.Config())
+    bot.awaiting_key = {"ex": "kucoin", "step": "key"}
+    for n, (text, mid) in enumerate((("APIKEY123", 55), ("SECRET456", 56), ("PASS789", 57)), 1):
+        asyncio.run(bot.handle_key_input(text, mid))
+        assert sum("вручную" in t for t in texts(bot)) == n    # предупреждение на каждом шаге
+    assert not any("удалено" in t for t in texts(bot))
+    assert accounts.passphrase("kucoin") == "PASS789"
+
+
+def test_handle_key_input_delete_ok_still_says_deleted():
+    bot = Stub(p2p.Config())
+    bot.awaiting_key = {"ex": "bybit", "step": "key"}
+    asyncio.run(bot.handle_key_input("APIKEY123", 55))
+    assert texts(bot) == ["Ключ получен, сообщение удалено. Теперь пришли <b>secret</b> для Bybit."]
+
+
+def test_handle_key_input_without_message_id_claims_nothing():
+    bot = Stub(p2p.Config())
+    bot.awaiting_key = {"ex": "bybit", "step": "key"}
+    asyncio.run(bot.handle_key_input("APIKEY123", None))
+    assert not any(m == "deleteMessage" for m, _ in bot.out)
+    assert not any("удалено" in t or "вручную" in t for t in texts(bot))
 
 
 def test_stats_view_reports_counts(tmp_path, monkeypatch):

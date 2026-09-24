@@ -334,6 +334,13 @@ def env_key_hint(ex):
             "не использует, но сотри его оттуда.")
 
 
+def readonly_note(safe):
+    """Хвост к «✅ Подключено»/«✅ Ключ рабочий»: «только чтение» — лишь когда биржа сама подтвердила права ключа."""
+    if safe:
+        return " (только чтение)"
+    return ", но права ключа проверить не удалось — убедись, что у него только чтение (без торговли и вывода)."
+
+
 def account_view(ex):
     """Текст и кнопки карточки одной биржи: статус, «Проверить»/«Удалить» или «Подключить»."""
     name = EXCHANGE_NAMES.get(ex, ex)
@@ -865,6 +872,18 @@ class Bot:
                 logger.warning("card error: %s", e)
         return await self.send(caption, chat_id=chat_id, markup=markup, topic=topic), False
 
+    async def delete_message(self, message_id):
+        """deleteMessage с проверкой ответа: True — только если Telegram подтвердил удаление."""
+        try:
+            r = await self.call("deleteMessage", chat_id=self.chat_id, message_id=message_id)
+        except Exception as e:
+            logger.warning("deleteMessage error: %s", e)
+            return False
+        if not r.get("ok"):
+            logger.warning("deleteMessage %s: %s", message_id, r.get("description"))
+            return False
+        return True
+
     def remember_deal(self, d, cfg=None, snap=None):
         """Запомнить связку под кнопками «✅ Сделал»/«📋 Шаги»; хранится ограниченное число последних."""
         cfg = dataclasses.replace(cfg or self.cfg)   # снимок настроек: старая карточка не увидит новую сумму/порог
@@ -1243,29 +1262,38 @@ class Bot:
 
         Для бирж из accounts.PASSPHRASE_REQUIRED (KuCoin) — третий шаг: passphrase."""
         state = self.awaiting_key
-        if message_id is not None:
-            await self.call("deleteMessage", chat_id=self.chat_id, message_id=message_id)
+        # «удалено» пишем, только если Telegram подтвердил; отказ/сбой — просим удалить вручную, ввод не прерываем
+        deleted = None if message_id is None else await self.delete_message(message_id)
+        if deleted is False:
+            await self.send("⚠️ Не смог удалить сообщение с ключом из чата — удали его вручную.")
+        done = ", сообщение удалено" if deleted else ""
         name = EXCHANGE_NAMES.get(state["ex"], state["ex"])
         text = text.strip()
         if state["step"] == "key":
             state["key"] = text
             state["step"] = "secret"
-            await self.send(f"Ключ получен, сообщение удалено. Теперь пришли <b>secret</b> для {name}.")
+            await self.send(f"Ключ получен{done}. Теперь пришли <b>secret</b> для {name}.")
             return
         if state["step"] == "secret":
             state["secret"] = text
             if state["ex"] in accounts.PASSPHRASE_REQUIRED:
                 state["step"] = "passphrase"
-                await self.send(f"Secret получен, сообщение удалено. Теперь пришли <b>passphrase</b> для {name}.")
+                await self.send(f"Secret получен{done}. Теперь пришли <b>passphrase</b> для {name}.")
                 return
         else:   # step == "passphrase"
             state["passphrase"] = text
         self.awaiting_key = None
-        accounts.save_key(state["ex"], state["key"], state["secret"], state.get("passphrase"))
-        ok, msg = await accounts.verify(self.s, state["ex"])
-        await self.send("✅ Подключено (только чтение)" if ok
-                        else f"⚠️ Ключ сохранён, но проверка не прошла: {html.escape(msg)}")
-        t, kb = account_view(state["ex"])
+        ex = state["ex"]
+        accounts.save_key(ex, state["key"], state["secret"], state.get("passphrase"))
+        # сначала права: ключ с торговлей/выводом удаляем сразу, «только чтение» — лишь когда биржа это подтвердила
+        safe, detail = await accounts.key_permissions(self.s, ex)
+        if safe is False:
+            await self.drop_unsafe_key(ex, detail)
+        else:
+            ok, msg = await accounts.verify(self.s, ex)
+            await self.send(f"✅ Подключено{readonly_note(safe)}" if ok
+                            else f"⚠️ Ключ сохранён, но проверка не прошла: {html.escape(msg)}")
+        t, kb = account_view(ex)
         await self.send(t, markup=kb)
 
     def apply(self, data):
@@ -1874,8 +1902,14 @@ class Bot:
                             f"Пришли <b>API key</b> — сообщение с ним сразу удалю из чата.")
         elif data.startswith("acc_check:"):
             ex = data[10:]
-            ok, msg = await accounts.verify(self.s, ex)
-            await self.send("✅ Ключ рабочий (только чтение)" if ok else f"⚠️ {html.escape(msg)}")
+            safe, detail = await accounts.key_permissions(self.s, ex)
+            if safe is False:
+                await self.drop_unsafe_key(ex, detail)
+                t, kb = account_view(ex)
+                await self.send(t, markup=kb)
+            else:
+                ok, msg = await accounts.verify(self.s, ex)
+                await self.send(f"✅ Ключ рабочий{readonly_note(safe)}" if ok else f"⚠️ {html.escape(msg)}")
         elif data.startswith("acc_del:"):
             ex = data[8:]
             if accounts.delete_key(ex):
@@ -1988,6 +2022,14 @@ class Bot:
         else:
             await self.send(GUIDE, markup=LINKS)
 
+    async def drop_unsafe_key(self, ex, detail):
+        """Ключ даёт больше, чем чтение: удалить его и попросить новый read-only."""
+        accounts.delete_key(ex)
+        name = EXCHANGE_NAMES.get(ex, ex)
+        await self.send(f"⚠️ {name}: ключ даёт больше, чем чтение ({detail}) — удалил его из бота.\n"
+                        f"Создай новый ключ ТОЛЬКО для чтения и подключи заново: «⚙️ Настройки → 🔑 Мои биржи»."
+                        + env_key_hint(ex))
+
     async def check_key_safety(self):
         """При старте: если сохранённый ключ биржи даёт торговать/выводить — удалить его и попросить read-only."""
         for ex in accounts.ONBOARDABLE:
@@ -1995,11 +2037,7 @@ class Bot:
                 continue
             safe, detail = await accounts.api_permissions(self.s, ex)
             if not safe:
-                accounts.delete_key(ex)
-                name = EXCHANGE_NAMES.get(ex, ex)
-                await self.send(f"⚠️ {name}: ключ даёт больше, чем чтение ({detail}) — удалил его из бота.\n"
-                                f"Создай новый ключ ТОЛЬКО для чтения и подключи заново: «⚙️ Настройки → 🔑 Мои биржи»."
-                                + env_key_hint(ex))
+                await self.drop_unsafe_key(ex, detail)
 
     async def setup(self):
         for method, params in (("setMyCommands", {"commands": COMMANDS}),
