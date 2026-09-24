@@ -1,0 +1,602 @@
+"""P2P scanner: Bybit, HTX, KuCoin, MEXC, BitPapa + обменники BestChange (public endpoints, no API keys).
+
+Монеты USDT/USDC/BTC/ETH/TON за рубли, связки P2P↔спот через USDT, сравнение сетей у обменников.
+One-off snapshot:  python p2p.py
+"""
+import asyncio
+import html
+import io
+import json
+import os
+import re
+import statistics
+import time
+import zipfile
+from dataclasses import dataclass, field
+
+import aiohttp
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0 Safari/537.36",
+    "Accept": "application/json",
+    "Content-Type": "application/json",
+}
+HTX_FIAT = {"RUB": 11}
+HTX_COIN = {"USDT": 2, "BTC": 1, "ETH": 3}
+DEFAULT_EXCLUDE = "mobile top-up,cash,наличн,чат,chat,api,qr"  # пополнение телефона, наличные, реквизиты «в чат», шлюзы
+ALL_EXCHANGES = "bybit,mexc,htx,kucoin,bitpapa,bestchange"
+DEFAULT_ASSETS = "USDT,USDC,BTC,ETH,TON"
+DEFAULT_FEES = "USDT:1,USDC:1,BTC:0.0002,ETH:0.001,TON:0.05"   # комиссия вывода по умолчанию, в единицах монеты
+# Комиссии вывода по биржам и сетям, в монете (агрегаторы Yieldo 31.07.2026 и ChainCost 01.2026 — сверять на бирже).
+# Для бирж не из таблицы берётся DEFAULT_FEES/TRANSFER_FEES.
+WITHDRAW = {
+    ("Bybit", "USDT"): {"TRC20": 1.0, "BEP20": 0.2, "ERC20": 0.8},
+    ("MEXC", "USDT"): {"TRC20": 1.0, "BEP20": 0.01, "TON": 0.023, "ERC20": 0.44},
+    ("MEXC", "USDC"): {"BEP20": 0.0},
+    ("Bybit", "ETH"): {"ERC20": 0.001},
+    ("MEXC", "ETH"): {"ERC20": 0.00003},
+}
+# Сети, которые точно принимает площадка-получатель (не подтверждено иное — только TRC20). Нет в списке — любые.
+RECEIVE_NETS = {"BitPapa": ("TRC20",)}
+SPOT_VENUES = ("Bybit", "MEXC")
+DEFAULT_SPOT_FEES = "Bybit:0.1,MEXC:0.1"          # % тейкер-комиссии спота
+DEFAULT_RISK = "BTC:0.3,ETH:0.5,TON:0.7"          # % запаса на движение курса, пока идут сделки и переводы
+# BestChange: берём все рублёвые банки и карты (тип 2/3 в bm_cy.dat), кроме наличных/QR/юрлиц.
+# Основные — латиницей, чтобы совпадали с названиями на P2P-биржах и в INCLUDE_PAY.
+BC_BANKS = {"Сбербанк RUB": "Sberbank", "Т-Банк RUB": "T-Bank", "Альфа-Банк RUB": "Alfa-bank", "СБП RUB": "SBP"}
+BC_SKIP = ("cash-in", "QR", "компании", "ATM")
+BC_COINS = {  # имя в bm_cy.dat -> (монета, сеть)
+    "Tether TRC20 (USDT)": ("USDT", "TRC20"), "Tether BEP20 (USDT)": ("USDT", "BEP20"),
+    "Tether TON (USDT)": ("USDT", "TON"), "Tether SOL (USDT)": ("USDT", "SOL"),
+    "Tether ERC20 (USDT)": ("USDT", "ERC20"), "Tether POLYGON (USDT)": ("USDT", "POLYGON"),
+    "Tether ARBITRUM (USDT)": ("USDT", "ARBITRUM"),
+    "USDC TRC20 (USDC)": ("USDC", "TRC20"), "USDC BEP20 (USDC)": ("USDC", "BEP20"),
+    "USDC ERC20 (USDC)": ("USDC", "ERC20"), "USDC SOL (USDC)": ("USDC", "SOL"),
+    "Bitcoin (BTC)": ("BTC", "BTC"), "Ethereum (ETH)": ("ETH", "ERC20"),
+}
+ENV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+
+
+def load_env(path=ENV_PATH):
+    if not os.path.exists(path):
+        return
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                os.environ.setdefault(k.strip(), v.split(" #")[0].strip())
+
+
+def _list(name, default=""):
+    return [x.strip().lower() for x in os.getenv(name, default).split(",") if x.strip()]
+
+
+def _fees(spec, upper=True):
+    out = {}
+    for part in spec.split(","):
+        if ":" in part:
+            k, v = part.split(":", 1)
+            out[k.strip().upper() if upper else k.strip()] = float(v)
+    return out
+
+
+@dataclass
+class Config:
+    fiat: str = "RUB"
+    amount: float = 50000          # сумма одного круга в фиате
+    min_profit: float = 1.0        # % чистыми, порог сигнала
+    min_orders: int = 100          # мин. сделок у мерчанта
+    min_rate: float = 95.0         # мин. % завершённых сделок
+    max_dev: float = 4.0           # % от биржевого курса; дальше — аномалия, отсев
+    interval: int = 20             # сек между сканами
+    alt_interval: int = 60         # сек между опросами монет кроме USDT
+    bc_refresh: int = 120          # сек между скачиваниями выгрузки BestChange (~16 МБ)
+    pay_fee: float = 0.0           # % комиссии банка за оплату продавцу (СБП сверх 100 тыс./мес — до 0.5%)
+    spot_fees: dict = field(default_factory=lambda: _fees(DEFAULT_SPOT_FEES, upper=False))
+    risk_buffer: dict = field(default_factory=lambda: _fees(DEFAULT_RISK))
+    assets: list = field(default_factory=lambda: DEFAULT_ASSETS.split(","))
+    transfer_fees: dict = field(default_factory=lambda: _fees(DEFAULT_FEES))
+    exchanges: list = field(default_factory=lambda: ALL_EXCHANGES.split(","))
+    include_pay: list = field(default_factory=list)
+    exclude_pay: list = field(default_factory=lambda: DEFAULT_EXCLUDE.split(","))
+
+    @classmethod
+    def from_env(cls):
+        fees = _fees(os.getenv("TRANSFER_FEES", DEFAULT_FEES))
+        if "TRANSFER_FEES" not in os.environ and os.getenv("TRANSFER_FEE"):
+            fees["USDT"] = float(os.getenv("TRANSFER_FEE"))
+        return cls(
+            fiat=os.getenv("FIAT", "RUB").upper(),
+            amount=float(os.getenv("AMOUNT", 50000)),
+            min_profit=float(os.getenv("MIN_PROFIT", 1.0)),
+            min_orders=int(os.getenv("MIN_ORDERS", 100)),
+            min_rate=float(os.getenv("MIN_RATE", 95)),
+            max_dev=float(os.getenv("MAX_DEV", 4)),
+            interval=int(os.getenv("INTERVAL", 20)),
+            alt_interval=int(os.getenv("ALT_INTERVAL", 60)),
+            bc_refresh=int(os.getenv("BC_REFRESH", 120)),
+            pay_fee=float(os.getenv("PAY_FEE", 0)),
+            spot_fees=_fees(os.getenv("SPOT_FEES", DEFAULT_SPOT_FEES), upper=False),
+            risk_buffer=_fees(os.getenv("RISK_BUFFER", DEFAULT_RISK)),
+            assets=[a.upper() for a in _list("ASSETS", DEFAULT_ASSETS)],
+            transfer_fees=fees,
+            exchanges=_list("EXCHANGES", ALL_EXCHANGES),
+            include_pay=_list("INCLUDE_PAY"),
+            exclude_pay=_list("EXCLUDE_PAY", DEFAULT_EXCLUDE),
+        )
+
+
+@dataclass
+class Ad:
+    ex: str
+    side: str        # "buy": мы покупаем монету у объявления; "sell": продаём ему
+    price: float     # фиат за 1 монету
+    min_amt: float   # лимиты в фиате
+    max_amt: float
+    avail: float     # сколько монеты доступно
+    pays: list
+    nick: str
+    orders: int
+    rate: float      # % завершённых сделок
+    url: str = ""
+    asset: str = "USDT"
+    net: str = ""    # сеть (только у обменников)
+
+
+async def _json(s, method, url, body=None):
+    async with s.request(method, url, json=body, headers=HEADERS) as r:
+        r.raise_for_status()
+        return await r.json(content_type=None)
+
+
+_bybit_pay = {}
+
+
+async def bybit(s, cfg, side, asset):
+    if not _bybit_pay:
+        j = await _json(s, "POST", "https://api2.bybit.com/fiat/otc/configuration/queryAllPaymentList", {})
+        _bybit_pay.update({str(p["paymentType"]): p["paymentName"] for p in j["result"]["paymentConfigVo"]})
+    body = {"userId": "", "tokenId": asset, "currencyId": cfg.fiat, "payment": [], "side": "1" if side == "buy" else "0",
+            "size": "20", "page": "1", "amount": str(int(cfg.amount)), "authMaker": False, "canTrade": False}
+    j = await _json(s, "POST", "https://api2.bybit.com/fiat/otc/item/online", body)
+    return [Ad("Bybit", side, float(i["price"]), float(i["minAmount"]), float(i["maxAmount"]), float(i["lastQuantity"]),
+               [_bybit_pay.get(p, p) for p in i["payments"]], i["nickName"], int(i["recentOrderNum"]),
+               float(i["recentExecuteRate"]), asset=asset)
+            for i in j["result"]["items"] or []]
+
+
+async def htx(s, cfg, side, asset):
+    cur, coin = HTX_FIAT.get(cfg.fiat), HTX_COIN.get(asset)
+    if cur is None or coin is None:
+        return []
+    url = ("https://www.htx.com/-/x/otc/v1/data/trade-market?coinId=%d&currency=%d&tradeType=%s&currPage=1&payMethod=0"
+           "&acceptOrder=0&blockType=general&online=1&range=0&amount=%d&onlyTradable=false&isFollowed=false"
+           % (coin, cur, "sell" if side == "buy" else "buy", cfg.amount))
+    j = await _json(s, "GET", url)
+    return [Ad("HTX", side, float(i["price"]), float(i["minTradeLimit"]), float(i["maxTradeLimit"]), float(i["tradeCount"]),
+               [p["name"] for p in i["payMethods"]], i["userName"], int(i["tradeMonthTimes"]),
+               float(i["orderCompleteRate"] or 0), asset=asset)
+            for i in j.get("data") or []]
+
+
+def _kucoin_pay(p):
+    if p["payTypeCode"] == "OTHER" and p.get("reservedFields"):
+        return json.loads(p["reservedFields"]).get("payTypeName", "Other")
+    return p["payTypeNameEn"]
+
+
+async def kucoin(s, cfg, side, asset):
+    url = (f"https://www.kucoin.com/_api/otc/ad/list?currency={asset}&side={'SELL' if side == 'buy' else 'BUY'}"
+           f"&legal={cfg.fiat}&page=1&pageSize=20&status=PUTUP&lang=en_US")
+    j = await _json(s, "GET", url)
+    return [Ad("KuCoin", side, float(i["floatPrice"]), float(i["limitMinQuote"]), float(i["limitMaxQuote"]),
+               float(i["currencyBalanceQuantity"]), [_kucoin_pay(p) for p in i["adPayTypes"]], i["nickName"],
+               int(i.get("dealOrderNum") or 0), float((i.get("dealOrderRate") or "0").rstrip("%")), asset=asset)
+            for i in j.get("items") or []]
+
+
+_mexc_pay = {}
+_mexc_coins = {}
+
+
+async def mexc(s, cfg, side, asset):
+    if not _mexc_pay:
+        j = await _json(s, "GET", f"https://www.mexc.com/api/platform/p2p/api/payment/method?currency={cfg.fiat}")
+        _mexc_pay.update({str(p["id"]): p["name"] for p in j["data"]})
+    if not _mexc_coins:
+        j = await _json(s, "GET", "https://www.mexc.com/api/platform/p2p/api/common/coins")
+        _mexc_coins.update({c["coinName"]: c["coinId"] for c in j["data"]})
+    coin = _mexc_coins.get(asset)
+    if not coin:
+        return []
+    url = ("https://p2p.mexc.com/api/market?adsType=1&allowTrade=false&blockTrade=false&countryCode=&follow=false"
+           f"&haveTrade=false&payMethod=&coinId={coin}&currency={cfg.fiat}&amount={int(cfg.amount)}&page=1&pageSize=50"
+           + ("&tradeType=SELL&adOrderSortField=price&adOrderSort=0" if side == "buy" else "&tradeType=BUY"))
+    j = await _json(s, "GET", url)
+    out = []
+    for i in j.get("data") or []:
+        st = i.get("merchantStatistics") or {}
+        out.append(Ad("MEXC", side, float(i["price"]), float(i["minTradeLimit"]), float(i["maxTradeLimit"]),
+                      float(i["availableQuantity"]), [_mexc_pay.get(p, f"pm{p}") for p in str(i["payMethod"]).split(",")],
+                      (i.get("merchant") or {}).get("nickName", "?"), int(st.get("doneLastMonthCount") or 0),
+                      float(st.get("completeRate") or 0) * 100, asset=asset))
+    return out
+
+
+async def bitpapa(s, cfg, side, asset):
+    url = ("https://bitpapa.com/api/v1/pro/search?crypto_currency_code=%s&currency_code=%s&page=1&limit=50&type=%s&sort=%s"
+           % (asset, cfg.fiat, "sell" if side == "buy" else "buy", "price" if side == "buy" else "-price"))
+    j = await _json(s, "GET", url)
+    out = []
+    for a in j.get("ads") or []:
+        u = a.get("user") or {}
+        if u.get("is_suspicious"):
+            continue
+        trades, done = u.get("trades_count") or 0, u.get("completed_trades_count") or 0
+        out.append(Ad("BitPapa", side, float(a["price"]), float(a["limit_min"] or 0), float(a["limit_max"] or 0),
+                      float(a["limit_max_crypto"] or 0), [a["payment_method"]["name"]], u.get("user_name", "?"),
+                      done, done / trades * 100 if trades else 0, asset=asset))
+    return out
+
+
+_bc = {"t": 0.0, "ads": []}
+_bc_lock = asyncio.Lock()
+
+
+def _bc_parse(data):
+    z = zipfile.ZipFile(io.BytesIO(data))
+    cy = {}
+    for line in z.read("bm_cy.dat").decode("cp1251").splitlines():
+        f = line.split(";")
+        cy[f[0]] = f
+    exch = {}
+    for line in z.read("bm_exch.dat").decode("cp1251").splitlines():
+        f = line.split(";")
+        exch[f[0]] = f[1]
+    coins = {k: BC_COINS[f[2]] for k, f in cy.items() if f[2] in BC_COINS}
+    banks = {k: BC_BANKS.get(f[2], f[2].removesuffix(" RUB")) for k, f in cy.items()
+             if f[4] == "643" and f[5] in ("2", "3") and not any(x in f[2] for x in BC_SKIP)}
+    pairs = {f"{c};{b};".encode(): "sell" for c in coins for b in banks}   # мы продаём монету обменнику
+    pairs.update({f"{b};{c};".encode(): "buy" for c in coins for b in banks})
+    ads = []
+    with z.open("bm_rates.dat") as rows:
+        for line in rows:
+            side = pairs.get(line[:line.find(b";", line.find(b";") + 1) + 1])
+            if not side:
+                continue
+            f = line.decode("cp1251").strip().split(";")
+            give, recv, reserve, mn, mx = float(f[3]), float(f[4]), float(f[5]), float(f[8]), float(f[9]) or 1e12
+            bad, _, good = f[6].partition(".")
+            bad, good = int(bad or 0), int(good or 0)
+            c, b = (f[0], f[1]) if side == "sell" else (f[1], f[0])
+            if side == "sell":   # лимиты в монете, резерв в рублях
+                price = recv / give
+                mn, mx, avail = mn * price, mx * price, reserve / price
+            else:                # лимиты в рублях, резерв в монете
+                price, avail = give / recv, reserve
+            asset, net = coins[c]
+            ads.append(Ad("BestChange", side, price, mn, mx, avail, [banks[b]], f"{exch.get(f[2], f[2])} [{net}]",
+                          good, good / (good + bad) * 100 if good + bad else 0,
+                          f"https://www.bestchange.ru/click.php?id={f[2]}&from={f[0]}&to={f[1]}&city=0", asset, net))
+    return ads
+
+
+async def bestchange(s, cfg, side, asset):
+    async with _bc_lock:   # все стороны и монеты скана делят одну выгрузку
+        now = time.time()
+        # после сбоя не повторяем минуту: иначе каждая пара монета×сторона ждёт свой таймаут
+        if now - _bc["t"] > cfg.bc_refresh and now - _bc.get("tried", 0) > 60:
+            _bc["tried"] = now
+            async with s.get("http://api.bestchange.ru/info.zip", headers=HEADERS,
+                             timeout=aiohttp.ClientTimeout(total=30)) as r:
+                r.raise_for_status()
+                data = await r.read()
+            _bc["ads"] = await asyncio.to_thread(_bc_parse, data)
+            _bc["t"] = time.time()
+    return [a for a in _bc["ads"] if a.side == side and a.asset == asset]
+
+
+FETCHERS = {"bybit": bybit, "htx": htx, "kucoin": kucoin, "mexc": mexc, "bitpapa": bitpapa, "bestchange": bestchange}
+
+
+async def rapira_mid(s):
+    j = await _json(s, "GET", "https://api.rapira.net/open/market/rates")
+    r = next(x for x in j["data"] if x["symbol"] == "USDT/RUB")
+    return (r["askPrice"] + r["bidPrice"]) / 2
+
+
+async def spot_prices(s, assets):
+    """{площадка: {монета: (bid, ask)}} к USDT на споте Bybit и MEXC (одним запросом на биржу)."""
+    by, mx = await asyncio.gather(_json(s, "GET", "https://api.bybit.com/v5/market/tickers?category=spot"),
+                                  _json(s, "GET", "https://api.mexc.com/api/v3/ticker/bookTicker"),
+                                  return_exceptions=True)
+    out = {"Bybit": {"USDT": (1.0, 1.0)}, "MEXC": {"USDT": (1.0, 1.0)}}
+    if not isinstance(by, Exception):
+        t = {x["symbol"]: x for x in by["result"]["list"]}
+        for a in assets:
+            x = t.get(a + "USDT")
+            if x and float(x["bid1Price"] or 0) > 0:
+                out["Bybit"][a] = (float(x["bid1Price"]), float(x["ask1Price"]))
+    if not isinstance(mx, Exception):
+        t = {x["symbol"]: x for x in mx}
+        for a in assets:
+            x = t.get(a + "USDT")
+            if x and float(x["bidPrice"] or 0) > 0:
+                out["MEXC"][a] = (float(x["bidPrice"]), float(x["askPrice"]))
+    if isinstance(by, Exception) and isinstance(mx, Exception):
+        raise by
+    return out
+
+
+def _mid(spot, asset):
+    for venue in SPOT_VENUES:
+        if asset in spot.get(venue, {}):
+            bid, ask = spot[venue][asset]
+            return (bid + ask) / 2
+    return None
+
+
+def usable(a, cfg):
+    pays = [p for p in a.pays if not any(x in p.lower() for x in cfg.exclude_pay)]
+    if cfg.include_pay:
+        pays = [p for p in pays if any(x in p.lower() for x in cfg.include_pay)]
+    a.pays = pays
+    return bool(pays) and a.min_amt <= cfg.amount <= a.max_amt and a.avail * a.price >= cfg.amount \
+        and a.orders >= cfg.min_orders and a.rate >= cfg.min_rate
+
+
+def _same_venue(b, s):
+    return b.ex == s.ex and b.ex != "BestChange"   # обменники всегда внешние: нужен перевод
+
+
+def _withdraw(cfg, sender, asset, net="", receiver=""):
+    """Комиссия вывода монеты с биржи и сеть. Сеть задана (её требует обменник) — берём её,
+    иначе самую дешёвую из тех, что принимает получатель."""
+    table = WITHDRAW.get((sender, asset), {})
+    if net:
+        return table.get(net, cfg.transfer_fees.get(asset, 0)), net
+    ok = {n: f for n, f in table.items() if n in RECEIVE_NETS.get(receiver, n)}
+    if ok:
+        best = min(ok, key=ok.get)
+        return ok[best], best
+    return cfg.transfer_fees.get(asset, 0), ""
+
+
+def _hop(cfg, frm, frm_net, to, to_net, asset):
+    """Перевод монеты между площадками: (комиссия в монете, подпись шага); та же биржа — (0, '')."""
+    if frm == to and frm != "BestChange":
+        return 0.0, ""
+    if frm == "BestChange" and to == "BestChange":   # обменник → твой кошелёк на бирже → другой обменник
+        fee, net = _withdraw(cfg, "Bybit", asset, to_net)
+        return fee, f"через Bybit: перевод −{fee:g} {asset} ({net})"
+    if frm == "BestChange":                          # обменник сам шлёт монету, комиссия в его курсе
+        return 0.0, f"обменник шлёт {asset} ({frm_net}) на {to}"
+    fee, net = _withdraw(cfg, frm, asset, to_net if to == "BestChange" else "", to)
+    cost = f"−{fee:g} {asset}" if fee else f"{asset} без комиссии"
+    return fee, f"перевод {cost}" + (f" ({net})" if net else "") + f" на {to}"
+
+
+def _route(b, s, cfg, spot):
+    """Чистая прибыль % и шаги маршрута со всеми издержками; None, если связка невозможна."""
+    steps = []
+    qty = cfg.amount * (1 - cfg.pay_fee / 100) / b.price
+    if cfg.pay_fee:
+        steps.append(f"комиссия банка −{cfg.pay_fee:g}%")
+    if b.asset == s.asset:
+        fee, label = _hop(cfg, b.ex, b.net, s.ex, s.net, b.asset)
+        qty -= fee
+        steps.append(label or "внутри биржи")
+    else:
+        if "USDT" not in (b.asset, s.asset):
+            return None
+        alt = s.asset if b.asset == "USDT" else b.asset
+        # спот там, где монета уже лежит: меньше переводов
+        venue = next((v for v in (b.ex, s.ex) + SPOT_VENUES if v in SPOT_VENUES and alt in spot.get(v, {})), None)
+        if not venue:
+            return None
+        bid, ask = spot[venue][alt]
+        fee, label = _hop(cfg, b.ex, b.net, venue, "", b.asset)
+        qty -= fee
+        if label:
+            steps.append(label)
+        sf = cfg.spot_fees.get(venue, 0.1)
+        qty = (qty / ask if b.asset == "USDT" else qty * bid) * (1 - sf / 100)
+        steps.append(f"спот {b.asset}→{s.asset} на {venue} (−{sf:g}%)")
+        fee, label = _hop(cfg, venue, "", s.ex, s.net, s.asset)
+        qty -= fee
+        if label:
+            steps.append(label)
+    vol = max(cfg.risk_buffer.get(b.asset, 0), cfg.risk_buffer.get(s.asset, 0))
+    if vol:   # курс ETH/BTC/TON может уйти, пока идут сделки и переводы
+        qty *= 1 - vol / 100
+        steps.append(f"запас на курс −{vol:g}%")
+    return (qty * s.price / cfg.amount - 1) * 100, " → ".join(steps)
+
+
+@dataclass
+class Snapshot:
+    ref: float
+    ref_src: str
+    refs: dict       # монета -> ориентир в фиате
+    best: dict       # (ex, side, asset) -> лучшее Ad после фильтров
+    deals: list      # [(profit %, buy Ad, sell Ad, маршрут)], по убыванию
+    networks: dict   # сеть -> {"buy": Ad, "sell": Ad} для USDT у обменников
+    dropped: dict    # ex -> сколько аномальных объявлений отсеяно
+    errors: dict     # "ex/монета" -> текст ошибки
+
+
+_alt = {"t": 0.0, "ads": [], "errors": {}}
+
+
+async def scan(s, cfg):
+    names = [n for n in cfg.exchanges if n in FETCHERS]
+    alts = [a for a in cfg.assets if a != "USDT"]
+    alt_due = bool(alts) and time.time() - _alt["t"] >= cfg.alt_interval
+    jobs = [(n, side, asset) for n in names
+            for asset in (["USDT"] if "USDT" in cfg.assets else []) + (alts if alt_due or n == "bestchange" else [])
+            for side in ("buy", "sell")]
+    ref_task = asyncio.ensure_future(rapira_mid(s)) if cfg.fiat == "RUB" else None
+    spot_task = asyncio.ensure_future(spot_prices(s, cfg.assets))
+    res = await asyncio.gather(*(FETCHERS[n](s, cfg, side, asset) for n, side, asset in jobs), return_exceptions=True)
+
+    ads, errors, alt_ads, alt_errors = [], {}, [], {}
+    for (n, _, asset), r in zip(jobs, res):
+        cached = asset != "USDT" and n != "bestchange"   # не-USDT монеты кэшируем на alt_interval
+        if isinstance(r, Exception):
+            (alt_errors if cached else errors)[f"{n}/{asset}"] = f"{type(r).__name__}: {r}"[:120]
+        else:
+            (alt_ads if cached else ads).extend(r)
+    if alt_due:
+        _alt.update(t=time.time(), ads=alt_ads, errors=alt_errors)
+    ads += _alt["ads"]
+    errors.update(_alt["errors"])
+
+    ref, ref_src = None, "-"
+    if ref_task:
+        try:
+            ref, ref_src = await ref_task, "Rapira USDT/RUB"
+        except Exception:
+            pass
+    if ref is None:
+        usdt = [a.price for a in ads if a.asset == "USDT"]
+        ref, ref_src = (statistics.median(usdt), "медиана P2P") if usdt else (None, "-")
+    try:
+        spot = await spot_task
+    except Exception as e:
+        spot = {"Bybit": {"USDT": (1.0, 1.0)}}
+        errors["spot"] = f"{type(e).__name__}: {e}"[:120]
+    refs = {}
+    for a in cfg.assets:
+        mid = _mid(spot, a)
+        if ref and mid:
+            refs[a] = ref * mid
+        else:
+            p = [x.price for x in ads if x.asset == a]
+            if p:
+                refs[a] = statistics.median(p)
+
+    best, dropped, networks = {}, {}, {}
+    for a in ads:
+        if not usable(a, cfg):
+            continue
+        r = refs.get(a.asset)
+        if r and abs(a.price / r - 1) * 100 > cfg.max_dev:
+            dropped[a.ex] = dropped.get(a.ex, 0) + 1
+            continue
+        better = (lambda cur: cur is None or (a.price < cur.price if a.side == "buy" else a.price > cur.price))
+        if better(best.get((a.ex, a.side, a.asset))):
+            best[(a.ex, a.side, a.asset)] = a
+        if a.net and a.asset == "USDT" and better(networks.setdefault(a.net, {}).get(a.side)):
+            networks[a.net][a.side] = a
+
+    buys = [a for (_, side, _), a in best.items() if side == "buy"]
+    sells = [a for (_, side, _), a in best.items() if side == "sell"]
+    deals = []
+    for b in buys:
+        for sl in sells:
+            r = _route(b, sl, cfg, spot)
+            if r:
+                deals.append((r[0], b, sl, r[1]))
+    deals.sort(key=lambda d: d[0], reverse=True)
+    return Snapshot(ref or 0, ref_src, refs, best, deals, networks, dropped, errors)
+
+
+def venue_url(a, fiat="RUB"):
+    """Страница площадки для объявления: у обменника — его ссылка с BestChange."""
+    if a.url:
+        return a.url
+    buy, t = a.side == "buy", a.asset.upper()
+    return {
+        "Bybit": f"https://www.bybit.com/fiat/trade/otc/?actionType={1 if buy else 0}&token={t}&fiat={fiat}",
+        "MEXC": f"https://www.mexc.com/ru-RU/buy-crypto/p2p?fiat={fiat}",
+        "HTX": f"https://www.htx.com/ru-ru/fiat-crypto/trade/{'buy' if buy else 'sell'}-{t.lower()}-{fiat.lower()}/",
+        "KuCoin": f"https://www.kucoin.com/ru/otc/{'buy' if buy else 'sell'}/{t}-{fiat}",
+        "BitPapa": "https://bitpapa.com/ru",
+    }.get(a.ex, "")
+
+
+def spot_url(route):
+    """Ссылка на спот-пару из описания маршрута («спот USDT→ETH на Bybit»), иначе пусто."""
+    m = re.search(r"спот (\w+)→(\w+) на (\w+)", route)
+    if not m:
+        return ""
+    coin = m.group(2) if m.group(1) == "USDT" else m.group(1)
+    return {"Bybit": f"https://www.bybit.com/trade/spot/{coin}/USDT",
+            "MEXC": f"https://www.mexc.com/ru-RU/exchange/{coin}_USDT"}.get(m.group(3), "")
+
+
+def _money(x):
+    return f"{x:,.0f}".replace(",", " ")
+
+
+def _price(p):
+    return _money(p) if p >= 1000 else f"{p:.2f}"
+
+
+def fmt_ad(a):
+    stats = f"{a.orders} отз/{a.rate:.0f}% хор." if a.ex == "BestChange" else f"{a.orders} сд/{a.rate:.0f}%"
+    link = f' · <a href="{html.escape(a.url)}">открыть</a>' if a.url else ""
+    pays = ", ".join(a.pays[:4]) + (f" +{len(a.pays) - 4}" if len(a.pays) > 4 else "")
+    return f"{a.ex} {a.asset} {_price(a.price)} ({html.escape(pays)}) · {html.escape(a.nick)} · {stats}{link}"
+
+
+def fmt_deal(d, cfg):
+    profit, b, s, route = d
+    return (f"<b>{profit:+.2f}%</b> на {_money(cfg.amount)} {cfg.fiat} ({route})\n"
+            f"Купить: {fmt_ad(b)}\nПродать: {fmt_ad(s)}")
+
+
+def fmt_top(snap, cfg, n=5):
+    refs = " · ".join(f"{a} {_price(p)}" for a, p in snap.refs.items() if a != "USDT")
+    lines = [f"Ориентир USDT {snap.ref:.2f} ({snap.ref_src})" + (f" · {refs}" if refs else ""),
+             f"Сумма круга {_money(cfg.amount)} {cfg.fiat}", "", "<b>USDT по площадкам:</b>"]
+    for ex in sorted({ex for ex, _, asset in snap.best if asset == "USDT"}):
+        b, s = snap.best.get((ex, "buy", "USDT")), snap.best.get((ex, "sell", "USDT"))
+        line = f"{ex}: купить {b.price:.2f}" if b else f"{ex}: купить —"
+        line += f" / продать {s.price:.2f}" if s else " / продать —"
+        if b and s:
+            line += f" → спред {(b.price / s.price - 1) * 100:.2f}%"
+        lines.append(line)
+    alts = [a for a in cfg.assets if a != "USDT"]
+    if alts:
+        lines += ["", "<b>Другие монеты (лучшее):</b>"]
+        for asset in alts:
+            bs = [v for (_, side, a), v in snap.best.items() if a == asset and side == "buy"]
+            ss = [v for (_, side, a), v in snap.best.items() if a == asset and side == "sell"]
+            b = min(bs, key=lambda x: x.price) if bs else None
+            s = max(ss, key=lambda x: x.price) if ss else None
+            lines.append(f"{asset}: купить " + (f"{_price(b.price)} ({b.ex})" if b else "—")
+                         + " / продать " + (f"{_price(s.price)} ({s.ex})" if s else "—"))
+    if snap.networks:
+        lines += ["", "<b>Сети USDT у обменников:</b>"]
+        for net, v in sorted(snap.networks.items()):
+            b, s = v.get("buy"), v.get("sell")
+            lines.append(f"{net}: купить " + (f"{b.price:.2f}" if b else "—") + " / продать " + (f"{s.price:.2f}" if s else "—"))
+    if snap.dropped:
+        lines.append("\nОтсеяно аномальных (>±%g%% от ориентира): %s" % (
+            cfg.max_dev, ", ".join(f"{ex} {c}" for ex, c in snap.dropped.items())))
+    if snap.errors:
+        lines.append("Ошибки: " + "; ".join(f"{ex}: {e}" for ex, e in snap.errors.items()))
+    lines += ["", "<b>Лучшие связки:</b>"]
+    text = "\n".join(lines)
+    if not snap.deals:
+        return text + "\nнет: на одной из сторон не осталось объявлений после фильтров"
+    for d in snap.deals[:n]:   # целыми блоками, чтобы не резать HTML и влезть в лимит Telegram 4096
+        block = "\n" + fmt_deal(d, cfg) + "\n"
+        if len(text) + len(block) > 4000:
+            break
+        text += block
+    return text
+
+
+async def main():
+    load_env()
+    cfg = Config.from_env()
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as s:
+        snap = await scan(s, cfg)
+    print(html.unescape(re.sub(r"<[^>]+>", "", fmt_top(snap, cfg, n=10))))
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

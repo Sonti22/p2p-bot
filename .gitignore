@@ -1,0 +1,11 @@
+# секреты: токен бота и chat_id живут только локально
+.env
+.env.*
+!.env.example
+
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.log
+samples.jsonl
