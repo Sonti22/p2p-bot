@@ -328,6 +328,94 @@ async def verify(s, exchange):
     return True, "ключ рабочий, доступ только для чтения"
 
 
+def _hist_ts(v):
+    """Время записи истории аккаунта: epoch-мс (большинство бирж) или "YYYY-MM-DD HH:MM:SS" (MEXC-выводы)."""
+    try:
+        return int(v) / 1000
+    except (TypeError, ValueError):
+        try:
+            return datetime.strptime(str(v), "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc).timestamp()
+        except (ValueError, TypeError):
+            return 0.0
+
+
+def _hist_item(kind, asset, amount, ts):
+    try:
+        return {"kind": kind, "asset": asset, "amount": float(amount or 0), "ts": _hist_ts(ts)}
+    except (TypeError, ValueError):
+        return None
+
+
+async def mexc_history(s, api_key, api_secret, limit=20):
+    """Фолбэк-история MEXC для автожурнала (нет отдельного P2P API, как у Bybit): депозиты, затем
+    выводы — берём первый источник, который вернул хотя бы одну запись."""
+    for kind, path, ts_field in (("deposit", "/api/v3/capital/deposit/hisrec", "insertTime"),
+                                  ("withdraw", "/api/v3/capital/withdraw/history", "applyTime")):
+        try:
+            j = await mexc_get(s, api_key, api_secret, path, {"limit": limit})
+        except Exception:
+            continue
+        if not isinstance(j, list):
+            continue
+        out = [it for it in (_hist_item(kind, it.get("coin"), it.get("amount"), it.get(ts_field)) for it in j) if it]
+        if out:
+            return out
+    return None
+
+
+async def htx_history(s, api_key, api_secret, limit=20):
+    """Фолбэк-история HTX: единый эндпоинт депозитов/выводов — депозиты, затем выводы."""
+    for kind in ("deposit", "withdraw"):
+        try:
+            j = await htx_get(s, api_key, api_secret, "/v1/query/deposit-withdraw", {"type": kind, "size": limit})
+        except Exception:
+            continue
+        if j.get("status") != "ok":
+            continue
+        out = [it for it in (_hist_item(kind, it.get("currency"), it.get("amount"), it.get("created-at"))
+                              for it in j.get("data") or []) if it]
+        if out:
+            return out
+    return None
+
+
+async def kucoin_history(s, api_key, api_secret, passphrase_value, limit=20):
+    """Фолбэк-история KuCoin: депозиты, затем выводы."""
+    for kind, path in (("deposit", "/api/v1/deposits"), ("withdraw", "/api/v1/withdrawals")):
+        try:
+            j = await kucoin_get(s, api_key, api_secret, passphrase_value, path, {"pageSize": limit})
+        except Exception:
+            continue
+        if j.get("code") != "200000":
+            continue
+        items = (j.get("data") or {}).get("items") or []
+        out = [it for it in (_hist_item(kind, it.get("currency"), it.get("amount"), it.get("createdAt"))
+                              for it in items) if it]
+        if out:
+            return out
+    return None
+
+
+HISTORY_FETCHERS = {"mexc": mexc_history, "htx": htx_history}  # kucoin отдельно — нужен passphrase
+
+
+async def account_history(s, exchange, limit=20):
+    """История последних движений по счёту для автожурнала: (id, side, asset, ..., ts) для Bybit
+    (P2P-эндпоинт, см. bybit_p2p_orders) или фолбэк депозиты→выводы для остальных площадок.
+    Нет ключа или ни один источник не сработал — None."""
+    ex = exchange.lower()
+    pair = keys(ex)
+    if not pair:
+        return None
+    if ex == "bybit":
+        return await bybit_p2p_orders(s, *pair, size=limit)
+    if ex == "kucoin":
+        pp = passphrase(ex)
+        return await kucoin_history(s, *pair, pp, limit=limit) if pp else None
+    fetch = HISTORY_FETCHERS.get(ex)
+    return await fetch(s, *pair, limit=limit) if fetch else None
+
+
 P2P_STATUS_COMPLETED = 50  # Bybit P2P: код статуса завершённого ордера
 
 
