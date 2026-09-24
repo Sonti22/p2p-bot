@@ -138,6 +138,50 @@ def test_route_uses_live_fee_over_table():
     assert profit == pytest.approx(((50000 / 88 - 1.0) * 90 / 50000 - 1) * 100)
 
 
+def test_route_blocks_when_all_known_nets_closed_without_table():
+    b, s = make_ad("HTX", "buy", 88.0), make_ad("Bybit", "sell", 90.0)
+    assert ("HTX", "USDT") not in p2p.WITHDRAW                  # у HTX нет таблицы комиссий
+    _, route = p2p._route(b, s, _cfg(), SPOT)
+    assert "−1 USDT на Bybit" in route                          # сведений нет — запасная комиссия
+    netstatus._apply("HTX", "USDT", {n: {"dep": True, "wd": False, "fee": 1.0} for n in ("TRC20", "BEP20", "ERC20", "TON")})
+    assert p2p._withdraw(_cfg(), "HTX", "USDT", "", "Bybit") is None
+    assert p2p._route(b, s, _cfg(), SPOT) is None               # справочник есть, и все его сети закрыты
+    assert p2p.profit_breakdown(b, s, _cfg(), SPOT) is None
+    netstatus.reset()
+    assert p2p._route(b, s, _cfg(), SPOT) is not None           # сведений снова нет — не мешаем
+
+
+def test_closed_net_blocks_only_nets_receiver_accepts():
+    b, s = make_ad("HTX", "buy", 88.0), make_ad("BitPapa", "sell", 94.0)
+    # у HTX открыт вывод только в BEP20 без известной комиссии, TRC20 закрыт — а BitPapa принимает лишь TRC20
+    netstatus._apply("HTX", "USDT", {"TRC20": {"dep": True, "wd": False, "fee": 1.0},
+                                     "BEP20": {"dep": True, "wd": True, "fee": None}})
+    assert p2p._route(b, s, _cfg(), SPOT) is None
+    assert p2p._route(b, make_ad("Bybit", "sell", 90.0), _cfg(), SPOT) is not None   # Bybit примет BEP20
+    netstatus._apply("HTX", "USDT", {"BEP20": {"dep": True, "wd": False, "fee": 0.01}})
+    _, route = p2p._route(b, s, _cfg(), SPOT)
+    assert "−1 USDT на BitPapa" in route                        # про TRC20 справочник молчит — запасная комиссия
+
+
+def test_exchanger_to_exchange_checks_receiver_deposit():
+    b, s = make_ad("BestChange", "buy", 88.0, net="TRC20"), make_ad("MEXC", "sell", 90.0)
+    netstatus._apply("MEXC", "USDT", {"TRC20": {"dep": False, "wd": True, "fee": 1.0}})
+    assert p2p._hop(_cfg(), "BestChange", "TRC20", "MEXC", "", "USDT") == (None, "")
+    assert p2p._route(b, s, _cfg(), SPOT) is None               # у биржи закрыт ввод в сети обменника
+    netstatus._apply("MEXC", "USDT", {"TRC20": {"dep": True, "wd": True, "fee": 1.0}})
+    _, route = p2p._route(b, s, _cfg(), SPOT)
+    assert "обменник шлёт USDT (TRC20) на MEXC" in route
+    # кросс-монета: обменник шлёт USDT на спот Bybit, а там ввод TRC20 закрыт
+    netstatus._apply("Bybit", "USDT", {"TRC20": {"dep": False, "wd": True, "fee": 1.0}})
+    spot = {"Bybit": {"USDT": (1.0, 1.0), "BTC": (5_000_000.0, 5_000_000.0)}}
+    assert p2p._route(b, make_ad("Bybit", "sell", 5_200_000.0, asset="BTC"), _cfg(), spot) is None
+    # обменник → обменник через кошелёк на Bybit: ввод TRC20 на Bybit закрыт
+    assert p2p._route(b, make_ad("BestChange", "sell", 90.0, net="BEP20"), _cfg(), SPOT) is None
+    netstatus.reset()
+    _, route = p2p._route(b, make_ad("BestChange", "sell", 90.0, net="BEP20"), _cfg(), SPOT)
+    assert "через Bybit" in route                               # сведений нет — не мешаем
+
+
 def test_scan_offline_refreshes_networks(offline):
     c = p2p.Config(exchanges=["htx", "kucoin"], assets=["USDT"], min_orders=0, min_rate=0)
     snap = asyncio.run(p2p.scan(None, c))

@@ -499,7 +499,8 @@ def _same_venue(b, s):
 def _withdraw(cfg, sender, asset, net="", receiver=""):
     """Комиссия вывода монеты с биржи и сеть. Сеть задана (её требует обменник) — берём её,
     иначе самую дешёвую из тех, что принимает получатель. None — открытой сети нет: у отправителя
-    закрыт вывод или у получателя ввод (по живому справочнику netstatus; неизвестно = не мешаем)."""
+    закрыт вывод или у получателя ввод (по живому справочнику netstatus; неизвестно = не мешаем),
+    либо справочник отправителя известен и все его сети закрыты. Нет сведений — запасная комиссия."""
     table = dict(WITHDRAW.get((sender, asset), {}))
     for n in netstatus.open_nets(sender, asset):       # живой справочник дополняет таблицу и переопределяет её
         fee = netstatus.live_fee(sender, asset, n)
@@ -519,6 +520,9 @@ def _withdraw(cfg, sender, asset, net="", receiver=""):
             return None
         best = min(cand, key=cand.get)
         return cand[best], best
+    known = [n for n in netstatus.known_nets(sender, asset) if n in RECEIVE_NETS.get(receiver, n)]
+    if known and not any(ok(n) for n in known):
+        return None   # справочник есть, и во всех его сетях вывод (или ввод у получателя) закрыт
     return cfg.transfer_fees.get(asset, 0), ""
 
 
@@ -528,12 +532,16 @@ def _hop(cfg, frm, frm_net, to, to_net, asset):
     if frm == to and frm != "BestChange":
         return 0.0, ""
     if frm == "BestChange" and to == "BestChange":   # обменник → твой кошелёк на бирже → другой обменник
+        if netstatus.deposit_ok("Bybit", asset, frm_net) is False:
+            return None, ""                          # на Bybit закрыт ввод в сети первого обменника
         w = _withdraw(cfg, "Bybit", asset, to_net)
         if w is None:
             return None, ""
         fee, net = w
         return fee, f"через Bybit: перевод −{fee:g} {asset} ({net})"
     if frm == "BestChange":                          # обменник сам шлёт монету, комиссия в его курсе
+        if netstatus.deposit_ok(to, asset, frm_net) is False:
+            return None, ""                          # у биржи закрыт ввод в сети обменника
         return 0.0, f"обменник шлёт {asset} ({frm_net}) на {to}"
     w = _withdraw(cfg, frm, asset, to_net if to == "BestChange" else "", to)
     if w is None:
