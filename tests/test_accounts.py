@@ -510,13 +510,17 @@ def test_bybit_p2p_orders_returns_none_on_error():
     assert asyncio.run(accounts.bybit_p2p_orders(_Boom(), "k", "s")) is None
 
 
-def test_mexc_history_prefers_deposits_when_present():
+def test_mexc_history_merges_deposits_and_withdrawals_by_time():
     session = _UrlJsonSession({
         "capital/deposit/hisrec": [{"coin": "USDT", "amount": "100.5", "insertTime": 1700000000000}],
-        "capital/withdraw/history": [{"coin": "USDT", "amount": "9", "applyTime": "2023-11-14 22:13:20"}],
+        "capital/withdraw/history": [{"coin": "USDT", "amount": "9", "applyTime": "2023-11-16 00:00:00"}],
     })
     hist = asyncio.run(accounts.mexc_history(session, "k", "s"))
-    assert hist == [{"kind": "deposit", "asset": "USDT", "amount": 100.5, "ts": 1700000000.0}]
+    assert hist == [
+        {"kind": "withdraw", "asset": "USDT", "amount": 9.0,
+         "ts": datetime(2023, 11, 16, 0, 0, 0, tzinfo=timezone.utc).timestamp()},
+        {"kind": "deposit", "asset": "USDT", "amount": 100.5, "ts": 1700000000.0},
+    ]
 
 
 def test_mexc_history_falls_back_to_withdrawals_when_no_deposits():
@@ -534,13 +538,16 @@ def test_mexc_history_returns_none_when_both_sources_empty():
     assert asyncio.run(accounts.mexc_history(session, "k", "s")) is None
 
 
-def test_htx_history_deposits_then_withdrawals():
+def test_htx_history_merges_deposits_and_withdrawals_by_time():
     session = _UrlJsonSession({
         "type=deposit": {"status": "ok", "data": [{"currency": "usdt", "amount": 50, "created-at": 1700000000000}]},
-        "type=withdraw": {"status": "ok", "data": []},
+        "type=withdraw": {"status": "ok", "data": [{"currency": "usdt", "amount": 5, "created-at": 1700000009000}]},
     })
     hist = asyncio.run(accounts.htx_history(session, "k", "s"))
-    assert hist == [{"kind": "deposit", "asset": "usdt", "amount": 50.0, "ts": 1700000000.0}]
+    assert hist == [
+        {"kind": "withdraw", "asset": "usdt", "amount": 5.0, "ts": 1700000009.0},
+        {"kind": "deposit", "asset": "usdt", "amount": 50.0, "ts": 1700000000.0},
+    ]
 
 
 def test_htx_history_returns_none_on_error_status():
@@ -552,10 +559,27 @@ def test_htx_history_returns_none_on_error_status():
 
 
 def test_kucoin_history_reads_paginated_items():
-    session = _JsonSession({"code": "200000", "data": {"items": [
-        {"currency": "USDT", "amount": "30", "createdAt": 1700000000000}]}})
+    session = _UrlJsonSession({
+        "api/v1/deposits": {"code": "200000", "data": {"items": [
+            {"currency": "USDT", "amount": "30", "createdAt": 1700000000000}]}},
+        "api/v1/withdrawals": {"code": "200000", "data": {"items": []}},
+    })
     hist = asyncio.run(accounts.kucoin_history(session, "k", "s", "pp"))
     assert hist == [{"kind": "deposit", "asset": "USDT", "amount": 30.0, "ts": 1700000000.0}]
+
+
+def test_kucoin_history_merges_deposits_and_withdrawals_by_time():
+    session = _UrlJsonSession({
+        "api/v1/deposits": {"code": "200000", "data": {"items": [
+            {"currency": "USDT", "amount": "30", "createdAt": 1700000000000}]}},
+        "api/v1/withdrawals": {"code": "200000", "data": {"items": [
+            {"currency": "USDT", "amount": "12", "createdAt": 1700000005000}]}},
+    })
+    hist = asyncio.run(accounts.kucoin_history(session, "k", "s", "pp"))
+    assert hist == [
+        {"kind": "withdraw", "asset": "USDT", "amount": 12.0, "ts": 1700000005.0},
+        {"kind": "deposit", "asset": "USDT", "amount": 30.0, "ts": 1700000000.0},
+    ]
 
 
 def test_mexc_spot_trades_merges_symbols_and_sorts_by_time():
@@ -615,6 +639,43 @@ def test_account_history_kucoin_falls_back_to_spot_trades(tmp_path, monkeypatch)
     })
     hist = asyncio.run(accounts.account_history(session, "kucoin"))
     assert hist == [{"kind": "trade", "asset": "TON", "side": "sell", "amount": 3.0, "price": 5.2, "ts": 1700000000.0}]
+
+
+def test_account_history_mexc_does_not_hide_fresh_trade_behind_old_deposit(tmp_path, monkeypatch):
+    """Старый депозит не должен скрывать более свежую спот-сделку — источники объединяются, а не
+    берётся первый непустой (до фикса при непустых депозитах спот-сделки вообще не запрашивались)."""
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    accounts.save_key("mexc", "k", "s")
+    session = _UrlJsonSession({
+        "capital/deposit/hisrec": [{"coin": "USDT", "amount": "100.5", "insertTime": 1700000000000}],
+        "capital/withdraw/history": [],
+        "symbol=USDCUSDT": [],
+        "symbol=BTCUSDT": [{"isBuyer": True, "qty": "0.001", "price": "60000", "time": 1700000009000}],
+        "symbol=ETHUSDT": [],
+        "symbol=TONUSDT": [],
+    })
+    hist = asyncio.run(accounts.account_history(session, "mexc"))
+    assert hist == [
+        {"kind": "trade", "asset": "BTC", "side": "buy", "amount": 0.001, "price": 60000.0, "ts": 1700000009.0},
+        {"kind": "deposit", "asset": "USDT", "amount": 100.5, "ts": 1700000000.0},
+    ]
+
+
+def test_account_history_kucoin_does_not_hide_fresh_trade_behind_old_deposit(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    accounts.save_key("kucoin", "k", "s", passphrase="pp")
+    session = _UrlJsonSession({
+        "api/v1/deposits": {"code": "200000", "data": {"items": [
+            {"currency": "USDT", "amount": "30", "createdAt": 1700000000000}]}},
+        "api/v1/withdrawals": {"code": "200000", "data": {"items": []}},
+        "api/v1/fills": {"code": "200000", "data": {"items": [
+            {"symbol": "TON-USDT", "side": "sell", "size": "3", "price": "5.2", "createdAt": 1700000009000}]}},
+    })
+    hist = asyncio.run(accounts.account_history(session, "kucoin"))
+    assert hist == [
+        {"kind": "trade", "asset": "TON", "side": "sell", "amount": 3.0, "price": 5.2, "ts": 1700000009.0},
+        {"kind": "deposit", "asset": "USDT", "amount": 30.0, "ts": 1700000000.0},
+    ]
 
 
 def test_account_history_dispatches_bybit_to_p2p_orders(tmp_path, monkeypatch):

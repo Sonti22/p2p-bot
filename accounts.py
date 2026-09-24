@@ -346,9 +346,22 @@ def _hist_item(kind, asset, amount, ts):
         return None
 
 
+def _merge_hist(*sources, limit=20):
+    """Объединяет несколько списков истории в одну ленту по времени (новые сверху), обрезая до limit.
+    Источник может быть None (эндпоинт недоступен/ошибка) — он просто не участвует; None возвращается,
+    только если ни один источник не дал ни одной записи."""
+    items = [it for src in sources if src for it in src]
+    if not items:
+        return None
+    items.sort(key=lambda it: it["ts"], reverse=True)
+    return items[:limit]
+
+
 async def mexc_history(s, api_key, api_secret, limit=20):
-    """Фолбэк-история MEXC для автожурнала (нет отдельного P2P API, как у Bybit): депозиты, затем
-    выводы — берём первый источник, который вернул хотя бы одну запись."""
+    """История MEXC для автожурнала (нет отдельного P2P API, как у Bybit): депозиты и выводы
+    объединяются в одну ленту по времени, а не берётся первый непустой источник — иначе старый
+    депозит скрывает более свежий вывод."""
+    sources = []
     for kind, path, ts_field in (("deposit", "/api/v3/capital/deposit/hisrec", "insertTime"),
                                   ("withdraw", "/api/v3/capital/withdraw/history", "applyTime")):
         try:
@@ -357,14 +370,15 @@ async def mexc_history(s, api_key, api_secret, limit=20):
             continue
         if not isinstance(j, list):
             continue
-        out = [it for it in (_hist_item(kind, it.get("coin"), it.get("amount"), it.get(ts_field)) for it in j) if it]
-        if out:
-            return out
-    return None
+        sources.append([it for it in (_hist_item(kind, it.get("coin"), it.get("amount"), it.get(ts_field))
+                                       for it in j) if it])
+    return _merge_hist(*sources, limit=limit)
 
 
 async def htx_history(s, api_key, api_secret, limit=20):
-    """Фолбэк-история HTX: единый эндпоинт депозитов/выводов — депозиты, затем выводы."""
+    """История HTX: депозиты и выводы (единый эндпоинт, два запроса по `type`) объединяются в одну
+    ленту по времени."""
+    sources = []
     for kind in ("deposit", "withdraw"):
         try:
             j = await htx_get(s, api_key, api_secret, "/v1/query/deposit-withdraw", {"type": kind, "size": limit})
@@ -372,15 +386,14 @@ async def htx_history(s, api_key, api_secret, limit=20):
             continue
         if j.get("status") != "ok":
             continue
-        out = [it for it in (_hist_item(kind, it.get("currency"), it.get("amount"), it.get("created-at"))
-                              for it in j.get("data") or []) if it]
-        if out:
-            return out
-    return None
+        sources.append([it for it in (_hist_item(kind, it.get("currency"), it.get("amount"), it.get("created-at"))
+                                       for it in j.get("data") or []) if it])
+    return _merge_hist(*sources, limit=limit)
 
 
 async def kucoin_history(s, api_key, api_secret, passphrase_value, limit=20):
-    """Фолбэк-история KuCoin: депозиты, затем выводы."""
+    """История KuCoin: депозиты и выводы объединяются в одну ленту по времени."""
+    sources = []
     for kind, path in (("deposit", "/api/v1/deposits"), ("withdraw", "/api/v1/withdrawals")):
         try:
             j = await kucoin_get(s, api_key, api_secret, passphrase_value, path, {"pageSize": limit})
@@ -389,11 +402,9 @@ async def kucoin_history(s, api_key, api_secret, passphrase_value, limit=20):
         if j.get("code") != "200000":
             continue
         items = (j.get("data") or {}).get("items") or []
-        out = [it for it in (_hist_item(kind, it.get("currency"), it.get("amount"), it.get("createdAt"))
-                              for it in items) if it]
-        if out:
-            return out
-    return None
+        sources.append([it for it in (_hist_item(kind, it.get("currency"), it.get("amount"), it.get("createdAt"))
+                                       for it in items) if it])
+    return _merge_hist(*sources, limit=limit)
 
 
 HISTORY_FETCHERS = {"htx": htx_history}  # mexc/kucoin — своя цепочка фолбэков ниже, bybit — P2P-эндпоинт
@@ -448,8 +459,10 @@ async def kucoin_spot_trades(s, api_key, api_secret, passphrase_value, limit=20)
 
 async def account_history(s, exchange, limit=20):
     """История последних движений по счёту для автожурнала: (id, side, asset, ..., ts) для Bybit
-    (P2P-эндпоинт, см. bybit_p2p_orders), депозиты→выводы→спот-сделки для MEXC/KuCoin, депозиты→выводы
-    для остальных площадок. Нет ключа или ни один источник не сработал — None."""
+    (P2P-эндпоинт, см. bybit_p2p_orders); для MEXC/KuCoin депозиты, выводы и спот-сделки объединяются
+    в одну ленту по времени (а не берётся первый непустой источник — иначе старый депозит скрывает
+    более свежий вывод или спот-сделку); депозиты+выводы для остальных площадок. Нет ключа или ни один
+    источник не сработал — None."""
     ex = exchange.lower()
     pair = keys(ex)
     if not pair:
@@ -460,11 +473,11 @@ async def account_history(s, exchange, limit=20):
         pp = passphrase(ex)
         if not pp:
             return None
-        hist = await kucoin_history(s, *pair, pp, limit=limit)
-        return hist if hist is not None else await kucoin_spot_trades(s, *pair, pp, limit=limit)
+        return _merge_hist(await kucoin_history(s, *pair, pp, limit=limit),
+                            await kucoin_spot_trades(s, *pair, pp, limit=limit), limit=limit)
     if ex == "mexc":
-        hist = await mexc_history(s, *pair, limit=limit)
-        return hist if hist is not None else await mexc_spot_trades(s, *pair, limit=limit)
+        return _merge_hist(await mexc_history(s, *pair, limit=limit),
+                            await mexc_spot_trades(s, *pair, limit=limit), limit=limit)
     fetch = HISTORY_FETCHERS.get(ex)
     return await fetch(s, *pair, limit=limit) if fetch else None
 
