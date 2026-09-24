@@ -678,6 +678,54 @@ def test_traps_view_lists_reasons():
     assert "продать" in text and "выше рынка" in text
 
 
+def _groups(*ads):
+    """Собрать snap.groups так же, как это делает scan(): по (ex, side, asset), отсортировано по цене."""
+    g = {}
+    for a in ads:
+        g.setdefault((a.ex, a.side, a.asset), []).append(a)
+    for key, grp in g.items():
+        grp.sort(key=lambda a: a.price, reverse=(key[1] == "sell"))
+    return g
+
+
+def test_maker_view_lists_quotes_per_venue():
+    g = _groups(make_ad("MEXC", "buy", 90.0), make_ad("MEXC", "sell", 92.0))
+    s = p2p.Snapshot(88.0, "test", {}, {}, [], {}, {}, {}, groups=g)
+    cfg = p2p.Config(exchanges=["mexc"])
+    text = B.maker_view(s, cfg, "USDT")
+    assert "MEXC" in text and "купить" in text and "продать" in text
+    assert "переплата" in text and "недополучим" in text
+
+
+def test_maker_view_skips_venue_without_both_sides():
+    g = _groups(make_ad("MEXC", "buy", 90.0))   # только одна сторона стакана
+    s = p2p.Snapshot(88.0, "test", {}, {}, [], {}, {}, {}, groups=g)
+    cfg = p2p.Config(exchanges=["mexc"])
+    text = B.maker_view(s, cfg, "USDT")
+    assert "Нет обеих сторон стакана" in text
+
+
+def test_maker_command_requires_known_asset():
+    bot = Stub(p2p.Config())
+    bot.last = p2p.Snapshot(88.0, "test", {}, {}, [], {}, {}, {})
+    asyncio.run(bot.maker("DOGE"))
+    assert "не отслеживается" in texts(bot)[-1]
+
+
+def test_maker_command_waits_for_first_scan():
+    bot = Stub(p2p.Config())
+    asyncio.run(bot.maker("USDT"))
+    assert texts(bot)[-1] == B.WAIT
+
+
+def test_maker_command_sends_quotes():
+    g = _groups(make_ad("MEXC", "buy", 90.0), make_ad("MEXC", "sell", 92.0))
+    bot = Stub(p2p.Config(exchanges=["mexc"]))
+    bot.last = p2p.Snapshot(88.0, "test", {}, {}, [], {}, {}, {}, groups=g)
+    asyncio.run(bot.maker("usdt"))
+    assert "MEXC" in texts(bot)[-1]
+
+
 def test_portfolio_view_no_exchanges_connected():
     text = B.portfolio_view({}, None)
     assert "Ни одна биржа не подключена" in text
