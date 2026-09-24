@@ -67,10 +67,25 @@ def test_intermediate_coin_routes_via_usdt_on_one_venue():
     assert profit == pytest.approx((qty * 245000.0 / 50000 - 1) * 100)
 
 
-def test_intermediate_coin_rejected_without_common_venue():
-    # BTC есть только на Bybit, ETH — только на MEXC: ни одна площадка не держит обе пары
+def test_intermediate_coin_routes_via_usdt_transfer_between_venues():
+    # BTC есть только на Bybit, ETH — только на MEXC: ни одна площадка не держит обе пары сразу,
+    # маршрут идёт через перевод самого USDT между площадками (BTC→USDT на Bybit, перевод, USDT→ETH на MEXC)
     spot = {"Bybit": {"USDT": (1.0, 1.0), "BTC": (7_000_000.0, 7_001_000.0)},
             "MEXC": {"USDT": (1.0, 1.0), "ETH": (2499.0, 2500.0)}}
+    b, s = make_ad("Bybit", "buy", 7_000_000.0, asset="BTC"), make_ad("MEXC", "sell", 245000.0, asset="ETH")
+    profit, route = p2p._route(b, s, cfg(), spot)
+    assert "спот BTC→USDT на Bybit (−0.1%)" in route and "спот USDT→ETH на MEXC (−0.1%)" in route
+    assert "перевод −0.2 USDT (BEP20) на MEXC" in route
+    qty = 50000 / 7_000_000.0
+    qty = qty * 7_000_000.0 * (1 - 0.001)   # BTC → USDT на Bybit
+    qty -= 0.2                              # перевод USDT Bybit → MEXC (дешевле всего BEP20)
+    qty = (qty / 2500.0) * (1 - 0.001)      # USDT → ETH на MEXC
+    assert profit == pytest.approx((qty * 245000.0 / 50000 - 1) * 100)
+
+
+def test_intermediate_coin_rejected_when_asset_unavailable_anywhere():
+    # BTC не торгуется ни на одной известной площадке спота — перевести его в USDT негде
+    spot = {"Bybit": {"USDT": (1.0, 1.0)}, "MEXC": {"USDT": (1.0, 1.0), "ETH": (2499.0, 2500.0)}}
     b, s = make_ad("Bybit", "buy", 7_000_000.0, asset="BTC"), make_ad("MEXC", "sell", 245000.0, asset="ETH")
     assert p2p._route(b, s, cfg(), spot) is None
 
