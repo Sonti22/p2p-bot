@@ -47,7 +47,9 @@ jobs:
           fi
       - name: Merge
         if: needs.test.result == 'success'
-        run: gh pr merge "$BRANCH" --squash --delete-branch
+        run: |
+          gh pr merge "$BRANCH" --squash
+          gh api -X DELETE "repos/${GITHUB_REPOSITORY}/git/refs/heads/${BRANCH}" || true
       - name: Нужна ручная проверка
         if: needs.test.result != 'success'
         run: gh pr comment "$BRANCH" --body "Тесты или guard не прошли — автомерж отключён, нужна ручная проверка."
