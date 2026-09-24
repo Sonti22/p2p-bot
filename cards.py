@@ -137,6 +137,36 @@ def deal_card(deal, cfg, amounts=None, rel=None):
     return _png(img)
 
 
+def portfolio_card(rows, total):
+    """Карточка баланса: rows — [(биржа, [(монета, кол-во, ₽ или None)])], total — итог в ₽."""
+    coin_lines = sum(len(coins) for _, coins in rows) or 1
+    W = 1080
+    H = 190 + len(rows) * 46 + coin_lines * 40 + 110
+    img = Image.new("RGB", (W, H), BG)
+    d = ImageDraw.Draw(img)
+    d.text((40, 30), "💰 Баланс по биржам", font=_font(40, "bold"), fill=TEXT)
+    stamp = time.strftime("%d.%m %H:%M")
+    d.text((W - 40 - _font(22).getlength(stamp), 46), stamp, font=_font(22), fill=MUTED)
+    d.line((40, 96, W - 40, 96), fill=BORDER, width=2)
+
+    y = 122
+    f_ex, f_coin, f_val = _font(28, "semi"), _font(24), _font(24)
+    for name, coins in rows:
+        d.text((40, y), name, font=f_ex, fill=VENUE_COLORS.get(name, BLUE))
+        y += 44
+        for coin, amt, rub in coins:
+            d.text((64, y), f"{amt:g} {coin}", font=f_coin, fill=TEXT)
+            val = f"≈ {_money(rub)} ₽" if rub else "нет ориентира"
+            d.text((W - 40 - f_val.getlength(val), y), val, font=f_val, fill=TEXT if rub else MUTED)
+            y += 40
+        y += 6
+
+    d.rounded_rectangle((40, H - 90, W - 40, H - 30), radius=18, fill=PANEL, outline=BORDER, width=2)
+    tot = f"Итого: ≈ {_money(total)} ₽"
+    d.text((64, H - 74), tot, font=_font(32, "bold"), fill=GREEN)
+    return _png(img)
+
+
 def top_chart(snap, cfg, n=8):
     deals = snap.deals[:n]
     rows = max(len(deals), 1)
