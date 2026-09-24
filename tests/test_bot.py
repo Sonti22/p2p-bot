@@ -1591,6 +1591,7 @@ def test_backtest_command_reports_top_pairs_and_disclaimer(tmp_path, monkeypatch
     text = texts(bot)[-1]
     assert "Bybit" in text and "MEXC" in text
     assert "прошлое — не прогноз" in text.lower()
+    assert "оценка по сохранённым снимкам" in text.lower()
 
 
 def test_backtest_command_empty_history_message(tmp_path, monkeypatch):
