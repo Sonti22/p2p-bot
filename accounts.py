@@ -483,30 +483,37 @@ async def account_history(s, exchange, limit=20):
 
 
 P2P_STATUS_COMPLETED = 50  # Bybit P2P: код статуса завершённого ордера
+P2P_SIDE_BUY = 0           # Bybit P2P: side 0 = покупка, 1 = продажа
 
 
 async def bybit_p2p_orders(s, api_key, api_secret, size=20):
     """История последних завершённых P2P-ордеров Bybit пользователя (только чтение, для автожурнала).
 
-    Возвращает список {id, side, asset, fiat, amount, price, ts} или None, если P2P API недоступно
-    этому ключу (нет прав/бизнес-аккаунта, ошибка сети) — тогда автожурнал берёт факт из другого места."""
+    Возвращает список {id, side, asset, fiat, amount, price, ts} (amount — количество монеты, не фиат)
+    или None, если P2P API недоступно этому ключу (нет прав/бизнес-аккаунта, ошибка сети) — тогда
+    автожурнал берёт факт из другого места."""
     try:
         j = await bybit_post(s, api_key, api_secret, "/v5/p2p/order/simplifyList",
                               {"page": 1, "size": size, "status": P2P_STATUS_COMPLETED})
     except Exception:
         return None
-    if j.get("retCode") != 0:
+    # P2P-эндпоинты Bybit отвечают в snake_case (ret_code/ret_msg), а не retCode, как остальной v5
+    if j.get("ret_code", j.get("retCode")) != 0:
         return None
     out = []
     for it in (j.get("result") or {}).get("items") or []:
         try:
+            price = float(it.get("price") or 0)
+            # amount — сумма сделки в фиате; монеты — notifyTokenQuantity (в order/info — quantity)
+            qty = it.get("notifyTokenQuantity") or it.get("quantity")
+            fiat_sum = float(it.get("amount") or 0)
             out.append({
                 "id": it.get("id"),
-                "side": "buy" if str(it.get("side")) in ("1", "buy", "Buy") else "sell",
+                "side": "buy" if str(it.get("side")) in (str(P2P_SIDE_BUY), "buy", "Buy") else "sell",
                 "asset": it.get("tokenId"),
                 "fiat": it.get("currencyId"),
-                "amount": float(it.get("amount") or 0),
-                "price": float(it.get("price") or 0),
+                "amount": float(qty) if qty else (fiat_sum / price if price else 0.0),
+                "price": price,
                 "ts": int(it.get("createDate") or 0) / 1000,
             })
         except (TypeError, ValueError):

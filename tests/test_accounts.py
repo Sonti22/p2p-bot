@@ -484,21 +484,56 @@ class _P2pSession:
 
 
 def test_bybit_p2p_orders_parses_completed_items():
-    body = {"retCode": 0, "result": {"items": [
-        {"id": "1", "side": "1", "tokenId": "USDT", "currencyId": "RUB", "amount": "100.5",
-         "price": "95.2", "createDate": "1700000000000"},
-        {"id": "2", "side": "2", "tokenId": "USDT", "currencyId": "RUB", "amount": "50",
-         "price": "94", "createDate": "1700000001000"},
+    # Контракт /v5/p2p/order/simplifyList: ret_code (snake_case), side 0 = Buy / 1 = Sell,
+    # amount — сумма в фиате, количество монеты — notifyTokenQuantity
+    body = {"ret_code": 0, "ret_msg": "SUCCESS", "result": {"count": 2, "items": [
+        {"id": "1", "side": 1, "tokenId": "USDT", "currencyId": "EUR", "amount": "64.400", "price": "0.920",
+         "notifyTokenQuantity": "70.0000", "status": 50, "createDate": "1700000000000"},
+        {"id": "2", "side": 0, "tokenId": "USDT", "currencyId": "RUB", "amount": "9500", "price": "95",
+         "notifyTokenQuantity": "100", "status": 50, "createDate": "1700000001000"},
     ]}}
     orders = asyncio.run(accounts.bybit_p2p_orders(_P2pSession(body), "k", "s"))
     assert orders == [
-        {"id": "1", "side": "buy", "asset": "USDT", "fiat": "RUB", "amount": 100.5, "price": 95.2, "ts": 1700000000.0},
-        {"id": "2", "side": "sell", "asset": "USDT", "fiat": "RUB", "amount": 50.0, "price": 94.0, "ts": 1700000001.0},
+        {"id": "1", "side": "sell", "asset": "USDT", "fiat": "EUR", "amount": 70.0, "price": 0.92, "ts": 1700000000.0},
+        {"id": "2", "side": "buy", "asset": "USDT", "fiat": "RUB", "amount": 100.0, "price": 95.0, "ts": 1700000001.0},
     ]
 
 
+def test_bybit_p2p_orders_documented_example():
+    # Пример ответа из документации Bybit P2P (Get All Orders), поля как есть
+    body = {
+        "ret_code": 0, "ret_msg": "SUCCESS", "ext_code": "", "ext_info": {}, "time_now": "1741774253.840364",
+        "result": {"count": 1, "items": [{
+            "id": "1899742990873296896", "side": 1, "tokenId": "USDT", "orderType": "ORIGIN",
+            "amount": "64.400", "currencyId": "EUR", "price": "0.920", "notifyTokenQuantity": "70.0000",
+            "notifyTokenId": "USDT", "fee": "0", "status": 50, "createDate": "1741769000000",
+        }]},
+    }
+    orders = asyncio.run(accounts.bybit_p2p_orders(_P2pSession(body), "k", "s"))
+    assert orders == [{"id": "1899742990873296896", "side": "sell", "asset": "USDT", "fiat": "EUR",
+                       "amount": 70.0, "price": 0.92, "ts": 1741769000.0}]
+
+
+def test_bybit_p2p_orders_accepts_camel_retcode():
+    body = {"retCode": 0, "result": {"items": []}}
+    assert asyncio.run(accounts.bybit_p2p_orders(_P2pSession(body), "k", "s")) == []
+
+
+def test_bybit_p2p_orders_quantity_falls_back_to_amount_over_price():
+    # нет notifyTokenQuantity/quantity — количество монеты = сумма в фиате / цена
+    body = {"ret_code": 0, "result": {"items": [
+        {"id": "1", "side": 0, "tokenId": "USDT", "currencyId": "EUR", "amount": "64.4", "price": "0.92",
+         "createDate": "1700000000000"},
+        {"id": "2", "side": 0, "tokenId": "USDT", "currencyId": "EUR", "amount": "64.4", "price": "0",
+         "createDate": "1700000000000"},
+    ]}}
+    orders = asyncio.run(accounts.bybit_p2p_orders(_P2pSession(body), "k", "s"))
+    assert orders[0]["amount"] == pytest.approx(70.0)
+    assert orders[1]["amount"] == 0.0   # цены нет — не делим на ноль
+
+
 def test_bybit_p2p_orders_returns_none_on_bad_retcode():
-    body = {"retCode": 10005, "retMsg": "Permission denied"}
+    body = {"ret_code": 10005, "ret_msg": "Permission denied"}
     assert asyncio.run(accounts.bybit_p2p_orders(_P2pSession(body), "k", "s")) is None
 
 
@@ -681,11 +716,11 @@ def test_account_history_kucoin_does_not_hide_fresh_trade_behind_old_deposit(tmp
 def test_account_history_dispatches_bybit_to_p2p_orders(tmp_path, monkeypatch):
     monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
     accounts.save_key("bybit", "k", "s")
-    body = {"retCode": 0, "result": {"items": [
-        {"id": "1", "side": "1", "tokenId": "USDT", "currencyId": "RUB", "amount": "10", "price": "95",
-         "createDate": "1700000000000"}]}}
+    body = {"ret_code": 0, "ret_msg": "SUCCESS", "result": {"items": [
+        {"id": "1", "side": 0, "tokenId": "USDT", "currencyId": "RUB", "amount": "950", "price": "95",
+         "notifyTokenQuantity": "10", "createDate": "1700000000000"}]}}
     hist = asyncio.run(accounts.account_history(_P2pSession(body), "bybit"))
-    assert hist[0]["id"] == "1"
+    assert hist[0]["id"] == "1" and hist[0]["side"] == "buy" and hist[0]["amount"] == 10.0
 
 
 def test_account_history_returns_none_without_keys(tmp_path, monkeypatch):
