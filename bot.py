@@ -405,17 +405,18 @@ def filters_view(cfg):
 
 
 def presets_view(cfg):
-    """Текст и кнопки «📋 Пресеты»: встроенные (не удаляются) и сохранённые пользователем (можно удалить)."""
+    """Текст и кнопки «📋 Пресеты»: встроенные (не удаляются) и сохранённые пользователем (можно удалить).
+    В callback_data — короткий id пресета, не имя: у Telegram лимит 64 байта, имя кириллицей его превышает."""
     builtin, custom = presets.builtin_presets(cfg), presets.list_custom()
     lines = ["📋 <b>Пресеты фильтров</b>", "", "Пресет меняет сразу все свои поля (условие «И»).", ""]
     kb = []
     for name in builtin:
-        lines.append(f"⚙️ {name}")
-        kb.append([{"text": f"▶️ {name}"[:64], "callback_data": f"preset_apply:{name}"}])
+        lines.append(f"⚙️ {html.escape(name)}")
+        kb.append([{"text": f"▶️ {name}"[:64], "callback_data": f"preset_apply:{presets.preset_id(name)}"}])
     for name in custom:
-        lines.append(f"💾 {name}")
-        kb.append([{"text": f"▶️ {name}"[:64], "callback_data": f"preset_apply:{name}"},
-                   {"text": "🗑", "callback_data": f"preset_del:{name}"}])
+        lines.append(f"💾 {html.escape(name)}")
+        kb.append([{"text": f"▶️ {name}"[:64], "callback_data": f"preset_apply:{presets.preset_id(name)}"},
+                   {"text": "🗑", "callback_data": f"preset_del:{presets.preset_id(name)}"}])
     if not custom:
         lines += ["", "Своих пресетов пока нет — «💾 Сохранить как пресет» в «🎛 Фильтры»."]
     kb.append([{"text": "⬅️ Фильтры", "callback_data": "filters"}])
@@ -1231,8 +1232,10 @@ class Bot:
         save_env(env_key, ",".join(values))
         return f"Включено: {item}"
 
-    def apply_preset(self, name):
-        """Применить пресет фильтров (встроенный или сохранённый «💾 Сохранить как пресет») — сразу все поля."""
+    def apply_preset(self, pid):
+        """Применить пресет фильтров (встроенный или сохранённый «💾 Сохранить как пресет») — сразу все поля.
+        pid — id из кнопки; кнопки из старых сообщений несут имя — его тоже понимаем."""
+        name = presets.name_by_id(pid, self.cfg) or pid
         fields = presets.get_preset(name, self.cfg)
         if fields is None:
             return "Пресет не найден"
@@ -1253,7 +1256,7 @@ class Bot:
             await self.send("Пустое имя, пресет не сохранён.")
             return
         presets.save_preset(name, self.cfg)
-        await self.send(f"💾 Пресет «{name}» сохранён.")
+        await self.send(f"💾 Пресет «{html.escape(name)}» сохранён.")
         text, kb = presets_view(self.cfg)
         await self.send(text, markup=kb)
 
@@ -1882,7 +1885,8 @@ class Bot:
             self.awaiting_preset_name = True
             await self.send("Введи имя пресета текстом (например «Мои банки»).")
         elif data.startswith("preset_del:"):
-            presets.delete_preset(data[len("preset_del:"):])
+            pid = data[len("preset_del:"):]
+            presets.delete_preset(presets.name_by_id(pid, self.cfg) or pid)   # старые кнопки несут имя
             await self.call("answerCallbackQuery", callback_query_id=cq["id"], text="Пресет удалён")
             text, kb = presets_view(self.cfg)
             await self.call("editMessageText", chat_id=self.chat_id, message_id=cq["message"]["message_id"],

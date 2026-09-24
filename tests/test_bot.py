@@ -1969,6 +1969,20 @@ def test_flt_callback_rerenders_filters_view(tmp_path, monkeypatch):
     assert method == "editMessageText" and "Фильтры" in params["text"]
 
 
+def use_presets_file(monkeypatch, pfile):
+    """Весь ввод-вывод presets — в файл из tmp_path (data/ в тестах не трогаем)."""
+    load, save = presets._load, presets._save
+    monkeypatch.setattr(presets, "_load", lambda path=None: load(str(pfile)))
+    monkeypatch.setattr(presets, "_save", lambda data, path=None: save(data, str(pfile)))
+
+
+def env_file(tmp_path, monkeypatch):
+    env = tmp_path / ".env"
+    env.write_text("", encoding="utf-8")
+    monkeypatch.setattr(B, "save_env", functools.partial(B.save_env, path=str(env)))
+    return env
+
+
 def test_preset_save_flow_writes_current_filters(tmp_path, monkeypatch):
     pfile = tmp_path / "presets.json"
     monkeypatch.setattr(B.presets, "save_preset", functools.partial(B.presets.save_preset, path=str(pfile)))
@@ -1997,12 +2011,10 @@ def test_apply_saved_preset_updates_cfg_and_env(tmp_path, monkeypatch):
     pfile = tmp_path / "presets.json"
     presets.save_preset("Быстрый", p2p.Config(assets=["USDT"], exchanges=["bybit", "mexc"],
                                               min_profit=3.0, amount=70000), path=str(pfile))
-    monkeypatch.setattr(B.presets, "get_preset", functools.partial(B.presets.get_preset, path=str(pfile)))
-    env = tmp_path / ".env"
-    env.write_text("", encoding="utf-8")
-    monkeypatch.setattr(B, "save_env", functools.partial(B.save_env, path=str(env)))
+    use_presets_file(monkeypatch, pfile)
+    env = env_file(tmp_path, monkeypatch)
     bot = Stub(p2p.Config())
-    toast = bot.apply("preset_apply:Быстрый")
+    toast = bot.apply("preset_apply:" + presets.preset_id("Быстрый"))
     assert "Быстрый" in toast
     assert bot.cfg.assets == ["USDT"] and bot.cfg.exchanges == ["bybit", "mexc"]
     assert bot.cfg.min_profit == 3.0 and bot.cfg.amount == 70000
@@ -2014,8 +2026,9 @@ def test_apply_builtin_preset_usdt_no_transfer(tmp_path, monkeypatch):
     env = tmp_path / ".env"
     env.write_text("", encoding="utf-8")
     monkeypatch.setattr(B, "save_env", functools.partial(B.save_env, path=str(env)))
+    use_presets_file(monkeypatch, tmp_path / "presets.json")
     bot = Stub(p2p.Config())
-    bot.apply("preset_apply:USDT без переводов")
+    bot.apply("preset_apply:" + presets.preset_id("USDT без переводов"))
     assert bot.cfg.assets == ["USDT"] and bot.cfg.same_venue_only is True
     assert "SAME_VENUE_ONLY=1" in env.read_text(encoding="utf-8")
 
@@ -2024,16 +2037,19 @@ def test_apply_builtin_preset_all_venues_resets(tmp_path, monkeypatch):
     env = tmp_path / ".env"
     env.write_text("", encoding="utf-8")
     monkeypatch.setattr(B, "save_env", functools.partial(B.save_env, path=str(env)))
+    use_presets_file(monkeypatch, tmp_path / "presets.json")
     bot = Stub(p2p.Config(assets=["USDT"], exchanges=["bybit"], same_venue_only=True))
-    bot.apply("preset_apply:Все площадки")
+    bot.apply("preset_apply:" + presets.preset_id("Все площадки"))
     assert set(bot.cfg.exchanges) == set(p2p.ALL_EXCHANGES.split(","))
     assert set(bot.cfg.assets) == set(p2p.DEFAULT_ASSETS.split(","))
     assert bot.cfg.same_venue_only is False
 
 
-def test_apply_unknown_preset_reports_not_found():
+def test_apply_unknown_preset_reports_not_found(tmp_path, monkeypatch):
+    use_presets_file(monkeypatch, tmp_path / "presets.json")
     bot = Stub(p2p.Config())
     assert "не найден" in bot.apply("preset_apply:нет такого").lower()
+    assert "не найден" in bot.apply("preset_apply:" + presets.preset_id("нет такого")).lower()
 
 
 def test_presets_view_lists_builtin_and_custom(tmp_path, monkeypatch):
@@ -2043,21 +2059,129 @@ def test_presets_view_lists_builtin_and_custom(tmp_path, monkeypatch):
     text, kb = B.presets_view(p2p.Config())
     assert "USDT без переводов" in text and "Мой" in text
     buttons = [b for row in kb["inline_keyboard"] for b in row]
-    assert any(b.get("callback_data") == "preset_apply:Мой" for b in buttons)
-    assert any(b.get("callback_data") == "preset_del:Мой" for b in buttons)
-    assert not any(b.get("callback_data") == "preset_del:USDT без переводов" for b in buttons)
+    assert any(b.get("callback_data") == "preset_apply:" + presets.preset_id("Мой") for b in buttons)
+    assert any(b.get("callback_data") == "preset_del:" + presets.preset_id("Мой") for b in buttons)
+    assert any(b.get("callback_data") == "preset_apply:" + presets.preset_id("USDT без переводов") for b in buttons)
+    assert not any(b.get("callback_data") == "preset_del:" + presets.preset_id("USDT без переводов")
+                   for b in buttons)
 
 
 def test_preset_del_callback_removes_and_rerenders(tmp_path, monkeypatch):
     pfile = tmp_path / "presets.json"
     presets.save_preset("Старый", p2p.Config(), path=str(pfile))
-    monkeypatch.setattr(B.presets, "delete_preset", functools.partial(B.presets.delete_preset, path=str(pfile)))
-    monkeypatch.setattr(B.presets, "list_custom", functools.partial(B.presets.list_custom, path=str(pfile)))
+    use_presets_file(monkeypatch, pfile)
     bot = Stub(p2p.Config())
-    asyncio.run(bot.on_callback({"id": "1", "data": "preset_del:Старый", "message": {"message_id": 1}}))
+    data = "preset_del:" + presets.preset_id("Старый")
+    asyncio.run(bot.on_callback({"id": "1", "data": data, "message": {"message_id": 1}}))
     assert "Старый" not in presets.list_custom(path=str(pfile))
     method, params = bot.out[-1]
     assert method == "editMessageText" and "Пресеты" in params["text"]
+
+
+# callback_data у Telegram — не больше 64 байт: пресет в кнопке — коротким id, не именем
+
+def callbacks(markup):
+    return [b["callback_data"] for row in markup["inline_keyboard"] for b in row if "callback_data" in b]
+
+
+def test_presets_view_callback_data_fits_64_bytes_for_long_names(tmp_path, monkeypatch):
+    pfile = tmp_path / "presets.json"
+    for name in ("г" * 40, "Мои любимые банки и площадки на все дни", "🔥💰🚀 ночные связки без переводов 🌙"):
+        presets.save_preset(name, p2p.Config(), path=str(pfile))
+    use_presets_file(monkeypatch, pfile)
+    _, kb = B.presets_view(p2p.Config(include_pay=["sberbank"]))
+    data = callbacks(kb)
+    assert len(data) == 3 + 2 * 3 + 1   # 3 встроенных, по 2 кнопки на 3 своих, «⬅️ Фильтры»
+    assert all(len(d.encode("utf-8")) <= 64 for d in data)
+
+
+def test_preset_long_cyrillic_name_save_apply_delete_via_buttons(tmp_path, monkeypatch):
+    """Полный путь из меню: сохранить длинное русское имя → кнопки валидны → ▶️ применяет, 🗑 удаляет."""
+    pfile = tmp_path / "presets.json"
+    use_presets_file(monkeypatch, pfile)
+    env_file(tmp_path, monkeypatch)
+    name = "Мои любимые банки и площадки на все дни"   # 39 букв: с префиксом по имени было 91 байт
+    bot = Stub(p2p.Config(assets=["USDT"], exchanges=["bybit"], min_profit=3.0, amount=70000))
+    asyncio.run(bot.on_callback({"id": "1", "data": "preset_save", "message": {"message_id": 1}}))
+    asyncio.run(bot.handle(name))
+    method, params = bot.out[-1]
+    assert method == "sendMessage" and "Пресеты" in params["text"]
+    data = callbacks(params["reply_markup"])
+    assert all(len(d.encode("utf-8")) <= 64 for d in data)
+    apply_btn = "preset_apply:" + presets.preset_id(name)
+    del_btn = "preset_del:" + presets.preset_id(name)
+    assert apply_btn in data and del_btn in data
+    bot.cfg = p2p.Config(assets=["BTC"], exchanges=["mexc"], min_profit=1.0, amount=20000)
+    asyncio.run(bot.on_callback({"id": "2", "data": apply_btn, "message": {"message_id": 1}}))
+    assert bot.cfg.assets == ["USDT"] and bot.cfg.exchanges == ["bybit"]
+    assert bot.cfg.min_profit == 3.0 and bot.cfg.amount == 70000
+    toast = next(p["text"] for m, p in bot.out if m == "answerCallbackQuery" and p["callback_query_id"] == "2")
+    assert name in toast
+    asyncio.run(bot.on_callback({"id": "3", "data": del_btn, "message": {"message_id": 1}}))
+    assert name not in presets.list_custom(path=str(pfile))
+
+
+def test_preset_name_is_html_escaped_in_messages(tmp_path, monkeypatch):
+    """Имя пресета в HTML-сообщениях экранируется, иначе Telegram не разберёт разметку всего сообщения."""
+    pfile = tmp_path / "presets.json"
+    use_presets_file(monkeypatch, pfile)
+    env_file(tmp_path, monkeypatch)
+    name = "<b>Банки</b> & <i>x"
+    bot = Stub(p2p.Config())
+    bot.awaiting_preset_name = True
+    asyncio.run(bot.handle(name))
+    saved_msg, view = texts(bot)[-2:]
+    escaped = "&lt;b&gt;Банки&lt;/b&gt; &amp; &lt;i&gt;x"
+    assert escaped in saved_msg and "<i>" not in saved_msg
+    assert escaped in view and "<i>" not in view
+    kb = bot.out[-1][1]["reply_markup"]
+    assert any(b["text"] == f"▶️ {name}" for row in kb["inline_keyboard"] for b in row)   # текст кнопки — как есть
+    toast = bot.apply("preset_apply:" + presets.preset_id(name))   # тост answerCallbackQuery — простой текст
+    assert name in toast
+
+
+def test_old_preset_buttons_with_name_still_work(tmp_path, monkeypatch):
+    """Кнопки из сообщений до перехода на id несли имя — применяются и удаляют как раньше."""
+    pfile = tmp_path / "presets.json"
+    presets.save_preset("Мой", p2p.Config(assets=["USDT"]), path=str(pfile))
+    use_presets_file(monkeypatch, pfile)
+    env_file(tmp_path, monkeypatch)
+    bot = Stub(p2p.Config(assets=["BTC"]))
+    assert "Мой" in bot.apply("preset_apply:Мой") and bot.cfg.assets == ["USDT"]
+    bot.apply("preset_apply:USDT без переводов")
+    assert bot.cfg.same_venue_only is True
+    asyncio.run(bot.on_callback({"id": "1", "data": "preset_del:Мой", "message": {"message_id": 1}}))
+    assert "Мой" not in presets.list_custom(path=str(pfile))
+
+
+# пользовательский пресет — полный снимок фильтров, включая «без переводов» (same_venue_only)
+
+def test_custom_preset_restores_same_venue_only(tmp_path, monkeypatch):
+    pfile = tmp_path / "presets.json"
+    use_presets_file(monkeypatch, pfile)
+    env = env_file(tmp_path, monkeypatch)
+    bot = Stub(p2p.Config())
+    bot.apply("preset_apply:" + presets.preset_id("USDT без переводов"))
+    assert bot.cfg.same_venue_only is True
+    B.presets.save_preset("Мой", bot.cfg)
+    bot.apply("preset_apply:" + presets.preset_id("Все площадки"))
+    assert bot.cfg.same_venue_only is False
+    bot.apply("preset_apply:" + presets.preset_id("Мой"))
+    assert bot.cfg.same_venue_only is True and bot.cfg.assets == ["USDT"]
+    assert "SAME_VENUE_ONLY=1" in env.read_text(encoding="utf-8")
+
+
+def test_legacy_custom_preset_without_same_venue_only_keeps_flag(tmp_path, monkeypatch):
+    """Пресет, сохранённый до правки (без same_venue_only), применяется без ошибок и флаг не трогает."""
+    pfile = tmp_path / "presets.json"
+    pfile.write_text('{"Старый": {"assets": ["USDT"], "exchanges": ["bybit"], "include_pay": [], '
+                     '"min_profit": 2.0, "amount": 50000}}', encoding="utf-8")
+    use_presets_file(monkeypatch, pfile)
+    env = env_file(tmp_path, monkeypatch)
+    bot = Stub(p2p.Config(same_venue_only=True))
+    assert "Старый" in bot.apply("preset_apply:" + presets.preset_id("Старый"))
+    assert bot.cfg.assets == ["USDT"] and bot.cfg.same_venue_only is True
+    assert "SAME_VENUE_ONLY" not in env.read_text(encoding="utf-8")
 
 
 def test_history_command_empty_sends_message_no_photos(tmp_path, monkeypatch):
