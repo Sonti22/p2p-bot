@@ -25,6 +25,7 @@ COMMANDS = [{"command": "best", "description": "Лучшая связка сей
             {"command": "top", "description": "Топ связок графиком"},
             {"command": "calc", "description": "Разовый расчёт под сумму, напр. /calc 20000"},
             {"command": "stats", "description": "Журнал сделок: день/неделя/месяц"},
+            {"command": "balance", "description": "Баланс по подключённым биржам"},
             {"command": "settings", "description": "Порог, сумма, пауза"},
             {"command": "dev", "description": "Как развивается бот: версия, изменения, план"},
             {"command": "help", "description": "Как работать с сигналами"}]
@@ -141,6 +142,30 @@ def account_view(ex):
         text = f"🔑 <b>{name}</b>\n\nПодключение ключа пока не реализовано."
         kb = [[back]]
     return text, {"inline_keyboard": kb}
+
+
+def portfolio_view(port, snap):
+    """Текст «💰 Баланс»: монеты по подключённым биржам и итог в ₽ по ориентиру текущего снимка."""
+    if not port:
+        connectable = ", ".join(EXCHANGE_NAMES.get(ex, ex) for ex in accounts.BALANCE_FETCHERS)
+        return (f"💰 <b>Баланс</b>\n\nНи одна биржа не подключена ({connectable}) или баланс пуст. "
+                f"Подключи ключ: ⚙️ Настройки → 🔑 Мои биржи.")
+    lines = ["💰 <b>Баланс по биржам</b>", ""]
+    total = 0.0
+    for ex, bal in port.items():
+        lines.append(f"<b>{EXCHANGE_NAMES.get(ex, ex)}</b>")
+        for coin, amt in sorted(bal.items()):
+            ref = snap.refs.get(coin) if snap else (1.0 if coin in ("USDT", "USDC") else None)
+            rub = amt * ref if ref else None
+            if rub:
+                total += rub
+            lines.append(f"  {amt:g} {coin}" + (f" ≈ {_money(rub)} ₽" if rub else " (нет ориентира в ₽)"))
+        lines.append("")
+    lines.append(f"<b>Итого:</b> ≈ {_money(total)} ₽")
+    return "\n".join(lines)
+
+
+BALANCE_MARKUP = {"inline_keyboard": [[{"text": "🔄 Обновить", "callback_data": "balance"}]]}
 
 
 def roadmap_progress(path=os.path.join(HERE, "ROADMAP.md")):
@@ -323,6 +348,11 @@ class Bot:
         snap = await scan(self.s, calc_cfg, force_alt=True)
         await self.show_top(snap, calc_cfg)
         await self.show_best(snap, calc_cfg)
+
+    async def balance(self):
+        """`/balance`: балансы по подключённым биржам (Bybit — Unified + Funding, MEXC — спот) и итог в ₽."""
+        port = await accounts.portfolio(self.s)
+        await self.send(portfolio_view(port, self.last), markup=BALANCE_MARKUP)
 
     def settings_view(self):
         c = self.cfg
@@ -511,6 +541,8 @@ class Bot:
         elif data == "dev":
             text, kb = dev_view()
             await self.send(text, markup=kb)
+        elif data == "balance":
+            await self.balance()
         elif data.startswith("did:"):
             await self.mark_done(cq, int(data[4:]))
         elif data == "amt_custom":
@@ -562,6 +594,8 @@ class Bot:
                 await self.send("Нужна сумма: /calc 20000")
         elif cmd == "/stats":
             await self.send(self.stats_view())
+        elif cmd == "/balance":
+            await self.balance()
         elif cmd == "/settings":
             text, kb = self.settings_view()
             await self.send(text, markup=kb)

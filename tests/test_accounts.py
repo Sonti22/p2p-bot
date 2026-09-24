@@ -377,6 +377,70 @@ def test_api_permissions_kucoin_spot_key_is_unsafe(tmp_path, monkeypatch):
     assert not safe and "Spot" in detail and "Withdraw" in detail
 
 
+class _UrlJsonSession:
+    """Возвращает тело по подстроке в URL — для эндпоинтов, которые запрашиваются несколько раз подряд."""
+    def __init__(self, by_substr):
+        self.by_substr = by_substr
+
+    def get(self, url, headers=None):
+        for substr, body in self.by_substr.items():
+            if substr in url:
+                return _JsonResp(body)
+        raise AssertionError(f"unexpected url: {url}")
+
+
+def test_bybit_balances_sums_unified_and_funding():
+    session = _UrlJsonSession({
+        "accountType=UNIFIED": {"retCode": 0, "result": {"list": [
+            {"coin": [{"coin": "USDT", "walletBalance": "10.5"}, {"coin": "BTC", "walletBalance": "0"}]}]}},
+        "accountType=FUND": {"retCode": 0, "result": {"balance": [
+            {"coin": "USDT", "walletBalance": "2.5"}, {"coin": "TON", "walletBalance": "3"}]}},
+    })
+    bal = asyncio.run(accounts.bybit_balances(session, "k", "s"))
+    assert bal == {"USDT": 13.0, "TON": 3.0}   # нулевой BTC не попадает в результат
+
+
+def test_bybit_balances_ignores_failed_call():
+    session = _UrlJsonSession({
+        "accountType=UNIFIED": {"retCode": 10003, "retMsg": "Invalid api_key"},
+        "accountType=FUND": {"retCode": 0, "result": {"balance": [{"coin": "USDT", "walletBalance": "1"}]}},
+    })
+    bal = asyncio.run(accounts.bybit_balances(session, "k", "s"))
+    assert bal == {"USDT": 1.0}
+
+
+def test_mexc_balances_sums_free_and_locked():
+    session = _JsonSession({"balances": [{"asset": "USDT", "free": "5", "locked": "1.5"},
+                                          {"asset": "ETH", "free": "0", "locked": "0"}]})
+    bal = asyncio.run(accounts.mexc_balances(session, "k", "s"))
+    assert bal == {"USDT": 6.5}   # нулевой ETH не попадает в результат
+
+
+def test_portfolio_skips_exchange_without_keys(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    port = asyncio.run(accounts.portfolio(_JsonSession({})))
+    assert port == {}
+
+
+def test_portfolio_filters_to_balance_coins(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    accounts.save_key("mexc", "k", "s")
+    body = {"balances": [{"asset": "USDT", "free": "10", "locked": "0"}, {"asset": "SHIB", "free": "1000", "locked": "0"}]}
+    port = asyncio.run(accounts.portfolio(_JsonSession(body)))
+    assert port == {"mexc": {"USDT": 10.0}}   # SHIB не в BALANCE_COINS
+
+
+def test_portfolio_skips_exchange_on_error(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    accounts.save_key("mexc", "k", "s")
+
+    class _Boom:
+        def get(self, url, headers=None):
+            raise RuntimeError("network down")
+
+    assert asyncio.run(accounts.portfolio(_Boom())) == {}
+
+
 def test_api_permissions_fails_open_when_api_errors(tmp_path, monkeypatch):
     """Если проверку прав нельзя выполнить (ошибка сети/формата) — не блокируем уже сохранённый ключ."""
     monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))

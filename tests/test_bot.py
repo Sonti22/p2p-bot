@@ -495,3 +495,49 @@ def test_stats_view_reports_counts(tmp_path, monkeypatch):
     text = bot.stats_view()
     assert "За сегодня: 1 сделок" in text and "За неделю: сделок нет" not in text
     assert "За месяц" in text
+
+
+def test_portfolio_view_no_exchanges_connected():
+    text = B.portfolio_view({}, None)
+    assert "Ни одна биржа не подключена" in text
+
+
+def test_portfolio_view_sums_total_in_rub():
+    port = {"bybit": {"USDT": 10.0, "BTC": 0.01}, "mexc": {"USDT": 5.0}}
+    snap = p2p.Snapshot(88.0, "test", {"USDT": 88.0, "BTC": 5_000_000.0}, {}, [], {}, {}, {})
+    text = B.portfolio_view(port, snap)
+    assert "Bybit" in text and "MEXC" in text
+    assert "10 USDT" in text and "0.01 BTC" in text
+    # 10*88 + 0.01*5_000_000 + 5*88 = 880 + 50000 + 440 = 51320
+    assert "51 320" in text
+
+
+def test_portfolio_view_missing_ref_marked_instead_of_crashing():
+    port = {"bybit": {"TON": 100.0}}
+    snap = p2p.Snapshot(88.0, "test", {}, {}, [], {}, {}, {})
+    text = B.portfolio_view(port, snap)
+    assert "нет ориентира" in text
+
+
+def test_balance_command_sends_view_with_refresh_button(monkeypatch):
+    async def fake_portfolio(s):
+        return {"mexc": {"USDT": 1.0}}
+
+    monkeypatch.setattr(B.accounts, "portfolio", fake_portfolio)
+    bot = Stub(p2p.Config())
+    bot.last = p2p.Snapshot(88.0, "test", {"USDT": 88.0}, {}, [], {}, {}, {})
+    asyncio.run(bot.handle("/balance"))
+    msgs = [(m, p) for m, p in bot.out if m == "sendMessage"]
+    assert len(msgs) == 1
+    assert "MEXC" in msgs[0][1]["text"]
+    assert msgs[0][1]["reply_markup"]["inline_keyboard"][0][0]["callback_data"] == "balance"
+
+
+def test_balance_callback_refreshes(monkeypatch):
+    async def fake_portfolio(s):
+        return {}
+
+    monkeypatch.setattr(B.accounts, "portfolio", fake_portfolio)
+    bot = Stub(p2p.Config())
+    asyncio.run(bot.on_callback({"id": "1", "data": "balance", "message": {"message_id": 1}}))
+    assert any("Баланс" in p.get("text", "") for m, p in bot.out if m == "sendMessage")
