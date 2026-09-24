@@ -182,6 +182,17 @@ def test_exchanger_to_exchange_checks_receiver_deposit():
     assert "через Bybit" in route                               # сведений нет — не мешаем
 
 
+def test_exchanger_to_bitpapa_only_in_trc20():
+    s = make_ad("BitPapa", "sell", 92.0)
+    assert p2p._hop(_cfg(), "BestChange", "BEP20", "BitPapa", "", "USDT") == (None, "")
+    for net in ("BEP20", "TON", "ERC20"):   # BitPapa принимает только TRC20 (RECEIVE_NETS)
+        assert p2p._route(make_ad("BestChange", "buy", 88.0, net=net), s, _cfg(), SPOT) is None
+    _, route = p2p._route(make_ad("BestChange", "buy", 88.0, net="TRC20"), s, _cfg(), SPOT)
+    assert "обменник шлёт USDT (TRC20) на BitPapa" in route
+    _, route = p2p._route(make_ad("BestChange", "buy", 88.0, net="BEP20"), make_ad("MEXC", "sell", 90.0), _cfg(), SPOT)
+    assert "обменник шлёт USDT (BEP20) на MEXC" in route        # у бирж ограничения сети нет
+
+
 def test_scan_offline_refreshes_networks(offline):
     c = p2p.Config(exchanges=["htx", "kucoin"], assets=["USDT"], min_orders=0, min_rate=0)
     snap = asyncio.run(p2p.scan(None, c))

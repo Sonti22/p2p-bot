@@ -226,6 +226,29 @@ def test_scan_stacks_exchangers_per_network(offline, monkeypatch):
     assert "перевод −1 USDT (TRC20) на BestChange" in route and "BEP20" not in route
 
 
+def test_scan_keeps_one_deal_per_venue_pair(offline, monkeypatch):
+    def fetcher(buys=(), sells=()):
+        async def f(s, cfg, side, asset):
+            return list(buys if side == "buy" else sells)
+        return f
+
+    # один курс обменника в четырёх сетях — это одна пара площадок; дубли не должны занять топ-3
+    bc = [make_ad("BestChange", "sell", 90.0, net=n, min_amt=500, max_amt=200_000, avail=5000)
+          for n in ("TRC20", "BEP20", "TON", "ERC20")]
+    monkeypatch.setitem(p2p.FETCHERS, "fakemexc", fetcher(buys=[make_ad("MEXC", "buy", 88.0)]))
+    monkeypatch.setitem(p2p.FETCHERS, "bestchange", fetcher(sells=bc))
+    monkeypatch.setitem(p2p.FETCHERS, "fakebybit", fetcher(sells=[make_ad("Bybit", "sell", 89.7)]))
+    monkeypatch.setitem(p2p.FETCHERS, "fakehtx", fetcher(sells=[make_ad("HTX", "sell", 89.6)]))
+    c = cfg(exchanges=["fakemexc", "bestchange", "fakebybit", "fakehtx"], assets=["USDT"], min_orders=0, min_rate=0)
+    snap = asyncio.run(p2p.scan(None, c))
+    keys = [(b.ex, b.asset, s.ex, s.asset) for _, b, s, _ in snap.deals]
+    assert len(keys) == len(set(keys)) == 3
+    assert {k[2] for k in keys[:3]} == {"BestChange", "Bybit", "HTX"}
+    profit, _, s, route = next(d for d in snap.deals if d[2].ex == "BestChange")
+    assert s.net == "BEP20" and "(BEP20)" in route   # из сетей обменника — лучшая: вывод MEXC в BEP20 дешевле всех
+    assert profit == pytest.approx(((50000 / 88 - 0.01) * 90 / 50000 - 1) * 100)
+
+
 def test_deal_amounts_respects_exchanger_network():
     ads = _exchangers("TRC20", "ERC20", "TRC20")
     buy_ads = [make_ad("MEXC", "buy", 88.0)]

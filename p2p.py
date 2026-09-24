@@ -584,6 +584,8 @@ def _hop(cfg, frm, frm_net, to, to_net, asset):
         fee, net = w
         return fee, f"через Bybit: перевод −{fee:g} {asset} ({net})"
     if frm == "BestChange":                          # обменник сам шлёт монету, комиссия в его курсе
+        if frm_net not in RECEIVE_NETS.get(to, (frm_net,)):
+            return None, ""                          # получатель не принимает сеть обменника (BitPapa — только TRC20)
         if netstatus.deposit_ok(to, asset, frm_net) is False:
             return None, ""                          # у биржи закрыт ввод в сети обменника
         return 0.0, f"обменник шлёт {asset} ({frm_net}) на {to}"
@@ -1068,7 +1070,14 @@ async def scan(s, cfg, force_alt=False):
     snap = Snapshot(ref or 0, ref_src, refs, best, [], networks, dropped, errors, groups, spot, over_banks)
     # сортировка «прибыль × надёжность»: каждая причина риска снимает risk_penalty п.п. с профита
     deals.sort(key=lambda d: d[0] - cfg.risk_penalty * len(reliability(d, cfg, snap)[1]), reverse=True)
-    snap.deals = deals
+    # обменники разных сетей дают по связке на одну и ту же пару площадок; бот сигналит по паре
+    # (b.ex, b.asset, s.ex, s.asset) — оставляем лучшую, чтобы дубли не вытеснили из топ-N другие площадки
+    seen = set()
+    for d in deals:
+        key = (d[1].ex, d[1].asset, d[2].ex, d[2].asset)
+        if key not in seen:
+            seen.add(key)
+            snap.deals.append(d)
     return snap
 
 
