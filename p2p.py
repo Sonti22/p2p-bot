@@ -579,21 +579,44 @@ def _route_qty(b, s, cfg, spot, over_banks=frozenset(), disable=frozenset()):
         # берём площадку, где есть обе пары к USDT — без лишнего перевода самого USDT между биржами
         venue = next((v for v in (b.ex, s.ex) + SPOT_VENUES
                       if v in SPOT_VENUES and b.asset in spot.get(v, {}) and s.asset in spot.get(v, {})), None)
-        if not venue:
-            return None
-        bid1, _ = spot[venue][b.asset]
-        _, ask2 = spot[venue][s.asset]
-        fee, _ = _hop(cfg, b.ex, b.net, venue, "", b.asset)
-        if fee is None:
-            return None
-        qty -= 0.0 if "withdraw" in disable else fee
-        sf = 0.0 if "spot" in disable else _spot_fee(cfg, venue)
-        qty = qty * bid1 * (1 - sf / 100)     # b.asset → USDT
-        qty = (qty / ask2) * (1 - sf / 100)   # USDT → s.asset
-        fee, _ = _hop(cfg, venue, "", s.ex, s.net, s.asset)
-        if fee is None:
-            return None
-        qty -= 0.0 if "withdraw" in disable else fee
+        if venue:
+            bid1, _ = spot[venue][b.asset]
+            _, ask2 = spot[venue][s.asset]
+            fee, _ = _hop(cfg, b.ex, b.net, venue, "", b.asset)
+            if fee is None:
+                return None
+            qty -= 0.0 if "withdraw" in disable else fee
+            sf = 0.0 if "spot" in disable else _spot_fee(cfg, venue)
+            qty = qty * bid1 * (1 - sf / 100)     # b.asset → USDT
+            qty = (qty / ask2) * (1 - sf / 100)   # USDT → s.asset
+            fee, _ = _hop(cfg, venue, "", s.ex, s.net, s.asset)
+            if fee is None:
+                return None
+            qty -= 0.0 if "withdraw" in disable else fee
+        else:
+            # ни одна площадка не держит обе пары: конвертация на каждой своей + перевод USDT между ними
+            venue1 = next((v for v in (b.ex,) + SPOT_VENUES if v in SPOT_VENUES and b.asset in spot.get(v, {})), None)
+            venue2 = next((v for v in (s.ex,) + SPOT_VENUES if v in SPOT_VENUES and s.asset in spot.get(v, {})), None)
+            if not venue1 or not venue2 or venue1 == venue2:
+                return None
+            bid1, _ = spot[venue1][b.asset]
+            _, ask2 = spot[venue2][s.asset]
+            fee, _ = _hop(cfg, b.ex, b.net, venue1, "", b.asset)
+            if fee is None:
+                return None
+            qty -= 0.0 if "withdraw" in disable else fee
+            sf1 = 0.0 if "spot" in disable else _spot_fee(cfg, venue1)
+            qty = qty * bid1 * (1 - sf1 / 100)    # b.asset → USDT на venue1
+            fee, _ = _hop(cfg, venue1, "", venue2, "", "USDT")
+            if fee is None:
+                return None
+            qty -= 0.0 if "withdraw" in disable else fee
+            sf2 = 0.0 if "spot" in disable else _spot_fee(cfg, venue2)
+            qty = (qty / ask2) * (1 - sf2 / 100)  # USDT → s.asset на venue2
+            fee, _ = _hop(cfg, venue2, "", s.ex, s.net, s.asset)
+            if fee is None:
+                return None
+            qty -= 0.0 if "withdraw" in disable else fee
     vol = 0.0 if "risk" in disable else max(cfg.risk_buffer.get(b.asset, 0), cfg.risk_buffer.get(s.asset, 0))
     if vol:   # курс ETH/BTC/TON может уйти, пока идут сделки и переводы
         qty *= 1 - vol / 100
@@ -638,21 +661,45 @@ def _route(b, s, cfg, spot, over_banks=frozenset()):
         # промежуточная монета: две спот-конвертации на одной площадке, где есть обе пары к USDT
         venue = next((v for v in (b.ex, s.ex) + SPOT_VENUES
                       if v in SPOT_VENUES and b.asset in spot.get(v, {}) and s.asset in spot.get(v, {})), None)
-        if not venue:
-            return None
-        fee, label = _hop(cfg, b.ex, b.net, venue, "", b.asset)
-        if fee is None:
-            return None
-        if label:
-            steps.append(label)
-        sf = _spot_fee(cfg, venue)
-        steps.append(f"спот {b.asset}→USDT на {venue} (−{sf:g}%)")
-        steps.append(f"спот USDT→{s.asset} на {venue} (−{sf:g}%)")
-        fee, label = _hop(cfg, venue, "", s.ex, s.net, s.asset)
-        if fee is None:
-            return None
-        if label:
-            steps.append(label)
+        if venue:
+            fee, label = _hop(cfg, b.ex, b.net, venue, "", b.asset)
+            if fee is None:
+                return None
+            if label:
+                steps.append(label)
+            sf = _spot_fee(cfg, venue)
+            steps.append(f"спот {b.asset}→USDT на {venue} (−{sf:g}%)")
+            steps.append(f"спот USDT→{s.asset} на {venue} (−{sf:g}%)")
+            fee, label = _hop(cfg, venue, "", s.ex, s.net, s.asset)
+            if fee is None:
+                return None
+            if label:
+                steps.append(label)
+        else:
+            # ни одна площадка не держит обе пары: конвертация на каждой своей + перевод USDT между ними
+            venue1 = next((v for v in (b.ex,) + SPOT_VENUES if v in SPOT_VENUES and b.asset in spot.get(v, {})), None)
+            venue2 = next((v for v in (s.ex,) + SPOT_VENUES if v in SPOT_VENUES and s.asset in spot.get(v, {})), None)
+            if not venue1 or not venue2 or venue1 == venue2:
+                return None
+            fee, label = _hop(cfg, b.ex, b.net, venue1, "", b.asset)
+            if fee is None:
+                return None
+            if label:
+                steps.append(label)
+            sf1 = _spot_fee(cfg, venue1)
+            steps.append(f"спот {b.asset}→USDT на {venue1} (−{sf1:g}%)")
+            fee, label = _hop(cfg, venue1, "", venue2, "", "USDT")
+            if fee is None:
+                return None
+            if label:
+                steps.append(label)
+            sf2 = _spot_fee(cfg, venue2)
+            steps.append(f"спот USDT→{s.asset} на {venue2} (−{sf2:g}%)")
+            fee, label = _hop(cfg, venue2, "", s.ex, s.net, s.asset)
+            if fee is None:
+                return None
+            if label:
+                steps.append(label)
     vol = max(cfg.risk_buffer.get(b.asset, 0), cfg.risk_buffer.get(s.asset, 0))
     if vol:
         steps.append(f"запас на курс −{vol:g}%")
