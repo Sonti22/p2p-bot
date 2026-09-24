@@ -183,6 +183,26 @@ def test_scan_drops_deal_when_depth_does_not_cover_amount(offline, monkeypatch):
     assert not snap.deals   # 20 000 доступного объёма не хватает на круг в 50 000
 
 
+def test_same_venue_only_filters_cross_exchange_deals(offline, monkeypatch):
+    async def fetcher_a(s, cfg, side, asset):
+        return [make_ad("A", side, 85.0 if side == "buy" else 90.0, min_amt=1000, max_amt=500000, avail=10000)]
+
+    async def fetcher_b(s, cfg, side, asset):
+        return [make_ad("B", side, 85.0 if side == "buy" else 95.0, min_amt=1000, max_amt=500000, avail=10000)]
+
+    monkeypatch.setitem(p2p.FETCHERS, "a", fetcher_a)
+    monkeypatch.setitem(p2p.FETCHERS, "b", fetcher_b)
+    c = p2p.Config(exchanges=["a", "b"], assets=["USDT"], min_orders=0, min_rate=0)
+
+    without_filter = asyncio.run(p2p.scan(None, c))
+    assert any(b.ex != s.ex for _, b, s, _ in without_filter.deals)   # межбиржевые связки есть без фильтра
+
+    c.same_venue_only = True
+    with_filter = asyncio.run(p2p.scan(None, c))
+    assert with_filter.deals
+    assert all(b.ex == s.ex for _, b, s, _ in with_filter.deals)   # только внутри одной площадки
+
+
 def test_deal_amounts_recomputes_profit_for_other_sums():
     buy_ads = [make_ad("MEXC", "buy", 85.0, min_amt=1000, max_amt=20000, avail=20000 / 85.0)]
     sell_ads = [make_ad("MEXC", "sell", 90.0, min_amt=1000, max_amt=500000, avail=10000)]

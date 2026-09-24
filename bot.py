@@ -14,10 +14,12 @@ import accounts
 import alerts
 import blacklist
 import netstatus
+import presets
 import trades
 from cards import deal_card, portfolio_card, top_chart
-from p2p import AMOUNT_MAX, AMOUNT_MIN, ENV_PATH, Config, _money, _price, deal_amounts, fmt_ad, fmt_deal, fmt_top, \
-    load_env, parse_amount, profit_breakdown, reliability, scan, spot_url, venue_url
+from p2p import ALL_EXCHANGES, AMOUNT_MAX, AMOUNT_MIN, DEFAULT_ASSETS, ENV_PATH, Config, _money, _price, \
+    deal_amounts, fmt_ad, fmt_deal, fmt_top, load_env, parse_amount, profit_breakdown, reliability, scan, spot_url, \
+    venue_url
 
 MENU = {"keyboard": [[{"text": "🔥 Лучшая сейчас"}, {"text": "📊 Топ связок"}],
                      [{"text": "⚙️ Настройки"}, {"text": "🛠 Разработка"}],
@@ -74,6 +76,9 @@ VENUE_DOWN_AFTER = 900      # сек: площадка отдаёт ошибку
 VENUE_FAIL_STREAK = 3       # или столько сканов подряд с ошибкой
 VENUE_ALERT_COOLDOWN = 3600  # не чаще раза в час на площадку
 EXCHANGE_NAMES = {"bybit": "Bybit", "mexc": "MEXC", "htx": "HTX", "kucoin": "KuCoin", "bitpapa": "BitPapa"}
+ASSET_LIST = tuple(DEFAULT_ASSETS.split(","))       # монеты для кнопок «🎛 Фильтры»
+EXCHANGE_LIST = tuple(ALL_EXCHANGES.split(","))      # площадки для кнопок «🎛 Фильтры»
+VENUE_NAMES = dict(EXCHANGE_NAMES, bestchange="BestChange")  # + обменник, которого нет в EXCHANGE_NAMES
 ACCOUNT_POLL_INTERVAL = int(os.getenv("ACCOUNT_POLL_INTERVAL", 60))  # опрос истории аккаунтов, сек
 MSK = timezone(timedelta(hours=3))                    # тихие часы и /pause считаем по МСК, не по времени ПК
 PAUSE_PRESETS = {"30m": 1800, "1h": 3600, "3h": 3 * 3600}  # аргументы /pause -> секунды
@@ -249,6 +254,40 @@ def account_view(ex):
     return text, {"inline_keyboard": kb}
 
 
+def filters_view(cfg):
+    """Текст и кнопки «🎛 Фильтры»: переключатели монет/площадок (✅/⬜) + пресеты. Нельзя выключить
+    последнюю монету или площадку. Изменения пишутся в .env и применяются со следующего скана."""
+    mark = lambda on, t: ("✅ " if on else "⬜ ") + t
+    asset_row = [{"text": mark(a in cfg.assets, a), "callback_data": f"flt_a:{a}"} for a in ASSET_LIST]
+    ex_rows = [[{"text": mark(ex in cfg.exchanges, VENUE_NAMES.get(ex, ex)), "callback_data": f"flt_e:{ex}"}]
+               for ex in EXCHANGE_LIST]
+    text = (f"🎛 <b>Фильтры</b>\n\nМонеты: {', '.join(cfg.assets)}\nПлощадки: {', '.join(cfg.exchanges)}\n\n"
+            f"Изменения применятся со следующего скана. Нельзя выключить все монеты или все площадки.")
+    kb = [asset_row] + ex_rows + [
+        [{"text": "💾 Сохранить как пресет", "callback_data": "preset_save"}],
+        [{"text": "📋 Пресеты", "callback_data": "presets"}],
+        [{"text": "⬅️ Настройки", "callback_data": "settings"}]]
+    return text, {"inline_keyboard": kb}
+
+
+def presets_view(cfg):
+    """Текст и кнопки «📋 Пресеты»: встроенные (не удаляются) и сохранённые пользователем (можно удалить)."""
+    builtin, custom = presets.builtin_presets(cfg), presets.list_custom()
+    lines = ["📋 <b>Пресеты фильтров</b>", "", "Пресет меняет сразу все свои поля (условие «И»).", ""]
+    kb = []
+    for name in builtin:
+        lines.append(f"⚙️ {name}")
+        kb.append([{"text": f"▶️ {name}"[:64], "callback_data": f"preset_apply:{name}"}])
+    for name in custom:
+        lines.append(f"💾 {name}")
+        kb.append([{"text": f"▶️ {name}"[:64], "callback_data": f"preset_apply:{name}"},
+                   {"text": "🗑", "callback_data": f"preset_del:{name}"}])
+    if not custom:
+        lines += ["", "Своих пресетов пока нет — «💾 Сохранить как пресет» в «🎛 Фильтры»."]
+    kb.append([{"text": "⬅️ Фильтры", "callback_data": "filters"}])
+    return "\n".join(lines), {"inline_keyboard": kb}
+
+
 def blacklist_view():
     """Текст и кнопки «/blacklist»: список скрытых мерчантов/обменников с удалением."""
     rows = blacklist.list_all()
@@ -390,6 +429,7 @@ class Bot:
         self.night_deals = {}    # (ex,asset,ex,asset) -> лучшая связка за тихие часы, для утреннего дайджеста
         self._was_quiet = False  # тихие часы были на прошлом скане — для разового дайджеста при выходе из них
         self.awaiting_amount = False  # ждём сумму текстом после «✏️ Своя сумма»
+        self.awaiting_preset_name = False  # ждём имя пресета текстом после «💾 Сохранить как пресет»
         self.awaiting_key = None      # {"ex":.., "step": "key"/"secret", "key":..} — ждём ключ биржи
         self.sent = {}
         self.venue = {}   # ex -> {"streak": сканов подряд с ошибкой, "down_since": ts, "alerted_at": ts}
@@ -637,6 +677,7 @@ class Bot:
         kb = [[{"text": mark(c.min_profit == v, f"{v}%"), "callback_data": f"min:{v}"} for v in MIN_PRESETS],
               [{"text": mark(c.amount == v, f"{v // 1000}к"), "callback_data": f"amt:{v}"} for v in AMOUNT_PRESETS],
               [{"text": "✏️ Своя сумма", "callback_data": "amt_custom"}],
+              [{"text": "🎛 Фильтры", "callback_data": "filters"}],
               [{"text": "🔑 Мои биржи", "callback_data": "accounts"}],
               [{"text": "🌙 Тихие часы: выкл" if self.quiet_on else "🌙 Тихие часы: вкл",
                 "callback_data": "quiet_off" if self.quiet_on else "quiet_on"},
@@ -656,6 +697,44 @@ class Bot:
         self.last = snap
         await self.show_top(snap)
         await self.show_best(snap)
+
+    def _toggle(self, values, item, env_key, label):
+        """Вкл/выкл монету или площадку в списке фильтра; нельзя выключить последнюю. Пишет в .env."""
+        if item in values:
+            if len(values) == 1:
+                return f"Нельзя выключить последнюю {label}"
+            values.remove(item)
+            save_env(env_key, ",".join(values))
+            return f"Выключено: {item}"
+        values.append(item)
+        save_env(env_key, ",".join(values))
+        return f"Включено: {item}"
+
+    def apply_preset(self, name):
+        """Применить пресет фильтров (встроенный или сохранённый «💾 Сохранить как пресет») — сразу все поля."""
+        fields = presets.get_preset(name, self.cfg)
+        if fields is None:
+            return "Пресет не найден"
+        env_map = {"assets": ("ASSETS", lambda v: ",".join(v)), "exchanges": ("EXCHANGES", lambda v: ",".join(v)),
+                   "include_pay": ("INCLUDE_PAY", lambda v: ",".join(v)),
+                   "min_profit": ("MIN_PROFIT", lambda v: f"{v:g}"), "amount": ("AMOUNT", lambda v: f"{v:.0f}"),
+                   "same_venue_only": ("SAME_VENUE_ONLY", lambda v: "1" if v else "0")}
+        for key, value in fields.items():
+            setattr(self.cfg, key, list(value) if isinstance(value, list) else value)
+            env_key, fmt = env_map[key]
+            save_env(env_key, fmt(getattr(self.cfg, key)))
+        return f"Применён пресет «{name}»"
+
+    async def save_preset_named(self, name):
+        """Ввод имени текстом после «💾 Сохранить как пресет»: снимок текущих фильтров в data/presets.json."""
+        name = name.strip()[:40]
+        if not name:
+            await self.send("Пустое имя, пресет не сохранён.")
+            return
+        presets.save_preset(name, self.cfg)
+        await self.send(f"💾 Пресет «{name}» сохранён.")
+        text, kb = presets_view(self.cfg)
+        await self.send(text, markup=kb)
 
     async def handle_key_input(self, text, message_id):
         """Ввод API key/secret[/passphrase] после «➕ Подключить»: сообщения с ключом удаляются из чата сразу же.
@@ -704,6 +783,12 @@ class Bot:
             self.quiet_on = data == "quiet_on"
             save_env("QUIET_HOURS_ON", "1" if self.quiet_on else "0")
             return f"Тихие часы ({self.quiet_hours} МСК) " + ("включены" if self.quiet_on else "выключены")
+        if data.startswith("flt_a:"):
+            return self._toggle(self.cfg.assets, data[6:], "ASSETS", "монету")
+        if data.startswith("flt_e:"):
+            return self._toggle(self.cfg.exchanges, data[6:], "EXCHANGES", "площадку")
+        if data.startswith("preset_apply:"):
+            return self.apply_preset(data[len("preset_apply:"):])
         return ""
 
     async def scan_loop(self):
@@ -904,9 +989,15 @@ class Bot:
             self.awaiting_amount = False   # любая другая кнопка сбрасывает ожидание суммы
         if not data.startswith("acc_add:"):
             self.awaiting_key = None       # любая другая кнопка прерывает ввод ключа
+        if data != "preset_save":
+            self.awaiting_preset_name = False   # любая другая кнопка прерывает ввод имени пресета
         toast = self.apply(data)
         await self.call("answerCallbackQuery", callback_query_id=cq["id"], text=toast)
-        if toast:
+        if data.startswith(("flt_a:", "flt_e:", "preset_apply:")):
+            text, kb = filters_view(self.cfg)
+            await self.call("editMessageText", chat_id=self.chat_id, message_id=cq["message"]["message_id"],
+                            text=text, parse_mode="HTML", reply_markup=kb)
+        elif toast:
             text, kb = self.settings_view()
             await self.call("editMessageText", chat_id=self.chat_id, message_id=cq["message"]["message_id"],
                             text=text, parse_mode="HTML", reply_markup=kb)
@@ -942,6 +1033,21 @@ class Bot:
             text, kb = alerts_view(self.chat_id)
             await self.call("editMessageText", chat_id=self.chat_id, message_id=cq["message"]["message_id"],
                             text=text, parse_mode="HTML", reply_markup=kb)
+        elif data == "filters":
+            text, kb = filters_view(self.cfg)
+            await self.send(text, markup=kb)
+        elif data == "presets":
+            text, kb = presets_view(self.cfg)
+            await self.send(text, markup=kb)
+        elif data == "preset_save":
+            self.awaiting_preset_name = True
+            await self.send("Введи имя пресета текстом (например «Мои банки»).")
+        elif data.startswith("preset_del:"):
+            presets.delete_preset(data[len("preset_del:"):])
+            await self.call("answerCallbackQuery", callback_query_id=cq["id"], text="Пресет удалён")
+            text, kb = presets_view(self.cfg)
+            await self.call("editMessageText", chat_id=self.chat_id, message_id=cq["message"]["message_id"],
+                            text=text, parse_mode="HTML", reply_markup=kb)
         elif data == "amt_custom":
             self.awaiting_amount = True
             await self.send(f"Введи сумму круга текстом, например 20000 или 1,5 млн "
@@ -970,6 +1076,11 @@ class Bot:
             await self.send(t, markup=kb)
 
     async def handle(self, text):
+        if self.awaiting_preset_name:
+            self.awaiting_preset_name = False  # любая другая команда/кнопка тоже сбрасывает ожидание
+            if text not in BUTTONS and not text.startswith("/"):
+                await self.save_preset_named(text)
+                return
         if self.awaiting_amount:
             self.awaiting_amount = False       # любая другая команда/кнопка тоже сбрасывает ожидание
             if text not in BUTTONS and not text.startswith("/"):

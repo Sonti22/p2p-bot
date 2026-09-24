@@ -126,6 +126,7 @@ class Config:
     exchanges: list = field(default_factory=lambda: ALL_EXCHANGES.split(","))
     include_pay: list = field(default_factory=list)
     exclude_pay: list = field(default_factory=lambda: DEFAULT_EXCLUDE.split(","))
+    same_venue_only: bool = False  # True — только связки внутри одной площадки (пресет «USDT без переводов»)
 
     @classmethod
     def from_env(cls):
@@ -151,6 +152,7 @@ class Config:
             exchanges=_list("EXCHANGES", ALL_EXCHANGES),
             include_pay=_list("INCLUDE_PAY"),
             exclude_pay=_list("EXCLUDE_PAY", DEFAULT_EXCLUDE),
+            same_venue_only=os.getenv("SAME_VENUE_ONLY", "0").strip().lower() in ("1", "true", "yes", "on"),
         )
 
 
@@ -730,6 +732,8 @@ async def scan(s, cfg, force_alt=False):
     deals = []
     for b in buys:
         for sl in sells:
+            if cfg.same_venue_only and not _same_venue(b, sl):
+                continue   # пресет «USDT без переводов»: только связки внутри одной площадки
             r = _route(b, sl, cfg, spot, over_banks)
             if r:
                 deals.append((r[0], b, sl, r[1]))

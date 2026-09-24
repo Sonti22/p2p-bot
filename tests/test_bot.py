@@ -7,6 +7,7 @@ import accounts
 import bot as B
 import blacklist
 import p2p
+import presets
 import trades
 from helpers import make_ad
 
@@ -1021,3 +1022,186 @@ def test_settings_view_quiet_toggle_button_and_persist(tmp_path, monkeypatch):
     toast2 = bot.apply("quiet_off")
     assert not bot.quiet_on and "выключены" in toast2
     assert "QUIET_HOURS_ON=0" in env.read_text(encoding="utf-8")
+
+
+# --- Фильтры монет/площадок и пресеты ---
+
+def test_settings_view_has_filters_button():
+    bot = Stub(p2p.Config())
+    _, kb = bot.settings_view()
+    buttons = [b for row in kb["inline_keyboard"] for b in row]
+    assert any(b.get("callback_data") == "filters" for b in buttons)
+
+
+def test_filters_view_lists_asset_and_exchange_toggles():
+    bot = Stub(p2p.Config())
+    text, kb = B.filters_view(bot.cfg)
+    buttons = [b for row in kb["inline_keyboard"] for b in row]
+    assert any(b.get("callback_data") == "flt_a:USDT" for b in buttons)
+    assert any(b.get("callback_data") == "flt_e:bybit" for b in buttons)
+    assert any(b.get("callback_data") == "flt_e:bestchange" for b in buttons)
+    assert "USDT" in text and "bybit" in text
+
+
+def test_filters_view_marks_enabled_and_disabled():
+    bot = Stub(p2p.Config(assets=["USDT"], exchanges=["bybit"]))
+    _, kb = B.filters_view(bot.cfg)
+    buttons = {b["callback_data"]: b["text"] for row in kb["inline_keyboard"] for b in row}
+    assert buttons["flt_a:USDT"].startswith("✅")
+    assert buttons["flt_a:BTC"].startswith("⬜")
+    assert buttons["flt_e:bybit"].startswith("✅")
+    assert buttons["flt_e:mexc"].startswith("⬜")
+
+
+def test_toggle_asset_off_updates_cfg_and_env(tmp_path, monkeypatch):
+    env = tmp_path / ".env"
+    env.write_text("ASSETS=USDT,USDC,BTC,ETH,TON\n", encoding="utf-8")
+    monkeypatch.setattr(B, "save_env", functools.partial(B.save_env, path=str(env)))
+    bot = Stub(p2p.Config())
+    toast = bot.apply("flt_a:BTC")
+    assert "Выключено" in toast and "BTC" not in bot.cfg.assets
+    saved = [x.strip() for x in env.read_text(encoding="utf-8").split("ASSETS=", 1)[1].splitlines()[0].split(",")]
+    assert "BTC" not in saved
+
+
+def test_toggle_asset_on_updates_cfg_and_env(tmp_path, monkeypatch):
+    env = tmp_path / ".env"
+    env.write_text("ASSETS=USDT\n", encoding="utf-8")
+    monkeypatch.setattr(B, "save_env", functools.partial(B.save_env, path=str(env)))
+    bot = Stub(p2p.Config(assets=["USDT"]))
+    toast = bot.apply("flt_a:BTC")
+    assert "Включено" in toast and "BTC" in bot.cfg.assets
+    assert "ASSETS=USDT,BTC" in env.read_text(encoding="utf-8")
+
+
+def test_toggle_exchange_updates_cfg_and_env(tmp_path, monkeypatch):
+    env = tmp_path / ".env"
+    env.write_text("EXCHANGES=bybit,mexc\n", encoding="utf-8")
+    monkeypatch.setattr(B, "save_env", functools.partial(B.save_env, path=str(env)))
+    bot = Stub(p2p.Config(exchanges=["bybit", "mexc"]))
+    toast = bot.apply("flt_e:mexc")
+    assert "Выключено" in toast and bot.cfg.exchanges == ["bybit"]
+    assert "EXCHANGES=bybit" in env.read_text(encoding="utf-8")
+
+
+def test_cannot_disable_last_asset(tmp_path, monkeypatch):
+    env = tmp_path / ".env"
+    env.write_text("", encoding="utf-8")
+    monkeypatch.setattr(B, "save_env", functools.partial(B.save_env, path=str(env)))
+    bot = Stub(p2p.Config(assets=["USDT"]))
+    toast = bot.apply("flt_a:USDT")
+    assert "нельзя" in toast.lower()
+    assert bot.cfg.assets == ["USDT"]
+    assert env.read_text(encoding="utf-8") == ""   # .env не тронут
+
+
+def test_cannot_disable_last_exchange(tmp_path, monkeypatch):
+    env = tmp_path / ".env"
+    env.write_text("", encoding="utf-8")
+    monkeypatch.setattr(B, "save_env", functools.partial(B.save_env, path=str(env)))
+    bot = Stub(p2p.Config(exchanges=["bybit"]))
+    toast = bot.apply("flt_e:bybit")
+    assert "нельзя" in toast.lower()
+    assert bot.cfg.exchanges == ["bybit"]
+    assert env.read_text(encoding="utf-8") == ""
+
+
+def test_flt_callback_rerenders_filters_view(tmp_path, monkeypatch):
+    env = tmp_path / ".env"
+    env.write_text("ASSETS=USDT,BTC\n", encoding="utf-8")
+    monkeypatch.setattr(B, "save_env", functools.partial(B.save_env, path=str(env)))
+    bot = Stub(p2p.Config(assets=["USDT", "BTC"]))
+    asyncio.run(bot.on_callback({"id": "1", "data": "flt_a:BTC", "message": {"message_id": 1}}))
+    method, params = bot.out[-1]
+    assert method == "editMessageText" and "Фильтры" in params["text"]
+
+
+def test_preset_save_flow_writes_current_filters(tmp_path, monkeypatch):
+    pfile = tmp_path / "presets.json"
+    monkeypatch.setattr(B.presets, "save_preset", functools.partial(B.presets.save_preset, path=str(pfile)))
+    monkeypatch.setattr(B.presets, "list_custom", functools.partial(B.presets.list_custom, path=str(pfile)))
+    bot = Stub(p2p.Config(assets=["USDT"], exchanges=["bybit"], min_profit=3.0, amount=70000))
+    asyncio.run(bot.on_callback({"id": "1", "data": "preset_save", "message": {"message_id": 1}}))
+    assert bot.awaiting_preset_name
+    asyncio.run(bot.handle("Мой набор"))
+    assert not bot.awaiting_preset_name
+    saved = presets.list_custom(path=str(pfile))
+    assert saved["Мой набор"]["assets"] == ["USDT"] and saved["Мой набор"]["amount"] == 70000
+    assert any("сохранён" in t for t in texts(bot))
+
+
+def test_preset_save_empty_name_not_saved(tmp_path, monkeypatch):
+    pfile = tmp_path / "presets.json"
+    monkeypatch.setattr(B.presets, "save_preset", functools.partial(B.presets.save_preset, path=str(pfile)))
+    bot = Stub(p2p.Config())
+    bot.awaiting_preset_name = True
+    asyncio.run(bot.handle("   "))
+    assert not pfile.exists()
+    assert "не сохранён" in texts(bot)[-1].lower()
+
+
+def test_apply_saved_preset_updates_cfg_and_env(tmp_path, monkeypatch):
+    pfile = tmp_path / "presets.json"
+    presets.save_preset("Быстрый", p2p.Config(assets=["USDT"], exchanges=["bybit", "mexc"],
+                                              min_profit=3.0, amount=70000), path=str(pfile))
+    monkeypatch.setattr(B.presets, "get_preset", functools.partial(B.presets.get_preset, path=str(pfile)))
+    env = tmp_path / ".env"
+    env.write_text("", encoding="utf-8")
+    monkeypatch.setattr(B, "save_env", functools.partial(B.save_env, path=str(env)))
+    bot = Stub(p2p.Config())
+    toast = bot.apply("preset_apply:Быстрый")
+    assert "Быстрый" in toast
+    assert bot.cfg.assets == ["USDT"] and bot.cfg.exchanges == ["bybit", "mexc"]
+    assert bot.cfg.min_profit == 3.0 and bot.cfg.amount == 70000
+    text = env.read_text(encoding="utf-8")
+    assert "MIN_PROFIT=3" in text and "AMOUNT=70000" in text
+
+
+def test_apply_builtin_preset_usdt_no_transfer(tmp_path, monkeypatch):
+    env = tmp_path / ".env"
+    env.write_text("", encoding="utf-8")
+    monkeypatch.setattr(B, "save_env", functools.partial(B.save_env, path=str(env)))
+    bot = Stub(p2p.Config())
+    bot.apply("preset_apply:USDT без переводов")
+    assert bot.cfg.assets == ["USDT"] and bot.cfg.same_venue_only is True
+    assert "SAME_VENUE_ONLY=1" in env.read_text(encoding="utf-8")
+
+
+def test_apply_builtin_preset_all_venues_resets(tmp_path, monkeypatch):
+    env = tmp_path / ".env"
+    env.write_text("", encoding="utf-8")
+    monkeypatch.setattr(B, "save_env", functools.partial(B.save_env, path=str(env)))
+    bot = Stub(p2p.Config(assets=["USDT"], exchanges=["bybit"], same_venue_only=True))
+    bot.apply("preset_apply:Все площадки")
+    assert set(bot.cfg.exchanges) == set(p2p.ALL_EXCHANGES.split(","))
+    assert set(bot.cfg.assets) == set(p2p.DEFAULT_ASSETS.split(","))
+    assert bot.cfg.same_venue_only is False
+
+
+def test_apply_unknown_preset_reports_not_found():
+    bot = Stub(p2p.Config())
+    assert "не найден" in bot.apply("preset_apply:нет такого").lower()
+
+
+def test_presets_view_lists_builtin_and_custom(tmp_path, monkeypatch):
+    pfile = tmp_path / "presets.json"
+    presets.save_preset("Мой", p2p.Config(), path=str(pfile))
+    monkeypatch.setattr(B.presets, "list_custom", functools.partial(B.presets.list_custom, path=str(pfile)))
+    text, kb = B.presets_view(p2p.Config())
+    assert "USDT без переводов" in text and "Мой" in text
+    buttons = [b for row in kb["inline_keyboard"] for b in row]
+    assert any(b.get("callback_data") == "preset_apply:Мой" for b in buttons)
+    assert any(b.get("callback_data") == "preset_del:Мой" for b in buttons)
+    assert not any(b.get("callback_data") == "preset_del:USDT без переводов" for b in buttons)
+
+
+def test_preset_del_callback_removes_and_rerenders(tmp_path, monkeypatch):
+    pfile = tmp_path / "presets.json"
+    presets.save_preset("Старый", p2p.Config(), path=str(pfile))
+    monkeypatch.setattr(B.presets, "delete_preset", functools.partial(B.presets.delete_preset, path=str(pfile)))
+    monkeypatch.setattr(B.presets, "list_custom", functools.partial(B.presets.list_custom, path=str(pfile)))
+    bot = Stub(p2p.Config())
+    asyncio.run(bot.on_callback({"id": "1", "data": "preset_del:Старый", "message": {"message_id": 1}}))
+    assert "Старый" not in presets.list_custom(path=str(pfile))
+    method, params = bot.out[-1]
+    assert method == "editMessageText" and "Пресеты" in params["text"]
