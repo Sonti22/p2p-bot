@@ -248,6 +248,37 @@ def test_exchanger_to_bitpapa_only_in_trc20():
     assert p2p._hop(_cfg(), "BestChange", "ERC20", "BitPapa", "", "ETH")[0] == 0.0
 
 
+def test_route_skips_network_below_min_withdraw():
+    # сумма вывода (50000/88 ≈ 568 USDT) ниже минимума BEP20 у HTX — сеть недоступна, как закрытая,
+    # хотя её комиссия дешевле; выбирается TRC20, для которого минимум неизвестен
+    b, s = make_ad("HTX", "buy", 88.0), make_ad("Bybit", "sell", 90.0)
+    netstatus._apply("HTX", "USDT", {"BEP20": {"dep": True, "wd": True, "fee": 0.01, "min": 10000},
+                                     "TRC20": {"dep": True, "wd": True, "fee": 1.0, "min": None}})
+    profit, route = p2p._route(b, s, _cfg(), SPOT)
+    assert "TRC20" in route and "−1 USDT" in route and "BEP20" not in route
+    assert profit == pytest.approx(((50000 / 88 - 1.0) * 90 / 50000 - 1) * 100)
+
+
+def test_route_blocks_when_amount_below_min_withdraw_everywhere():
+    b, s = make_ad("HTX", "buy", 88.0), make_ad("Bybit", "sell", 90.0)
+    netstatus._apply("HTX", "USDT", {n: {"dep": True, "wd": True, "fee": 1.0, "min": 100000}
+                                     for n in ("TRC20", "BEP20", "ERC20", "TON")})
+    assert p2p._withdraw(_cfg(), "HTX", "USDT", "", "Bybit", qty=568.0) is None
+    assert p2p._route(b, s, _cfg(), SPOT) is None
+    assert p2p.profit_breakdown(b, s, _cfg(), SPOT) is None
+
+
+def test_min_withdraw_ignored_when_withdraw_stage_disabled():
+    # валовый спред (disable содержит "withdraw") не проверяет минимум вывода — только реальные
+    # стадии с комиссией вывода из profit_breakdown должны блокироваться
+    b, s = make_ad("HTX", "buy", 88.0), make_ad("Bybit", "sell", 90.0)
+    netstatus._apply("HTX", "USDT", {n: {"dep": True, "wd": True, "fee": 1.0, "min": 100000}
+                                     for n in ("TRC20", "BEP20", "ERC20", "TON")})
+    gross = p2p._route_qty(b, s, _cfg(), SPOT, disable=frozenset({"bank", "withdraw", "spot", "risk"}))
+    assert gross is not None
+    assert p2p.profit_breakdown(b, s, _cfg(), SPOT) is None
+
+
 def test_scan_offline_refreshes_networks(offline):
     c = p2p.Config(exchanges=["htx", "kucoin"], assets=["USDT"], min_orders=0, min_rate=0)
     snap = asyncio.run(p2p.scan(None, c))
