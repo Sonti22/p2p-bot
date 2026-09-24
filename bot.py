@@ -1,5 +1,6 @@
 """Telegram-бот сигналов P2P-связок: карточки-картинки, кнопки, меню. Запуск: python bot.py (настройки в .env)."""
 import asyncio
+import contextvars
 import dataclasses
 import html
 import json
@@ -56,6 +57,21 @@ MENU = {"keyboard": [[{"text": "🔥 Лучшая сейчас"}, {"text": "📊
         "resize_keyboard": True, "is_persistent": True}
 BUTTONS = {"🔥 Лучшая сейчас": "/best", "📊 Топ связок": "/top", "⚙️ Настройки": "/settings",
            "🛠 Разработка": "/dev", "❓ Как работать": "/help"}
+
+# Гости (TG_GUESTS в .env): получают сигналы и рыночные команды; настройки, ключи, журнал, алерты — только
+# владельцу. REPLY_CHAT живёт в контексте задачи command_loop: фоновые циклы (скан, аккаунты) его не видят
+# и шлют владельцу, даже если в этот момент обрабатывается команда гостя.
+REPLY_CHAT = contextvars.ContextVar("reply_chat", default=None)
+GUEST_MENU = {"keyboard": [[{"text": "🔥 Лучшая сейчас"}, {"text": "📊 Топ связок"}], [{"text": "❓ Как работать"}]],
+              "resize_keyboard": True, "is_persistent": True}
+GUEST_CMDS = {"/start", "/help", "/best", "/top", "/calc", "/banks", "/maker", "/fees", "/history", "/backtest"}
+GUEST_CALLBACKS = {"best", "top"}
+GUEST_DENIED = "🔒 Это только для владельца бота. Тебе доступны: /best, /top, /calc, /banks, /maker, /fees, /history."
+GUEST_WELCOME = ("👋 <b>Владелец открыл тебе доступ.</b>\n\nБуду присылать 🔔 карточки связок, как и ему. "
+                 "Команды: 🔥 лучшая связка, 📊 топ, /calc &lt;сумма&gt;, /banks, /maker, /fees, /history. "
+                 "Настройки, ключи бирж и журнал сделок — только у владельца.")
+ACCESS_HINT = ("🔒 Бот приватный. Твой id: <code>{chat}</code> — попроси владельца выполнить "
+               "<code>/allow {chat}</code>, и я начну отвечать.")
 COMMANDS = [{"command": "best", "description": "Лучшая связка сейчас"},
             {"command": "top", "description": "Топ связок графиком"},
             {"command": "history", "description": "История спредов: время суток, дни недели, BestChange"},
@@ -76,6 +92,7 @@ COMMANDS = [{"command": "best", "description": "Лучшая связка сей
             {"command": "dev", "description": "Как развивается бот: версия, изменения, план"},
             {"command": "status", "description": "Версия, аптайм, последний скан, ошибки площадок"},
             {"command": "logs", "description": "Последние строки лога (logs/bot.log)"},
+            {"command": "guests", "description": "Гости: кому ещё слать сигналы (/allow id, /deny id)"},
             {"command": "help", "description": "Как работать с сигналами"}]
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEV_STATUS = os.path.join(HERE, ".dev_status.json")   # пишет launcher.py при каждом запуске
@@ -700,6 +717,8 @@ class Bot:
         self.fancy = os.getenv("FANCY_BUTTONS", "1") != "0"   # цветные кнопки и «📋»; сам выключится при ошибке API
         self.topics = {}          # ключ топика -> message_thread_id, если у бота включены топики в личке
         self.cur_thread = None    # топик, из которого пришла последняя команда/кнопка — туда и отвечаем
+        self.guests = {g.strip() for g in os.getenv("TG_GUESTS", "").split(",") if g.strip()}
+        self.asked = set()        # чужие чаты, которым уже ответили «бот приватный» (раз за запуск)
         self.repeat_step = float(os.getenv("REPEAT_STEP", 0.3))  # п.п. роста профита для досрочного повтора
         self.max_signals = int(os.getenv("MAX_SIGNALS", 3))      # сигналим только из топ-N
         self.last = None
@@ -757,9 +776,17 @@ class Bot:
             await self.send(TOPIC_HINTS[key], topic=key)
         self.topics = saved
 
-    def thread_for(self, topic):
-        """id топика для сообщения: свой у сигналов/журнала/…, иначе тот, где написал пользователь."""
-        if not self.topics:
+    def chat_for(self, chat_id=None):
+        """Куда слать: явный chat_id → он; команда гостя (REPLY_CHAT) → гость; иначе владелец."""
+        return chat_id or REPLY_CHAT.get() or self.chat_id
+
+    def is_guest(self, chat):
+        return chat in self.guests
+
+    def thread_for(self, topic, chat_id=None):
+        """id топика для сообщения: свой у сигналов/журнала/…, иначе тот, где написал пользователь.
+        Топики — только в чате владельца."""
+        if not self.topics or self.chat_for(chat_id) != self.chat_id:
             return None
         return self.topics.get(topic) if topic else self.cur_thread
 
@@ -776,27 +803,30 @@ class Bot:
         return True
 
     async def send(self, text, chat_id=None, markup=None, topic=None):
-        params = dict(chat_id=chat_id or self.chat_id, text=text, parse_mode="HTML", disable_web_page_preview=True)
+        chat_id = self.chat_for(chat_id)
+        params = dict(chat_id=chat_id, text=text, parse_mode="HTML", disable_web_page_preview=True)
         if markup:
             params["reply_markup"] = self.markup(markup)
-        if self.thread_for(topic):
-            params["message_thread_id"] = self.thread_for(topic)
+        if self.thread_for(topic, chat_id):
+            params["message_thread_id"] = self.thread_for(topic, chat_id)
         r = await self.call("sendMessage", **params)
         if self._fancy_failed(r, markup):
             params["reply_markup"] = plain_markup(markup)
             r = await self.call("sendMessage", **params)
         return r
 
-    async def send_photo(self, png, caption, markup=None, topic=None):
-        thread = self.thread_for(topic)
-        r = await self._post_photo(png, caption, self.markup(markup), thread)
+    async def send_photo(self, png, caption, markup=None, topic=None, chat_id=None):
+        chat_id = self.chat_for(chat_id)
+        thread = self.thread_for(topic, chat_id)
+        kw = {"chat_id": chat_id} if chat_id != self.chat_id else {}
+        r = await self._post_photo(png, caption, self.markup(markup), thread, **kw)
         if self._fancy_failed(r, markup):
-            r = await self._post_photo(png, caption, plain_markup(markup), thread)
+            r = await self._post_photo(png, caption, plain_markup(markup), thread, **kw)
         return r
 
-    async def _post_photo(self, png, caption, markup, thread=None):
+    async def _post_photo(self, png, caption, markup, thread=None, chat_id=None):
         form = aiohttp.FormData()
-        form.add_field("chat_id", str(self.chat_id))
+        form.add_field("chat_id", str(chat_id or self.chat_id))
         form.add_field("caption", caption)
         form.add_field("parse_mode", "HTML")
         if markup:
@@ -808,18 +838,20 @@ class Bot:
                                timeout=aiohttp.ClientTimeout(total=40)) as r:
             return await r.json()
 
-    async def photo_or_text(self, render, caption, markup, topic=None):
+    async def photo_or_text(self, render, caption, markup, topic=None, chat_id=None):
         """Картинка с подписью; если не вышло — тем же текстом. Возвращает (ответ Telegram, картинка ли)."""
         if len(caption) <= 1024:
             try:
                 kw = {"topic": topic} if topic and self.topics else {}
+                if chat_id:
+                    kw["chat_id"] = chat_id
                 r = await self.send_photo(await asyncio.to_thread(render), caption, markup, **kw)
                 if r.get("ok"):
                     return r, True
                 logger.warning("sendPhoto: %s", r.get("description"))
             except Exception as e:
                 logger.warning("card error: %s", e)
-        return await self.send(caption, markup=markup, topic=topic), False
+        return await self.send(caption, chat_id=chat_id, markup=markup, topic=topic), False
 
     def remember_deal(self, d, cfg=None, snap=None):
         """Запомнить связку под кнопками «✅ Сделал»/«📋 Шаги»; хранится ограниченное число последних."""
@@ -831,18 +863,19 @@ class Bot:
             del self.deals_by_id[min(self.deals_by_id)]
         return deal_id
 
-    async def send_deal(self, d, prefix="", cfg=None, snap=None, topic=None):
+    async def send_deal(self, d, prefix="", cfg=None, snap=None, topic=None, chat_id=None):
         cfg = cfg or self.cfg
         snap = snap if snap is not None else self.last
-        deal_id = self.remember_deal(d, cfg, snap)
+        guest = self.is_guest(self.chat_for(chat_id))
+        deal_id = None if guest else self.remember_deal(d, cfg, snap)   # у гостя нет «✅ Сделал»/«📋 Шаги»/«🚫»
         amounts = deal_amounts(d, cfg, snap) if snap else None
         rel = reliability(d, cfg, snap) if snap else None
         breakdown = profit_breakdown(d[1], d[2], cfg, snap.spot, snap.over_banks) if snap else None
         caption = prefix + fmt_deal(d, cfg, snap)
         r, is_photo = await self.photo_or_text(lambda: deal_card(d, cfg, amounts, rel, breakdown), caption,
-                                               deal_markup(d, deal_id, cfg, snap), topic)
+                                               deal_markup(d, deal_id, cfg, snap), topic, chat_id)
         message_id = (r.get("result") or {}).get("message_id") if r.get("ok") else None
-        if topic == "signals" and message_id is not None:
+        if topic == "signals" and message_id is not None and not guest:
             key = self._deal_key(d)
             self.live_msg[key] = {"message_id": message_id, "photo": is_photo,
                                   "last_edit": time.time(), "caption": caption, "stale": False}
@@ -1435,6 +1468,11 @@ class Bot:
                 continue
             self.sent[key] = (now, profit)
             await self.send_deal(d, "🔔 " + self.held_label(d, now), snap=snap, topic="signals")
+            for g in sorted(self.guests):   # гостям — та же карточка, без кнопок журнала и без «живого» обновления
+                try:
+                    await self.send_deal(d, "🔔 " + self.held_label(d, now), snap=snap, chat_id=g)
+                except Exception as e:
+                    logger.warning("сигнал гостю %s: %s", g, e)
         await self.mark_stale_deals(active)
 
     async def update_live_card(self, key, d, snap, now):
@@ -1527,9 +1565,12 @@ class Bot:
     async def on_update(self, u):
         cq = u.get("callback_query")
         if cq:
-            if str(cq.get("message", {}).get("chat", {}).get("id", "")) == self.chat_id:
+            chat = str(cq.get("message", {}).get("chat", {}).get("id", ""))
+            if chat == self.chat_id:
                 self.cur_thread = cq["message"].get("message_thread_id")   # ответ — в тот же топик
                 await self.on_callback(cq)
+            elif self.is_guest(chat):
+                await self.on_guest_callback(cq, chat)
             return
         msg = u.get("message") or {}
         chat = str(msg.get("chat", {}).get("id", ""))
@@ -1549,8 +1590,83 @@ class Bot:
                 await self.handle_key_input(text, msg.get("message_id"))
             else:
                 await self.handle(text)
+        elif self.is_guest(chat):
+            await self.handle_guest(chat, (msg.get("text") or "").strip())
+        else:
+            await self.ask_access(chat, msg.get("from") or {})
+
+    async def handle_guest(self, chat, text):
+        """Команда гостя: ответы уходят ему (REPLY_CHAT), состояния ввода владельца не трогаем."""
+        token = REPLY_CHAT.set(chat)
+        try:
+            cmd, _, arg = BUTTONS.get(text, text).partition(" ")
+            await self.dispatch(cmd.split("@")[0], arg)
+        finally:
+            REPLY_CHAT.reset(token)
+
+    async def on_guest_callback(self, cq, chat):
+        data = cq.get("data", "")
+        if data not in GUEST_CALLBACKS:
+            await self.call("answerCallbackQuery", callback_query_id=cq["id"], text="Только для владельца бота")
+            return
+        await self.call("answerCallbackQuery", callback_query_id=cq["id"])
+        token = REPLY_CHAT.set(chat)
+        try:
+            await (self.show_best() if data == "best" else self.show_top())
+        finally:
+            REPLY_CHAT.reset(token)
+
+    async def ask_access(self, chat, sender):
+        """Чужой чат: один раз за запуск сказать ему id и один раз сообщить владельцу, как дать доступ."""
+        if chat in self.asked:
+            return
+        self.asked.add(chat)
+        await self.send(ACCESS_HINT.format(chat=chat), chat_id=chat)
+        who = html.escape(" ".join(x for x in (sender.get("first_name"), sender.get("last_name")) if x) or "?")
+        if sender.get("username"):
+            who += f" (@{html.escape(sender['username'])})"
+        await self.send(f"👤 {who}, id <code>{chat}</code> написал боту. Дать доступ к сигналам и рыночным "
+                        f"командам: <code>/allow {chat}</code>", topic="settings")
+
+    def save_guests(self):
+        save_env("TG_GUESTS", ",".join(sorted(self.guests)))
+
+    async def cmd_allow(self, arg):
+        gid = (arg or "").strip()
+        if not re.fullmatch(r"-?\d+", gid):
+            await self.send("Нужен id чата: /allow 123456789 (бот присылает его, когда человек пишет ему).")
+        elif gid == self.chat_id:
+            await self.send("Это твой собственный чат.")
+        elif gid in self.guests:
+            await self.send(f"{gid} уже в списке гостей.")
+        else:
+            self.guests.add(gid)
+            self.save_guests()
+            self.asked.discard(gid)
+            await self.send(f"✅ {gid} добавлен: получает сигналы и рыночные команды. Убрать: /deny {gid}")
+            await self.send(GUEST_WELCOME, chat_id=gid, markup=GUEST_MENU)
+
+    async def cmd_deny(self, arg):
+        gid = (arg or "").strip()
+        if gid not in self.guests:
+            await self.send(f"{gid or '?'} не в списке гостей. Список: /guests")
+            return
+        self.guests.discard(gid)
+        self.save_guests()
+        await self.send(f"🚫 {gid} убран из гостей.")
+        await self.send("🔒 Владелец закрыл доступ к боту.", chat_id=gid, markup={"remove_keyboard": True})
+
+    async def cmd_guests(self):
+        if not self.guests:
+            await self.send("Гостей нет. Когда друг напишет боту, пришлю его id и команду /allow.")
+        else:
+            await self.send("👥 <b>Гости</b> (сигналы + /best, /top, /calc, /banks, /maker, /fees, /history):\n"
+                            + "\n".join(f"• <code>{g}</code> — /deny {g}" for g in sorted(self.guests)))
 
     async def welcome(self):
+        if REPLY_CHAT.get() is not None:
+            await self.send(GUEST_WELCOME, markup=GUEST_MENU)
+            return
         await self.send("👋 <b>Бот P2P-связок на связи.</b>\n\n"
                         "Сам пришлю 🔔 карточку, когда появится связка выше порога. "
                         "Кнопки внизу: 🔥 лучшая связка сейчас, 📊 топ графиком, ⚙️ настройки, "
@@ -1724,8 +1840,20 @@ class Bot:
                 return
         self.awaiting_key = None               # команда/кнопка прерывает ввод ключа биржи
         cmd, _, arg = BUTTONS.get(text, text).partition(" ")
-        cmd = cmd.split("@")[0]
-        if cmd == "/start":
+        await self.dispatch(cmd.split("@")[0], arg)
+
+    async def dispatch(self, cmd, arg):
+        """Команда → обработчик. Гостю (REPLY_CHAT задан) доступны только GUEST_CMDS."""
+        if REPLY_CHAT.get() is not None and cmd not in GUEST_CMDS:
+            await self.send(GUEST_DENIED)
+            return
+        if cmd == "/allow":
+            await self.cmd_allow(arg)
+        elif cmd == "/deny":
+            await self.cmd_deny(arg)
+        elif cmd == "/guests":
+            await self.cmd_guests()
+        elif cmd == "/start":
             await self.welcome()
         elif cmd == "/best":
             await self.show_best()
