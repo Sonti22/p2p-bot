@@ -219,6 +219,62 @@ async def api_permissions(s, exchange):
     return True, ""
 
 
+BALANCE_COINS = ("USDT", "USDC", "BTC", "ETH", "TON")   # монеты, которые показывает /balance
+
+
+async def bybit_balances(s, api_key, api_secret):
+    """Балансы монет на Bybit: Unified Trading Account + Funding wallet (складываются по монете)."""
+    totals = {}
+    uni = await bybit_get(s, api_key, api_secret, "/v5/account/wallet-balance", {"accountType": "UNIFIED"})
+    if uni.get("retCode") == 0:
+        for acc in uni.get("result", {}).get("list", []):
+            for c in acc.get("coin", []):
+                amt = float(c.get("walletBalance") or 0)
+                if amt:
+                    totals[c["coin"]] = totals.get(c["coin"], 0) + amt
+    fund = await bybit_get(s, api_key, api_secret, "/v5/asset/transfer/query-account-coins-balance",
+                            {"accountType": "FUND"})
+    if fund.get("retCode") == 0:
+        for c in fund.get("result", {}).get("balance", []):
+            amt = float(c.get("walletBalance") or 0)
+            if amt:
+                totals[c["coin"]] = totals.get(c["coin"], 0) + amt
+    return totals
+
+
+async def mexc_balances(s, api_key, api_secret):
+    """Балансы монет на споте MEXC."""
+    j = await mexc_get(s, api_key, api_secret, "/api/v3/account")
+    totals = {}
+    for b in j.get("balances", []):
+        amt = float(b.get("free") or 0) + float(b.get("locked") or 0)
+        if amt:
+            totals[b["asset"]] = totals.get(b["asset"], 0) + amt
+    return totals
+
+
+BALANCE_FETCHERS = {"bybit": bybit_balances, "mexc": mexc_balances}   # биржи, для которых уже есть /balance
+
+
+async def portfolio(s):
+    """{биржа: {монета: количество}} по всем подключённым биржам с реализованным чтением баланса.
+
+    Оставляет только BALANCE_COINS; ошибка запроса или отсутствие ключа — биржа просто пропускается."""
+    out = {}
+    for ex, fetch in BALANCE_FETCHERS.items():
+        pair = keys(ex)
+        if not pair:
+            continue
+        try:
+            bal = await fetch(s, *pair)
+        except Exception:
+            continue
+        bal = {c: amt for c, amt in bal.items() if c in BALANCE_COINS and amt}
+        if bal:
+            out[ex] = bal
+    return out
+
+
 async def verify(s, exchange):
     """Проверить сохранённый ключ биржи запросом баланса: (ok, сообщение для пользователя)."""
     ex = exchange.lower()
