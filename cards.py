@@ -9,7 +9,7 @@ import time
 
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
-from p2p import _money, _price
+from p2p import _money, _price, terms_flags
 
 FONT_DIR = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts")
 BG, PANEL, BORDER = "#0F1419", "#18212C", "#2A3441"
@@ -71,6 +71,9 @@ def _side_box(d, x, y, w, h, title, color, ad):
     stats = f"{ad.orders} отзывов · {ad.rate:.0f}% хор." if ad.ex == "BestChange" else f"{ad.orders} сделок · {ad.rate:.0f}%"
     d.text((x + 20, y + 156), stats, font=_font(22), fill=MUTED)
     d.text((x + 20, y + 190), _fit(", ".join(ad.pays), _font(22), w - 40), font=_font(22), fill=MUTED)
+    notes = terms_flags(ad.terms)[1]
+    if notes:   # ключевые условия мерчанта — одной строкой
+        d.text((x + 20, y + 216), _fit("⚠ " + " · ".join(notes), _font(19), w - 40), font=_font(19), fill=AMBER)
 
 
 def _amounts_line(amounts):

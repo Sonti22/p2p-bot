@@ -169,6 +169,7 @@ class Ad:
     url: str = ""
     asset: str = "USDT"
     net: str = ""    # сеть (только у обменников)
+    terms: str = ""  # условия мерчанта из объявления (remark/remarks/tradeTerms/conditions)
 
 
 async def _json(s, method, url, body=None):
@@ -189,7 +190,7 @@ async def bybit(s, cfg, side, asset):
     j = await _json(s, "POST", "https://api2.bybit.com/fiat/otc/item/online", body)
     return [Ad("Bybit", side, float(i["price"]), float(i["minAmount"]), float(i["maxAmount"]), float(i["lastQuantity"]),
                [_bybit_pay.get(p, p) for p in i["payments"]], i["nickName"], int(i["recentOrderNum"]),
-               float(i["recentExecuteRate"]), asset=asset)
+               float(i["recentExecuteRate"]), asset=asset, terms=i.get("remark") or "")
             for i in j["result"]["items"] or []]
 
 
@@ -219,7 +220,8 @@ async def kucoin(s, cfg, side, asset):
     j = await _json(s, "GET", url)
     return [Ad("KuCoin", side, float(i["floatPrice"]), float(i["limitMinQuote"]), float(i["limitMaxQuote"]),
                float(i["currencyBalanceQuantity"]), [_kucoin_pay(p) for p in i["adPayTypes"]], i["nickName"],
-               int(i.get("dealOrderNum") or 0), float((i.get("dealOrderRate") or "0").rstrip("%")), asset=asset)
+               int(i.get("dealOrderNum") or 0), float((i.get("dealOrderRate") or "0").rstrip("%")), asset=asset,
+               terms=i.get("remarks") or "")
             for i in j.get("items") or []]
 
 
@@ -247,7 +249,7 @@ async def mexc(s, cfg, side, asset):
         out.append(Ad("MEXC", side, float(i["price"]), float(i["minTradeLimit"]), float(i["maxTradeLimit"]),
                       float(i["availableQuantity"]), [_mexc_pay.get(p, f"pm{p}") for p in str(i["payMethod"]).split(",")],
                       (i.get("merchant") or {}).get("nickName", "?"), int(st.get("doneLastMonthCount") or 0),
-                      float(st.get("completeRate") or 0) * 100, asset=asset))
+                      float(st.get("completeRate") or 0) * 100, asset=asset, terms=i.get("tradeTerms") or ""))
     return out
 
 
@@ -261,9 +263,12 @@ async def bitpapa(s, cfg, side, asset):
         if u.get("is_suspicious"):
             continue
         trade_count, done = u.get("trades_count") or 0, u.get("completed_trades_count") or 0
+        terms = a.get("conditions") or ""
+        if a.get("for_identified_people"):
+            terms += " [только верифицированные]"
         out.append(Ad("BitPapa", side, float(a["price"]), float(a["limit_min"] or 0), float(a["limit_max"] or 0),
                       float(a["limit_max_crypto"] or 0), [a["payment_method"]["name"]], u.get("user_name", "?"),
-                      done, done / trade_count * 100 if trade_count else 0, asset=asset))
+                      done, done / trade_count * 100 if trade_count else 0, asset=asset, terms=terms.strip()))
     return out
 
 
@@ -391,16 +396,47 @@ def _pays(a, cfg):
     return pays
 
 
+# Условия мерчанта. Стоп-фразы — объявление отсеивается; заметки — показываем в карточке.
+# Отрицания про третьих лиц («от третьих лиц не принимаю») вырезаются до проверки — это норма, а не риск.
+_TERMS_NEG_THIRD = re.compile(r"(не\s+принима\w*\s+(оплат\w*\s+)?от\s+третьих\s+лиц|от\s+третьих\s+лиц\s+не\s+принима\w*"
+                              r"|треть\w+\s+лиц\w*\s+не\s+принима\w*|без\s+третьих\s+лиц|третьи\s+лица\s+(мимо|нет|запрещ\w*))", re.I)
+TERMS_BLOCK = (
+    (r"треть\w+\s+лиц|с\s+любых\s+карт|любые\s+карты|чужих\s+карт|чужие\s+карты", "оплата от третьих лиц"),
+    (r"telegram|телеграм|whatsapp|ватсап|вацап|(?<![\w.])@[A-Za-z0-9_]{5,}", "зовёт на связь вне площадки"),
+    (r"обнал|дроп\b|дропы|обход\s+(банк|лимит)", "обещает «обнал/обход банка» — серая схема"),
+)
+TERMS_WARN = (
+    (r"без\s+блокировок|никаких\s+блокир", "обещает «без блокировок»"),
+    (r"в\s+чат", "реквизиты в чате"),
+    (r"\bчек", "нужен чек (на почту/в чат)"),
+    (r"одним\s+платеж|не\s+дел[иь]|кратн", "одним платежом / кратные суммы"),
+    (r"только\s+(с\s+)?(т[\s-]?банк|тиньк|сбер|альф|втб|райф)", "принимает только с одного банка"),
+    (r"сч[её]т\s+ип|на\s+ип\b|юр\.?\s?лиц|расч[её]тн\w*\s+сч", "оплата на счёт ИП/юрлица"),
+    (r"верифиц|kyc", "требует верификацию"),
+    (r"\+7\s?\(?\d{3}|\b8\s?9\d{2}", "в условиях указан телефон"),
+)
+TERMS_RISKY = ("реквизиты в чате", "оплата на счёт ИП/юрлица", "в условиях указан телефон")
+
+
+def terms_flags(text):
+    """(стоп-причины, заметки) по тексту условий объявления."""
+    t = _TERMS_NEG_THIRD.sub(" ", (text or "").lower())
+    blocked = [label for pat, label in TERMS_BLOCK if re.search(pat, t, re.I)]
+    notes = [label for pat, label in TERMS_WARN if re.search(pat, t, re.I)]
+    return blocked, notes
+
+
 def usable(a, cfg, blocked=frozenset()):
     return bool(_pays(a, cfg)) and a.min_amt <= cfg.amount <= a.max_amt and a.avail * a.price >= cfg.amount \
-        and a.orders >= cfg.min_orders and a.rate >= cfg.min_rate and (a.ex, a.nick) not in blocked
+        and a.orders >= cfg.min_orders and a.rate >= cfg.min_rate and (a.ex, a.nick) not in blocked \
+        and not terms_flags(a.terms)[0]
 
 
 def _signal_ok(a, cfg, blocked=frozenset()):
-    """Фильтр объявления для стакана глубины: мерчант/способ оплаты, без требования, что объём
+    """Фильтр объявления для стакана глубины: мерчант/способ оплаты/условия, без требования, что объём
     покрывает всю сумму в одиночку — это делает _stack, складывая несколько объявлений."""
     return bool(_pays(a, cfg)) and a.orders >= cfg.min_orders and a.rate >= cfg.min_rate \
-        and (a.ex, a.nick) not in blocked
+        and (a.ex, a.nick) not in blocked and not terms_flags(a.terms)[0]
 
 
 def _stack(ads, amount):
@@ -767,6 +803,9 @@ def reliability(deal, cfg, snap):
                 reasons.append(f"{side}: цена {dev:.1f}% от ориентира (отсев >{cfg.max_dev:g}%)")
         if ad.orders < cfg.min_orders * 1.5 or ad.rate < cfg.min_rate + 1:
             reasons.append(f"{side}: мерчант у порога фильтра ({ad.orders} сделок/{ad.rate:.0f}%)")
+        risky = [n for n in terms_flags(ad.terms)[1] if n in TERMS_RISKY]
+        if risky:
+            reasons.append(f"{side}: условия — {', '.join(risky)}")
     steps = route.split(" → ") if route else []
     transfers = sum(1 for st in steps if "перевод" in st or "спот" in st or "через" in st)
     if transfers >= 2:
@@ -796,7 +835,9 @@ def fmt_ad(a):
     stats = f"{a.orders} отз/{a.rate:.0f}% хор." if a.ex == "BestChange" else f"{a.orders} сд/{a.rate:.0f}%"
     link = f' · <a href="{html.escape(a.url)}">открыть</a>' if a.url else ""
     pays = ", ".join(a.pays[:4]) + (f" +{len(a.pays) - 4}" if len(a.pays) > 4 else "")
-    return f"{a.ex} {a.asset} {_price(a.price)} ({html.escape(pays)}) · {html.escape(a.nick)} · {stats}{link}"
+    notes = terms_flags(a.terms)[1]
+    cond = f" · ⚠ {html.escape('; '.join(notes[:2]))}" if notes else ""
+    return f"{a.ex} {a.asset} {_price(a.price)} ({html.escape(pays)}) · {html.escape(a.nick)} · {stats}{link}{cond}"
 
 
 def fmt_deal(d, cfg, snap=None):
