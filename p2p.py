@@ -435,23 +435,18 @@ def _hop(cfg, frm, frm_net, to, to_net, asset):
     return fee, f"перевод {cost}" + (f" ({net})" if net else "") + f" на {to}"
 
 
-def _route(b, s, cfg, spot, over_banks=frozenset()):
-    """Чистая прибыль % и шаги маршрута со всеми издержками; None, если связка невозможна.
-    over_banks — банки, уже превысившие месячный лимит СБП: комиссия банка выставляется автоматически,
-    даже если PAY_FEE в настройках не задан (или задан меньше)."""
-    steps = []
-    pay_fee, auto_bank = cfg.pay_fee, ""
+def _route_qty(b, s, cfg, spot, over_banks=frozenset(), disable=frozenset()):
+    """Количество s.asset на выходе маршрута; None, если связка невозможна. disable — категории
+    издержек, которые надо считать нулевыми ('bank'/'withdraw'/'spot'/'risk') — для разложения
+    прибыли на составляющие в profit_breakdown."""
+    pay_fee = 0.0 if "bank" in disable else cfg.pay_fee
     bank = trades.sbp_bank(b.pays)
-    if bank in over_banks and pay_fee < trades.SBP_OVER_FEE:
-        pay_fee, auto_bank = trades.SBP_OVER_FEE, bank
+    if "bank" not in disable and bank in over_banks and pay_fee < trades.SBP_OVER_FEE:
+        pay_fee = trades.SBP_OVER_FEE
     qty = cfg.amount * (1 - pay_fee / 100) / b.price
-    if pay_fee:
-        note = f" (лимит СБП {auto_bank} исчерпан)" if auto_bank else ""
-        steps.append(f"комиссия банка −{pay_fee:g}%{note}")
     if b.asset == s.asset:
-        fee, label = _hop(cfg, b.ex, b.net, s.ex, s.net, b.asset)
-        qty -= fee
-        steps.append(label or "внутри биржи")
+        fee, _ = _hop(cfg, b.ex, b.net, s.ex, s.net, b.asset)
+        qty -= 0.0 if "withdraw" in disable else fee
     else:
         if "USDT" not in (b.asset, s.asset):
             return None
@@ -461,22 +456,77 @@ def _route(b, s, cfg, spot, over_banks=frozenset()):
         if not venue:
             return None
         bid, ask = spot[venue][alt]
-        fee, label = _hop(cfg, b.ex, b.net, venue, "", b.asset)
-        qty -= fee
+        fee, _ = _hop(cfg, b.ex, b.net, venue, "", b.asset)
+        qty -= 0.0 if "withdraw" in disable else fee
+        sf = 0.0 if "spot" in disable else cfg.spot_fees.get(venue, 0.1)
+        qty = (qty / ask if b.asset == "USDT" else qty * bid) * (1 - sf / 100)
+        fee, _ = _hop(cfg, venue, "", s.ex, s.net, s.asset)
+        qty -= 0.0 if "withdraw" in disable else fee
+    vol = 0.0 if "risk" in disable else max(cfg.risk_buffer.get(b.asset, 0), cfg.risk_buffer.get(s.asset, 0))
+    if vol:   # курс ETH/BTC/TON может уйти, пока идут сделки и переводы
+        qty *= 1 - vol / 100
+    return qty
+
+
+def _route(b, s, cfg, spot, over_banks=frozenset()):
+    """Чистая прибыль % и шаги маршрута со всеми издержками; None, если связка невозможна.
+    over_banks — банки, уже превысившие месячный лимит СБП: комиссия банка выставляется автоматически,
+    даже если PAY_FEE в настройках не задан (или задан меньше)."""
+    steps = []
+    pay_fee, auto_bank = cfg.pay_fee, ""
+    bank = trades.sbp_bank(b.pays)
+    if bank in over_banks and pay_fee < trades.SBP_OVER_FEE:
+        pay_fee, auto_bank = trades.SBP_OVER_FEE, bank
+    if pay_fee:
+        note = f" (лимит СБП {auto_bank} исчерпан)" if auto_bank else ""
+        steps.append(f"комиссия банка −{pay_fee:g}%{note}")
+    if b.asset == s.asset:
+        _, label = _hop(cfg, b.ex, b.net, s.ex, s.net, b.asset)
+        steps.append(label or "внутри биржи")
+    else:
+        if "USDT" not in (b.asset, s.asset):
+            return None
+        alt = s.asset if b.asset == "USDT" else b.asset
+        venue = next((v for v in (b.ex, s.ex) + SPOT_VENUES if v in SPOT_VENUES and alt in spot.get(v, {})), None)
+        if not venue:
+            return None
+        _, label = _hop(cfg, b.ex, b.net, venue, "", b.asset)
         if label:
             steps.append(label)
         sf = cfg.spot_fees.get(venue, 0.1)
-        qty = (qty / ask if b.asset == "USDT" else qty * bid) * (1 - sf / 100)
         steps.append(f"спот {b.asset}→{s.asset} на {venue} (−{sf:g}%)")
-        fee, label = _hop(cfg, venue, "", s.ex, s.net, s.asset)
-        qty -= fee
+        _, label = _hop(cfg, venue, "", s.ex, s.net, s.asset)
         if label:
             steps.append(label)
     vol = max(cfg.risk_buffer.get(b.asset, 0), cfg.risk_buffer.get(s.asset, 0))
-    if vol:   # курс ETH/BTC/TON может уйти, пока идут сделки и переводы
-        qty *= 1 - vol / 100
+    if vol:
         steps.append(f"запас на курс −{vol:g}%")
+    qty = _route_qty(b, s, cfg, spot, over_banks)
+    if qty is None:
+        return None
     return (qty * s.price / cfg.amount - 1) * 100, " → ".join(steps)
+
+
+def profit_breakdown(b, s, cfg, spot, over_banks=frozenset()):
+    """Разложение чистой прибыли связки на составляющие: валовый спред (без издержек) → минус
+    вывод → минус спот (если есть конвертация монеты) → минус запас на курс → чистыми (с учётом
+    комиссии банка, если применяется) — каждая стадия в % от суммы круга. None — маршрут невозможен."""
+    def profit(disable):
+        qty = _route_qty(b, s, cfg, spot, over_banks, disable)
+        return None if qty is None else (qty * s.price / cfg.amount - 1) * 100
+
+    stages = [("Валовый спред", {"bank", "withdraw", "spot", "risk"}),
+              ("− вывод", {"bank", "spot", "risk"})]
+    if b.asset != s.asset:
+        stages.append(("− спот", {"bank", "risk"}))
+    stages += [("− запас на курс", {"bank"}), ("Чистыми", set())]
+    out = []
+    for label, disable in stages:
+        p = profit(disable)
+        if p is None:
+            return None
+        out.append((label, p))
+    return out
 
 
 @dataclass

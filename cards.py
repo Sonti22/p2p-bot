@@ -84,7 +84,11 @@ def _amounts_line(amounts):
 REL_COLORS = {"✅ надёжно": GREEN, "⚠️ риск": AMBER, "🪤 ловушка": RED}
 
 
-def deal_card(deal, cfg, amounts=None, rel=None):
+def _breakdown_line(breakdown):
+    return " → ".join(f"{label} {p:+.2f}%" for label, p in breakdown)
+
+
+def deal_card(deal, cfg, amounts=None, rel=None, breakdown=None):
     profit, b, s, route = deal
     W, H = 1080, 640
     img = Image.new("RGB", (W, H), BG)
@@ -104,10 +108,13 @@ def deal_card(deal, cfg, amounts=None, rel=None):
         f_rel = _font(22, "semi")
         pw = f_rel.getlength(label) + 24
         _pill(d, W - 40 - pw, 176, label, REL_COLORS.get(label, AMBER), f_rel)
-    if amounts:
-        d.text((40, 212), _fit(_amounts_line(amounts), _font(18), W - 80), font=_font(18), fill=MUTED)
 
-    y, h = 240, 240
+    f_extra, ey = _font(18), 210
+    for line in filter(None, [_breakdown_line(breakdown) if breakdown else "", _amounts_line(amounts) if amounts else ""]):
+        d.text((40, ey), _fit(line, f_extra, W - 80), font=f_extra, fill=MUTED)
+        ey += 22
+
+    y, h = (240, 240) if ey == 210 else (ey + 8, 240)
     _side_box(d, 40, y, 360, h, "КУПИТЬ", GREEN, b)
     _side_box(d, 680, y, 360, h, "ПРОДАТЬ", RED, s)
     # шаги маршрута столбиком (каждый шаг целиком, с номером) и стрелка под ними

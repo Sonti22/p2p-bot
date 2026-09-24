@@ -45,7 +45,7 @@ def texts(bot):
 
 
 def test_notify_top_n_and_dedup(monkeypatch):
-    monkeypatch.setattr(B, "deal_card", lambda d, c, a=None, r=None: b"png")
+    monkeypatch.setattr(B, "deal_card", lambda d, c, a=None, r=None, breakdown=None: b"png")
     bot = Stub(p2p.Config(min_profit=2.0))
     bot.max_signals = 2
     ds = [deal(5, "MEXC"), deal(4, "KuCoin"), deal(3, "HTX")]
@@ -56,7 +56,7 @@ def test_notify_top_n_and_dedup(monkeypatch):
 
 
 def test_below_threshold_not_sent(monkeypatch):
-    monkeypatch.setattr(B, "deal_card", lambda d, c, a=None, r=None: b"png")
+    monkeypatch.setattr(B, "deal_card", lambda d, c, a=None, r=None, breakdown=None: b"png")
     bot = Stub(p2p.Config(min_profit=5.0))
     asyncio.run(bot.notify(snap([deal(3)])))
     assert not bot.out
@@ -77,7 +77,7 @@ def test_settings_apply_persists(tmp_path, monkeypatch):
 def test_send_deal_passes_amount_breakdown_from_snap(monkeypatch):
     captured = {}
 
-    def fake_deal_card(d, c, amounts=None, rel=None):
+    def fake_deal_card(d, c, amounts=None, rel=None, breakdown=None):
         captured["amounts"] = amounts
         return b"png"
 
@@ -156,7 +156,7 @@ def test_dev_view_without_files(tmp_path):
 
 
 def test_send_deal_adds_done_button(monkeypatch):
-    monkeypatch.setattr(B, "deal_card", lambda d, c, a=None, r=None: b"png")
+    monkeypatch.setattr(B, "deal_card", lambda d, c, a=None, r=None, breakdown=None: b"png")
     bot = Stub(p2p.Config())
     asyncio.run(bot.send_deal(deal(), "🔔 "))
     markup = photos(bot)[0][1]["markup"]
@@ -190,7 +190,7 @@ def test_mark_done_unknown_id_not_logged(monkeypatch):
 
 
 def test_calc_command_scans_with_custom_amount(offline, monkeypatch):
-    monkeypatch.setattr(B, "deal_card", lambda d, c, a=None, r=None: b"png")
+    monkeypatch.setattr(B, "deal_card", lambda d, c, a=None, r=None, breakdown=None: b"png")
     monkeypatch.setattr(B, "top_chart", lambda snap, c: b"png")
     bot = Stub(p2p.Config(exchanges=["bybit", "htx", "kucoin", "mexc", "bitpapa"], assets=["USDT"],
                           min_orders=0, min_rate=0, amount=50000))
@@ -228,7 +228,7 @@ def test_amt_custom_button_arms_waiting_state():
 
 
 def test_custom_amount_text_scans_and_saves(tmp_path, monkeypatch, offline):
-    monkeypatch.setattr(B, "deal_card", lambda d, c, a=None, r=None: b"png")
+    monkeypatch.setattr(B, "deal_card", lambda d, c, a=None, r=None, breakdown=None: b"png")
     monkeypatch.setattr(B, "top_chart", lambda snap, c: b"png")
     env = tmp_path / ".env"
     env.write_text("AMOUNT=50000\n", encoding="utf-8")

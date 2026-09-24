@@ -235,6 +235,40 @@ def test_scan_ranks_deals_by_profit_times_reliability(offline, monkeypatch):
     assert snap.deals.index(rel) < snap.deals.index(risky)    # но с поправкой на риск она позади
 
 
+def test_profit_breakdown_same_asset_sums_to_net():
+    b, s = make_ad("MEXC", "buy", 88.0), make_ad("Bybit", "sell", 90.0)
+    profit, _ = p2p._route(b, s, cfg(), SPOT)
+    out = p2p.profit_breakdown(b, s, cfg(), SPOT)
+    labels = [label for label, _ in out]
+    assert labels == ["Валовый спред", "− вывод", "− запас на курс", "Чистыми"]
+    assert out[0][1] == pytest.approx((90.0 / 88.0 - 1) * 100)   # без издержек — чистый спред цен
+    assert out[-1][1] == pytest.approx(profit)                   # последняя стадия равна итогу _route
+    assert out[0][1] > out[1][1]                                 # вывод снижает профит
+    assert out[1][1] == pytest.approx(out[-1][1])                # нет ни риск-буфера, ни комиссии банка
+
+
+def test_profit_breakdown_cross_asset_has_spot_stage():
+    b, s = make_ad("MEXC", "buy", 88.0), make_ad("MEXC", "sell", 245000.0, asset="ETH")
+    profit, _ = p2p._route(b, s, cfg(risk_buffer={"ETH": 0.5}), SPOT)
+    out = p2p.profit_breakdown(b, s, cfg(risk_buffer={"ETH": 0.5}), SPOT)
+    labels = [label for label, _ in out]
+    assert labels == ["Валовый спред", "− вывод", "− спот", "− запас на курс", "Чистыми"]
+    assert out[-1][1] == pytest.approx(profit)
+
+
+def test_profit_breakdown_bank_fee_lowers_final_stage_only():
+    b, s = make_ad("MEXC", "buy", 88.0), make_ad("MEXC", "sell", 88.0)
+    out = p2p.profit_breakdown(b, s, cfg(pay_fee=0.5), SPOT)
+    assert out[-2][0] == "− запас на курс" and out[-2][1] == pytest.approx(0.0)   # без комиссии банка
+    assert out[-1] == ("Чистыми", pytest.approx(-0.5))
+
+
+def test_profit_breakdown_unroutable_pair_is_none():
+    b = make_ad("MEXC", "buy", 7_000_000, asset="BTC")
+    s = make_ad("MEXC", "sell", 245000, asset="ETH")
+    assert p2p.profit_breakdown(b, s, cfg(), SPOT) is None
+
+
 def test_scan_applies_auto_fee_for_bank_over_limit(offline, monkeypatch):
     async def fake_fetcher(s, cfg, side, asset):
         return [make_ad("Fake", side, 85.0 if side == "buy" else 90.0, pays=("T-Bank",))]

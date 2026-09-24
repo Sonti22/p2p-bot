@@ -13,7 +13,7 @@ import accounts
 import trades
 from cards import deal_card, portfolio_card, top_chart
 from p2p import AMOUNT_MAX, AMOUNT_MIN, ENV_PATH, Config, _money, deal_amounts, fmt_deal, fmt_top, load_env, \
-    parse_amount, reliability, scan, spot_url, venue_url
+    parse_amount, profit_breakdown, reliability, scan, spot_url, venue_url
 
 MENU = {"keyboard": [[{"text": "🔥 Лучшая сейчас"}, {"text": "📊 Топ связок"}],
                      [{"text": "⚙️ Настройки"}, {"text": "🛠 Разработка"}],
@@ -312,7 +312,8 @@ class Bot:
         deal_id = self.remember_deal(d, cfg)
         amounts = deal_amounts(d, cfg, snap) if snap else None
         rel = reliability(d, cfg, snap) if snap else None
-        await self.photo_or_text(lambda: deal_card(d, cfg, amounts, rel), prefix + fmt_deal(d, cfg, snap),
+        breakdown = profit_breakdown(d[1], d[2], cfg, snap.spot, snap.over_banks) if snap else None
+        await self.photo_or_text(lambda: deal_card(d, cfg, amounts, rel, breakdown), prefix + fmt_deal(d, cfg, snap),
                                  deal_markup(d, deal_id))
 
     async def mark_done(self, cq, deal_id):
