@@ -293,6 +293,20 @@ def test_account_view_not_connected_offers_connect(tmp_path, monkeypatch):
     assert "acc_add:mexc" in callbacks
 
 
+def test_account_view_hint_is_exchange_specific():
+    bybit_text, _ = B.account_view("bybit")
+    mexc_text, _ = B.account_view("mexc")
+    assert "API Management" in mexc_text and "API Management" not in bybit_text
+    assert "Create New Key" in bybit_text and "Create New Key" not in mexc_text
+    assert "Read-Only" in bybit_text and "Read Info" in mexc_text
+
+
+def test_acc_add_sends_exchange_specific_hint():
+    bot = Stub(p2p.Config())
+    asyncio.run(bot.on_callback({"id": "1", "data": "acc_add:mexc", "message": {"message_id": 1}}))
+    assert any("API Management" in p.get("text", "") for m, p in bot.out if m == "sendMessage")
+
+
 def test_account_view_unsupported_exchange_has_no_connect_button(tmp_path, monkeypatch):
     monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "no_such.json"))
     text, kb = B.account_view("htx")
