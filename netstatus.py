@@ -1,8 +1,10 @@
 """Статус сетей ввода/вывода монет по биржам — чтобы не сигналить связку, в которой вывод закрыт.
 
 HTX и KuCoin — публичные справочники валют; Bybit и MEXC — только при подключённом ключе «только чтение»
-(accounts.keys). Неизвестный статус = не мешаем. Обновление раз в TTL секунд; если биржа не ответила,
-остаётся прежняя таблица. Переключения открыт ↔ закрыт копятся в CHANGES — бот забирает их и шлёт алерт.
+(accounts.keys). Неизвестный статус = не мешаем. Обновление раз в TTL секунд; если биржа не ответила
+или ответила HTTP 200 с ошибкой в теле (retCode/code не «успех»), остаётся прежняя таблица — распознанная
+ошибка API не должна выглядеть как «у площадки нет сетей». Переключения открыт ↔ закрыт копятся в CHANGES —
+бот забирает их и шлёт алерт.
 """
 import asyncio
 import time
@@ -48,6 +50,8 @@ def _f(v):
 
 
 def _parse_htx(j):
+    if j.get("code") != 200:      # HTTP 200, но ошибка в теле — не путать с «монеты нет в ответе»
+        raise ValueError(j.get("message") or j.get("code"))
     out = {}
     for c in j.get("data") or []:
         for ch in c.get("chains") or []:
@@ -58,6 +62,8 @@ def _parse_htx(j):
 
 
 def _parse_kucoin(j):
+    if str(j.get("code")) != "200000":
+        raise ValueError(j.get("msg") or j.get("code"))
     out = {}
     for ch in (j.get("data") or {}).get("chains") or []:
         net = normalize(ch.get("chainName"))
@@ -70,6 +76,8 @@ def _parse_kucoin(j):
 
 
 def _parse_bybit(j):
+    if j.get("retCode"):
+        raise ValueError(j.get("retMsg") or j.get("retCode"))
     out = {}
     for row in (j.get("result") or {}).get("rows") or []:
         for ch in row.get("chains") or []:
@@ -80,8 +88,10 @@ def _parse_bybit(j):
 
 
 def _parse_mexc(j, asset):
+    if not isinstance(j, list):       # успешный ответ — список монет; словарь — ошибка API (code/msg)
+        raise ValueError((j or {}).get("msg") or "MEXC error")
     out = {}
-    for c in j if isinstance(j, list) else []:
+    for c in j:
         if c.get("coin") != asset:
             continue
         for ch in c.get("networkList") or []:
@@ -133,7 +143,8 @@ async def refresh(s, assets, exchanges, get_json):
                     _apply(venue, a, _parse_mexc(r, a))
             else:
                 _apply(venue, asset, parse(r))
-        except (KeyError, TypeError, AttributeError) as e:   # формат ответа изменился — оставляем прежние данные
+        except (KeyError, TypeError, AttributeError, ValueError) as e:
+            # формат ответа изменился, или HTTP 200 с ошибкой в теле (retCode/code != OK) — прежние данные не трогаем
             errors[venue] = f"parse: {e}"[:80]
     _meta["errors"] = errors
     _meta["t"] = time.time()
