@@ -358,13 +358,47 @@ def _mid(spot, asset):
     return None
 
 
-def usable(a, cfg):
+def _pays(a, cfg):
+    """Отфильтровать способы оплаты объявления по exclude_pay/include_pay (мутирует a.pays)."""
     pays = [p for p in a.pays if not any(x in p.lower() for x in cfg.exclude_pay)]
     if cfg.include_pay:
         pays = [p for p in pays if any(x in p.lower() for x in cfg.include_pay)]
     a.pays = pays
-    return bool(pays) and a.min_amt <= cfg.amount <= a.max_amt and a.avail * a.price >= cfg.amount \
+    return pays
+
+
+def usable(a, cfg):
+    return bool(_pays(a, cfg)) and a.min_amt <= cfg.amount <= a.max_amt and a.avail * a.price >= cfg.amount \
         and a.orders >= cfg.min_orders and a.rate >= cfg.min_rate
+
+
+def _signal_ok(a, cfg):
+    """Фильтр объявления для стакана глубины: мерчант/способ оплаты, без требования, что объём
+    покрывает всю сумму в одиночку — это делает _stack, складывая несколько объявлений."""
+    return bool(_pays(a, cfg)) and a.orders >= cfg.min_orders and a.rate >= cfg.min_rate
+
+
+def _stack(ads, amount):
+    """Сложить объявления по цене (ads отсортированы: лучшая цена первой), пока не наберётся amount
+    в фиате — не только верхнее объявление. Возвращает синтетическое Ad со средневзвешенной ценой,
+    None — если суммарной глубины меньше amount."""
+    remaining, qty, used = amount, 0.0, []
+    for a in ads:
+        if remaining <= 0:
+            break
+        take = min(remaining, a.max_amt, a.avail * a.price)
+        if take < a.min_amt:
+            continue   # меньше минимума этого объявления — пропускаем, берём из следующего
+        remaining -= take
+        qty += take / a.price
+        used.append(a)
+    if remaining > 0.01 or not used:
+        return None
+    one = len(used) == 1
+    return Ad(used[0].ex, used[0].side, amount / qty, amount, sum(a.max_amt for a in used), qty,
+              sorted(set(p for a in used for p in a.pays)), used[0].nick if one else f"{len(used)} объявл.",
+              min(a.orders for a in used), min(a.rate for a in used), used[0].url if one else "",
+              used[0].asset, used[0].net if one else "")
 
 
 def _same_venue(b, s):
@@ -520,8 +554,25 @@ async def scan(s, cfg, force_alt=False):
         if a.net and a.asset == "USDT" and better(networks.setdefault(a.net, {}).get(a.side)):
             networks[a.net][a.side] = a
 
-    buys = [a for (_, side, _), a in best.items() if side == "buy"]
-    sells = [a for (_, side, _), a in best.items() if side == "sell"]
+    # для связок — стакан глубины: складываем объявления по цене, пока не наберётся сумма круга;
+    # связку, которую суммарный объём не покрывает, не сигналим (сюда она просто не попадёт)
+    groups = {}
+    for a in ads:
+        if not _signal_ok(a, cfg):
+            continue
+        r = refs.get(a.asset)
+        if r and abs(a.price / r - 1) * 100 > cfg.max_dev:
+            continue
+        groups.setdefault((a.ex, a.side, a.asset), []).append(a)
+    depth = {}
+    for key, grp in groups.items():
+        grp.sort(key=lambda a: a.price, reverse=(key[1] == "sell"))
+        stacked = _stack(grp, cfg.amount)
+        if stacked:
+            depth[key] = stacked
+
+    buys = [a for (_, side, _), a in depth.items() if side == "buy"]
+    sells = [a for (_, side, _), a in depth.items() if side == "sell"]
     over_banks = trades.banks_over_limit({trades.sbp_bank(b.pays) for b in buys})
     deals = []
     for b in buys:
