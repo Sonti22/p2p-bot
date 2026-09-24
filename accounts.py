@@ -386,11 +386,12 @@ def _hist_item(kind, asset, amount, ts):
 
 def _merge_hist(*sources, limit=20):
     """Объединяет несколько списков истории в одну ленту по времени (новые сверху), обрезая до limit.
-    Источник может быть None (эндпоинт недоступен/ошибка) — он просто не участвует; None возвращается,
-    только если ни один источник не дал ни одной записи."""
+    Источник может быть None (эндпоинт недоступен/ошибка) — он просто не участвует. Записей нет ни в
+    одном: [] — ответили все источники (история действительно пуста), None — хотя бы один не ответил:
+    сбой не должен выглядеть как «история пуста» (см. Bot.check_accounts)."""
     items = [it for src in sources if src for it in src]
     if not items:
-        return None
+        return None if any(src is None for src in sources) else []
     items.sort(key=lambda it: it["ts"], reverse=True)
     return items[:limit]
 
@@ -405,8 +406,9 @@ async def mexc_history(s, api_key, api_secret, limit=20):
         try:
             j = await mexc_get(s, api_key, api_secret, path, {"limit": limit})
         except Exception:
-            continue
+            j = None
         if not isinstance(j, list):
+            sources.append(None)   # не ответил — пустоту истории им не подтвердить
             continue
         sources.append([it for it in (_hist_item(kind, it.get("coin"), it.get("amount"), it.get(ts_field))
                                        for it in j) if it])
@@ -421,8 +423,9 @@ async def htx_history(s, api_key, api_secret, limit=20):
         try:
             j = await htx_get(s, api_key, api_secret, "/v1/query/deposit-withdraw", {"type": kind, "size": limit})
         except Exception:
-            continue
+            j = {}
         if j.get("status") != "ok":
+            sources.append(None)
             continue
         sources.append([it for it in (_hist_item(kind, it.get("currency"), it.get("amount"), it.get("created-at"))
                                        for it in j.get("data") or []) if it])
@@ -436,8 +439,9 @@ async def kucoin_history(s, api_key, api_secret, passphrase_value, limit=20):
         try:
             j = await kucoin_get(s, api_key, api_secret, passphrase_value, path, {"pageSize": limit})
         except Exception:
-            continue
+            j = {}
         if j.get("code") != "200000":
+            sources.append(None)
             continue
         items = (j.get("data") or {}).get("items") or []
         sources.append([it for it in (_hist_item(kind, it.get("currency"), it.get("amount"), it.get("createdAt"))
@@ -461,27 +465,30 @@ def _trade_item(asset, side, amount, price, ts):
 
 async def mexc_spot_trades(s, api_key, api_secret, limit=20):
     """Фолбэк-история MEXC, третий источник (после депозитов/выводов): спот-сделки. У MEXC нет эндпоинта
-    истории без символа — перебираем монеты бота (SPOT_TRADE_SYMBOLS) против USDT и объединяем результат."""
-    out = []
+    истории без символа — перебираем монеты бота (SPOT_TRADE_SYMBOLS) против USDT и объединяем результат.
+    Сделок нет: [] — ответили все символы, None — хотя бы один не ответил."""
+    out, failed = [], False
     for sym in SPOT_TRADE_SYMBOLS:
         try:
             j = await mexc_get(s, api_key, api_secret, "/api/v3/myTrades", {"symbol": sym, "limit": limit})
         except Exception:
-            continue
+            j = None
         if not isinstance(j, list):
+            failed = True
             continue
         asset = sym[:-len("USDT")]
         out.extend(it for it in (_trade_item(asset, tr.get("isBuyer"), tr.get("qty"), tr.get("price"),
                                               tr.get("time")) for tr in j) if it)
     if not out:
-        return None
+        return None if failed else []
     out.sort(key=lambda it: it["ts"], reverse=True)
     return out[:limit]
 
 
 async def kucoin_spot_trades(s, api_key, api_secret, passphrase_value, limit=20):
     """Фолбэк-история KuCoin, третий источник: спот-сделки (`/api/v1/fills`). В отличие от MEXC, тут
-    обязателен не symbol, а tradeType — одним запросом получаем сделки по всем парам."""
+    обязателен не symbol, а tradeType — одним запросом получаем сделки по всем парам. [] — ответ без
+    сделок, None — ошибка."""
     try:
         j = await kucoin_get(s, api_key, api_secret, passphrase_value, "/api/v1/fills",
                               {"tradeType": "TRADE", "pageSize": limit})
@@ -492,15 +499,15 @@ async def kucoin_spot_trades(s, api_key, api_secret, passphrase_value, limit=20)
     items = (j.get("data") or {}).get("items") or []
     out = [it for it in (_trade_item(str(tr.get("symbol") or "").split("-")[0], tr.get("side") == "buy",
                                       tr.get("size"), tr.get("price"), tr.get("createdAt")) for tr in items) if it]
-    return out or None
+    return out
 
 
 async def account_history(s, exchange, limit=20):
     """История последних движений по счёту для автожурнала: (id, side, asset, ..., ts) для Bybit
     (P2P-эндпоинт, см. bybit_p2p_orders); для MEXC/KuCoin депозиты, выводы и спот-сделки объединяются
     в одну ленту по времени (а не берётся первый непустой источник — иначе старый депозит скрывает
-    более свежий вывод или спот-сделку); депозиты+выводы для остальных площадок. Нет ключа или ни один
-    источник не сработал — None."""
+    более свежий вывод или спот-сделку); депозиты+выводы для остальных площадок. [] — все источники
+    ответили, записей нет; None — нет ключа или записей нет, а какой-то источник не ответил."""
     ex = exchange.lower()
     pair = keys(ex)
     if not pair:

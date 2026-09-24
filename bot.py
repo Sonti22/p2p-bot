@@ -21,9 +21,10 @@ import netstatus
 import presets
 import trades
 from cards import deal_card, history_card, history_compare_card, portfolio_card, top_chart
-from p2p import ALL_EXCHANGES, AMOUNT_MAX, AMOUNT_MIN, DEFAULT_ASSETS, ENV_PATH, LOG_PATH, Config, _money, _price, \
-    _route_qty, bank_liquidity, deal_amounts, fmt_ad, fmt_breakeven, fmt_deal, fmt_top, load_env, maker_quote, \
-    parse_amount, profit_breakdown, reliability, scan, setup_logging, spot_url, traps_log, venue_url
+from p2p import ALL_EXCHANGES, AMOUNT_MAX, AMOUNT_MIN, DEFAULT_ASSETS, ENV_PATH, LOG_PATH, MIN_PROFIT_MAX, \
+    MIN_PROFIT_MIN, Config, _money, _price, _route_qty, bank_liquidity, deal_amounts, fmt_ad, fmt_breakeven, \
+    fmt_deal, fmt_top, load_env, maker_quote, parse_amount, parse_min_profit, profit_breakdown, reliability, scan, \
+    setup_logging, spot_url, traps_log, venue_url
 
 logger = logging.getLogger(__name__)
 
@@ -545,7 +546,7 @@ def portfolio_rows(port, snap):
     for ex, bal in port.items():
         coins = []
         for coin, amt in sorted(bal.items()):
-            ref = snap.refs.get(coin) if snap else (1.0 if coin in ("USDT", "USDC") else None)
+            ref = snap.refs.get(coin) if snap else None   # до первого снимка курса нет — ₽ не считаем
             rub = amt * ref if ref else None
             if rub:
                 total += rub
@@ -555,7 +556,8 @@ def portfolio_rows(port, snap):
 
 
 def portfolio_view(port, snap):
-    """Текст «💰 Баланс»: монеты по подключённым биржам и итог в ₽ по ориентиру текущего снимка."""
+    """Текст «💰 Баланс»: монеты по подключённым биржам и итог в ₽ по ориентиру текущего снимка.
+    Снимка ещё нет (первый скан не прошёл) — только количества и пометка, что курс ещё не получен."""
     if not port:
         connectable = ", ".join(EXCHANGE_NAMES.get(ex, ex) for ex in accounts.BALANCE_FETCHERS)
         return (f"💰 <b>Баланс</b>\n\nНи одна биржа не подключена ({connectable}) или баланс пуст. "
@@ -565,9 +567,13 @@ def portfolio_view(port, snap):
     for name, coins in rows:
         lines.append(f"<b>{name}</b>")
         for coin, amt, rub in coins:
-            lines.append(f"  {amt:g} {coin}" + (f" ≈ {_money(rub)} ₽" if rub else " (нет ориентира в ₽)"))
+            no_rub = " (нет ориентира в ₽)" if snap else ""
+            lines.append(f"  {amt:g} {coin}" + (f" ≈ {_money(rub)} ₽" if rub else no_rub))
         lines.append("")
-    lines.append(f"<b>Итого:</b> ≈ {_money(total)} ₽")
+    if snap:
+        lines.append(f"<b>Итого:</b> ≈ {_money(total)} ₽")
+    else:
+        lines.append("<b>Итого:</b> курс ещё не получен — оценка в ₽ появится после первого скана.")
     return "\n".join(lines)
 
 
@@ -741,10 +747,11 @@ class Bot:
         self.live = {}                                            # (ex,asset,ex,asset) -> {"first": ts, "streak": n}
         self.live_scans = int(os.getenv("LIVE_SCANS", 2))        # сигнал, только если связка держится ≥ N сканов
         self.venue = {}   # ex -> {"streak": сканов подряд с ошибкой, "down_since": ts, "alerted_at": ts}
-        self.deals_by_id = {}   # id -> (d, cfg, snap на момент сигнала) для кнопок «✅ Сделал»/«📋 Шаги»; не переживает рестарт
-        self.next_deal_id = 1
+        self.deals_by_id = {}   # id -> (d, снимок cfg, snap на момент сигнала) для кнопок «✅ Сделал»/«📋 Шаги»; не переживает рестарт
         self.acc_seen = {}   # ex -> set известных ключей истории; None пока не было первого опроса
         self.start_ts = time.time()     # для аптайма в /status
+        # id сигналов от времени старта в мс: после рестарта старая кнопка did:N не попадёт на новую связку
+        self.next_deal_id = int(self.start_ts * 1000)
         self.last_scan_ts = 0.0         # unix-время окончания последнего скана
         self.last_scan_duration = 0.0   # сколько секунд занял последний скан
         self.market_msg_id = None       # id закреплённого сообщения «Статус рынка»
@@ -860,7 +867,7 @@ class Bot:
 
     def remember_deal(self, d, cfg=None, snap=None):
         """Запомнить связку под кнопками «✅ Сделал»/«📋 Шаги»; хранится ограниченное число последних."""
-        cfg = cfg or self.cfg
+        cfg = dataclasses.replace(cfg or self.cfg)   # снимок настроек: старая карточка не увидит новую сумму/порог
         snap = snap if snap is not None else self.last
         deal_id, self.next_deal_id = self.next_deal_id, self.next_deal_id + 1
         self.deals_by_id[deal_id] = (d, cfg, snap)
@@ -869,6 +876,7 @@ class Bot:
         return deal_id
 
     async def send_deal(self, d, prefix="", cfg=None, snap=None, topic=None, chat_id=None):
+        """Карточка связки (картинка или текст); возвращает ответ Telegram — ok ли доставка."""
         cfg = cfg or self.cfg
         snap = snap if snap is not None else self.last
         guest = self.is_guest(self.chat_for(chat_id))
@@ -884,6 +892,7 @@ class Bot:
             key = self._deal_key(d)
             self.live_msg[key] = {"message_id": message_id, "photo": is_photo,
                                   "last_edit": time.time(), "caption": caption, "stale": False}
+        return r
 
     async def show_steps(self, cq, deal_id):
         """Кнопка «📋 Шаги»: отдельным сообщением пошаговый чек-лист маршрута."""
@@ -1022,11 +1031,20 @@ class Bot:
                         f"Список — /alerts.")
 
     async def check_alerts(self, snap, cfg=None):
-        """Сработавшие алерты по текущему снимку → сообщение в тот чат, где алерт создан."""
+        """Сработавшие алерты по текущему снимку → сообщение в тот чат, где алерт создан. Сработавшим
+        (одноразовый — удалён) алерт помечается только после доставки; сбой — повторим в следующем скане."""
         for alert_id, chat_id, asset, side, rate, price, ad in alerts.due(snap, cfg or self.cfg):
             label, cmp = ("продать", "≥") if side == "sell" else ("купить", "≤")
-            await self.send(f"🔔 <b>Алерт сработал:</b> {asset} можно {label} по {_price(price)} ₽ "
-                            f"({cmp}{rate:g}) — {fmt_ad(ad)}", chat_id=chat_id, topic="signals")
+            try:
+                r = await self.send(f"🔔 <b>Алерт сработал:</b> {asset} можно {label} по {_price(price)} ₽ "
+                                    f"({cmp}{rate:g}) — {fmt_ad(ad)}", chat_id=chat_id, topic="signals")
+            except Exception as e:   # сеть/таймаут: остальные алерты этого скана тоже не дойдут
+                logger.warning("alert send error: %s", e)
+                break
+            if r.get("ok"):
+                alerts.mark_fired(alert_id)
+            else:
+                logger.warning("alert not sent: %s", r.get("description"))
 
     def stats_view(self):
         st = trades.stats()
@@ -1135,7 +1153,7 @@ class Bot:
         Картинка-карточка портфеля; не вышло отрисовать — тот же текст, как у остальных карточек."""
         port = await accounts.portfolio(self.s)
         caption = portfolio_view(port, self.last)
-        if not port:
+        if not port or not self.last:   # до первого скана карточку с «≈ 0 ₽» не рисуем — только текст
             await self.send(caption, markup=BALANCE_MARKUP)
             return
         rows, total = portfolio_rows(port, self.last)
@@ -1251,14 +1269,21 @@ class Bot:
         await self.send(t, markup=kb)
 
     def apply(self, data):
+        # порог и сумма — теми же парсерами, что и команды: 0/nan/inf/минус не попадут ни в cfg, ни в .env
         if data.startswith("min:"):
-            self.cfg.min_profit = float(data[4:])
-            save_env("MIN_PROFIT", f"{self.cfg.min_profit:g}")
-            return f"Порог {self.cfg.min_profit:g}%"
+            v = parse_min_profit(data[4:])
+            if v is None:
+                return "Некорректное значение"
+            self.cfg.min_profit = v
+            save_env("MIN_PROFIT", f"{v:g}")
+            return f"Порог {v:g}%"
         if data.startswith("amt:"):
-            self.cfg.amount = float(data[4:])
-            save_env("AMOUNT", f"{self.cfg.amount:.0f}")
-            return f"Сумма {_money(self.cfg.amount)} ₽ — применится со следующего скана"
+            v = parse_amount(data[4:])
+            if v is None:
+                return "Некорректное значение"
+            self.cfg.amount = v
+            save_env("AMOUNT", f"{v:.0f}")
+            return f"Сумма {_money(v)} ₽ — применится со следующего скана"
         if data in ("pause", "resume"):
             self.paused = data == "pause"
             if data == "resume":
@@ -1356,9 +1381,7 @@ class Bot:
 
     def collect_night_deals(self, snap):
         """Запомнить связки выше порога за тихие часы — по одной, лучшей по прибыли, на пару площадок."""
-        for d in snap.deals[:self.max_signals]:
-            if d[0] < self.cfg.min_profit:
-                break
+        for d in self._signal_deals(snap):
             _, b, s, _ = d
             key = (b.ex, b.asset, s.ex, s.asset)
             if key not in self.night_deals or d[0] > self.night_deals[key][0]:
@@ -1434,6 +1457,12 @@ class Bot:
         _, b, s, _ = d
         return (b.ex, b.asset, s.ex, s.asset)
 
+    def _signal_deals(self, snap):
+        """Связки выше порога в порядке сканера (прибыль × надёжность), не больше MAX_SIGNALS.
+        Сначала порог, потом топ-N: надёжная связка ниже порога, стоящая выше в списке, не должна
+        закрывать связки выше порога за ней."""
+        return [d for d in snap.deals if d[0] >= self.cfg.min_profit][:self.max_signals]
+
     def track_liveness(self, snap, now=None):
         """Сколько сканов подряд связка держится выше порога: минутный выброс не сигналим, устойчивую — да."""
         now = now or time.time()
@@ -1458,22 +1487,30 @@ class Bot:
 
     async def notify(self, snap):
         now = time.time()
-        active = set()
-        for d in snap.deals[:self.max_signals]:   # только топ-N: новые сигналы, когда меняется верх списка
-            profit, b, s, _ = d
-            if profit < self.cfg.min_profit:
-                break
-            key = (b.ex, b.asset, s.ex, s.asset)
-            active.add(key)
+        deals = self._signal_deals(snap)   # сначала порог, потом топ-N по надёжности
+        active = {self._deal_key(d) for d in deals}   # заранее: обрыв отправки не делает связки «устаревшими»
+        for d in deals:
+            profit = d[0]
+            key = self._deal_key(d)
             if self.live_scans > 1 and self.live.get(key, {}).get("streak", 0) < self.live_scans:
                 continue                                          # появилась только что — ждём подтверждения
             prev = self.sent.get(key)
             if prev and now - prev[0] < self.cooldown and profit < prev[1] + self.repeat_step:
                 await self.update_live_card(key, d, snap, now)    # без нового сообщения — обновляем на месте
                 continue
+            # антидубль расходуем только после доставки: сбой Telegram — повторим в следующем скане
+            try:
+                r = await self.send_deal(d, "🔔 " + self.held_label(d, now), snap=snap, topic="signals")
+            except Exception as e:   # сеть/таймаут: остальные связки этого скана тоже не дойдут
+                logger.warning("signal send error: %s", e)
+                break
+            if not r.get("ok"):
+                logger.warning("signal not sent: %s", r.get("description"))
+                continue
             self.sent[key] = (now, profit)
-            await self.send_deal(d, "🔔 " + self.held_label(d, now), snap=snap, topic="signals")
-            for g in sorted(self.guests):   # гостям — та же карточка, без кнопок журнала и без «живого» обновления
+            # гостям — та же карточка, без кнопок журнала и без «живого» обновления; только после доставки
+            # владельцу, иначе повтор на следующем скане продублировал бы её гостям
+            for g in sorted(self.guests):
                 try:
                     await self.send_deal(d, "🔔 " + self.held_label(d, now), snap=snap, chat_id=g)
                 except Exception as e:
@@ -1520,7 +1557,8 @@ class Bot:
         """Уведомление о новых движениях по подключённым биржам: депозит, вывод, спот-сделка, P2P-ордер.
 
         Первый опрос после старта только запоминает текущую историю (без сообщений, чтобы не спамить
-        старыми записями) — дальше в Telegram уходят только записи, которых не было в прошлый раз."""
+        старыми записями) — дальше в Telegram уходят только записи, которых не было в прошлый раз.
+        Пустая история при успешном ответе ([]) — тоже первый опрос: первая же операция после неё придёт."""
         for ex in accounts.ONBOARDABLE:
             if accounts.keys(ex) is None:
                 continue
@@ -1529,7 +1567,7 @@ class Bot:
             except Exception as e:
                 logger.warning("account history error: %s %s", ex, accounts.api_error_text(e))   # без URL с ключом
                 continue
-            if not hist:
+            if hist is None:   # ошибка / не ответил источник — базу не трогаем; [] — успешно пусто, это тоже база
                 continue
             seen = self.acc_seen.get(ex)
             if seen is not None:
@@ -1929,13 +1967,20 @@ class Bot:
             await self.send(self.status_view())
         elif cmd == "/logs":
             await self.send(logs_view(LOG_PATH))
-        elif cmd in ("/min", "/amount") and arg:
-            try:
-                v = float(arg.replace(",", ".").replace(" ", ""))
-            except ValueError:
-                await self.send("Нужно число.")
+        elif cmd == "/amount" and arg:
+            amount = parse_amount(arg)
+            if amount is None:
+                await self.send(f"Не понял сумму. Пример: /amount 20000, /amount 1,5 млн "
+                                f"(от {_money(AMOUNT_MIN)} до {_money(AMOUNT_MAX)} ₽).")
                 return
-            await self.send(self.apply(f"{'min' if cmd == '/min' else 'amt'}:{v}"))
+            await self.send(self.apply(f"amt:{amount}"))
+        elif cmd == "/min" and arg:
+            v = parse_min_profit(arg)
+            if v is None:
+                await self.send(f"Не понял порог. Пример: /min 2, /min 1,5 "
+                                f"(от {MIN_PROFIT_MIN:g} до {MIN_PROFIT_MAX:g}% чистыми).")
+                return
+            await self.send(self.apply(f"min:{v}"))
         elif cmd == "/pause":
             await self.cmd_pause(arg)
         elif cmd == "/resume":

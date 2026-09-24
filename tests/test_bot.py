@@ -72,6 +72,38 @@ def test_below_threshold_not_sent(monkeypatch):
     assert not bot.out
 
 
+def test_notify_threshold_before_top_n(monkeypatch):
+    """Сканер ставит надёжную 1.5% выше рискованной 3%: связка выше порога за ней всё равно уходит."""
+    monkeypatch.setattr(B, "deal_card", lambda d, c, a=None, r=None, breakdown=None: b"png")
+    bot = Stub(p2p.Config(min_profit=2.0))
+    bot.live_scans = 1
+    bot.max_signals = 3
+    asyncio.run(bot.notify(snap([deal(1.5, "MEXC"), deal(3, "KuCoin")])))
+    caps = [p["caption"] for m, p in photos(bot)]
+    assert len(caps) == 1 and "KuCoin" in caps[0] and "+3.00%" in caps[0]
+
+
+def test_notify_slices_after_threshold(monkeypatch):
+    """Топ-N режется уже после порога: три надёжные связки ниже порога не съедают MAX_SIGNALS."""
+    monkeypatch.setattr(B, "deal_card", lambda d, c, a=None, r=None, breakdown=None: b"png")
+    bot = Stub(p2p.Config(min_profit=2.0))
+    bot.live_scans = 1
+    bot.max_signals = 3
+    asyncio.run(bot.notify(snap([deal(1.5, "MEXC"), deal(1.5, "HTX"), deal(1.5, "Bitpapa"), deal(3, "KuCoin")])))
+    caps = [p["caption"] for m, p in photos(bot)]
+    assert len(caps) == 1 and "KuCoin" in caps[0]
+
+
+def test_notify_top_n_counts_only_above_threshold(monkeypatch):
+    monkeypatch.setattr(B, "deal_card", lambda d, c, a=None, r=None, breakdown=None: b"png")
+    bot = Stub(p2p.Config(min_profit=2.0))
+    bot.live_scans = 1
+    bot.max_signals = 2
+    asyncio.run(bot.notify(snap([deal(1.5, "MEXC"), deal(5, "KuCoin"), deal(4, "HTX"), deal(3, "Bitpapa")])))
+    caps = [p["caption"] for m, p in photos(bot)]
+    assert len(caps) == 2 and "KuCoin" in caps[0] and "HTX" in caps[1]
+
+
 def test_settings_apply_persists(tmp_path, monkeypatch):
     env = tmp_path / ".env"
     env.write_text("MIN_PROFIT=2\n", encoding="utf-8")
@@ -82,6 +114,57 @@ def test_settings_apply_persists(tmp_path, monkeypatch):
     text = env.read_text(encoding="utf-8")
     assert "MIN_PROFIT=3" in text and "AMOUNT=100000" in text
     assert bot.cfg.min_profit == 3 and bot.cfg.amount == 100000
+
+
+def _env_bot(tmp_path, monkeypatch, **cfg):
+    env = tmp_path / ".env"
+    env.write_text("TG_CHAT_ID=1\n", encoding="utf-8")
+    monkeypatch.setattr(B, "save_env", functools.partial(B.save_env, path=str(env)))
+    return Stub(p2p.Config(**cfg)), env
+
+
+def test_amount_command_rejects_bad_values(tmp_path, monkeypatch):
+    bot, env = _env_bot(tmp_path, monkeypatch, amount=50000)
+    for arg in ("0", "-5", "nan", "inf", "1e999", "99999999"):
+        asyncio.run(bot.handle(f"/amount {arg}"))
+        assert "от 1 000 до 5 000 000" in texts(bot)[-1], arg
+        assert bot.cfg.amount == 50000, arg
+    assert "AMOUNT" not in env.read_text(encoding="utf-8")
+
+
+def test_amount_command_accepts_units(tmp_path, monkeypatch):
+    bot, env = _env_bot(tmp_path, monkeypatch, amount=50000)
+    asyncio.run(bot.handle("/amount 20к"))
+    assert bot.cfg.amount == 20000
+    assert "AMOUNT=20000" in env.read_text(encoding="utf-8")
+    assert "20 000" in texts(bot)[-1]
+
+
+def test_min_command_rejects_bad_values(tmp_path, monkeypatch):
+    bot, env = _env_bot(tmp_path, monkeypatch, min_profit=2.0)
+    for arg in ("nan", "-100", "inf", "1e308", "0"):
+        asyncio.run(bot.handle(f"/min {arg}"))
+        assert "Не понял порог" in texts(bot)[-1], arg
+        assert bot.cfg.min_profit == 2.0, arg
+    assert "MIN_PROFIT" not in env.read_text(encoding="utf-8")
+
+
+def test_min_command_accepts_comma(tmp_path, monkeypatch):
+    bot, env = _env_bot(tmp_path, monkeypatch, min_profit=2.0)
+    asyncio.run(bot.handle("/min 1,5"))
+    assert bot.cfg.min_profit == 1.5
+    assert "MIN_PROFIT=1.5" in env.read_text(encoding="utf-8")
+    assert "Порог 1.5%" in texts(bot)[-1]
+
+
+def test_apply_callback_rejects_forged_values(tmp_path, monkeypatch):
+    """callback_data «amt:»/«min:» можно подделать клиентом — apply проверяет значение тем же парсером."""
+    bot, env = _env_bot(tmp_path, monkeypatch, amount=50000, min_profit=2.0)
+    for data in ("amt:nan", "amt:0", "min:inf", "min:-1"):
+        asyncio.run(bot.on_callback({"id": "1", "data": data, "message": {"message_id": 3}}))
+        assert ("answerCallbackQuery", {"callback_query_id": "1", "text": "Некорректное значение"}) in bot.out, data
+    assert bot.cfg.amount == 50000 and bot.cfg.min_profit == 2.0
+    assert env.read_text(encoding="utf-8") == "TG_CHAT_ID=1\n"
 
 
 def test_send_deal_passes_amount_breakdown_from_snap(monkeypatch):
@@ -246,6 +329,89 @@ def test_mark_done_logs_trade_and_clears_button(tmp_path, monkeypatch):
     assert not any(b.get("callback_data", "").startswith("did:") for b in buttons)
 
 
+def test_mark_done_uses_amount_at_signal_time(tmp_path, monkeypatch):
+    """Сумму сменили после сигнала — «✅ Сделал» старой карточки пишет сумму, под которую считали %."""
+    db = str(tmp_path / "trades.db")
+    monkeypatch.setattr(B.trades, "log_trade", functools.partial(B.trades.log_trade, path=db))
+    bot = Stub(p2p.Config(amount=50000))
+    deal_id = bot.remember_deal(deal(5.0))
+    bot.cfg.amount = 200000
+    asyncio.run(bot.mark_done({"id": "1", "message": {"message_id": 9}}, deal_id))
+    assert trades.stats(path=db)["day"]["amount"] == 50000
+
+
+def test_show_steps_uses_cfg_at_signal_time():
+    bot = Stub(p2p.Config(amount=50000))
+    d = deal(5.0)
+    deal_id = bot.remember_deal(d, snap=snap([d]))
+    bot.cfg.amount = 200000
+    asyncio.run(bot.show_steps({"id": "1"}, deal_id))
+    head = texts(bot)[-1].splitlines()[0]
+    assert "50 000" in head and "200 000" not in head
+
+
+def test_amount_change_via_settings_keeps_old_card_amount(tmp_path, monkeypatch):
+    """Сценарий целиком: сигнал на 50 000 → «amt:200000» в настройках → «✅ Сделал» старой карточки."""
+    monkeypatch.setattr(B, "deal_card", lambda d, c, a=None, r=None, breakdown=None: b"png")
+    monkeypatch.setattr(B, "save_env", lambda *a, **k: None)
+    db = str(tmp_path / "trades.db")
+    monkeypatch.setattr(B.trades, "log_trade", functools.partial(B.trades.log_trade, path=db))
+    bot = Stub(p2p.Config(amount=50000, min_profit=2.0))
+    bot.live_scans = 1
+    asyncio.run(bot.notify(snap([deal(5.0)])))
+    deal_id = next(iter(bot.deals_by_id))
+    assert bot.deals_by_id[deal_id][1] is not bot.cfg
+    bot.apply("amt:200000")
+    asyncio.run(bot.on_callback({"id": "1", "data": f"did:{deal_id}", "message": {"message_id": 9}}))
+    assert trades.stats(path=db)["day"]["amount"] == 50000
+
+
+def _callbacks(markup):
+    return {b["callback_data"].split(":", 1)[0]: b["callback_data"]
+            for row in markup["inline_keyboard"] for b in row if ":" in b.get("callback_data", "")}
+
+
+def _restarted_bots(monkeypatch):
+    """Бот до рестарта отправил связку в MEXC, бот после рестарта — в KuCoin; кнопки первой карточки."""
+    monkeypatch.setattr(B, "deal_card", lambda d, c, a=None, r=None, breakdown=None: b"png")
+    monkeypatch.setattr(B.time, "time", lambda: 1_790_000_000.0)
+    old = Stub(p2p.Config())
+    asyncio.run(old.send_deal(deal(5.0, "MEXC")))
+    monkeypatch.setattr(B.time, "time", lambda: 1_790_000_600.0)   # рестарт через 10 минут
+    new = Stub(p2p.Config())
+    asyncio.run(new.send_deal(deal(5.0, "KuCoin")))
+    new.out.clear()
+    return new, _callbacks(photos(old)[0][1]["markup"])
+
+
+def test_deal_ids_unique_across_restarts(monkeypatch):
+    new, old_buttons = _restarted_bots(monkeypatch)
+    assert int(old_buttons["did"][4:]) not in new.deals_by_id
+
+
+def test_old_did_button_after_restart_is_stale(tmp_path, monkeypatch):
+    db = str(tmp_path / "trades.db")
+    monkeypatch.setattr(B.trades, "log_trade", functools.partial(B.trades.log_trade, path=db))
+    new, old_buttons = _restarted_bots(monkeypatch)
+    for data in (old_buttons["did"], "did:1"):   # кнопка прошлого запуска и кнопка до этой правки
+        asyncio.run(new.on_callback({"id": "1", "data": data, "message": {"message_id": 9}}))
+        assert new.out[-1] == ("answerCallbackQuery", {"callback_query_id": "1", "text": "Сигнал устарел, не записан"})
+    assert trades.stats(path=db)["day"]["count"] == 0
+    assert not [m for m, p in new.out if m == "editMessageReplyMarkup"]
+
+
+def test_old_bl_and_steps_buttons_after_restart_are_stale(tmp_path, monkeypatch):
+    db = str(tmp_path / "blacklist.db")
+    monkeypatch.setattr(B.blacklist, "add", functools.partial(B.blacklist.add, path=db))
+    new, old_buttons = _restarted_bots(monkeypatch)
+    asyncio.run(new.on_callback({"id": "1", "data": old_buttons["bl"], "message": {"message_id": 9}}))
+    assert "устарел" in new.out[-1][1]["text"]
+    assert blacklist.blocked(path=db) == set()
+    asyncio.run(new.on_callback({"id": "1", "data": old_buttons["steps"], "message": {"message_id": 9}}))
+    assert "устарел" in new.out[-1][1]["text"]
+    assert not any("Шаги связки" in t for t in texts(new))
+
+
 def test_deal_markup_has_hide_button():
     kb = B.deal_markup(deal(), deal_id=7)["inline_keyboard"]
     buttons = [b for row in kb for b in row]
@@ -404,9 +570,95 @@ def test_delalert_callback_removes_entry(tmp_path, monkeypatch):
 def test_check_alerts_sends_message(monkeypatch):
     ad = make_ad("MEXC", "sell", 93.0)
     monkeypatch.setattr(B.alerts, "due", lambda snap, cfg: [(1, "1", "USDT", "sell", 92.0, 93.0, ad)])
+    marked = []
+    monkeypatch.setattr(B.alerts, "mark_fired", marked.append)
     bot = Stub(p2p.Config())
     asyncio.run(bot.check_alerts(snap([])))
     assert "Алерт сработал" in texts(bot)[-1]
+    assert marked == [1]   # доставлено — помечаем сработавшим
+
+
+class Flaky(Stub):
+    """Telegram не принимает сообщения, пока fail задан: «raise» — сбой сети, иначе ответ ok=False (429)."""
+    def __init__(self, cfg, fail="raise"):
+        super().__init__(cfg)
+        self.fail = fail
+        self.fancy = False   # без разового повтора с обычными кнопками (_fancy_failed)
+
+    def _failure(self):
+        if self.fail == "raise":
+            raise aiohttp.ClientConnectionError("telegram down")
+        return {"ok": False, "error_code": 429, "description": "Too Many Requests"}
+
+    async def call(self, method, **p):
+        if self.fail and method == "sendMessage":
+            return self._failure()
+        return await super().call(method, **p)
+
+    async def send_photo(self, png, caption, markup=None):
+        if self.fail:
+            return self._failure()
+        return await super().send_photo(png, caption, markup)
+
+
+def test_notify_not_marked_sent_when_telegram_raises(monkeypatch):
+    monkeypatch.setattr(B, "deal_card", lambda d, c, a=None, r=None, breakdown=None: b"png")
+    bot = Flaky(p2p.Config(min_profit=2.0))
+    bot.live_scans = 1
+    ds = [deal(5, "MEXC"), deal(4, "KuCoin")]
+    asyncio.run(bot.notify(snap(ds)))
+    assert bot.sent == {} and not photos(bot)
+    bot.fail = None                      # сеть вернулась — обе связки уходят в следующем скане
+    asyncio.run(bot.notify(snap(ds)))
+    assert len(photos(bot)) == 2 and len(bot.sent) == 2
+
+
+def test_notify_not_marked_sent_when_not_ok(monkeypatch):
+    monkeypatch.setattr(B, "deal_card", lambda d, c, a=None, r=None, breakdown=None: b"png")
+    bot = Flaky(p2p.Config(min_profit=2.0), fail="not_ok")
+    bot.live_scans = 1
+    asyncio.run(bot.notify(snap([deal(5)])))
+    assert bot.sent == {}
+    bot.fail = None
+    asyncio.run(bot.notify(snap([deal(5)])))
+    assert len(photos(bot)) == 1 and len(bot.sent) == 1
+
+
+def _alerts_db(tmp_path, monkeypatch):
+    db = str(tmp_path / "alerts.db")
+    for name in ("add", "due", "mark_fired", "list_all"):
+        monkeypatch.setattr(B.alerts, name, functools.partial(getattr(B.alerts, name), path=db))
+    return {("MEXC", "sell", "USDT"): make_ad("MEXC", "sell", 93.0)}
+
+
+def test_check_alerts_keeps_alert_when_send_fails(tmp_path, monkeypatch):
+    best = _alerts_db(tmp_path, monkeypatch)
+    B.alerts.add("1", "USDT", "sell", 92.0, time.time() + 86400)
+    s = p2p.Snapshot(88.0, "test", {}, best, [], {}, {}, {})
+    bot = Flaky(p2p.Config())
+    asyncio.run(bot.check_alerts(s))
+    assert len(B.alerts.list_all("1")) == 1          # одноразовый не удалён: сообщение не дошло
+    bot.fail = None
+    asyncio.run(bot.check_alerts(s))
+    assert "Алерт сработал" in texts(bot)[-1]
+    assert B.alerts.list_all("1") == []
+
+
+def test_check_alerts_marks_only_delivered(tmp_path, monkeypatch):
+    best = _alerts_db(tmp_path, monkeypatch)
+    B.alerts.add("2", "USDT", "sell", 92.0, time.time() + 86400)   # чат, куда Telegram не доставил
+    B.alerts.add("1", "USDT", "sell", 91.0, time.time() + 86400)
+    s = p2p.Snapshot(88.0, "test", {}, best, [], {}, {}, {})
+    bot = Stub(p2p.Config())
+
+    async def call(method, **p):
+        bot.out.append((method, p))
+        return {"ok": p.get("chat_id") != "2", "description": "Bad Request: chat not found"}
+
+    bot.call = call
+    asyncio.run(bot.check_alerts(s))
+    assert len(texts(bot)) == 2
+    assert len(B.alerts.list_all("2")) == 1 and B.alerts.list_all("1") == []
 
 
 def test_mark_done_unknown_id_not_logged(monkeypatch):
@@ -947,6 +1199,37 @@ def test_portfolio_rows_matches_totals_from_view():
     assert rows[0][1] == [("BTC", 0.01, 50_000.0), ("USDT", 10.0, 880.0)]
 
 
+def test_portfolio_rows_without_snapshot_has_no_rub_values():
+    port = {"bybit": {"USDT": 100.0, "USDC": 50.0}}
+    rows, total = B.portfolio_rows(port, None)
+    assert rows == [("Bybit", [("USDC", 50.0, None), ("USDT", 100.0, None)])]
+    assert total == 0.0
+
+
+def test_portfolio_view_without_snapshot_says_rate_not_received():
+    text = B.portfolio_view({"bybit": {"USDT": 100.0, "USDC": 50.0}}, None)
+    assert "100 USDT" in text and "курс ещё не получен" in text
+    assert "≈ 100 ₽" not in text and "Итого:</b> ≈" not in text and "нет ориентира" not in text
+
+
+def test_balance_before_first_scan_sends_text_without_card(monkeypatch):
+    async def fake_portfolio(s):
+        return {"bybit": {"USDT": 100.0}}
+
+    def boom(rows, total):
+        raise AssertionError("карточка до первого скана не нужна")
+
+    monkeypatch.setattr(B.accounts, "portfolio", fake_portfolio)
+    monkeypatch.setattr(B, "portfolio_card", boom)
+    bot = Stub(p2p.Config())
+    assert bot.last is None
+    asyncio.run(bot.handle("/balance"))
+    assert not photos(bot)
+    (method, params), = bot.out
+    assert method == "sendMessage" and "курс ещё не получен" in params["text"] and "≈ 100 ₽" not in params["text"]
+    assert params["reply_markup"]["inline_keyboard"][0][0]["callback_data"] == "balance"
+
+
 def test_balance_command_sends_card_with_refresh_button(monkeypatch):
     async def fake_portfolio(s):
         return {"mexc": {"USDT": 1.0}}
@@ -1026,6 +1309,40 @@ def test_check_accounts_first_poll_is_silent_then_new_items_notify(tmp_path, mon
 
     asyncio.run(bot.check_accounts())
     assert len(texts(bot)) == 1       # повтор той же истории не шлём
+
+
+def _history_bot(tmp_path, monkeypatch, answers):
+    """Бот с ключом MEXC; account_history отдаёт по очереди ответы из answers."""
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    accounts.save_key("mexc", "k", "s")
+    answers = list(answers)
+
+    async def fake_history(s, ex, limit=20):
+        return answers.pop(0) if ex == "mexc" else None
+
+    monkeypatch.setattr(B.accounts, "account_history", fake_history)
+    return Stub(p2p.Config())
+
+
+def test_check_accounts_empty_history_then_first_deposit_notifies(tmp_path, monkeypatch):
+    dep = {"kind": "deposit", "asset": "USDT", "amount": 100.0, "ts": 1.0}
+    bot = _history_bot(tmp_path, monkeypatch, [[], [dep], [dep]])
+    asyncio.run(bot.check_accounts())
+    assert bot.acc_seen["mexc"] == set() and texts(bot) == []   # пустой успешный ответ — это первый опрос
+    asyncio.run(bot.check_accounts())
+    msgs = texts(bot)
+    assert len(msgs) == 1 and "пришёл депозит" in msgs[0]
+    asyncio.run(bot.check_accounts())
+    assert len(texts(bot)) == 1
+
+
+def test_check_accounts_none_history_does_not_seed_baseline(tmp_path, monkeypatch):
+    dep = {"kind": "deposit", "asset": "USDT", "amount": 100.0, "ts": 1.0}
+    bot = _history_bot(tmp_path, monkeypatch, [None, [dep]])
+    asyncio.run(bot.check_accounts())
+    assert bot.acc_seen.get("mexc") is None                   # ошибка — не первый опрос
+    asyncio.run(bot.check_accounts())
+    assert texts(bot) == [] and bot.acc_seen["mexc"] == {B.hist_key(dep)}
 
 
 def test_deal_markup_has_steps_button():
@@ -1127,6 +1444,16 @@ def test_quiet_hours_blocks_signal_and_stores_for_digest(monkeypatch):
     asyncio.run(bot.quiet_and_pause_tick(snap([d])))
     assert not bot.out                              # сигнал не отправлен
     assert list(bot.night_deals.values()) == [d]     # но накоплен для утреннего дайджеста
+
+
+def test_night_digest_collects_after_low_deal(monkeypatch):
+    """Ночной дайджест тоже не обрывается на связке ниже порога, стоящей выше в списке сканера."""
+    monkeypatch.setattr(B.time, "time", lambda: msk_ts(2, 0))
+    bot = Stub(p2p.Config(min_profit=2.0))
+    bot.quiet_on = True
+    asyncio.run(bot.quiet_and_pause_tick(snap([deal(1.5, "MEXC"), deal(3, "KuCoin")])))
+    assert not bot.out
+    assert [d[0] for d in bot.night_deals.values()] == [3]
 
 
 def test_quiet_hours_off_sends_signal_as_usual(monkeypatch):

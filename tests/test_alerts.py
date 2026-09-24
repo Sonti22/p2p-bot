@@ -55,7 +55,9 @@ def test_due_fires_on_sell_threshold(tmp_path):
     assert len(fired) == 1
     alert_id, chat_id, asset, side, rate, price, ad = fired[0]
     assert (chat_id, asset, side, rate, price, ad.ex) == ("1", "USDT", "sell", 92.0, 93.0, "MEXC")
-    assert alerts.list_all("1", path=db) == []   # одноразовый — сработал и удалился
+    assert len(alerts.list_all("1", path=db)) == 1   # до доставки сообщения алерт не трогаем
+    alerts.mark_fired(alert_id, path=db)
+    assert alerts.list_all("1", path=db) == []   # одноразовый — доставлен и удалился
 
 
 def test_due_not_fired_below_threshold(tmp_path):
@@ -98,6 +100,7 @@ def test_due_repeat_survives_firing_and_shows_in_list(tmp_path):
     best = {("Bybit", "sell", "USDT"): make_ad("Bybit", "sell", 93.0)}
     fired = alerts.due(snap(best), cfg(), path=db)
     assert len(fired) == 1
+    alerts.mark_fired(fired[0][0], path=db)
     rows = alerts.list_all("1", path=db)
     assert [(a, s, r, c) for _, a, s, r, _, c, _, _ in rows] == [("USDT", "sell", 92.0, 3600)]   # не удалился
 
@@ -105,11 +108,32 @@ def test_due_repeat_survives_firing_and_shows_in_list(tmp_path):
 def test_due_repeat_waits_out_cooldown(tmp_path):
     db = str(tmp_path / "alerts.db")
     now = time.time()
-    alerts.add("1", "USDT", "sell", 92.0, now + 86400, path=db, repeat_cooldown=3600)
+    alert_id = alerts.add("1", "USDT", "sell", 92.0, now + 86400, path=db, repeat_cooldown=3600)
     best = {("Bybit", "sell", "USDT"): make_ad("Bybit", "sell", 93.0)}
     assert len(alerts.due(snap(best), cfg(), path=db, now=now)) == 1
+    alerts.mark_fired(alert_id, path=db, now=now)
     assert alerts.due(snap(best), cfg(), path=db, now=now + 100) == []   # кулдаун ещё не прошёл
     assert len(alerts.due(snap(best), cfg(), path=db, now=now + 3601)) == 1   # кулдаун прошёл — сработал снова
+
+
+def test_due_without_mark_fires_again(tmp_path):
+    """Сообщение не доставили (mark_fired не вызван) — и одноразовый, и «повторно» сработают на следующем скане."""
+    db = str(tmp_path / "alerts.db")
+    now = time.time()
+    alerts.add("1", "USDT", "sell", 92.0, now + 86400, path=db)
+    alerts.add("1", "USDT", "sell", 92.0, now + 86400, path=db, repeat_cooldown=3600)
+    best = {("Bybit", "sell", "USDT"): make_ad("Bybit", "sell", 93.0)}
+    assert len(alerts.due(snap(best), cfg(), path=db, now=now)) == 2
+    assert len(alerts.due(snap(best), cfg(), path=db, now=now + 20)) == 2
+    assert len(alerts.list_all("1", path=db)) == 2
+
+
+def test_mark_fired_deletes_only_that_one_shot(tmp_path):
+    db = str(tmp_path / "alerts.db")
+    first = alerts.add("1", "USDT", "sell", 92.0, time.time() + 86400, path=db)
+    alerts.add("1", "USDT", "buy", 85.0, time.time() + 86400, path=db)
+    alerts.mark_fired(first, path=db)
+    assert [(a, s) for _, a, s, *_ in alerts.list_all("1", path=db)] == [("USDT", "buy")]
 
 
 # условия через «И»: объём стакана и надёжность встречной связки

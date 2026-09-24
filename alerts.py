@@ -101,7 +101,7 @@ def _volume_ok(snap, ad, side, asset, rate, min_volume):
 
 
 def _matching_deal(snap, ad, side, asset):
-    """Лучшая связка из snap.deals (уже отсортирован по профиту), использующая объявление с той же
+    """Лучшая связка из snap.deals (отсортирован по прибыли × надёжности), использующая объявление с той же
     площадки и стороны, что сработавшее ad — для оценки метки надёжности алерта на одну сторону."""
     for deal in snap.deals:
         cand = deal[1] if side == "buy" else deal[2]
@@ -113,9 +113,9 @@ def _matching_deal(snap, ad, side, asset):
 def due(snap, cfg, path=DB_PATH, now=None):
     """Сработавшие алерты по текущему снимку: [(id, chat_id, asset, side, rate, price, Ad), ...].
     Цена берётся из snap.best (объявления уже прошли фильтры usable() — мин. сделок/отзывов, отсев
-    аномалий, блэклист). Одноразовый алерт (repeat_cooldown is NULL) сразу удаляется. Алерт «повторно»
-    не удаляется по сроку — ждёт следующего скана и срабатывает снова не раньше, чем пройдёт кулдаун
-    с прошлого срабатывания; истёкшие (expires_ts) удаляются в любом режиме. min_volume/require_reliable —
+    аномалий, блэклист). Сами алерты здесь не меняются: после доставки сообщения бот вызывает
+    mark_fired — одноразовый удаляется, у «повторно» начинается кулдаун; не доставили — алерт сработает
+    снова на следующем скане. Истёкшие (expires_ts) удаляются в любом режиме. min_volume/require_reliable —
     дополнительные условия через «И» (см. модульный docstring), проверяются только когда цена уже подошла."""
     now = time.time() if now is None else now
     if not os.path.exists(path):
@@ -125,7 +125,7 @@ def due(snap, cfg, path=DB_PATH, now=None):
         _prune_expired(con, now)
     rows = con.execute("SELECT id, chat_id, asset, side, rate, repeat_cooldown, last_fired_ts, "
                        "min_volume, require_reliable FROM alerts").fetchall()
-    fired, one_shot, repeat_fired = [], [], []
+    fired = []
     for alert_id, chat_id, asset, side, rate, cooldown, last_fired, min_volume, require_reliable in rows:
         if cooldown is not None and last_fired is not None and now - last_fired < cooldown:
             continue   # алерт «повторно» ещё «отдыхает» после прошлого срабатывания
@@ -145,12 +145,15 @@ def due(snap, cfg, path=DB_PATH, now=None):
             ok = deal is not None and p2p.reliability(deal, cfg, snap)[0] != p2p.TRAP
         if ok:
             fired.append((alert_id, chat_id, asset, side, rate, best_price, best_ad))
-            (repeat_fired if cooldown is not None else one_shot).append(alert_id)
-    if one_shot:
-        with con:
-            con.executemany("DELETE FROM alerts WHERE id = ?", [(i,) for i in one_shot])
-    if repeat_fired:
-        with con:
-            con.executemany("UPDATE alerts SET last_fired_ts = ? WHERE id = ?", [(now, i) for i in repeat_fired])
     con.close()
     return fired
+
+
+def mark_fired(alert_id, path=DB_PATH, now=None):
+    """Сообщение об алерте доставлено: одноразовый удалить, «повторно» — запомнить время для кулдауна."""
+    now = time.time() if now is None else now
+    con = _connect(path)
+    with con:
+        con.execute("DELETE FROM alerts WHERE id = ? AND repeat_cooldown IS NULL", (alert_id,))
+        con.execute("UPDATE alerts SET last_fired_ts = ? WHERE id = ?", (now, alert_id))
+    con.close()

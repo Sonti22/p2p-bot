@@ -134,6 +134,35 @@ def parse_amount(text):
     return num if AMOUNT_MIN <= num <= AMOUNT_MAX else None
 
 
+MIN_PROFIT_MIN, MIN_PROFIT_MAX = 0.1, 100   # порог сигнала, % чистыми
+
+
+def parse_min_profit(text):
+    """Порог сигнала из текста: «2», «1,5», «1.5 %». None — не разобрано или вне диапазона 0,1–100%
+    (как и в parse_amount, regex не пропускает nan/inf/минус/экспоненту)."""
+    m = re.fullmatch(r"([\d.,]+)%?", re.sub(r"\s+", "", (text or "").strip()))
+    if not m:
+        return None
+    try:
+        num = float(m.group(1).replace(",", "."))
+    except ValueError:
+        return None
+    return num if MIN_PROFIT_MIN <= num <= MIN_PROFIT_MAX else None
+
+
+def _env_parsed(name, parse, default):
+    """Сумма/порог из .env тем же парсером, что и команды бота: испорченное значение (0, nan, inf…)
+    не должно пережить рестарт — берём значение по умолчанию и пишем предупреждение в лог."""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    value = parse(raw)
+    if value is None:
+        logger.warning("%s=%s в .env не подходит, использую %g", name, raw, default)
+        return default
+    return value
+
+
 @dataclass
 class Config:
     fiat: str = "RUB"
@@ -163,8 +192,8 @@ class Config:
             fees["USDT"] = float(os.getenv("TRANSFER_FEE"))
         return cls(
             fiat=os.getenv("FIAT", "RUB").upper(),
-            amount=float(os.getenv("AMOUNT", 50000)),
-            min_profit=float(os.getenv("MIN_PROFIT", 1.0)),
+            amount=_env_parsed("AMOUNT", parse_amount, 50000),
+            min_profit=_env_parsed("MIN_PROFIT", parse_min_profit, 1.0),
             min_orders=int(os.getenv("MIN_ORDERS", 100)),
             min_rate=float(os.getenv("MIN_RATE", 95)),
             max_dev=float(os.getenv("MAX_DEV", 4)),
