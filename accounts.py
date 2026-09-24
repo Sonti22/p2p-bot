@@ -18,6 +18,8 @@ from urllib.parse import urlencode
 
 import aiohttp
 
+import jsonstore
+
 KEYS_PATH = os.path.join("data", "keys.json")
 BYBIT_BASE = "https://api.bybit.com"
 MEXC_BASE = "https://api.mexc.com"
@@ -29,17 +31,11 @@ ONBOARDABLE = tuple(dict.fromkeys(CONNECTABLE + PASSPHRASE_REQUIRED))   # бир
 
 
 def _keys_file():
-    try:
-        with open(KEYS_PATH, encoding="utf-8") as f:
-            return json.load(f)
-    except (OSError, json.JSONDecodeError):
-        return {}
+    return jsonstore.read_dict(KEYS_PATH)
 
 
 def _write_keys_file(data):
-    os.makedirs(os.path.dirname(KEYS_PATH), exist_ok=True)
-    with open(KEYS_PATH, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    jsonstore.write_dict(KEYS_PATH, data)
 
 
 def in_env(exchange):
