@@ -10,6 +10,7 @@ import time
 import aiohttp
 
 import accounts
+import blacklist
 import trades
 from cards import deal_card, portfolio_card, top_chart
 from p2p import AMOUNT_MAX, AMOUNT_MIN, ENV_PATH, Config, _money, _price, deal_amounts, fmt_deal, fmt_top, load_env, \
@@ -25,6 +26,7 @@ COMMANDS = [{"command": "best", "description": "Лучшая связка сей
             {"command": "top", "description": "Топ связок графиком"},
             {"command": "calc", "description": "Разовый расчёт под сумму, напр. /calc 20000"},
             {"command": "stats", "description": "Журнал сделок: день/неделя/месяц"},
+            {"command": "blacklist", "description": "Скрытые мерчанты и обменники"},
             {"command": "balance", "description": "Баланс по подключённым биржам"},
             {"command": "settings", "description": "Порог, сумма, пауза"},
             {"command": "dev", "description": "Как развивается бот: версия, изменения, план"},
@@ -107,6 +109,7 @@ def deal_markup(d, deal_id=None):
     if deal_id is not None:
         rows.append([{"text": "📋 Шаги", "callback_data": f"steps:{deal_id}"},
                      {"text": "✅ Сделал", "callback_data": f"did:{deal_id}"}])
+        rows.append([{"text": "🚫 Не показывать", "callback_data": f"bl:{deal_id}"}])
     rows.append([{"text": "📊 Все связки", "callback_data": "top"}, {"text": "🔄 Обновить", "callback_data": "best"}])
     return {"inline_keyboard": rows}
 
@@ -184,6 +187,21 @@ def account_view(ex):
         text = f"🔑 <b>{name}</b>\n\nПодключение ключа пока не реализовано."
         kb = [[back]]
     return text, {"inline_keyboard": kb}
+
+
+def blacklist_view():
+    """Текст и кнопки «/blacklist»: список скрытых мерчантов/обменников с удалением."""
+    rows = blacklist.list_all()
+    if not rows:
+        return ("🚫 <b>Блэклист пуст</b>\n\nКнопка «🚫 Не показывать» под сигналом добавляет сюда мерчанта "
+                "или обменника — скан больше не покажет связки с ним.", {"inline_keyboard": []})
+    lines = ["🚫 <b>Блэклист</b>", "", "Скан больше не показывает связки с этими мерчантами и обменниками.", ""]
+    kb = []
+    for entry_id, ex, nick in rows:
+        name = EXCHANGE_NAMES.get(ex, ex)
+        lines.append(f"{name}: {html.escape(nick)}")
+        kb.append([{"text": f"🗑 {name}: {nick}"[:64], "callback_data": f"unbl:{entry_id}"}])
+    return "\n".join(lines), {"inline_keyboard": kb}
 
 
 def portfolio_rows(port, snap):
@@ -365,6 +383,20 @@ class Bot:
             await self.send(f"⚠️ Через {bank} по СБП в этом месяце отправлено {_money(total)} ₽ — выше "
                             f"бесплатного лимита 100 000 ₽, дальше банк может взять комиссию до 0.5%. "
                             f"Для следующих сделок с этим мерчантом лучше выбрать другой банк.")
+
+    async def hide_deal(self, cq, deal_id):
+        """Кнопка «🚫 Не показывать»: занести обе стороны связки в блэклист, скан их больше не покажет."""
+        entry = self.deals_by_id.pop(deal_id, None)
+        if not entry:
+            await self.call("answerCallbackQuery", callback_query_id=cq["id"], text="Сигнал устарел")
+            return
+        d, cfg, snap = entry
+        _, b, s, _ = d
+        blacklist.add(b.ex, b.nick)
+        blacklist.add(s.ex, s.nick)
+        await self.call("answerCallbackQuery", callback_query_id=cq["id"], text="Скрыто, больше не покажу")
+        await self.call("editMessageReplyMarkup", chat_id=self.chat_id, message_id=cq["message"]["message_id"],
+                        reply_markup=deal_markup(d))
 
     def stats_view(self):
         st = trades.stats()
@@ -651,6 +683,14 @@ class Bot:
             await self.mark_done(cq, int(data[4:]))
         elif data.startswith("steps:"):
             await self.show_steps(cq, int(data[6:]))
+        elif data.startswith("bl:"):
+            await self.hide_deal(cq, int(data[3:]))
+        elif data.startswith("unbl:"):
+            blacklist.remove(int(data[5:]))
+            await self.call("answerCallbackQuery", callback_query_id=cq["id"], text="Удалено из блэклиста")
+            text, kb = blacklist_view()
+            await self.call("editMessageText", chat_id=self.chat_id, message_id=cq["message"]["message_id"],
+                            text=text, parse_mode="HTML", reply_markup=kb)
         elif data == "amt_custom":
             self.awaiting_amount = True
             await self.send(f"Введи сумму круга текстом, например 20000 или 1,5 млн "
@@ -700,6 +740,9 @@ class Bot:
                 await self.send("Нужна сумма: /calc 20000")
         elif cmd == "/stats":
             await self.send(self.stats_view())
+        elif cmd == "/blacklist":
+            text, kb = blacklist_view()
+            await self.send(text, markup=kb)
         elif cmd == "/balance":
             await self.balance()
         elif cmd == "/settings":

@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 
 import aiohttp
 
+import blacklist
 import trades
 
 HEADERS = {
@@ -370,15 +371,16 @@ def _pays(a, cfg):
     return pays
 
 
-def usable(a, cfg):
+def usable(a, cfg, blocked=frozenset()):
     return bool(_pays(a, cfg)) and a.min_amt <= cfg.amount <= a.max_amt and a.avail * a.price >= cfg.amount \
-        and a.orders >= cfg.min_orders and a.rate >= cfg.min_rate
+        and a.orders >= cfg.min_orders and a.rate >= cfg.min_rate and (a.ex, a.nick) not in blocked
 
 
-def _signal_ok(a, cfg):
+def _signal_ok(a, cfg, blocked=frozenset()):
     """Фильтр объявления для стакана глубины: мерчант/способ оплаты, без требования, что объём
     покрывает всю сумму в одиночку — это делает _stack, складывая несколько объявлений."""
-    return bool(_pays(a, cfg)) and a.orders >= cfg.min_orders and a.rate >= cfg.min_rate
+    return bool(_pays(a, cfg)) and a.orders >= cfg.min_orders and a.rate >= cfg.min_rate \
+        and (a.ex, a.nick) not in blocked
 
 
 def _stack(ads, amount):
@@ -596,9 +598,10 @@ async def scan(s, cfg, force_alt=False):
             if p:
                 refs[a] = statistics.median(p)
 
+    blocked = blacklist.blocked()
     best, dropped, networks = {}, {}, {}
     for a in ads:
-        if not usable(a, cfg):
+        if not usable(a, cfg, blocked):
             continue
         r = refs.get(a.asset)
         if r and abs(a.price / r - 1) * 100 > cfg.max_dev:
@@ -614,7 +617,7 @@ async def scan(s, cfg, force_alt=False):
     # связку, которую суммарный объём не покрывает, не сигналим (сюда она просто не попадёт)
     groups = {}
     for a in ads:
-        if not _signal_ok(a, cfg):
+        if not _signal_ok(a, cfg, blocked):
             continue
         r = refs.get(a.asset)
         if r and abs(a.price / r - 1) * 100 > cfg.max_dev:
