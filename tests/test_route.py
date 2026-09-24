@@ -4,6 +4,7 @@ import pytest
 
 import p2p
 import trades
+from conftest import load
 from helpers import make_ad
 
 SPOT = {"Bybit": {"USDT": (1.0, 1.0), "ETH": (2500.0, 2501.0), "USDC": (0.9999, 1.0)},
@@ -89,6 +90,16 @@ def test_usable_filters():
     assert not p2p.usable(make_ad(avail=1), c)
 
 
+def test_usable_and_signal_ok_respect_blacklist():
+    c = p2p.Config()
+    ad = make_ad()
+    blocked = {(ad.ex, ad.nick)}
+    assert not p2p.usable(ad, c, blocked)
+    assert not p2p._signal_ok(ad, c, blocked)
+    assert p2p.usable(ad, c, {("Bybit", "другой ник")})
+    assert p2p._signal_ok(ad, c)
+
+
 def test_scan_offline_keeps_prices_near_reference(offline):
     c = p2p.Config(exchanges=["bybit", "htx", "kucoin", "mexc", "bitpapa"], assets=["USDT"], min_orders=0, min_rate=0)
     snap = asyncio.run(p2p.scan(None, c))
@@ -97,6 +108,24 @@ def test_scan_offline_keeps_prices_near_reference(offline):
         assert abs(a.price / snap.ref - 1) * 100 <= c.max_dev
     scores = [d[0] - c.risk_penalty * len(p2p.reliability(d, c, snap)[1]) for d in snap.deals]
     assert scores == sorted(scores, reverse=True)   # отсортировано по прибыли с поправкой на надёжность
+
+
+def test_scan_drops_blacklisted_merchant(offline, monkeypatch):
+    c = p2p.Config(exchanges=["bybit", "htx", "kucoin", "mexc", "bitpapa"], assets=["USDT"], min_orders=0, min_rate=0)
+    before = asyncio.run(p2p.scan(None, c))
+    best_nick = before.best[("Bybit", "buy", "USDT")].nick
+    monkeypatch.setattr(p2p.blacklist, "blocked", lambda: {("Bybit", best_nick)})
+    after = asyncio.run(p2p.scan(None, c))
+    assert after.best[("Bybit", "buy", "USDT")].nick != best_nick   # лучшую цену давал именно он
+
+
+def test_scan_removes_venue_entirely_when_all_merchants_blacklisted(offline, monkeypatch):
+    c = p2p.Config(exchanges=["bybit", "htx", "kucoin", "mexc", "bitpapa"], assets=["USDT"], min_orders=0, min_rate=0)
+    nicks = {i["nickName"] for i in load("bybit_ads.json")["result"]["items"]}
+    monkeypatch.setattr(p2p.blacklist, "blocked", lambda: {("Bybit", n) for n in nicks})
+    after = asyncio.run(p2p.scan(None, c))
+    assert ("Bybit", "buy", "USDT") not in after.best
+    assert ("Bybit", "sell", "USDT") not in after.best
 
 
 def test_stack_combines_several_ads_by_price():

@@ -4,6 +4,7 @@ import time
 
 import accounts
 import bot as B
+import blacklist
 import p2p
 import trades
 from helpers import make_ad
@@ -178,6 +179,65 @@ def test_mark_done_logs_trade_and_clears_button(tmp_path, monkeypatch):
     assert method == "editMessageReplyMarkup"
     buttons = [b for row in params["reply_markup"]["inline_keyboard"] for b in row]
     assert not any(b.get("callback_data", "").startswith("did:") for b in buttons)
+
+
+def test_deal_markup_has_hide_button():
+    kb = B.deal_markup(deal(), deal_id=7)["inline_keyboard"]
+    buttons = [b for row in kb for b in row]
+    assert any(b.get("callback_data") == "bl:7" for b in buttons)
+
+
+def test_hide_deal_blacklists_both_sides_and_clears_button(tmp_path, monkeypatch):
+    db = str(tmp_path / "blacklist.db")
+    monkeypatch.setattr(B.blacklist, "add", functools.partial(B.blacklist.add, path=db))
+    bot = Stub(p2p.Config())
+    d = deal(5.0)
+    deal_id = bot.remember_deal(d)
+    asyncio.run(bot.hide_deal({"id": "1", "message": {"message_id": 9}}, deal_id))
+    assert blacklist.blocked(path=db) == {("Bybit", "nick"), ("MEXC", "nick")}
+    assert deal_id not in bot.deals_by_id
+    method, params = bot.out[-1]
+    assert method == "editMessageReplyMarkup"
+    buttons = [b for row in params["reply_markup"]["inline_keyboard"] for b in row]
+    assert not any(b.get("callback_data", "").startswith("bl:") for b in buttons)
+
+
+def test_hide_deal_unknown_id_not_blacklisted(tmp_path, monkeypatch):
+    db = str(tmp_path / "blacklist.db")
+    monkeypatch.setattr(B.blacklist, "add", functools.partial(B.blacklist.add, path=db))
+    bot = Stub(p2p.Config())
+    asyncio.run(bot.hide_deal({"id": "1", "message": {"message_id": 9}}, 999))
+    assert blacklist.blocked(path=db) == set()
+    assert "устарел" in bot.out[-1][1]["text"]
+
+
+def test_blacklist_command_lists_entries(tmp_path, monkeypatch):
+    db = str(tmp_path / "blacklist.db")
+    monkeypatch.setattr(B.blacklist, "list_all", functools.partial(B.blacklist.list_all, path=db))
+    blacklist.add("Bybit", "Плохой", path=db)
+    bot = Stub(p2p.Config())
+    asyncio.run(bot.handle("/blacklist"))
+    text = texts(bot)[-1]
+    assert "Плохой" in text
+
+
+def test_blacklist_command_empty():
+    bot = Stub(p2p.Config())
+    asyncio.run(bot.handle("/blacklist"))
+    assert "пуст" in texts(bot)[-1].lower()
+
+
+def test_unbl_callback_removes_entry(tmp_path, monkeypatch):
+    db = str(tmp_path / "blacklist.db")
+    monkeypatch.setattr(B.blacklist, "list_all", functools.partial(B.blacklist.list_all, path=db))
+    monkeypatch.setattr(B.blacklist, "remove", functools.partial(B.blacklist.remove, path=db))
+    blacklist.add("Bybit", "Плохой", path=db)
+    entry_id = blacklist.list_all(path=db)[0][0]
+    bot = Stub(p2p.Config())
+    asyncio.run(bot.on_callback({"id": "1", "data": f"unbl:{entry_id}", "message": {"message_id": 3}}))
+    assert blacklist.list_all(path=db) == []
+    method, params = bot.out[-1]
+    assert method == "editMessageText" and "пуст" in params["text"].lower()
 
 
 def test_mark_done_unknown_id_not_logged(monkeypatch):
