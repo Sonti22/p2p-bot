@@ -18,6 +18,7 @@ import alerts
 import blacklist
 import fees
 import history
+import jsonstore
 import netstatus
 import presets
 import trades
@@ -40,17 +41,13 @@ TOPICS_PATH = os.path.join("data", "topics.json")
 
 def load_topics(path=None):
     try:
-        with open(path or TOPICS_PATH, encoding="utf-8") as f:
-            return {k: int(v) for k, v in json.load(f).items()}
-    except (OSError, ValueError, AttributeError):
+        return {k: int(v) for k, v in jsonstore.read_dict(path or TOPICS_PATH).items()}
+    except (TypeError, ValueError):   # значение не приводится к id топика
         return {}
 
 
 def save_topics(topics, path=None):
-    path = path or TOPICS_PATH
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(topics, f, ensure_ascii=False)
+    jsonstore.write_dict(path or TOPICS_PATH, topics)
 
 
 MENU = {"keyboard": [[{"text": "🔥 Лучшая сейчас"}, {"text": "📊 Топ связок"}],

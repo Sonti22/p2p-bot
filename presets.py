@@ -3,9 +3,9 @@
 встроенные — «Только мои банки», «USDT без переводов», «Все площадки» — считаются от текущих cfg/env.
 В кнопках пресет адресуется коротким id (preset_id), а не именем: callback_data у Telegram — до 64 байт."""
 import hashlib
-import json
 import os
 
+import jsonstore
 from p2p import ALL_EXCHANGES, DEFAULT_ASSETS
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -15,16 +15,11 @@ FIELDS = ("assets", "exchanges", "include_pay", "min_profit", "amount", "same_ve
 
 
 def _load(path=PRESETS_PATH):
-    if not os.path.exists(path):
-        return {}
-    with open(path, encoding="utf-8") as f:
-        return json.load(f)
+    return jsonstore.read_dict(path)
 
 
 def _save(data, path=PRESETS_PATH):
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    jsonstore.write_dict(path, data)
 
 
 def save_preset(name, cfg, path=PRESETS_PATH):
