@@ -26,6 +26,30 @@ from p2p import ALL_EXCHANGES, AMOUNT_MAX, AMOUNT_MIN, DEFAULT_ASSETS, ENV_PATH,
 
 logger = logging.getLogger(__name__)
 
+# Топики в личке с ботом (Bot API 9.5): ключ -> название; id созданных топиков — в data/topics.json.
+TOPICS = (("signals", "🔔 Сигналы"), ("journal", "📒 Журнал"), ("settings", "⚙️ Настройки"), ("dev", "🛠 Разработка"))
+TOPIC_HINTS = {"signals": "Сюда приходят 🔔 сигналы, алерты по курсу и утренний дайджест.",
+               "journal": "Здесь журнал: подтверждения «✅ Сделал», факт по сделкам, движения по подключённым биржам.",
+               "settings": "Пиши здесь ⚙️ команды настроек: /settings, /amount, /filters, /pause — ответы останутся тут.",
+               "dev": "Здесь 🛠 разработка и здоровье бота: /dev, /status, /logs, недоступность площадок."}
+TOPICS_PATH = os.path.join("data", "topics.json")
+
+
+def load_topics(path=None):
+    try:
+        with open(path or TOPICS_PATH, encoding="utf-8") as f:
+            return {k: int(v) for k, v in json.load(f).items()}
+    except (OSError, ValueError, AttributeError):
+        return {}
+
+
+def save_topics(topics, path=None):
+    path = path or TOPICS_PATH
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(topics, f, ensure_ascii=False)
+
+
 MENU = {"keyboard": [[{"text": "🔥 Лучшая сейчас"}, {"text": "📊 Топ связок"}],
                      [{"text": "⚙️ Настройки"}, {"text": "🛠 Разработка"}],
                      [{"text": "❓ Как работать"}]],
@@ -615,6 +639,8 @@ class Bot:
         self.s, self.token, self.chat_id, self.cfg = session, token, chat_id, cfg
         self.cooldown = int(os.getenv("COOLDOWN", 600))      # сек: не повторять ту же пару бирж
         self.fancy = os.getenv("FANCY_BUTTONS", "1") != "0"   # цветные кнопки и «📋»; сам выключится при ошибке API
+        self.topics = {}          # ключ топика -> message_thread_id, если у бота включены топики в личке
+        self.cur_thread = None    # топик, из которого пришла последняя команда/кнопка — туда и отвечаем
         self.repeat_step = float(os.getenv("REPEAT_STEP", 0.3))  # п.п. роста профита для досрочного повтора
         self.max_signals = int(os.getenv("MAX_SIGNALS", 3))      # сигналим только из топ-N
         self.last = None
@@ -644,6 +670,36 @@ class Bot:
                                timeout=aiohttp.ClientTimeout(total=40)) as r:
             return await r.json()
 
+    async def setup_topics(self):
+        """Топики в личке (Bot API 9.5): если владелец включил режим топиков у бота в @BotFather
+        (`getMe.has_topics_enabled`), завести 4 топика — id хранятся в data/topics.json — и слать сигналы,
+        журнал и т.д. каждый в свой. Не включено или не вышло создать — всё в один чат, как раньше."""
+        self.topics = {}
+        if not self.chat_id:
+            return
+        me = await self.call("getMe")
+        if not me.get("ok") or not me["result"].get("has_topics_enabled"):
+            return
+        saved = load_topics()
+        for key, name in TOPICS:
+            if key in saved:
+                continue
+            r = await self.call("createForumTopic", chat_id=self.chat_id, name=name)
+            if not r.get("ok"):
+                logger.warning("createForumTopic: %s", r.get("description"))
+                return
+            saved[key] = r["result"]["message_thread_id"]
+            save_topics(saved)
+            self.topics = dict(saved)
+            await self.send(TOPIC_HINTS[key], topic=key)
+        self.topics = saved
+
+    def thread_for(self, topic):
+        """id топика для сообщения: свой у сигналов/журнала/…, иначе тот, где написал пользователь."""
+        if not self.topics:
+            return None
+        return self.topics.get(topic) if topic else self.cur_thread
+
     def markup(self, markup):
         """Разметка под возможности сервера/клиента: без цветов и «📋», если они не поддерживаются."""
         return markup if self.fancy or not markup else plain_markup(markup)
@@ -656,45 +712,51 @@ class Bot:
         logger.warning("Telegram: цветные кнопки/copy_text не поддерживаются, дальше обычные: %s", r.get("description"))
         return True
 
-    async def send(self, text, chat_id=None, markup=None):
+    async def send(self, text, chat_id=None, markup=None, topic=None):
         params = dict(chat_id=chat_id or self.chat_id, text=text, parse_mode="HTML", disable_web_page_preview=True)
         if markup:
             params["reply_markup"] = self.markup(markup)
+        if self.thread_for(topic):
+            params["message_thread_id"] = self.thread_for(topic)
         r = await self.call("sendMessage", **params)
         if self._fancy_failed(r, markup):
             params["reply_markup"] = plain_markup(markup)
             r = await self.call("sendMessage", **params)
         return r
 
-    async def send_photo(self, png, caption, markup=None):
-        r = await self._post_photo(png, caption, self.markup(markup))
+    async def send_photo(self, png, caption, markup=None, topic=None):
+        thread = self.thread_for(topic)
+        r = await self._post_photo(png, caption, self.markup(markup), thread)
         if self._fancy_failed(r, markup):
-            r = await self._post_photo(png, caption, plain_markup(markup))
+            r = await self._post_photo(png, caption, plain_markup(markup), thread)
         return r
 
-    async def _post_photo(self, png, caption, markup):
+    async def _post_photo(self, png, caption, markup, thread=None):
         form = aiohttp.FormData()
         form.add_field("chat_id", str(self.chat_id))
         form.add_field("caption", caption)
         form.add_field("parse_mode", "HTML")
         if markup:
             form.add_field("reply_markup", json.dumps(markup))
+        if thread:
+            form.add_field("message_thread_id", str(thread))
         form.add_field("photo", png, filename="card.png", content_type="image/png")
         async with self.s.post(f"https://api.telegram.org/bot{self.token}/sendPhoto", data=form,
                                timeout=aiohttp.ClientTimeout(total=40)) as r:
             return await r.json()
 
-    async def photo_or_text(self, render, caption, markup):
+    async def photo_or_text(self, render, caption, markup, topic=None):
         """Картинка с подписью; если не вышло — тем же текстом."""
         if len(caption) <= 1024:
             try:
-                r = await self.send_photo(await asyncio.to_thread(render), caption, markup)
+                kw = {"topic": topic} if topic and self.topics else {}
+                r = await self.send_photo(await asyncio.to_thread(render), caption, markup, **kw)
                 if r.get("ok"):
                     return
                 logger.warning("sendPhoto: %s", r.get("description"))
             except Exception as e:
                 logger.warning("card error: %s", e)
-        await self.send(caption, markup=markup)
+        await self.send(caption, markup=markup, topic=topic)
 
     def remember_deal(self, d, cfg=None, snap=None):
         """Запомнить связку под кнопками «✅ Сделал»/«📋 Шаги»; хранится ограниченное число последних."""
@@ -706,7 +768,7 @@ class Bot:
             del self.deals_by_id[min(self.deals_by_id)]
         return deal_id
 
-    async def send_deal(self, d, prefix="", cfg=None, snap=None):
+    async def send_deal(self, d, prefix="", cfg=None, snap=None, topic=None):
         cfg = cfg or self.cfg
         snap = snap if snap is not None else self.last
         deal_id = self.remember_deal(d, cfg, snap)
@@ -714,7 +776,7 @@ class Bot:
         rel = reliability(d, cfg, snap) if snap else None
         breakdown = profit_breakdown(d[1], d[2], cfg, snap.spot, snap.over_banks) if snap else None
         await self.photo_or_text(lambda: deal_card(d, cfg, amounts, rel, breakdown), prefix + fmt_deal(d, cfg, snap),
-                                 deal_markup(d, deal_id, cfg, snap))
+                                 deal_markup(d, deal_id, cfg, snap), topic)
 
     async def show_steps(self, cq, deal_id):
         """Кнопка «📋 Шаги»: отдельным сообщением пошаговый чек-лист маршрута."""
@@ -736,13 +798,13 @@ class Bot:
         d, cfg, snap = entry
         trade_id, bank, total, crossed = trades.log_trade(d, cfg.amount)
         await self.call("answerCallbackQuery", callback_query_id=cq["id"], text="Записано в журнал ✅")
-        await self.send(f"Расчёт был {d[0]:+.2f}%. Какой вышел факт?", markup=fact_markup(trade_id))
+        await self.send(f"Расчёт был {d[0]:+.2f}%. Какой вышел факт?", markup=fact_markup(trade_id), topic="journal")
         await self.call("editMessageReplyMarkup", chat_id=self.chat_id, message_id=cq["message"]["message_id"],
                         reply_markup=self.markup(deal_markup(d, cfg=cfg, snap=snap)))
         if crossed:
             await self.send(f"⚠️ Через {bank} по СБП в этом месяце отправлено {_money(total)} ₽ — выше "
                             f"бесплатного лимита 100 000 ₽, дальше банк может взять комиссию до 0.5%. "
-                            f"Для следующих сделок с этим мерчантом лучше выбрать другой банк.")
+                            f"Для следующих сделок с этим мерчантом лучше выбрать другой банк.", topic="journal")
 
     async def handle_fact_button(self, cq, data):
         """Кнопка быстрого факта («как расчёт»/«±0.5 п.п.»/«✏️ ввести число») под подтверждением сделки."""
@@ -767,7 +829,7 @@ class Bot:
             await self.call("answerCallbackQuery", callback_query_id=cq["id"], text="Факт записан")
             await self.call("editMessageReplyMarkup", chat_id=self.chat_id, message_id=cq["message"]["message_id"],
                             reply_markup={"inline_keyboard": []})
-        await self.send(f"✅ Факт: {fact:+.2f}% (расчёт был {row['profit']:+.2f}%)")
+        await self.send(f"✅ Факт: {fact:+.2f}% (расчёт был {row['profit']:+.2f}%)", topic="journal")
 
     async def set_fact_from_text(self, trade_id, text):
         """Ввод факта текстом после «✏️ ввести число»: проценты или сумма в ₽ — `trades.parse_fact`."""
@@ -857,7 +919,7 @@ class Bot:
         for alert_id, chat_id, asset, side, rate, price, ad in alerts.due(snap, cfg or self.cfg):
             label, cmp = ("продать", "≥") if side == "sell" else ("купить", "≤")
             await self.send(f"🔔 <b>Алерт сработал:</b> {asset} можно {label} по {_price(price)} ₽ "
-                            f"({cmp}{rate:g}) — {fmt_ad(ad)}", chat_id=chat_id)
+                            f"({cmp}{rate:g}) — {fmt_ad(ad)}", chat_id=chat_id, topic="signals")
 
     def stats_view(self):
         st = trades.stats()
@@ -1151,7 +1213,8 @@ class Bot:
         """Сеть вывода/ввода переключилась (открыт ↔ закрыт) — одно сообщение на переключение."""
         for venue, asset, net, kind, is_open in netstatus.pop_changes():
             await self.send(f"{'✅' if is_open else '⚠️'} {venue}: {kind} {asset} ({net}) "
-                            + ("снова открыт" if is_open else "приостановлен — связки через эту сеть не показываю"))
+                            + ("снова открыт" if is_open else "приостановлен — связки через эту сеть не показываю"),
+                            topic="signals")
 
     def is_quiet_now(self):
         """Сейчас внутри окна тихих часов (МСК) и они включены в настройках?"""
@@ -1171,11 +1234,11 @@ class Bot:
         """Дайджест по окончании тихих часов: топ-3 связки за ночь по прибыли, одним сообщением."""
         deals, self.night_deals = list(self.night_deals.values()), {}
         if not deals:
-            await self.send("🌅 Тихие часы закончились — связок выше порога не было.")
+            await self.send("🌅 Тихие часы закончились — связок выше порога не было.", topic="signals")
             return
         top = sorted(deals, key=lambda d: d[0], reverse=True)[:3]
         parts = [f"{i}) {fmt_deal(d, self.cfg)}" for i, d in enumerate(top, 1)]
-        await self.send("🌅 <b>Доброе утро! Топ-3 связки за ночь</b>\n\n" + "\n\n".join(parts))
+        await self.send("🌅 <b>Доброе утро! Топ-3 связки за ночь</b>\n\n" + "\n\n".join(parts), topic="signals")
 
     async def quiet_and_pause_tick(self, snap):
         """Тихие часы копят связки для утреннего дайджеста вместо отправки; обычная пауза (ручная или
@@ -1226,10 +1289,10 @@ class Bot:
                 trouble = st["streak"] >= VENUE_FAIL_STREAK or now - st["down_since"] > VENUE_DOWN_AFTER
                 if trouble and (not st["alerted_at"] or now - st["alerted_at"] > VENUE_ALERT_COOLDOWN):
                     st["alerted_at"] = now
-                    await self.send(f"⚠️ {ex}: недоступна ({failed[ex]})")
+                    await self.send(f"⚠️ {ex}: недоступна ({failed[ex]})", topic="dev")
             else:
                 if st["alerted_at"]:
-                    await self.send(f"✅ {ex}: снова доступна")
+                    await self.send(f"✅ {ex}: снова доступна", topic="dev")
                 st.update(streak=0, down_since=None, alerted_at=None)
 
     @staticmethod
@@ -1272,7 +1335,7 @@ class Bot:
             if prev and now - prev[0] < self.cooldown and profit < prev[1] + self.repeat_step:
                 continue
             self.sent[key] = (now, profit)
-            await self.send_deal(d, "🔔 " + self.held_label(d, now), snap=snap)
+            await self.send_deal(d, "🔔 " + self.held_label(d, now), snap=snap, topic="signals")
 
     async def check_accounts(self):
         """Уведомление о новых движениях по подключённым биржам: депозит, вывод, спот-сделка, P2P-ордер.
@@ -1293,7 +1356,7 @@ class Bot:
             if seen is not None:
                 for it in hist:
                     if hist_key(it) not in seen:
-                        await self.send(hist_text(ex, it))
+                        await self.send(hist_text(ex, it), topic="journal")
             self.acc_seen[ex] = {hist_key(it) for it in hist}
 
     async def accounts_loop(self):
@@ -1329,17 +1392,20 @@ class Bot:
         cq = u.get("callback_query")
         if cq:
             if str(cq.get("message", {}).get("chat", {}).get("id", "")) == self.chat_id:
+                self.cur_thread = cq["message"].get("message_thread_id")   # ответ — в тот же топик
                 await self.on_callback(cq)
             return
         msg = u.get("message") or {}
         chat = str(msg.get("chat", {}).get("id", ""))
         if not chat:
             return
+        self.cur_thread = msg.get("message_thread_id")
         if not self.chat_id:
             # первый написавший чат становится получателем сигналов
             self.chat_id = chat
             save_env("TG_CHAT_ID", chat)
             logger.info("chat_id сохранён в .env: %s", chat)
+            await self.setup_topics()
             await self.welcome()
         elif chat == self.chat_id:
             text = (msg.get("text") or "").strip()
@@ -1573,6 +1639,7 @@ async def main():
         bot = Bot(s, token, os.getenv("TG_CHAT_ID", "").strip(), cfg)
         await bot.setup()
         if bot.chat_id:
+            await bot.setup_topics()
             await bot.check_key_safety()
         logger.info("Бот запущен: каждые %ss, порог %g%%, биржи %s", cfg.interval, cfg.min_profit,
                     ', '.join(cfg.exchanges))

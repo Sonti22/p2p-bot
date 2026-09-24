@@ -29,7 +29,7 @@ class Stub(B.Bot):
             return {"ok": False, "description": "Bad Request: can't parse reply keyboard markup JSON object"}
         return {"ok": True, "result": {"message_id": 1}}
 
-    async def _post_photo(self, png, caption, markup):
+    async def _post_photo(self, png, caption, markup, thread=None):
         return await self.call("sendPhoto", caption=caption, reply_markup=markup)
 
 
