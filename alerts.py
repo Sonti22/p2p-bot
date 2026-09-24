@@ -1,12 +1,18 @@
 """Алерты на целевой курс: /alert USDT sell 92 7d — сообщить, когда надёжный покупатель/обменник
 даёт нужную цену, до истечения срока. SQLite data/alerts.db. По умолчанию одноразовые: срабатывают
 один раз и удаляются. С «repeat <кулдаун>» алерт не удаляется по сроку — ждёт следующего скана и
-может сработать снова не раньше, чем пройдёт кулдаун с прошлого срабатывания (условия объёма/
-надёжности — следующим пунктом очереди)."""
+может сработать снова не раньше, чем пройдёт кулдаун с прошлого срабатывания.
+Условия можно объединять через «И»: «vol <сумма>» — в стакане по цене не хуже порога должно набираться
+не меньше этой суммы (p2p._stack на отфильтрованном по цене срезе snap.groups); «reliable» — метка
+p2p.reliability() встречной связки (лучшая по snap.deals с этим же объявлением) не хуже «⚠️ риск»,
+т.е. не «🪤 ловушка». Нет объявления встречной связки для reliable — алерт не срабатывает: подтвердить
+надёжность нечем."""
 import os
 import re
 import sqlite3
 import time
+
+import p2p
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(HERE, "data", "alerts.db")
@@ -20,12 +26,16 @@ def _connect(path):
     con.execute("CREATE TABLE IF NOT EXISTS alerts ("
                 "id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id TEXT, asset TEXT, side TEXT, "
                 "rate REAL, created_ts REAL, expires_ts REAL, "
-                "repeat_cooldown REAL, last_fired_ts REAL)")
+                "repeat_cooldown REAL, last_fired_ts REAL, min_volume REAL, require_reliable INTEGER)")
     cols = {row[1] for row in con.execute("PRAGMA table_info(alerts)")}
     if "repeat_cooldown" not in cols:   # апгрейд базы, созданной до режима «повторно»
         con.execute("ALTER TABLE alerts ADD COLUMN repeat_cooldown REAL")
     if "last_fired_ts" not in cols:
         con.execute("ALTER TABLE alerts ADD COLUMN last_fired_ts REAL")
+    if "min_volume" not in cols:   # апгрейд базы, созданной до условий «И» (объём/надёжность)
+        con.execute("ALTER TABLE alerts ADD COLUMN min_volume REAL")
+    if "require_reliable" not in cols:
+        con.execute("ALTER TABLE alerts ADD COLUMN require_reliable INTEGER")
     con.commit()
     return con
 
@@ -39,14 +49,17 @@ def parse_duration(text):
     return sec if 0 < sec <= MAX_DURATION else None
 
 
-def add(chat_id, asset, side, rate, expires_ts, path=DB_PATH, repeat_cooldown=None):
+def add(chat_id, asset, side, rate, expires_ts, path=DB_PATH, repeat_cooldown=None,
+        min_volume=None, require_reliable=False):
     """Создать алерт, вернуть его id. repeat_cooldown (сек) — режим «повторно»: алерт не удаляется
-    по срабатыванию, а может сработать снова не раньше, чем пройдёт кулдаун; None — одноразовый."""
+    по срабатыванию, а может сработать снова не раньше, чем пройдёт кулдаун; None — одноразовый.
+    min_volume (₽) и require_reliable — дополнительные условия через «И» (см. модульный docstring)."""
     con = _connect(path)
     with con:
         cur = con.execute("INSERT INTO alerts (chat_id, asset, side, rate, created_ts, expires_ts, "
-                          "repeat_cooldown) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                          (chat_id, asset, side, rate, time.time(), expires_ts, repeat_cooldown))
+                          "repeat_cooldown, min_volume, require_reliable) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                          (chat_id, asset, side, rate, time.time(), expires_ts, repeat_cooldown,
+                           min_volume, int(require_reliable)))
         alert_id = cur.lastrowid
     con.close()
     return alert_id
@@ -57,16 +70,16 @@ def _prune_expired(con, now):
 
 
 def list_all(chat_id, path=DB_PATH, now=None):
-    """Активные алерты чата [(id, asset, side, rate, expires_ts, repeat_cooldown), ...] — для /alerts;
-    попутно чистит истёкшие."""
+    """Активные алерты чата [(id, asset, side, rate, expires_ts, repeat_cooldown, min_volume,
+    require_reliable), ...] — для /alerts; попутно чистит истёкшие."""
     now = time.time() if now is None else now
     if not os.path.exists(path):
         return []
     con = _connect(path)
     with con:
         _prune_expired(con, now)
-    rows = con.execute("SELECT id, asset, side, rate, expires_ts, repeat_cooldown FROM alerts "
-                       "WHERE chat_id = ? ORDER BY id", (chat_id,)).fetchall()
+    rows = con.execute("SELECT id, asset, side, rate, expires_ts, repeat_cooldown, min_volume, "
+                       "require_reliable FROM alerts WHERE chat_id = ? ORDER BY id", (chat_id,)).fetchall()
     con.close()
     return rows
 
@@ -79,22 +92,41 @@ def remove(alert_id, chat_id, path=DB_PATH):
     con.close()
 
 
-def due(snap, path=DB_PATH, now=None):
+def _volume_ok(snap, ad, side, asset, rate, min_volume):
+    """В стакане площадки ad.ex по цене не хуже rate должно набираться не меньше min_volume ₽ —
+    переиспользуем p2p._stack на срезе snap.groups, отфильтрованном по цене."""
+    grp = snap.groups.get((ad.ex, side, asset), [])
+    qualifying = [a for a in grp if (a.price >= rate if side == "sell" else a.price <= rate)]
+    return p2p._stack(qualifying, min_volume) is not None
+
+
+def _matching_deal(snap, ad, side, asset):
+    """Лучшая связка из snap.deals (уже отсортирован по профиту), использующая объявление с той же
+    площадки и стороны, что сработавшее ad — для оценки метки надёжности алерта на одну сторону."""
+    for deal in snap.deals:
+        cand = deal[1] if side == "buy" else deal[2]
+        if cand.ex == ad.ex and cand.asset == asset:
+            return deal
+    return None
+
+
+def due(snap, cfg, path=DB_PATH, now=None):
     """Сработавшие алерты по текущему снимку: [(id, chat_id, asset, side, rate, price, Ad), ...].
     Цена берётся из snap.best (объявления уже прошли фильтры usable() — мин. сделок/отзывов, отсев
     аномалий, блэклист). Одноразовый алерт (repeat_cooldown is NULL) сразу удаляется. Алерт «повторно»
     не удаляется по сроку — ждёт следующего скана и срабатывает снова не раньше, чем пройдёт кулдаун
-    с прошлого срабатывания; истёкшие (expires_ts) удаляются в любом режиме."""
+    с прошлого срабатывания; истёкшие (expires_ts) удаляются в любом режиме. min_volume/require_reliable —
+    дополнительные условия через «И» (см. модульный docstring), проверяются только когда цена уже подошла."""
     now = time.time() if now is None else now
     if not os.path.exists(path):
         return []
     con = _connect(path)
     with con:
         _prune_expired(con, now)
-    rows = con.execute("SELECT id, chat_id, asset, side, rate, repeat_cooldown, last_fired_ts "
-                       "FROM alerts").fetchall()
+    rows = con.execute("SELECT id, chat_id, asset, side, rate, repeat_cooldown, last_fired_ts, "
+                       "min_volume, require_reliable FROM alerts").fetchall()
     fired, one_shot, repeat_fired = [], [], []
-    for alert_id, chat_id, asset, side, rate, cooldown, last_fired in rows:
+    for alert_id, chat_id, asset, side, rate, cooldown, last_fired, min_volume, require_reliable in rows:
         if cooldown is not None and last_fired is not None and now - last_fired < cooldown:
             continue   # алерт «повторно» ещё «отдыхает» после прошлого срабатывания
         best_ad, best_price = None, None
@@ -106,6 +138,11 @@ def due(snap, path=DB_PATH, now=None):
         if best_ad is None:
             continue
         ok = best_price >= rate if side == "sell" else best_price <= rate
+        if ok and min_volume:
+            ok = _volume_ok(snap, best_ad, side, asset, rate, min_volume)
+        if ok and require_reliable:
+            deal = _matching_deal(snap, best_ad, side, asset)
+            ok = deal is not None and p2p.reliability(deal, cfg, snap)[0] != p2p.TRAP
         if ok:
             fired.append((alert_id, chat_id, asset, side, rate, best_price, best_ad))
             (repeat_fired if cooldown is not None else one_shot).append(alert_id)

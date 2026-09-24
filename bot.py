@@ -211,9 +211,12 @@ def blacklist_view():
 ALERT_HELP = ("Формат: /alert USDT sell 92 7d — сообщу, когда надёжный покупатель или обменник даст "
               "≥92 ₽ за USDT (для buy — ≤ порога) в течение 7 дней. Монета: одна из настроенных. "
               "Срок: число + h/d/w (часы/дни/недели), не больше 90d.\n"
-              "Добавь «repeat 1h» в конце — алерт не удалится после срабатывания, а будет проверяться "
-              "дальше и может сработать снова не раньше, чем через кулдаун (здесь 1h) после прошлого раза: "
-              "/alert USDT sell 92 7d repeat 1h")
+              "Можно добавить условия через «И» в любом порядке:\n"
+              "«vol 50000» (или «50к») — в стакане по такой цене должно набираться не меньше этой суммы;\n"
+              "«reliable» — встречная связка с этим объявлением не хуже «⚠️ риск» (не «🪤 ловушка»);\n"
+              "«repeat 1h» — алерт не удалится после срабатывания, а будет проверяться дальше и может "
+              "сработать снова не раньше, чем через кулдаун (здесь 1h) после прошлого раза.\n"
+              "Пример: /alert USDT sell 92 7d vol 50000 reliable repeat 1h")
 
 
 def alerts_view(chat_id):
@@ -223,11 +226,13 @@ def alerts_view(chat_id):
         return (f"🔔 <b>Алертов нет</b>\n\n{ALERT_HELP}", {"inline_keyboard": []})
     lines = ["🔔 <b>Алерты на курс</b>", ""]
     kb = []
-    for alert_id, asset, side, rate, expires_ts, cooldown in rows:
+    for alert_id, asset, side, rate, expires_ts, cooldown, min_volume, require_reliable in rows:
         label, cmp = ("продать", "≥") if side == "sell" else ("купить", "≤")
         left_h = max(0, round((expires_ts - time.time()) / 3600))
         mark = f" 🔁 каждые ≥{cooldown / 3600:g} ч" if cooldown else ""
-        lines.append(f"{asset} {label} {cmp}{rate:g} ₽ (осталось ~{left_h} ч){mark}")
+        vol_mark = f" 📦 ≥{_money(min_volume)} ₽" if min_volume else ""
+        rel_mark = " 🛡 не хуже риска" if require_reliable else ""
+        lines.append(f"{asset} {label} {cmp}{rate:g} ₽ (осталось ~{left_h} ч){mark}{vol_mark}{rel_mark}")
         kb.append([{"text": f"🗑 {asset} {label} {cmp}{rate:g}"[:64], "callback_data": f"delalert:{alert_id}"}])
     return "\n".join(lines), {"inline_keyboard": kb}
 
@@ -427,15 +432,14 @@ class Bot:
                         reply_markup=deal_markup(d))
 
     async def add_alert(self, arg):
-        """Команда «/alert USDT sell 92 7d [repeat 1h]»: разобрать и создать алерт на курс —
-        одноразовый, либо «повторно» с кулдауном между срабатываниями."""
-        m = re.fullmatch(r"(\w+)\s+(buy|sell)\s+([\d.,]+)\s+(\d+[hdw])(?:\s+repeat\s+(\d+[hdw]))?",
-                         (arg or "").strip(), re.I)
+        """Команда «/alert USDT sell 92 7d [vol 50000] [reliable] [repeat 1h]»: разобрать и создать
+        алерт на курс — одноразовый либо «повторно» с кулдауном, с необязательными условиями через
+        «И» (объём стакана / надёжность встречной связки) в любом порядке хвоста."""
+        m = re.match(r"(\w+)\s+(buy|sell)\s+([\d.,]+)\s+(\d+[hdw])(\s.*)?$", (arg or "").strip(), re.I)
         if not m:
             await self.send(ALERT_HELP)
             return
         asset, side, rate_s, dur_s = m.group(1).upper(), m.group(2).lower(), m.group(3), m.group(4).lower()
-        cooldown_s = m.group(5).lower() if m.group(5) else None
         if asset not in self.cfg.assets:
             await self.send(f"Монета {asset} не отслеживается ботом ({', '.join(self.cfg.assets)}).")
             return
@@ -448,21 +452,45 @@ class Bot:
         if dur is None:
             await self.send("Срок — число + h/d/w (часы/дни/недели), не больше 90d.")
             return
+        min_volume, require_reliable, cooldown_s = None, False, None
+        tokens = (m.group(5) or "").split()
+        i = 0
+        while i < len(tokens):
+            tok = tokens[i].lower()
+            if tok == "vol" and i + 1 < len(tokens):
+                min_volume = parse_amount(tokens[i + 1])
+                if min_volume is None:
+                    await self.send(f"Объём — сумма в ₽ от {int(AMOUNT_MIN)} до {int(AMOUNT_MAX)}, "
+                                    f"например «vol 50000» или «vol 50к».")
+                    return
+                i += 2
+            elif tok == "reliable":
+                require_reliable = True
+                i += 1
+            elif tok == "repeat" and i + 1 < len(tokens):
+                cooldown_s = tokens[i + 1].lower()
+                i += 2
+            else:
+                await self.send(ALERT_HELP)
+                return
         cooldown = None
         if cooldown_s:
             cooldown = alerts.parse_duration(cooldown_s)
             if cooldown is None:
                 await self.send("Кулдаун repeat — число + h/d/w (часы/дни/недели), не больше 90d.")
                 return
-        alerts.add(self.chat_id, asset, side, rate, time.time() + dur, repeat_cooldown=cooldown)
+        alerts.add(self.chat_id, asset, side, rate, time.time() + dur, repeat_cooldown=cooldown,
+                   min_volume=min_volume, require_reliable=require_reliable)
         label, cmp = ("продать", "≥") if side == "sell" else ("купить", "≤")
-        repeat_note = f", повтор не чаще раза в {cooldown_s}" if cooldown_s else ""
-        await self.send(f"🔔 Алерт создан: {asset} {label} {cmp}{rate:g} ₽, срок {dur_s}{repeat_note}. "
+        notes = "".join([f", повтор не чаще раза в {cooldown_s}" if cooldown_s else "",
+                         f", объём ≥{_money(min_volume)} ₽" if min_volume else "",
+                         ", надёжность не хуже риска" if require_reliable else ""])
+        await self.send(f"🔔 Алерт создан: {asset} {label} {cmp}{rate:g} ₽, срок {dur_s}{notes}. "
                         f"Список — /alerts.")
 
-    async def check_alerts(self, snap):
+    async def check_alerts(self, snap, cfg=None):
         """Сработавшие алерты по текущему снимку → сообщение в тот чат, где алерт создан."""
-        for alert_id, chat_id, asset, side, rate, price, ad in alerts.due(snap):
+        for alert_id, chat_id, asset, side, rate, price, ad in alerts.due(snap, cfg or self.cfg):
             label, cmp = ("продать", "≥") if side == "sell" else ("купить", "≤")
             await self.send(f"🔔 <b>Алерт сработал:</b> {asset} можно {label} по {_price(price)} ₽ "
                             f"({cmp}{rate:g}) — {fmt_ad(ad)}", chat_id=chat_id)

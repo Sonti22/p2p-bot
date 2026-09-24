@@ -246,7 +246,8 @@ def test_add_alert_creates_entry(tmp_path, monkeypatch):
     bot = Stub(p2p.Config())
     asyncio.run(bot.handle("/alert USDT sell 92 7d"))
     rows = B.alerts.list_all("1", path=db)
-    assert [(a, s, r, c) for _, a, s, r, _, c in rows] == [("USDT", "sell", 92.0, None)]
+    assert [(a, s, r, c, v, rl) for _, a, s, r, _, c, v, rl in rows] == \
+        [("USDT", "sell", 92.0, None, None, 0)]
     assert "Алерт создан" in texts(bot)[-1]
 
 
@@ -256,8 +257,32 @@ def test_add_alert_repeat_creates_entry_with_cooldown(tmp_path, monkeypatch):
     bot = Stub(p2p.Config())
     asyncio.run(bot.handle("/alert USDT sell 92 7d repeat 1h"))
     rows = B.alerts.list_all("1", path=db)
-    assert [(a, s, r, c) for _, a, s, r, _, c in rows] == [("USDT", "sell", 92.0, 3600)]
+    assert [(a, s, r, c) for _, a, s, r, _, c, _, _ in rows] == [("USDT", "sell", 92.0, 3600)]
     assert "повтор" in texts(bot)[-1].lower()
+
+
+def test_add_alert_volume_and_reliable_creates_entry(tmp_path, monkeypatch):
+    db = str(tmp_path / "alerts.db")
+    monkeypatch.setattr(B.alerts, "add", functools.partial(B.alerts.add, path=db))
+    bot = Stub(p2p.Config())
+    asyncio.run(bot.handle("/alert USDT sell 92 7d vol 50к reliable repeat 1h"))
+    rows = B.alerts.list_all("1", path=db)
+    assert [(a, s, r, c, v, rl) for _, a, s, r, _, c, v, rl in rows] == \
+        [("USDT", "sell", 92.0, 3600, 50_000.0, 1)]
+    text = texts(bot)[-1]
+    assert "объём" in text.lower() and "надёжность" in text.lower()
+
+
+def test_add_alert_bad_volume():
+    bot = Stub(p2p.Config())
+    asyncio.run(bot.handle("/alert USDT sell 92 7d vol abc"))
+    assert "Объём" in texts(bot)[-1]
+
+
+def test_add_alert_unknown_token_sends_help():
+    bot = Stub(p2p.Config())
+    asyncio.run(bot.handle("/alert USDT sell 92 7d bogus"))
+    assert "Формат" in texts(bot)[-1]
 
 
 def test_add_alert_bad_repeat_duration():
@@ -313,7 +338,7 @@ def test_delalert_callback_removes_entry(tmp_path, monkeypatch):
 
 def test_check_alerts_sends_message(monkeypatch):
     ad = make_ad("MEXC", "sell", 93.0)
-    monkeypatch.setattr(B.alerts, "due", lambda snap: [(1, "1", "USDT", "sell", 92.0, 93.0, ad)])
+    monkeypatch.setattr(B.alerts, "due", lambda snap, cfg: [(1, "1", "USDT", "sell", 92.0, 93.0, ad)])
     bot = Stub(p2p.Config())
     asyncio.run(bot.check_alerts(snap([])))
     assert "Алерт сработал" in texts(bot)[-1]
