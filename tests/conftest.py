@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 
 import pytest
@@ -54,6 +55,7 @@ def offline(monkeypatch):
         cache.clear()
     p2p._alt.update(t=0.0, ads=[], errors={})
     p2p.TRAPS_LOG.clear()
+    p2p._venue_backoff.clear()
     return fake_json
 
 
@@ -63,3 +65,14 @@ def _clean_netstatus():
     netstatus.reset()
     yield
     netstatus.reset()
+
+
+@pytest.fixture(autouse=True)
+def _clean_logging():
+    """Тесты setup_logging открывают файл в tmp_path — закрыть хендлер, чтобы Windows не держал файл."""
+    yield
+    root = logging.getLogger()
+    for h in list(p2p._log_handlers):
+        root.removeHandler(h)
+        h.close()
+    p2p._log_handlers.clear()

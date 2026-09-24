@@ -1423,3 +1423,108 @@ def test_backtest_callback_routes_same_as_command(tmp_path, monkeypatch):
 def test_history_markup_has_backtest_button():
     buttons = [b for row in B.HISTORY_MARKUP["inline_keyboard"] for b in row]
     assert any(b.get("callback_data") == "backtest" for b in buttons)
+
+
+def test_uptime_str_formats_seconds_and_days():
+    assert B._uptime_str(5) == "00:00:05"
+    assert B._uptime_str(3725) == "01:02:05"
+    assert B._uptime_str(90000) == "1д 01:00:00"
+
+
+def test_status_reports_version_uptime_scan_and_errors(tmp_path):
+    status = tmp_path / "status.json"
+    status.write_text('{"version": "abc1234"}', encoding="utf-8")
+    bot = Stub(p2p.Config(min_profit=2.0))
+    bot.start_ts = time.time() - 3725
+    bot.last_scan_ts = time.time() - 1
+    bot.last_scan_duration = 1.5
+    ds = [deal(5, "MEXC"), deal(1, "KuCoin")]
+    bot.last = p2p.Snapshot(88.0, "test", {}, {}, ds, {}, {}, {"bybit/USDT": "TimeoutError: x"})
+    text = bot.status_view(str(status))
+    assert "abc1234" in text
+    assert "01:02:0" in text                       # аптайм ~1ч02м (секунда могла чуть уйти)
+    assert "1.5 с" in text
+    assert "Связок выше порога 2%: 1" in text       # только одна связка (5%) выше порога 2%
+    assert "bybit/USDT" in text and "TimeoutError" in text
+
+
+def test_status_before_first_scan(tmp_path):
+    status = tmp_path / "status.json"
+    bot = Stub(p2p.Config())
+    text = bot.status_view(str(status))
+    assert "?" in text                              # версии в .dev_status.json ещё нет
+    assert "Последний скан: ещё не было" in text
+    assert "Скан ещё не выполнялся." in text
+
+
+def test_status_no_errors_says_all_ok(tmp_path):
+    status = tmp_path / "status.json"
+    bot = Stub(p2p.Config(min_profit=1.0))
+    bot.last_scan_ts = time.time()
+    bot.last = p2p.Snapshot(88.0, "test", {}, {}, [], {}, {}, {})
+    text = bot.status_view(str(status))
+    assert "Ошибок нет" in text
+
+
+def test_status_command_sends_status_view(monkeypatch):
+    monkeypatch.setattr(B.Bot, "status_view", lambda self, status_path=B.DEV_STATUS: "STATUS TEXT")
+    bot = Stub(p2p.Config())
+    asyncio.run(bot.handle("/status"))
+    assert texts(bot)[-1] == "STATUS TEXT"
+
+
+def test_status_callback_sends_status_view(monkeypatch):
+    monkeypatch.setattr(B.Bot, "status_view", lambda self, status_path=B.DEV_STATUS: "STATUS TEXT")
+    bot = Stub(p2p.Config())
+    asyncio.run(bot.on_callback({"id": "1", "data": "status", "message": {"message_id": 1}}))
+    assert texts(bot)[-1] == "STATUS TEXT"
+
+
+def test_logs_view_reads_tail_and_escapes_html(tmp_path):
+    log = tmp_path / "bot.log"
+    lines = [f"24.09 10:00:{i:02d} INFO bot: line {i}" for i in range(40)]
+    log.write_text("\n".join(lines) + "\n<script>bad</script>\n", encoding="utf-8")
+    text = B.logs_view(str(log), n=30)
+    assert "line 39" in text and "line 0" not in text     # только последние 30 строк
+    assert "&lt;script&gt;" in text and "<script>bad" not in text
+
+
+def test_logs_view_missing_file(tmp_path):
+    text = B.logs_view(str(tmp_path / "none.log"))
+    assert "пока пуст" in text
+
+
+def test_logs_view_empty_file(tmp_path):
+    log = tmp_path / "bot.log"
+    log.write_text("", encoding="utf-8")
+    text = B.logs_view(str(log))
+    assert "пуст" in text
+
+
+def test_logs_command_sends_logs_view(tmp_path, monkeypatch):
+    log = tmp_path / "bot.log"
+    log.write_text("24.09 10:00:00 INFO bot: hello\n", encoding="utf-8")
+    monkeypatch.setattr(B, "LOG_PATH", str(log))
+    bot = Stub(p2p.Config())
+    asyncio.run(bot.handle("/logs"))
+    assert "hello" in texts(bot)[-1]
+
+
+def test_scan_loop_records_last_scan_timestamp_and_duration(monkeypatch):
+    async def fake_scan(s, cfg):
+        return p2p.Snapshot(88.0, "test", {}, {}, [], {}, {}, {})
+
+    monkeypatch.setattr(B, "scan", fake_scan)
+    monkeypatch.setattr(B.history, "record", lambda snap: False)   # не пишем в реальный data/history.db
+
+    async def no_sleep(_):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(B.asyncio, "sleep", no_sleep)
+    bot = Stub(p2p.Config())
+    bot.chat_id = ""   # без чата — не шлём алерты/дайджесты
+    try:
+        asyncio.run(bot.scan_loop())
+    except asyncio.CancelledError:
+        pass
+    assert bot.last_scan_ts > 0 and bot.last_scan_duration >= 0
