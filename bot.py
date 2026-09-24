@@ -455,6 +455,8 @@ class Bot:
         self.awaiting_preset_name = False  # ждём имя пресета текстом после «💾 Сохранить как пресет»
         self.awaiting_key = None      # {"ex":.., "step": "key"/"secret", "key":..} — ждём ключ биржи
         self.sent = {}
+        self.live = {}                                            # (ex,asset,ex,asset) -> {"first": ts, "streak": n}
+        self.live_scans = int(os.getenv("LIVE_SCANS", 2))        # сигнал, только если связка держится ≥ N сканов
         self.venue = {}   # ex -> {"streak": сканов подряд с ошибкой, "down_since": ts, "alerted_at": ts}
         self.deals_by_id = {}   # id -> (d, cfg, snap на момент сигнала) для кнопок «✅ Сделал»/«📋 Шаги»; не переживает рестарт
         self.next_deal_id = 1
@@ -641,7 +643,7 @@ class Bot:
         elif not snap.deals:
             await self.send("Связок сейчас нет: все объявления отсеяны фильтрами.")
         else:
-            await self.send_deal(snap.deals[0], "🔥 ", cfg, snap)
+            await self.send_deal(snap.deals[0], "🔥 " + self.held_label(snap.deals[0]), cfg, snap)
 
     async def show_top(self, snap=None, cfg=None):
         snap = self.last if snap is None else snap
@@ -835,6 +837,7 @@ class Bot:
         while True:
             try:
                 self.last = await scan(self.s, self.cfg)
+                self.track_liveness(self.last)
                 if history.record(self.last):   # не чаще раза в 5 минут, независимо от чата
                     history.cleanup()
                 if self.chat_id:
@@ -931,6 +934,33 @@ class Bot:
                     await self.send(f"✅ {ex}: снова доступна")
                 st.update(streak=0, down_since=None, alerted_at=None)
 
+    @staticmethod
+    def _deal_key(d):
+        _, b, s, _ = d
+        return (b.ex, b.asset, s.ex, s.asset)
+
+    def track_liveness(self, snap, now=None):
+        """Сколько сканов подряд связка держится выше порога: минутный выброс не сигналим, устойчивую — да."""
+        now = now or time.time()
+        alive = {self._deal_key(d) for d in snap.deals if d[0] >= self.cfg.min_profit}
+        for key in alive:
+            rec = self.live.get(key)
+            if rec:
+                rec["streak"] += 1
+            else:
+                self.live[key] = {"first": now, "streak": 1}
+        for key in list(self.live):
+            if key not in alive:
+                del self.live[key]
+
+    def held_label(self, d, now=None):
+        """«⏱ держится N мин», если связка видна не первый скан; иначе пусто."""
+        rec = self.live.get(self._deal_key(d))
+        if not rec or rec["streak"] < 2:
+            return ""
+        minutes = max(1, int(((now or time.time()) - rec["first"]) / 60))
+        return f"⏱ держится {minutes} мин · "
+
     async def notify(self, snap):
         now = time.time()
         for d in snap.deals[:self.max_signals]:   # только топ-N: новые сигналы, когда меняется верх списка
@@ -938,11 +968,13 @@ class Bot:
             if profit < self.cfg.min_profit:
                 break
             key = (b.ex, b.asset, s.ex, s.asset)
+            if self.live_scans > 1 and self.live.get(key, {}).get("streak", 0) < self.live_scans:
+                continue                                          # появилась только что — ждём подтверждения
             prev = self.sent.get(key)
             if prev and now - prev[0] < self.cooldown and profit < prev[1] + self.repeat_step:
                 continue
             self.sent[key] = (now, profit)
-            await self.send_deal(d, "🔔 ", snap=snap)
+            await self.send_deal(d, "🔔 " + self.held_label(d, now), snap=snap)
 
     async def check_accounts(self):
         """Уведомление о новых движениях по подключённым биржам: депозит, вывод, спот-сделка, P2P-ордер.

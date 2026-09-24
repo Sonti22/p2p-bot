@@ -51,6 +51,7 @@ def texts(bot):
 def test_notify_top_n_and_dedup(monkeypatch):
     monkeypatch.setattr(B, "deal_card", lambda d, c, a=None, r=None, breakdown=None: b"png")
     bot = Stub(p2p.Config(min_profit=2.0))
+    bot.live_scans = 1   # тест про антидубль/паузу, не про живость
     bot.max_signals = 2
     ds = [deal(5, "MEXC"), deal(4, "KuCoin"), deal(3, "HTX")]
     asyncio.run(bot.notify(snap(ds)))
@@ -895,6 +896,7 @@ def test_quiet_hours_off_sends_signal_as_usual(monkeypatch):
     monkeypatch.setattr(B, "deal_card", lambda d, c, a=None, r=None, breakdown=None: b"png")
     monkeypatch.setattr(B.time, "time", lambda: msk_ts(2, 0))
     bot = Stub(p2p.Config(min_profit=2.0))
+    bot.live_scans = 1   # тест про антидубль/паузу, не про живость
     d = deal(5, "MEXC")
     asyncio.run(bot.quiet_and_pause_tick(snap([d])))
     assert photos(bot)                               # тихие часы выключены — сигнал уходит как обычно
@@ -945,6 +947,7 @@ def test_pause_1h_blocks_signals_and_expires(monkeypatch):
     now = [1_000_000.0]
     monkeypatch.setattr(B.time, "time", lambda: now[0])
     bot = Stub(p2p.Config(min_profit=2.0))
+    bot.live_scans = 1   # тест про антидубль/паузу, не про живость
     asyncio.run(bot.handle("/pause 1h"))
     assert bot.pause_until == now[0] + 3600 and not bot.paused
 
