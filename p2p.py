@@ -610,9 +610,12 @@ def _withdraw(cfg, sender, asset, net="", receiver="", qty=None):
         return netstatus.withdraw_ok(sender, asset, n) is not False and \
             (not receiver or netstatus.deposit_ok(receiver, asset, n) is not False)
 
+    need = _receive_nets(receiver, asset)   # ограничение получателя (BitPapa — TRC20) только для монет,
+    accepts = (lambda n: n in need) if need else (lambda n: True)   # которые в этой сети реально ходят (BC_COINS)
+
     if net:
         return (table.get(net, cfg.transfer_fees.get(asset, 0)), net) if ok(net) else None
-    allowed = {n: f for n, f in table.items() if n in RECEIVE_NETS.get(receiver, n)}
+    allowed = {n: f for n, f in table.items() if accepts(n)}
     if allowed:
         cand = {n: f for n, f in allowed.items() if ok(n)}
         if not cand:
@@ -620,10 +623,9 @@ def _withdraw(cfg, sender, asset, net="", receiver="", qty=None):
         best = min(cand, key=cand.get)
         return cand[best], best
     listed = netstatus.known_nets(sender, asset)
-    known = [n for n in listed if n in RECEIVE_NETS.get(receiver, n)]
+    known = [n for n in listed if accepts(n)]
     if known and not any(ok(n) for n in known):
         return None   # справочник есть, и во всех его сетях вывод (или ввод у получателя) закрыт
-    need = _receive_nets(receiver, asset)
     if listed and not known and need and set(need) <= set(netstatus.KNOWN_NETS):
         return None   # справочник есть, а сети, которую принимает получатель (BitPapa — TRC20), в нём нет
     return cfg.transfer_fees.get(asset, 0), ""
