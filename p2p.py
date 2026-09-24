@@ -403,8 +403,14 @@ async def spot_prices(s, assets):
             continue
         for a in assets:
             x = t.get(sym(a))
-            if x and float(x.get(k_bid) or 0) > 0 and float(x.get(k_ask) or 0) > 0:
-                out[venue][a] = (float(x[k_bid]), float(x[k_ask]))
+            if not x:
+                continue
+            try:   # битый тикер (не число в bid/ask) — пропустить монету, площадку не ронять
+                bid, ask = float(x.get(k_bid) or 0), float(x.get(k_ask) or 0)
+            except (TypeError, ValueError):
+                continue
+            if bid > 0 and ask > 0:
+                out[venue][a] = (bid, ask)
     if len(errors) == len(SPOT_VENUES):
         raise errors[0]
     return out
