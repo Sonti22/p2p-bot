@@ -664,6 +664,19 @@ def test_stats_view_reports_counts(tmp_path, monkeypatch):
     assert "За месяц" in text
 
 
+def test_traps_view_empty():
+    p2p.TRAPS_LOG.clear()
+    text = B.traps_view()
+    assert "Пока ни одной" in text
+
+
+def test_traps_view_lists_reasons():
+    p2p.TRAPS_LOG.clear()
+    p2p.TRAPS_LOG.append(p2p._trap_entry(make_ad(side="sell", price=120.0), ref=90.0, cfg=p2p.Config()))
+    text = B.traps_view()
+    assert "продать" in text and "выше рынка" in text
+
+
 def test_portfolio_view_no_exchanges_connected():
     text = B.portfolio_view({}, None)
     assert "Ни одна биржа не подключена" in text

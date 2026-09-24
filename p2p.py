@@ -13,6 +13,7 @@ import re
 import statistics
 import time
 import zipfile
+from collections import deque
 from dataclasses import dataclass, field
 
 import aiohttp
@@ -633,6 +634,31 @@ class Snapshot:
 
 _alt = {"t": 0.0, "ads": [], "errors": {}}
 
+TRAPS_LOG_SIZE = 30
+TRAPS_LOG = deque(maxlen=TRAPS_LOG_SIZE)   # последние отсеянные «ловушки» — для /traps, обучение без риска
+
+
+def _trap_entry(a, ref, cfg):
+    """Объявление отсеяно фильтром аномалий (usable/_signal_ok прошли, но цена далеко от рынка).
+    Возвращает запись для /traps, только если отклонение делает объявление привлекательным
+    (дешевле рынка на покупку / дороже рынка на продажу) — это и есть типичная ловушка;
+    невыгодные для нас аномалии в другую сторону никого не заманивают, их не показываем."""
+    dev = (a.price / ref - 1) * 100
+    attractive = dev < 0 if a.side == "buy" else dev > 0
+    if not attractive:
+        return None
+    action = "купить" if a.side == "buy" else "продать"
+    word = "ниже" if a.side == "buy" else "выше"
+    reason = (f"{action} {a.asset} на {a.ex} по {_price(a.price)} ₽ — на {abs(dev):.1f}% {word} рынка "
+              f"(ориентир {_price(ref)} ₽, отсев >{cfg.max_dev:g}%)")
+    return {"ts": time.time(), "ex": a.ex, "side": a.side, "asset": a.asset, "price": a.price,
+            "ref": ref, "dev": dev, "reason": reason}
+
+
+def traps_log():
+    """Последние отсеянные ловушки, новые первыми."""
+    return list(reversed(TRAPS_LOG))
+
 
 async def scan(s, cfg, force_alt=False):
     """force_alt — разовый скан под свою сумму (`/calc`, «своя сумма»): всегда опросить не-USDT монеты
@@ -697,6 +723,9 @@ async def scan(s, cfg, force_alt=False):
         r = refs.get(a.asset)
         if r and abs(a.price / r - 1) * 100 > cfg.max_dev:
             dropped[a.ex] = dropped.get(a.ex, 0) + 1
+            trap = _trap_entry(a, r, cfg)
+            if trap:
+                TRAPS_LOG.append(trap)
             continue
         better = (lambda cur: cur is None or (a.price < cur.price if a.side == "buy" else a.price > cur.price))
         if better(best.get((a.ex, a.side, a.asset))):
