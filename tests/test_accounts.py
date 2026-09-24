@@ -4,9 +4,13 @@ import hashlib
 import hmac
 import json
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from urllib.parse import urlencode
 
+import aiohttp
 import pytest
+from multidict import CIMultiDict, CIMultiDictProxy
+from yarl import URL
 
 import accounts
 
@@ -133,6 +137,63 @@ def test_delete_key_removes_saved_entry(tmp_path, monkeypatch):
     assert accounts.delete_key("bybit") is True
     assert accounts.keys("bybit") is None
     assert accounts.delete_key("bybit") is False
+
+
+def _clear_env_keys(monkeypatch):
+    for ex in ("BYBIT", "MEXC", "HTX", "KUCOIN"):
+        for suffix in ("API_KEY", "API_SECRET", "API_PASSPHRASE"):
+            monkeypatch.delenv(f"{ex}_{suffix}", raising=False)
+
+
+def test_delete_key_blocks_env_fallback(tmp_path, monkeypatch):
+    # ключ и в файле, и в .env: удаление должно выключить оба источника
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    _clear_env_keys(monkeypatch)
+    monkeypatch.setenv("BYBIT_API_KEY", "envkey")
+    monkeypatch.setenv("BYBIT_API_SECRET", "envsecret")
+    accounts.save_key("bybit", "k1", "s1")
+    assert accounts.delete_key("bybit") is True
+    assert accounts.keys("bybit") is None
+    assert accounts._keys_file()["bybit"] == {"disabled": True}
+
+
+def test_delete_key_env_only_disables(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    _clear_env_keys(monkeypatch)
+    monkeypatch.setenv("BYBIT_API_KEY", "envkey")
+    monkeypatch.setenv("BYBIT_API_SECRET", "envsecret")
+    assert accounts.delete_key("bybit") is True
+    assert accounts.keys("bybit") is None
+    assert accounts.delete_key("bybit") is False   # уже выключен
+
+
+def test_delete_key_nothing_returns_false(tmp_path, monkeypatch):
+    path = tmp_path / "keys.json"
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(path))
+    _clear_env_keys(monkeypatch)
+    assert accounts.delete_key("bybit") is False
+    assert not path.exists()
+
+
+def test_save_key_after_delete_reenables(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    _clear_env_keys(monkeypatch)
+    monkeypatch.setenv("BYBIT_API_KEY", "envkey")
+    monkeypatch.setenv("BYBIT_API_SECRET", "envsecret")
+    accounts.delete_key("bybit")
+    accounts.save_key("bybit", "k2", "s2")
+    assert accounts.keys("bybit") == ("k2", "s2")
+    assert "disabled" not in accounts._keys_file()["bybit"]
+
+
+def test_passphrase_disabled_overrides_env(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    _clear_env_keys(monkeypatch)
+    for suffix, value in (("API_KEY", "envkey"), ("API_SECRET", "envsecret"), ("API_PASSPHRASE", "envpass")):
+        monkeypatch.setenv(f"KUCOIN_{suffix}", value)
+    assert accounts.delete_key("kucoin") is True
+    assert accounts.keys("kucoin") is None
+    assert accounts.passphrase("kucoin") is None
 
 
 def test_mask_short_key_falls_back():
@@ -308,6 +369,72 @@ def test_verify_kucoin_bad_key(tmp_path, monkeypatch):
     assert not ok and "KC-API-KEY not exists" in msg
 
 
+def _request_info(url):
+    u = URL(url)
+    return aiohttp.RequestInfo(u, "GET", CIMultiDictProxy(CIMultiDict()), u)
+
+
+class _HttpErrorSession:
+    """raise_for_status() бросает настоящий aiohttp.ClientResponseError с фактическим URL запроса,
+    как aiohttp при ответе 4xx/5xx (str() такой ошибки содержит URL целиком)."""
+    def __init__(self, status=401, message="Unauthorized"):
+        self.status, self.message, self.errors = status, message, []
+
+    def get(self, url, headers=None):
+        session = self
+
+        class _Resp(_JsonResp):
+            def raise_for_status(self):
+                e = aiohttp.ClientResponseError(_request_info(url), (), status=session.status, message=session.message)
+                session.errors.append(e)
+                raise e
+
+        return _Resp(None)
+
+
+def test_verify_htx_http_error_hides_key(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    accounts.save_key("htx", "AKID-TEST-KEY-1234", "s")
+    s = _HttpErrorSession()
+    ok, msg = asyncio.run(accounts.verify(s, "htx"))
+    assert "AKID-TEST-KEY-1234" in str(s.errors[0])   # сама ошибка aiohttp несёт ключ в URL
+    assert not ok and "401" in msg
+    assert "AKID-TEST-KEY-1234" not in msg and "Signature" not in msg and "https://" not in msg
+
+
+def test_verify_mexc_http_error_hides_signature(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    accounts.save_key("mexc", "k", "s")
+    ok, msg = asyncio.run(accounts.verify(_HttpErrorSession(429, "Too Many Requests"), "mexc"))
+    assert not ok and msg == "HTTP 429: Too Many Requests"
+
+
+def test_verify_timeout_readable(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    accounts.save_key("bybit", "k", "s")
+
+    class _Slow:
+        def get(self, url, headers=None):
+            raise asyncio.TimeoutError()
+
+    ok, msg = asyncio.run(accounts.verify(_Slow(), "bybit"))
+    assert not ok and "таймаут" in msg   # str(TimeoutError()) пустой — пользователь видел пустое «⚠️ »
+
+
+_URL_WITH_KEY = "https://api.htx.com/v1/account/accounts?AccessKeyId=AKID-TEST&Signature=abc%3D"
+
+
+@pytest.mark.parametrize("exc", [
+    aiohttp.ContentTypeError(_request_info(_URL_WITH_KEY), (), status=200, message="unexpected mimetype: text/html"),
+    aiohttp.InvalidURL(_URL_WITH_KEY),
+    RuntimeError(f"boom {_URL_WITH_KEY}"),
+    aiohttp.ClientConnectorError(SimpleNamespace(host="api.htx.com", port=443, ssl=True), OSError(1, "refused")),
+])
+def test_api_error_text_has_no_url_or_query(exc):
+    text = accounts.api_error_text(exc)
+    assert text and "AKID-TEST" not in text and "https://" not in text and "?" not in text
+
+
 def test_api_permissions_no_key_is_safe(tmp_path, monkeypatch):
     monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
     safe, detail = asyncio.run(accounts.api_permissions(_JsonSession({}), "bybit"))
@@ -346,20 +473,50 @@ def test_api_permissions_mexc_withdraw_key_is_unsafe(tmp_path, monkeypatch):
     assert not safe and "вывод" in detail
 
 
+class _HtxKeySession:
+    """Заглушка HTX: /v2/user/uid -> uid; /v2/user/api-key без uid отвечает ошибкой параметра, как биржа."""
+    def __init__(self, permission, uid_body=None):
+        self.permission, self.urls = permission, []
+        self.uid_body = uid_body or {"code": 200, "data": 123456}
+
+    def get(self, url, headers=None):
+        self.urls.append(url)
+        if "/v2/user/uid?" in url:
+            return _JsonResp(self.uid_body)
+        if "/v2/user/api-key?" in url:
+            if "uid=123456" not in url:
+                return _JsonResp({"code": 2002, "message": "invalid.parameter"})
+            return _JsonResp({"code": 200, "data": [{"accessKey": "k", "permission": self.permission}]})
+        raise AssertionError(f"unexpected url: {url}")
+
+
 def test_api_permissions_htx_readonly_is_safe(tmp_path, monkeypatch):
     monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
     accounts.save_key("htx", "k", "s")
-    body = {"code": 200, "data": [{"accessKey": "k", "permission": "readOnly"}]}
-    safe, detail = asyncio.run(accounts.api_permissions(_JsonSession(body), "htx"))
+    safe, detail = asyncio.run(accounts.api_permissions(_HtxKeySession("readOnly"), "htx"))
     assert safe and detail == ""
 
 
 def test_api_permissions_htx_trade_key_is_unsafe(tmp_path, monkeypatch):
     monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
     accounts.save_key("htx", "k", "s")
-    body = {"code": 200, "data": [{"accessKey": "k", "permission": "readOnly,trade"}]}
-    safe, detail = asyncio.run(accounts.api_permissions(_JsonSession(body), "htx"))
-    assert not safe and "trade" in detail
+    s = _HtxKeySession("readOnly,trade,withdraw")
+    safe, detail = asyncio.run(accounts.api_permissions(s, "htx"))
+    # сначала uid, затем api-key с uid в подписанной query
+    assert [u.split("?")[0] for u in s.urls] == ["https://api.htx.com/v2/user/uid",
+                                                  "https://api.htx.com/v2/user/api-key"]
+    assert "uid=123456" in s.urls[1] and "Signature=" in s.urls[1]
+    assert not safe and detail == "trade, withdraw"
+
+
+def test_api_permissions_htx_uid_error_fails_open(tmp_path, monkeypatch):
+    """Не удалось узнать uid (сбой/нет прав) — ключ не блокируем, как и при других ошибках проверки."""
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    accounts.save_key("htx", "k", "s")
+    s = _HtxKeySession("readOnly,trade", uid_body={"code": 1002, "message": "unauthorized"})
+    safe, detail = asyncio.run(accounts.api_permissions(s, "htx"))
+    assert safe and detail == ""
+    assert len(s.urls) == 1   # api-key без uid не запрашиваем
 
 
 def test_api_permissions_kucoin_general_only_is_safe(tmp_path, monkeypatch):
@@ -484,21 +641,56 @@ class _P2pSession:
 
 
 def test_bybit_p2p_orders_parses_completed_items():
-    body = {"retCode": 0, "result": {"items": [
-        {"id": "1", "side": "1", "tokenId": "USDT", "currencyId": "RUB", "amount": "100.5",
-         "price": "95.2", "createDate": "1700000000000"},
-        {"id": "2", "side": "2", "tokenId": "USDT", "currencyId": "RUB", "amount": "50",
-         "price": "94", "createDate": "1700000001000"},
+    # Контракт /v5/p2p/order/simplifyList: ret_code (snake_case), side 0 = Buy / 1 = Sell,
+    # amount — сумма в фиате, количество монеты — notifyTokenQuantity
+    body = {"ret_code": 0, "ret_msg": "SUCCESS", "result": {"count": 2, "items": [
+        {"id": "1", "side": 1, "tokenId": "USDT", "currencyId": "EUR", "amount": "64.400", "price": "0.920",
+         "notifyTokenQuantity": "70.0000", "status": 50, "createDate": "1700000000000"},
+        {"id": "2", "side": 0, "tokenId": "USDT", "currencyId": "RUB", "amount": "9500", "price": "95",
+         "notifyTokenQuantity": "100", "status": 50, "createDate": "1700000001000"},
     ]}}
     orders = asyncio.run(accounts.bybit_p2p_orders(_P2pSession(body), "k", "s"))
     assert orders == [
-        {"id": "1", "side": "buy", "asset": "USDT", "fiat": "RUB", "amount": 100.5, "price": 95.2, "ts": 1700000000.0},
-        {"id": "2", "side": "sell", "asset": "USDT", "fiat": "RUB", "amount": 50.0, "price": 94.0, "ts": 1700000001.0},
+        {"id": "1", "side": "sell", "asset": "USDT", "fiat": "EUR", "amount": 70.0, "price": 0.92, "ts": 1700000000.0},
+        {"id": "2", "side": "buy", "asset": "USDT", "fiat": "RUB", "amount": 100.0, "price": 95.0, "ts": 1700000001.0},
     ]
 
 
+def test_bybit_p2p_orders_documented_example():
+    # Пример ответа из документации Bybit P2P (Get All Orders), поля как есть
+    body = {
+        "ret_code": 0, "ret_msg": "SUCCESS", "ext_code": "", "ext_info": {}, "time_now": "1741774253.840364",
+        "result": {"count": 1, "items": [{
+            "id": "1899742990873296896", "side": 1, "tokenId": "USDT", "orderType": "ORIGIN",
+            "amount": "64.400", "currencyId": "EUR", "price": "0.920", "notifyTokenQuantity": "70.0000",
+            "notifyTokenId": "USDT", "fee": "0", "status": 50, "createDate": "1741769000000",
+        }]},
+    }
+    orders = asyncio.run(accounts.bybit_p2p_orders(_P2pSession(body), "k", "s"))
+    assert orders == [{"id": "1899742990873296896", "side": "sell", "asset": "USDT", "fiat": "EUR",
+                       "amount": 70.0, "price": 0.92, "ts": 1741769000.0}]
+
+
+def test_bybit_p2p_orders_accepts_camel_retcode():
+    body = {"retCode": 0, "result": {"items": []}}
+    assert asyncio.run(accounts.bybit_p2p_orders(_P2pSession(body), "k", "s")) == []
+
+
+def test_bybit_p2p_orders_quantity_falls_back_to_amount_over_price():
+    # нет notifyTokenQuantity/quantity — количество монеты = сумма в фиате / цена
+    body = {"ret_code": 0, "result": {"items": [
+        {"id": "1", "side": 0, "tokenId": "USDT", "currencyId": "EUR", "amount": "64.4", "price": "0.92",
+         "createDate": "1700000000000"},
+        {"id": "2", "side": 0, "tokenId": "USDT", "currencyId": "EUR", "amount": "64.4", "price": "0",
+         "createDate": "1700000000000"},
+    ]}}
+    orders = asyncio.run(accounts.bybit_p2p_orders(_P2pSession(body), "k", "s"))
+    assert orders[0]["amount"] == pytest.approx(70.0)
+    assert orders[1]["amount"] == 0.0   # цены нет — не делим на ноль
+
+
 def test_bybit_p2p_orders_returns_none_on_bad_retcode():
-    body = {"retCode": 10005, "retMsg": "Permission denied"}
+    body = {"ret_code": 10005, "ret_msg": "Permission denied"}
     assert asyncio.run(accounts.bybit_p2p_orders(_P2pSession(body), "k", "s")) is None
 
 
@@ -681,11 +873,11 @@ def test_account_history_kucoin_does_not_hide_fresh_trade_behind_old_deposit(tmp
 def test_account_history_dispatches_bybit_to_p2p_orders(tmp_path, monkeypatch):
     monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
     accounts.save_key("bybit", "k", "s")
-    body = {"retCode": 0, "result": {"items": [
-        {"id": "1", "side": "1", "tokenId": "USDT", "currencyId": "RUB", "amount": "10", "price": "95",
-         "createDate": "1700000000000"}]}}
+    body = {"ret_code": 0, "ret_msg": "SUCCESS", "result": {"items": [
+        {"id": "1", "side": 0, "tokenId": "USDT", "currencyId": "RUB", "amount": "950", "price": "95",
+         "notifyTokenQuantity": "10", "createDate": "1700000000000"}]}}
     hist = asyncio.run(accounts.account_history(_P2pSession(body), "bybit"))
-    assert hist[0]["id"] == "1"
+    assert hist[0]["id"] == "1" and hist[0]["side"] == "buy" and hist[0]["amount"] == 10.0
 
 
 def test_account_history_returns_none_without_keys(tmp_path, monkeypatch):

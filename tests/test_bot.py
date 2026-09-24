@@ -1,7 +1,12 @@
 import asyncio
 import functools
+import logging
 import time
 from datetime import datetime
+
+import aiohttp
+from multidict import CIMultiDict, CIMultiDictProxy
+from yarl import URL
 
 import accounts
 import bot as B
@@ -659,6 +664,46 @@ def test_acc_check_callback_reports_status(monkeypatch):
     assert "bad key" in texts(bot)[-1]
 
 
+def test_acc_check_callback_escapes_error_html(monkeypatch):
+    async def fake_verify(s, ex):
+        return False, "HTTP 400: <bad request>"
+
+    monkeypatch.setattr(B.accounts, "verify", fake_verify)
+    bot = Stub(p2p.Config())
+    asyncio.run(bot.on_callback({"id": "1", "data": "acc_check:bybit", "message": {"message_id": 1}}))
+    assert "&lt;bad request&gt;" in texts(bot)[-1] and "<bad" not in texts(bot)[-1]
+
+
+def test_handle_key_input_escapes_error_html(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+
+    async def fake_verify(s, ex):
+        return False, "HTTP 400: <bad request>"
+
+    monkeypatch.setattr(B.accounts, "verify", fake_verify)
+    bot = Stub(p2p.Config())
+    bot.awaiting_key = {"ex": "bybit", "step": "secret", "key": "APIKEY123"}
+    asyncio.run(bot.handle_key_input("SECRET456", 56))
+    assert any("&lt;bad request&gt;" in t for t in texts(bot))
+    assert not any("<bad" in t for t in texts(bot))
+
+
+def test_check_accounts_error_log_has_no_url_with_key(tmp_path, monkeypatch, caplog):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    accounts.save_key("htx", "AKID-TEST-KEY-1234", "s")
+    url = URL("https://api.htx.com/v1/query/deposit-withdraw?AccessKeyId=AKID-TEST-KEY-1234&Signature=abc%3D")
+
+    async def fake_history(s, ex, limit=20):
+        raise aiohttp.ClientResponseError(aiohttp.RequestInfo(url, "GET", CIMultiDictProxy(CIMultiDict()), url), (),
+                                          status=403, message="Forbidden")
+
+    monkeypatch.setattr(B.accounts, "account_history", fake_history)
+    caplog.set_level(logging.WARNING)
+    asyncio.run(Stub(p2p.Config()).check_accounts())
+    assert "HTTP 403" in caplog.text
+    assert "AKID-TEST-KEY-1234" not in caplog.text and "Signature" not in caplog.text
+
+
 def test_acc_del_callback_removes_key(tmp_path, monkeypatch):
     monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
     accounts.save_key("bybit", "k", "s")
@@ -666,6 +711,56 @@ def test_acc_del_callback_removes_key(tmp_path, monkeypatch):
     asyncio.run(bot.on_callback({"id": "1", "data": "acc_del:bybit", "message": {"message_id": 1}}))
     assert accounts.keys("bybit") is None
     assert any("удалён" in t for t in texts(bot))
+
+
+def _clear_env_keys(monkeypatch):
+    for ex in ("BYBIT", "MEXC", "HTX", "KUCOIN"):
+        for suffix in ("API_KEY", "API_SECRET", "API_PASSPHRASE"):
+            monkeypatch.delenv(f"{ex}_{suffix}", raising=False)
+
+
+def test_acc_del_callback_disables_env_key(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    _clear_env_keys(monkeypatch)
+    monkeypatch.setenv("BYBIT_API_KEY", "envkey")
+    monkeypatch.setenv("BYBIT_API_SECRET", "envsecret")
+    bot = Stub(p2p.Config())
+    asyncio.run(bot.on_callback({"id": "1", "data": "acc_del:bybit", "message": {"message_id": 1}}))
+    assert accounts.keys("bybit") is None
+    out = texts(bot)
+    assert any("удалён" in t and ".env" in t for t in out)
+    assert any("Ключ не подключён" in t for t in out)
+    assert not any("Ключ подключён" in t for t in out)
+    assert not any("envkey" in t or "envsecret" in t for t in out)
+
+
+def test_acc_del_callback_without_key_says_not_connected(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    _clear_env_keys(monkeypatch)
+    bot = Stub(p2p.Config())
+    asyncio.run(bot.on_callback({"id": "1", "data": "acc_del:bybit", "message": {"message_id": 1}}))
+    out = texts(bot)
+    assert "не был подключён" in out[0] and not any("удалён" in t for t in out)
+
+
+def test_check_key_safety_disables_env_only_key(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    _clear_env_keys(monkeypatch)
+    monkeypatch.setenv("BYBIT_API_KEY", "envkey")
+    monkeypatch.setenv("BYBIT_API_SECRET", "envsecret")
+    calls = []
+
+    async def fake_permissions(s, ex):
+        calls.append(ex)
+        return False, "торговля"
+
+    monkeypatch.setattr(B.accounts, "api_permissions", fake_permissions)
+    bot = Stub(p2p.Config())
+    asyncio.run(bot.check_key_safety())
+    assert accounts.keys("bybit") is None
+    assert len(texts(bot)) == 1 and ".env" in texts(bot)[0]
+    asyncio.run(bot.check_key_safety())   # следующий старт: ключ выключен, проверять и предупреждать нечего
+    assert calls == ["bybit"] and len(texts(bot)) == 1
 
 
 def test_check_key_safety_removes_unsafe_key_and_warns(tmp_path, monkeypatch):

@@ -2,9 +2,11 @@
 
 Ключи хранятся локально: сначала `data/keys.json` (папка `data/` в git не попадает), иначе `.env`
 (`BYBIT_API_KEY`/`BYBIT_API_SECRET`, `MEXC_API_KEY`/`MEXC_API_SECRET`). Нет ключей для биржи —
-`keys()` вернёт None, функции аккаунтов для неё выключены. Никаких торговых/выводных запросов —
-только подписанные GET к read-only эндпоинтам.
+`keys()` вернёт None, функции аккаунтов для неё выключены. Удалённый в боте ключ помечается в
+`data/keys.json` как `disabled` — пометка выключает его, даже если он остался в `.env`. Никаких
+торговых/выводных запросов — только подписанные GET к read-only эндпоинтам.
 """
+import asyncio
 import base64
 import hashlib
 import hmac
@@ -13,6 +15,8 @@ import os
 import time
 from datetime import datetime, timezone
 from urllib.parse import urlencode
+
+import aiohttp
 
 KEYS_PATH = os.path.join("data", "keys.json")
 BYBIT_BASE = "https://api.bybit.com"
@@ -32,10 +36,25 @@ def _keys_file():
         return {}
 
 
+def _write_keys_file(data):
+    os.makedirs(os.path.dirname(KEYS_PATH), exist_ok=True)
+    with open(KEYS_PATH, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def in_env(exchange):
+    """Есть ли ключ биржи в окружении (.env): {EXCHANGE}_API_KEY или {EXCHANGE}_API_SECRET."""
+    ex = exchange.upper()
+    return bool(os.getenv(f"{ex}_API_KEY") or os.getenv(f"{ex}_API_SECRET"))
+
+
 def keys(exchange):
-    """(api_key, api_secret) для биржи или None, если ключей нет (файл имеет приоритет над .env)."""
+    """(api_key, api_secret) для биржи или None, если ключей нет или ключ выключен пометкой disabled
+    (файл имеет приоритет над .env)."""
     ex = exchange.lower()
     saved = _keys_file().get(ex, {})
+    if saved.get("disabled"):   # ключ удалён в боте — не подхватываем его и из .env
+        return None
     key = saved.get("key") or os.getenv(f"{exchange.upper()}_API_KEY")
     secret = saved.get("secret") or os.getenv(f"{exchange.upper()}_API_SECRET")
     return (key, secret) if key and secret else None
@@ -49,27 +68,30 @@ def save_key(exchange, key, secret, passphrase=None):
     entry = {"key": key, "secret": secret}
     if passphrase:
         entry["passphrase"] = passphrase
-    data[exchange.lower()] = entry
-    os.makedirs(os.path.dirname(KEYS_PATH), exist_ok=True)
-    with open(KEYS_PATH, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    data[exchange.lower()] = entry   # новая запись целиком — снимает и пометку disabled
+    _write_keys_file(data)
 
 
 def passphrase(exchange):
     """Passphrase ключа биржи (сейчас только KuCoin): data/keys.json, иначе {EXCHANGE}_API_PASSPHRASE в .env."""
     ex = exchange.lower()
     saved = _keys_file().get(ex, {})
+    if saved.get("disabled"):
+        return None
     return saved.get("passphrase") or os.getenv(f"{exchange.upper()}_API_PASSPHRASE")
 
 
 def delete_key(exchange):
-    """Удалить сохранённый ключ биржи из data/keys.json, если он там есть."""
-    data = _keys_file()
-    if data.pop(exchange.lower(), None) is None:
+    """Отключить ключ биржи из любого источника: убрать запись из data/keys.json, а если ключ есть
+    и в .env — записать пометку disabled, которая перекрывает .env. False — ключ не был подключён."""
+    ex = exchange.lower()
+    if keys(ex) is None:
         return False
-    os.makedirs(os.path.dirname(KEYS_PATH), exist_ok=True)
-    with open(KEYS_PATH, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    data = _keys_file()
+    data.pop(ex, None)
+    if in_env(ex):
+        data[ex] = {"disabled": True}
+    _write_keys_file(data)
     return True
 
 
@@ -106,6 +128,18 @@ async def _get_json(s, url, headers):
     async with s.get(url, headers=headers) as r:
         r.raise_for_status()
         return await r.json(content_type=None)
+
+
+def api_error_text(e):
+    """Текст ошибки запроса к бирже для пользователя и лога — без URL и параметров запроса: str() ошибки
+    aiohttp содержит полный URL, а в query HTX лежат AccessKeyId и Signature, у MEXC — signature."""
+    if isinstance(e, (asyncio.TimeoutError, TimeoutError)):
+        return "таймаут запроса"
+    if isinstance(e, aiohttp.ClientResponseError):   # и ContentTypeError: только код и причина
+        return f"HTTP {e.status}: {e.message}"[:120] if e.message else f"HTTP {e.status}"
+    if isinstance(e, aiohttp.ClientConnectorError):   # только хост, без пути и query
+        return f"нет соединения с {e.host}"
+    return type(e).__name__   # прочие ошибки: str(e) может содержать URL
 
 
 async def bybit_get(s, api_key, api_secret, path, params=None):
@@ -214,7 +248,11 @@ async def api_permissions(s, exchange):
             bad = [name for name, granted in (("торговля", j.get("canTrade")), ("вывод", j.get("canWithdraw"))) if granted]
             return not bad, ", ".join(bad)
         elif ex == "htx":
-            j = await htx_get(s, api_key, api_secret, "/v2/user/api-key")
+            # /v2/user/api-key требует обязательный uid владельца ключа — сначала узнаём его
+            u = await htx_get(s, api_key, api_secret, "/v2/user/uid")
+            if u.get("code") != 200 or not u.get("data"):
+                return True, ""
+            j = await htx_get(s, api_key, api_secret, "/v2/user/api-key", {"uid": u["data"]})
             if j.get("code") != 200:
                 return True, ""
             entry = next((e for e in j.get("data") or [] if e.get("accessKey") == api_key), None)
@@ -324,7 +362,7 @@ async def verify(s, exchange):
         else:
             return False, f"{exchange}: подпись запросов пока не реализована"
     except Exception as e:
-        return False, str(e)
+        return False, api_error_text(e)
     return True, "ключ рабочий, доступ только для чтения"
 
 
@@ -483,30 +521,37 @@ async def account_history(s, exchange, limit=20):
 
 
 P2P_STATUS_COMPLETED = 50  # Bybit P2P: код статуса завершённого ордера
+P2P_SIDE_BUY = 0           # Bybit P2P: side 0 = покупка, 1 = продажа
 
 
 async def bybit_p2p_orders(s, api_key, api_secret, size=20):
     """История последних завершённых P2P-ордеров Bybit пользователя (только чтение, для автожурнала).
 
-    Возвращает список {id, side, asset, fiat, amount, price, ts} или None, если P2P API недоступно
-    этому ключу (нет прав/бизнес-аккаунта, ошибка сети) — тогда автожурнал берёт факт из другого места."""
+    Возвращает список {id, side, asset, fiat, amount, price, ts} (amount — количество монеты, не фиат)
+    или None, если P2P API недоступно этому ключу (нет прав/бизнес-аккаунта, ошибка сети) — тогда
+    автожурнал берёт факт из другого места."""
     try:
         j = await bybit_post(s, api_key, api_secret, "/v5/p2p/order/simplifyList",
                               {"page": 1, "size": size, "status": P2P_STATUS_COMPLETED})
     except Exception:
         return None
-    if j.get("retCode") != 0:
+    # P2P-эндпоинты Bybit отвечают в snake_case (ret_code/ret_msg), а не retCode, как остальной v5
+    if j.get("ret_code", j.get("retCode")) != 0:
         return None
     out = []
     for it in (j.get("result") or {}).get("items") or []:
         try:
+            price = float(it.get("price") or 0)
+            # amount — сумма сделки в фиате; монеты — notifyTokenQuantity (в order/info — quantity)
+            qty = it.get("notifyTokenQuantity") or it.get("quantity")
+            fiat_sum = float(it.get("amount") or 0)
             out.append({
                 "id": it.get("id"),
-                "side": "buy" if str(it.get("side")) in ("1", "buy", "Buy") else "sell",
+                "side": "buy" if str(it.get("side")) in (str(P2P_SIDE_BUY), "buy", "Buy") else "sell",
                 "asset": it.get("tokenId"),
                 "fiat": it.get("currencyId"),
-                "amount": float(it.get("amount") or 0),
-                "price": float(it.get("price") or 0),
+                "amount": float(qty) if qty else (fiat_sum / price if price else 0.0),
+                "price": price,
                 "ts": int(it.get("createDate") or 0) / 1000,
             })
         except (TypeError, ValueError):
