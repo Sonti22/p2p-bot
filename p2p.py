@@ -540,11 +540,20 @@ def _same_venue(b, s):
     return b.ex == s.ex and b.ex != "BestChange"   # обменники всегда внешние: нужен перевод
 
 
+def _receive_nets(to, asset):
+    """Сети, в которых получатель точно примет asset (RECEIVE_NETS); None — ограничения нет. Ограничение
+    касается монет, которые вообще ходят в этих сетях (USDT/USDC в TRC20 — по BC_COINS): BTC или ETH
+    в TRC20 не бывает, сети получателя для них не подтверждены — не мешаем."""
+    nets = RECEIVE_NETS.get(to)
+    return nets if nets and any((asset, n) in BC_COINS.values() for n in nets) else None
+
+
 def _withdraw(cfg, sender, asset, net="", receiver=""):
     """Комиссия вывода монеты с биржи и сеть. Сеть задана (её требует обменник) — берём её,
     иначе самую дешёвую из тех, что принимает получатель. None — открытой сети нет: у отправителя
     закрыт вывод или у получателя ввод (по живому справочнику netstatus; неизвестно = не мешаем),
-    либо справочник отправителя известен и все его сети закрыты. Нет сведений — запасная комиссия."""
+    либо справочник отправителя известен и все его сети закрыты (или нет сети, которую принимает
+    получатель). Нет сведений — запасная комиссия."""
     table = dict(WITHDRAW.get((sender, asset), {}))
     for n in netstatus.open_nets(sender, asset):       # живой справочник дополняет таблицу и переопределяет её
         fee = netstatus.live_fee(sender, asset, n)
@@ -564,9 +573,13 @@ def _withdraw(cfg, sender, asset, net="", receiver=""):
             return None
         best = min(cand, key=cand.get)
         return cand[best], best
-    known = [n for n in netstatus.known_nets(sender, asset) if n in RECEIVE_NETS.get(receiver, n)]
+    listed = netstatus.known_nets(sender, asset)
+    known = [n for n in listed if n in RECEIVE_NETS.get(receiver, n)]
     if known and not any(ok(n) for n in known):
         return None   # справочник есть, и во всех его сетях вывод (или ввод у получателя) закрыт
+    need = _receive_nets(receiver, asset)
+    if listed and not known and need and set(need) <= set(netstatus.KNOWN_NETS):
+        return None   # справочник есть, а сети, которую принимает получатель (BitPapa — TRC20), в нём нет
     return cfg.transfer_fees.get(asset, 0), ""
 
 
@@ -584,8 +597,9 @@ def _hop(cfg, frm, frm_net, to, to_net, asset):
         fee, net = w
         return fee, f"через Bybit: перевод −{fee:g} {asset} ({net})"
     if frm == "BestChange":                          # обменник сам шлёт монету, комиссия в его курсе
-        if frm_net not in RECEIVE_NETS.get(to, (frm_net,)):
-            return None, ""                          # получатель не принимает сеть обменника (BitPapa — только TRC20)
+        need = _receive_nets(to, asset)
+        if need and frm_net not in need:
+            return None, ""                          # получатель не принимает сеть обменника (BitPapa: USDT/USDC — только TRC20)
         if netstatus.deposit_ok(to, asset, frm_net) is False:
             return None, ""                          # у биржи закрыт ввод в сети обменника
         return 0.0, f"обменник шлёт {asset} ({frm_net}) на {to}"
@@ -770,7 +784,9 @@ def _match(b, sell_ads, cfg, spot, over_banks=frozenset()):
     (прибыль %, b, s, маршрут) или None — маршрут невозможен или глубины продажи не хватает."""
     if not sell_ads:
         return None
-    qty = _route_qty(b, sell_ads[0], cfg, spot, over_banks)   # от цены продажи выход не зависит
+    # от цены продажи выход не зависит; запас на курс только занижает оценку прибыли, а продавать
+    # придётся всю монету — глубину сверяем с количеством без него
+    qty = _route_qty(b, sell_ads[0], cfg, spot, over_banks, disable=frozenset({"risk"}))
     s = _stack_qty(sell_ads, qty)
     if s is None:
         return None
@@ -896,7 +912,7 @@ class Snapshot:
     over_banks: frozenset = field(default_factory=frozenset)
 
 
-_alt = {"t": 0.0, "ads": [], "errors": {}, "key": None}   # key — (монеты, площадки), под которые собран кэш
+_alt = {"t": 0.0, "ads": [], "errors": {}, "key": None}   # key — (монеты, площадки, сумма круга), под которые собран кэш
 
 VENUE_BACKOFF_BASE = 30    # сек: первая пауза площадки после ошибки
 VENUE_BACKOFF_MAX = 600    # сек: потолок паузы (10 мин)
@@ -955,8 +971,8 @@ async def scan(s, cfg, force_alt=False):
     """force_alt — разовый скан под свою сумму (`/calc`, «своя сумма»): всегда опросить не-USDT монеты
     заново и не трогать общий кэш _alt, потому что лимиты объявлений зависят от cfg.amount."""
     names_all = [n for n in cfg.exchanges if n in FETCHERS]
-    key = (tuple(cfg.assets), tuple(names_all))
-    if not force_alt and _alt["key"] != key:   # сменили монеты/площадки — старый кэш не годится, опросить заново
+    key = (tuple(cfg.assets), tuple(names_all), cfg.amount)   # площадки фильтруют объявления по сумме
+    if not force_alt and _alt["key"] != key:   # сменили монеты/площадки/сумму — старый кэш не годится, опросить заново
         _alt.update(t=0.0, ads=[], errors={}, key=key)
     paused = {n: u for n in names_all if (u := _venue_paused_until(n))}   # площадки на паузе после ошибок
     names = [n for n in names_all if n not in paused]

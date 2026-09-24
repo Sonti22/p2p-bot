@@ -307,6 +307,18 @@ def test_match_cross_asset_limits_sell_in_coin():
     assert profit == pytest.approx(((first * 245000.0 + (qty - first) * 244000.0) / 50000 - 1) * 100)
 
 
+def test_match_checks_sell_depth_before_risk_buffer():
+    c = cfg(risk_buffer={"ETH": 0.5})
+    b = make_ad("MEXC", "buy", 200_000.0, asset="ETH", avail=100)
+    real = 50_000 / 200_000.0                  # 0.25 ETH физически на выходе
+    short = [make_ad("MEXC", "sell", 204_000.0, asset="ETH", avail=real * (1 - 0.5 / 100))]
+    assert p2p._match(b, short, c, SPOT) is None   # стакан примет только 0.24875 — 0.5% монеты не продать
+    full = [make_ad("MEXC", "sell", 204_000.0, asset="ETH", avail=real)]
+    profit, _, s, route = p2p._match(b, full, c, SPOT)
+    assert s.avail == pytest.approx(real) and "запас на курс −0.5%" in route
+    assert profit == pytest.approx((real * (1 - 0.5 / 100) * 204_000.0 / 50_000 - 1) * 100)   # запас — в оценке прибыли
+
+
 def _fake_sell_scan(monkeypatch, sell_ads):
     async def fake_fetcher(s, cfg, side, asset):
         return [make_ad("Fake", "buy", 87.0)] if side == "buy" else sell_ads

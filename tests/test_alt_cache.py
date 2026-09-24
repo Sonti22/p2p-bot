@@ -103,3 +103,16 @@ def test_force_alt_does_not_touch_cache_key(offline, monkeypatch):
     calls.clear()
     asyncio.run(p2p.scan(None, c))                      # обычный скан после /calc: кэш не пересобирается
     assert not [x for x in calls if x[2] == "ETH"]
+
+
+def test_amount_change_refetches_alts(offline, monkeypatch):
+    calls = []
+    monkeypatch.setitem(p2p.FETCHERS, "fake", _fetch_for("Fake", calls))
+    c = _cfg()
+    asyncio.run(p2p.scan(None, c))
+    calls.clear()
+    asyncio.run(p2p.scan(None, c))
+    assert not [x for x in calls if x[2] == "ETH"]      # внутри alt_interval — из кэша
+    c.amount = 100000                                   # /amount или пресет: площадки отдают объявления под сумму
+    asyncio.run(p2p.scan(None, c))
+    assert ("Fake", "buy", "ETH") in calls
