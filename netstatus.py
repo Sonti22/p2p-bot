@@ -13,7 +13,7 @@ import accounts
 
 TTL = 600
 KNOWN_NETS = ("TRC20", "BEP20", "ERC20", "TON", "SOL", "POLYGON", "ARBITRUM", "APT", "BTC")
-STATUS = {}      # (площадка, монета) -> {сеть: {"dep": bool|None, "wd": bool|None, "fee": float|None}}
+STATUS = {}      # (площадка, монета) -> {сеть: {"dep": bool|None, "wd": bool|None, "fee": float|None, "min": float|None}}
 CHANGES = []     # (площадка, монета, сеть, "вывод"/"ввод", открыт: bool)
 _meta = {"t": 0.0, "errors": {}}
 
@@ -57,7 +57,7 @@ def _parse_htx(j):
         for ch in c.get("chains") or []:
             out[normalize(ch.get("displayName") or ch.get("chain"))] = {
                 "dep": ch.get("depositStatus") == "allowed", "wd": ch.get("withdrawStatus") == "allowed",
-                "fee": _f(ch.get("transactFeeWithdraw"))}
+                "fee": _f(ch.get("transactFeeWithdraw")), "min": _f(ch.get("minWithdrawAmt"))}
     return out
 
 
@@ -68,7 +68,7 @@ def _parse_kucoin(j):
     for ch in (j.get("data") or {}).get("chains") or []:
         net = normalize(ch.get("chainName"))
         rec = {"dep": bool(ch.get("isDepositEnabled")), "wd": bool(ch.get("isWithdrawEnabled")),
-               "fee": _f(ch.get("withdrawalMinFee"))}
+               "fee": _f(ch.get("withdrawalMinFee")), "min": _f(ch.get("withdrawalMinSize"))}
         cur = out.get(net)
         if cur is None or (rec["wd"] and not cur["wd"]):   # у KuCoin бывает две записи TON — берём открытую
             out[net] = rec
@@ -83,7 +83,7 @@ def _parse_bybit(j):
         for ch in row.get("chains") or []:
             out[normalize(ch.get("chainType") or ch.get("chain"))] = {
                 "dep": str(ch.get("chainDeposit")) == "1", "wd": str(ch.get("chainWithdraw")) == "1",
-                "fee": _f(ch.get("withdrawFee"))}
+                "fee": _f(ch.get("withdrawFee")), "min": _f(ch.get("withdrawMin"))}
     return out
 
 
@@ -97,7 +97,7 @@ def _parse_mexc(j, asset):
         for ch in c.get("networkList") or []:
             out[normalize(ch.get("network") or ch.get("netWork"))] = {
                 "dep": bool(ch.get("depositEnable")), "wd": bool(ch.get("withdrawEnable")),
-                "fee": _f(ch.get("withdrawFee"))}
+                "fee": _f(ch.get("withdrawFee")), "min": _f(ch.get("withdrawMin"))}
     return out
 
 
@@ -176,6 +176,12 @@ def deposit_ok(venue, asset, net):
 def live_fee(venue, asset, net):
     r = _rec(venue, asset, net)
     return None if r is None else r.get("fee")
+
+
+def min_withdraw(venue, asset, net):
+    """Минимальная сумма вывода монеты в этой сети по живому справочнику; None — сведений нет."""
+    r = _rec(venue, asset, net)
+    return None if r is None else r.get("min")
 
 
 def open_nets(venue, asset):
