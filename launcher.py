@@ -1,14 +1,19 @@
 """Запускает бота, сам подтягивает обновления из GitHub и откатывается, если новая версия падает.
 
 Запуск: python launcher.py (через run.bat). Защищённый файл: правится только вручную, не облачным Claude.
-- каждые UPDATE_EVERY сек: git fetch; есть новое в origin/main и папка чистая → pull → смоук-тест →
+- каждые UPDATE_EVERY сек: git fetch; есть новое в origin/main и папка чистая → pull → смоук-тест
+  (компиляция + pytest; нет pytest — ставит его, не вышло или тестов нет — провал) →
   перезапуск бота и сообщение в Telegram; смоук не прошёл → возврат на прежний коммит;
-- бот падает быстрее CRASH_WINDOW сек CRASH_LIMIT раза подряд → откат на последнюю рабочую версию.
+- бот падает быстрее CRASH_WINDOW сек CRASH_LIMIT раза подряд → откат на последнюю рабочую версию;
+- один launcher на папку (замок logs/launcher.lock, второй выходит с кодом 3); бот не переживает launcher:
+  при любом выходе из run() он останавливается, а бот-сирота убитого извне launcher (pid в logs/bot.pid)
+  завершается при следующем старте — иначе два экземпляра делят один токен.
 """
 import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -23,6 +28,11 @@ CRASH_WINDOW, CRASH_LIMIT = 60, 3
 
 
 LOG_PATH = os.path.join(HERE, "logs", "launcher.log")
+# служебные файлы — в logs/ (уже в .gitignore)
+PID_FILE = os.path.join(HERE, "logs", "bot.pid")
+LOCK_PATH = os.path.join(HERE, "logs", "launcher.lock")
+NO_PYTEST = "pytest не установлен и не ставится сам — выполните вручную: pip install -r requirements.txt"
+_lock_fd = None   # дескриптор замка держим открытым до конца процесса
 
 
 def log(msg):
@@ -107,22 +117,133 @@ def write_dev_status():
         log(f"dev status: {e}")
 
 
+def _run(args, timeout):
+    """python -m <args> в папке бота; в тестах подменяется."""
+    return subprocess.run([sys.executable, "-m", *args], cwd=HERE, capture_output=True, text=True, errors="replace",
+                          timeout=timeout)
+
+
 def smoke():
-    """Компиляция и тесты новой версии до перезапуска бота."""
-    py = [sys.executable, "-m"]
+    """Компиляция и тесты новой версии до перезапуска бота. Без pytest или без единого теста — провал:
+    иначе обновление считалось бы проверенным, хотя тесты не запускались."""
     files = [f for f in os.listdir(HERE) if f.endswith(".py")]
+    tests = ["pytest", "-q", "-x", "-p", "no:cacheprovider"]
     try:
-        r = subprocess.run(py + ["py_compile", *files], cwd=HERE, capture_output=True, text=True, errors="replace",
-                           timeout=120)
+        r = _run(["py_compile", *files], 120)
         if r.returncode:
             return False, r.stderr[-500:]
-        r = subprocess.run(py + ["pytest", "-q", "-x", "-p", "no:cacheprovider"], cwd=HERE, capture_output=True,
-                           text=True, errors="replace", timeout=600)
+        r = _run(tests, 600)
+        if "No module named pytest" in r.stderr:   # ставим только сам pytest и повторяем один раз
+            log("pytest не установлен — ставлю")
+            p = _run(["pip", "install", "-q", "pytest"], 300)
+            if p.returncode:
+                return False, NO_PYTEST + "\n" + p.stderr[-300:]
+            r = _run(tests, 600)
     except subprocess.TimeoutExpired:
         return False, "смоук-тест не завершился за отведённое время"
     if "No module named pytest" in r.stderr:
-        return True, ""
-    return r.returncode in (0, 5), (r.stdout + r.stderr)[-500:]   # 5 = тестов нет
+        return False, NO_PYTEST
+    if r.returncode == 5:
+        return False, "pytest не нашёл ни одного теста (tests/ удалён или пуст?)"
+    return r.returncode == 0, (r.stdout + r.stderr)[-500:]
+
+
+def start_bot():
+    """Процесс бота; в тестах подменяется."""
+    return subprocess.Popen([sys.executable, "bot.py"], cwd=HERE)
+
+
+def stop(proc):
+    """Остановить бота: terminate, не вышел за 30 с — kill."""
+    if proc.poll() is not None:
+        return
+    proc.terminate()
+    try:
+        proc.wait(30)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        try:
+            proc.wait(10)
+        except subprocess.TimeoutExpired:
+            log(f"бот pid {proc.pid} не завершился после kill")
+
+
+def write_pid(pid):
+    try:
+        os.makedirs(os.path.dirname(PID_FILE), exist_ok=True)
+        with open(PID_FILE, "w") as f:
+            f.write(str(pid))
+    except OSError as e:
+        log(f"pid-файл: {e}")
+
+
+def remove_pid():
+    try:
+        os.remove(PID_FILE)
+    except OSError:
+        pass
+
+
+def _tasklist(pid):
+    """Строка tasklist о процессе pid (Windows); пусто, если узнать не удалось."""
+    if os.name != "nt":
+        return ""
+    try:
+        return subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"], capture_output=True,
+                              text=True, errors="replace", timeout=30).stdout
+    except (OSError, subprocess.TimeoutExpired) as e:
+        log(f"tasklist: {e}")
+        return ""
+
+
+def bot_alive(pid):
+    """Жив ли pid и это наш python. os.kill(pid, 0) на Windows не проверка: это Ctrl+C, а не опрос."""
+    return f'"{os.path.basename(sys.executable).lower()}","{pid}"' in _tasklist(pid).lower()
+
+
+def kill_orphan():
+    """Бот, переживший прошлый launcher (убит из Диспетчера задач): завершить до запуска нового.
+    Вызывать только под замком acquire_lock — иначе второй launcher убьёт бота первого."""
+    try:
+        with open(PID_FILE) as f:
+            pid = int(f.read().strip())
+    except (OSError, ValueError):
+        return
+    if pid != os.getpid() and bot_alive(pid):
+        log(f"завершаю осиротевший бот pid {pid}")
+        try:
+            os.kill(pid, signal.SIGTERM)   # на Windows = TerminateProcess
+        except OSError as e:
+            log(f"не смог завершить pid {pid}: {e}")
+        for _ in range(10):
+            time.sleep(1)
+            if not bot_alive(pid):
+                break
+        else:   # pid-файл оставляем: run.bat перезапустит launcher, и он попробует снова
+            raise RuntimeError(f"осиротевший бот pid {pid} не завершился — второй не запускаю")
+    remove_pid()
+
+
+def acquire_lock():
+    """Один launcher на папку (Windows): False — замок держит другой живой launcher.
+    Замок снимает ОС, когда процесс умирает (даже убитый извне), поэтому устаревшего замка не бывает."""
+    global _lock_fd
+    if os.name != "nt":
+        return True
+    import msvcrt
+    try:
+        os.makedirs(os.path.dirname(LOCK_PATH), exist_ok=True)
+        fd = os.open(LOCK_PATH, os.O_RDWR | os.O_CREAT)
+    except OSError as e:   # файл не открыть (права, синхронизация) — работаем без замка, но пишем в лог
+        log(f"замок launcher недоступен: {e}")
+        return True
+    try:
+        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+    except OSError:
+        os.close(fd)
+        return False
+    _lock_fd = fd
+    return True
 
 
 class Launcher:
@@ -197,6 +318,7 @@ class Launcher:
 
     def run(self):
         every = int(env_value("UPDATE_EVERY", "300"))
+        kill_orphan()
         try:
             self.try_update()
         except Exception as e:
@@ -205,41 +327,55 @@ class Launcher:
         while True:
             started = time.time()
             write_dev_status()
-            proc = subprocess.Popen([sys.executable, "bot.py"], cwd=HERE)
-            log(f"бот запущен (pid {proc.pid}, версия {git('rev-parse', '--short', 'HEAD', check=False)})")
-            good_marked, updated = False, False
-            while proc.poll() is None:
-                time.sleep(5)
-                if not good_marked and time.time() - started > STABLE_AFTER:
-                    with open(LAST_GOOD, "w") as f:
-                        f.write(git("rev-parse", "HEAD"))
-                    good_marked, crashes = True, 0
-                if time.time() - last_check > every:
-                    last_check = time.time()
-                    log("проверка обновлений")
-                    try:
-                        self.check_prs()
-                        updated = self.try_update()
-                    except Exception as e:   # любая неожиданная ошибка не должна убивать цикл
-                        log(f"ошибка проверки: {type(e).__name__}: {e}")
-                        updated = False
-                    if updated:
-                        proc.terminate()
+            try:   # версию — до запуска: таймаут git после Popen оставил бы бота без присмотра
+                ver = git("rev-parse", "--short", "HEAD", check=False)
+            except RuntimeError:
+                ver = "?"
+            proc = start_bot()
+            try:   # любой выход из run() (исключение, Ctrl+C) останавливает бота — иначе run.bat запустит второго
+                write_pid(proc.pid)
+                log(f"бот запущен (pid {proc.pid}, версия {ver})")
+                good_marked, updated = False, False
+                while proc.poll() is None:
+                    time.sleep(5)
+                    if not good_marked and time.time() - started > STABLE_AFTER:
+                        try:   # одна попытка на запуск: ошибка записи не повод бросать бота
+                            head = git("rev-parse", "HEAD")
+                            with open(LAST_GOOD, "w") as f:
+                                f.write(head)
+                        except (OSError, RuntimeError) as e:
+                            log(f"last_good: {e}")
+                        good_marked, crashes = True, 0
+                    if time.time() - last_check > every:
+                        last_check = time.time()
+                        log("проверка обновлений")
                         try:
-                            proc.wait(30)
-                        except subprocess.TimeoutExpired:
-                            proc.kill()
-                        updated = True
+                            self.check_prs()
+                            updated = self.try_update()
+                        except Exception as e:   # любая неожиданная ошибка не должна убивать цикл
+                            log(f"ошибка проверки: {type(e).__name__}: {e}")
+                            updated = False
+                        if updated:
+                            break   # бота остановит finally
+            finally:
+                stop(proc)
+                remove_pid()
             if updated:
                 continue
             uptime = time.time() - started
             log(f"бот завершился (код {proc.returncode}) через {uptime:.0f} с")
             crashes = crashes + 1 if uptime < CRASH_WINDOW else 0
             if crashes >= CRASH_LIMIT:
-                self.rollback()
+                try:
+                    self.rollback()
+                except Exception as e:
+                    log(f"ошибка отката: {type(e).__name__}: {e}")
                 crashes = 0
             time.sleep(15)
 
 
 if __name__ == "__main__":
+    if not acquire_lock():   # замок — до kill_orphan в run(): второй launcher не должен трогать бота первого
+        log("launcher уже запущен в другом окне — выхожу")
+        sys.exit(3)
     Launcher().run()
