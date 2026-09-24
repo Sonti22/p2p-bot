@@ -70,6 +70,9 @@ KEY_HINT = {
     "mexc": ("Создай ключ на MEXC: Профиль → API Management → Create API. "
              "Права — только «Read Info» (сними «Spot & Contract Trading» и «Withdrawals»), "
              "в Bind IP Address впиши IP своего ПК."),
+    "kucoin": ("Создай ключ на KuCoin: Профиль → API Management → Create API. "
+               "Права — только «General» (сними «Trade» и «Transfer»), в IP restriction впиши IP своего ПК. "
+               "KuCoin попросит придумать <b>passphrase</b> — запомни её, бот спросит третьим шагом."),
 }
 
 
@@ -131,7 +134,7 @@ def account_view(ex):
                 f"Доступ: только чтение.")
         kb = [[{"text": "🔄 Проверить", "callback_data": f"acc_check:{ex}"}],
               [{"text": "🗑 Удалить ключ", "callback_data": f"acc_del:{ex}"}], [back]]
-    elif ex in accounts.CONNECTABLE:
+    elif ex in accounts.ONBOARDABLE:
         text = f"🔑 <b>{name}</b>\n\nКлюч не подключён.\n\n{key_hint(ex, name)}"
         kb = [[{"text": "➕ Подключить", "callback_data": f"acc_add:{ex}"}], [back]]
     else:
@@ -349,18 +352,29 @@ class Bot:
         await self.show_best(snap)
 
     async def handle_key_input(self, text, message_id):
-        """Ввод API key/secret после «➕ Подключить»: сообщение с ключом удаляется из чата сразу же."""
+        """Ввод API key/secret[/passphrase] после «➕ Подключить»: сообщения с ключом удаляются из чата сразу же.
+
+        Для бирж из accounts.PASSPHRASE_REQUIRED (KuCoin) — третий шаг: passphrase."""
         state = self.awaiting_key
         if message_id is not None:
             await self.call("deleteMessage", chat_id=self.chat_id, message_id=message_id)
         name = EXCHANGE_NAMES.get(state["ex"], state["ex"])
+        text = text.strip()
         if state["step"] == "key":
-            state["key"] = text.strip()
+            state["key"] = text
             state["step"] = "secret"
             await self.send(f"Ключ получен, сообщение удалено. Теперь пришли <b>secret</b> для {name}.")
             return
+        if state["step"] == "secret":
+            state["secret"] = text
+            if state["ex"] in accounts.PASSPHRASE_REQUIRED:
+                state["step"] = "passphrase"
+                await self.send(f"Secret получен, сообщение удалено. Теперь пришли <b>passphrase</b> для {name}.")
+                return
+        else:   # step == "passphrase"
+            state["passphrase"] = text
         self.awaiting_key = None
-        accounts.save_key(state["ex"], state["key"], text.strip())
+        accounts.save_key(state["ex"], state["key"], state["secret"], state.get("passphrase"))
         ok, msg = await accounts.verify(self.s, state["ex"])
         await self.send("✅ Подключено (только чтение)" if ok else f"⚠️ Ключ сохранён, но проверка не прошла: {msg}")
         t, kb = account_view(state["ex"])

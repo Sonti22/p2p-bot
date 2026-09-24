@@ -315,6 +315,38 @@ def test_account_view_unsupported_exchange_has_no_connect_button(tmp_path, monke
     assert not any(c.startswith("acc_add:") for c in callbacks)
 
 
+def test_account_view_kucoin_offers_connect_button(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "no_such.json"))
+    text, kb = B.account_view("kucoin")
+    assert "не подключён" in text and "passphrase" in text
+    callbacks = [b["callback_data"] for row in kb["inline_keyboard"] for b in row if "callback_data" in b]
+    assert "acc_add:kucoin" in callbacks
+
+
+def test_acc_add_kucoin_arms_awaiting_key_three_step_flow(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+
+    async def fake_verify(s, ex):
+        return False, "kucoin: подпись запросов пока не реализована"
+
+    monkeypatch.setattr(B.accounts, "verify", fake_verify)
+    bot = Stub(p2p.Config())
+    asyncio.run(bot.on_callback({"id": "1", "data": "acc_add:kucoin", "message": {"message_id": 1}}))
+    assert bot.awaiting_key == {"ex": "kucoin", "step": "key"}
+
+    asyncio.run(bot.handle_key_input("APIKEY123", 55))
+    assert bot.awaiting_key == {"ex": "kucoin", "step": "secret", "key": "APIKEY123"}
+
+    asyncio.run(bot.handle_key_input("SECRET456", 56))
+    assert bot.awaiting_key == {"ex": "kucoin", "step": "passphrase", "key": "APIKEY123", "secret": "SECRET456"}
+    assert accounts.keys("kucoin") is None   # ещё не сохранён — ждём passphrase
+
+    asyncio.run(bot.handle_key_input("PASS789", 57))
+    assert bot.awaiting_key is None
+    assert accounts.keys("kucoin") == ("APIKEY123", "SECRET456")
+    assert accounts.passphrase("kucoin") == "PASS789"
+
+
 def test_settings_view_has_accounts_button():
     bot = Stub(p2p.Config())
     _, kb = bot.settings_view()
