@@ -3,6 +3,7 @@ import base64
 import hashlib
 import hmac
 import json
+from datetime import datetime, timezone
 from urllib.parse import urlencode
 
 import pytest
@@ -507,6 +508,75 @@ def test_bybit_p2p_orders_returns_none_on_error():
             raise RuntimeError("network down")
 
     assert asyncio.run(accounts.bybit_p2p_orders(_Boom(), "k", "s")) is None
+
+
+def test_mexc_history_prefers_deposits_when_present():
+    session = _UrlJsonSession({
+        "capital/deposit/hisrec": [{"coin": "USDT", "amount": "100.5", "insertTime": 1700000000000}],
+        "capital/withdraw/history": [{"coin": "USDT", "amount": "9", "applyTime": "2023-11-14 22:13:20"}],
+    })
+    hist = asyncio.run(accounts.mexc_history(session, "k", "s"))
+    assert hist == [{"kind": "deposit", "asset": "USDT", "amount": 100.5, "ts": 1700000000.0}]
+
+
+def test_mexc_history_falls_back_to_withdrawals_when_no_deposits():
+    session = _UrlJsonSession({
+        "capital/deposit/hisrec": [],
+        "capital/withdraw/history": [{"coin": "USDT", "amount": "9", "applyTime": "2023-11-14 22:13:20"}],
+    })
+    hist = asyncio.run(accounts.mexc_history(session, "k", "s"))
+    assert hist == [{"kind": "withdraw", "asset": "USDT", "amount": 9.0,
+                     "ts": datetime(2023, 11, 14, 22, 13, 20, tzinfo=timezone.utc).timestamp()}]
+
+
+def test_mexc_history_returns_none_when_both_sources_empty():
+    session = _UrlJsonSession({"capital/deposit/hisrec": [], "capital/withdraw/history": []})
+    assert asyncio.run(accounts.mexc_history(session, "k", "s")) is None
+
+
+def test_htx_history_deposits_then_withdrawals():
+    session = _UrlJsonSession({
+        "type=deposit": {"status": "ok", "data": [{"currency": "usdt", "amount": 50, "created-at": 1700000000000}]},
+        "type=withdraw": {"status": "ok", "data": []},
+    })
+    hist = asyncio.run(accounts.htx_history(session, "k", "s"))
+    assert hist == [{"kind": "deposit", "asset": "usdt", "amount": 50.0, "ts": 1700000000.0}]
+
+
+def test_htx_history_returns_none_on_error_status():
+    session = _UrlJsonSession({
+        "type=deposit": {"status": "error", "err-msg": "no permission"},
+        "type=withdraw": {"status": "error", "err-msg": "no permission"},
+    })
+    assert asyncio.run(accounts.htx_history(session, "k", "s")) is None
+
+
+def test_kucoin_history_reads_paginated_items():
+    session = _JsonSession({"code": "200000", "data": {"items": [
+        {"currency": "USDT", "amount": "30", "createdAt": 1700000000000}]}})
+    hist = asyncio.run(accounts.kucoin_history(session, "k", "s", "pp"))
+    assert hist == [{"kind": "deposit", "asset": "USDT", "amount": 30.0, "ts": 1700000000.0}]
+
+
+def test_account_history_dispatches_bybit_to_p2p_orders(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    accounts.save_key("bybit", "k", "s")
+    body = {"retCode": 0, "result": {"items": [
+        {"id": "1", "side": "1", "tokenId": "USDT", "currencyId": "RUB", "amount": "10", "price": "95",
+         "createDate": "1700000000000"}]}}
+    hist = asyncio.run(accounts.account_history(_P2pSession(body), "bybit"))
+    assert hist[0]["id"] == "1"
+
+
+def test_account_history_returns_none_without_keys(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    assert asyncio.run(accounts.account_history(_JsonSession({}), "mexc")) is None
+
+
+def test_account_history_kucoin_without_passphrase_returns_none(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    accounts.save_key("kucoin", "k", "s")   # без passphrase
+    assert asyncio.run(accounts.account_history(_JsonSession({}), "kucoin")) is None
 
 
 def test_api_permissions_fails_open_when_api_errors(tmp_path, monkeypatch):
