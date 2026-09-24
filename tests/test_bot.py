@@ -309,7 +309,7 @@ def test_acc_add_sends_exchange_specific_hint():
 
 def test_account_view_unsupported_exchange_has_no_connect_button(tmp_path, monkeypatch):
     monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "no_such.json"))
-    text, kb = B.account_view("htx")
+    text, kb = B.account_view("bitpapa")
     assert "не реализовано" in text
     callbacks = [b.get("callback_data", "") for row in kb["inline_keyboard"] for b in row]
     assert not any(c.startswith("acc_add:") for c in callbacks)

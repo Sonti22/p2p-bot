@@ -1,7 +1,9 @@
 import asyncio
+import base64
 import hashlib
 import hmac
 import json
+from urllib.parse import urlencode
 
 import pytest
 
@@ -156,9 +158,59 @@ def test_passphrase_falls_back_to_env(tmp_path, monkeypatch):
     assert accounts.passphrase("kucoin") == "envpass"
 
 
-def test_kucoin_is_onboardable_but_not_yet_connectable():
-    assert "kucoin" in accounts.ONBOARDABLE
-    assert "kucoin" not in accounts.CONNECTABLE
+def test_htx_and_kucoin_are_onboardable_and_connectable():
+    assert "htx" in accounts.ONBOARDABLE and "htx" in accounts.CONNECTABLE
+    assert "kucoin" in accounts.ONBOARDABLE and "kucoin" in accounts.CONNECTABLE
+    assert accounts.ONBOARDABLE.count("kucoin") == 1   # kucoin в CONNECTABLE и PASSPHRASE_REQUIRED сразу
+
+
+def test_htx_signed_params_matches_documented_formula():
+    # Формула HTX (Huobi) Signature Version 2: Base64(HMAC_SHA256(secret, METHOD\nhost\npath\nquery))
+    key, secret, ts = "apikey123", "secretxyz", "2024-01-01T00:00:00"
+    params = accounts.htx_signed_params(key, secret, "GET", "/v1/account/accounts",
+                                         {"coin": "usdt"}, timestamp=ts)
+    assert params["AccessKeyId"] == key
+    assert params["Timestamp"] == ts
+    base = {"AccessKeyId": key, "SignatureMethod": "HmacSHA256", "SignatureVersion": "2",
+            "Timestamp": ts, "coin": "usdt"}
+    query = urlencode(sorted(base.items()))
+    payload = "\n".join(["GET", "api.htx.com", "/v1/account/accounts", query])
+    expected = base64.b64encode(hmac.new(secret.encode(), payload.encode(), hashlib.sha256).digest()).decode()
+    assert params["Signature"] == expected
+
+
+def test_kucoin_headers_matches_documented_formula():
+    # Формула KuCoin v2: sign/passphrase = Base64(HMAC_SHA256(secret, ...)), заголовок KC-API-KEY-VERSION=2
+    key, secret, pp, ts = "apikey123", "secretxyz", "mypassphrase", "1700000000000"
+    h = accounts.kucoin_headers(key, secret, pp, "GET", "/api/v1/accounts", timestamp=ts)
+    expected_sign = base64.b64encode(
+        hmac.new(secret.encode(), (ts + "GET" + "/api/v1/accounts").encode(), hashlib.sha256).digest()
+    ).decode()
+    expected_pp = base64.b64encode(hmac.new(secret.encode(), pp.encode(), hashlib.sha256).digest()).decode()
+    assert h["KC-API-KEY"] == key
+    assert h["KC-API-SIGN"] == expected_sign
+    assert h["KC-API-PASSPHRASE"] == expected_pp
+    assert h["KC-API-KEY-VERSION"] == "2"
+    assert h["KC-API-TIMESTAMP"] == ts
+
+
+def test_htx_get_signs_and_builds_url():
+    j = asyncio.run(accounts.htx_get(_FakeSession(), "k", "s", "/v1/account/accounts"))
+    assert j["url"].startswith("https://api.htx.com/v1/account/accounts?")
+    assert "Signature=" in j["url"] and "AccessKeyId=k" in j["url"]
+    assert j["headers"] == {}
+
+
+def test_kucoin_get_signs_and_builds_url():
+    j = asyncio.run(accounts.kucoin_get(_FakeSession(), "k", "s", "pp", "/api/v1/accounts"))
+    assert j["url"] == "https://api.kucoin.com/api/v1/accounts"
+    assert j["headers"]["KC-API-KEY"] == "k"
+    assert j["headers"]["KC-API-KEY-VERSION"] == "2"
+
+
+def test_kucoin_get_with_params_signs_path_and_query():
+    j = asyncio.run(accounts.kucoin_get(_FakeSession(), "k", "s", "pp", "/api/v1/accounts", {"currency": "USDT"}))
+    assert j["url"] == "https://api.kucoin.com/api/v1/accounts?currency=USDT"
 
 
 class _JsonResp:
@@ -215,13 +267,41 @@ def test_verify_mexc_ok(tmp_path, monkeypatch):
 
 def test_verify_unsupported_exchange(tmp_path, monkeypatch):
     monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
-    accounts.save_key("htx", "k", "s")
-    ok, msg = asyncio.run(accounts.verify(_JsonSession({}), "htx"))
+    accounts.save_key("bitpapa", "k", "s")
+    ok, msg = asyncio.run(accounts.verify(_JsonSession({}), "bitpapa"))
     assert not ok and "не реализована" in msg
 
 
-def test_verify_kucoin_saved_but_not_signed_yet(tmp_path, monkeypatch):
+def test_verify_htx_ok(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    accounts.save_key("htx", "k", "s")
+    ok, msg = asyncio.run(accounts.verify(_JsonSession({"status": "ok", "data": []}), "htx"))
+    assert ok and "чтени" in msg
+
+
+def test_verify_htx_bad_key(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    accounts.save_key("htx", "k", "s")
+    ok, msg = asyncio.run(accounts.verify(_JsonSession({"status": "error", "err-msg": "Api key not found"}), "htx"))
+    assert not ok and "Api key not found" in msg
+
+
+def test_verify_kucoin_ok(tmp_path, monkeypatch):
     monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
     accounts.save_key("kucoin", "k", "s", "pp")
+    ok, msg = asyncio.run(accounts.verify(_JsonSession({"code": "200000", "data": []}), "kucoin"))
+    assert ok and "чтени" in msg
+
+
+def test_verify_kucoin_without_passphrase(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    accounts.save_key("kucoin", "k", "s")   # без passphrase
     ok, msg = asyncio.run(accounts.verify(_JsonSession({}), "kucoin"))
-    assert not ok and "не реализована" in msg
+    assert not ok and "passphrase" in msg
+
+
+def test_verify_kucoin_bad_key(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    accounts.save_key("kucoin", "k", "s", "pp")
+    ok, msg = asyncio.run(accounts.verify(_JsonSession({"code": "400003", "msg": "KC-API-KEY not exists"}), "kucoin"))
+    assert not ok and "KC-API-KEY not exists" in msg
