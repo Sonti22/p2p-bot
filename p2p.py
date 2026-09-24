@@ -4,6 +4,7 @@
 One-off snapshot:  python p2p.py
 """
 import asyncio
+import dataclasses
 import html
 import io
 import json
@@ -486,6 +487,9 @@ class Snapshot:
     networks: dict   # сеть -> {"buy": Ad, "sell": Ad} для USDT у обменников
     dropped: dict    # ex -> сколько аномальных объявлений отсеяно
     errors: dict     # "ex/монета" -> текст ошибки
+    groups: dict = field(default_factory=dict)      # (ex, side, asset) -> объявления стакана (отсортированы по цене)
+    spot: dict = field(default_factory=dict)        # для deal_amounts: те же спот-цены, что использовал _route
+    over_banks: frozenset = field(default_factory=frozenset)
 
 
 _alt = {"t": 0.0, "ads": [], "errors": {}}
@@ -581,7 +585,27 @@ async def scan(s, cfg, force_alt=False):
             if r:
                 deals.append((r[0], b, sl, r[1]))
     deals.sort(key=lambda d: d[0], reverse=True)
-    return Snapshot(ref or 0, ref_src, refs, best, deals, networks, dropped, errors)
+    return Snapshot(ref or 0, ref_src, refs, best, deals, networks, dropped, errors, groups, spot, over_banks)
+
+
+DEPTH_AMOUNTS = (50_000, 100_000, 300_000)   # суммы круга для разбивки прибыли в карточке связки
+
+
+def deal_amounts(deal, cfg, snap, amounts=DEPTH_AMOUNTS):
+    """Прибыль % той же связки на другие суммы круга: пересобрать те же объявления стакана
+    (snap.groups) через _stack под каждую сумму. None для суммы, на которую не хватает глубины."""
+    _, b, s, _ = deal
+    buy_ads = snap.groups.get((b.ex, "buy", b.asset), [])
+    sell_ads = snap.groups.get((s.ex, "sell", s.asset), [])
+    out = {}
+    for amount in amounts:
+        bb, ss = _stack(buy_ads, amount), _stack(sell_ads, amount)
+        if not bb or not ss:
+            out[amount] = None
+            continue
+        r = _route(bb, ss, dataclasses.replace(cfg, amount=amount), snap.spot, snap.over_banks)
+        out[amount] = r[0] if r else None
+    return out
 
 
 def venue_url(a, fiat="RUB"):

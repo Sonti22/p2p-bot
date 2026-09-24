@@ -11,8 +11,8 @@ import aiohttp
 
 import trades
 from cards import deal_card, top_chart
-from p2p import AMOUNT_MAX, AMOUNT_MIN, ENV_PATH, Config, _money, fmt_deal, fmt_top, load_env, parse_amount, scan, \
-    spot_url, venue_url
+from p2p import AMOUNT_MAX, AMOUNT_MIN, ENV_PATH, Config, _money, deal_amounts, fmt_deal, fmt_top, load_env, \
+    parse_amount, scan, spot_url, venue_url
 
 MENU = {"keyboard": [[{"text": "🔥 Лучшая сейчас"}, {"text": "📊 Топ связок"}],
                      [{"text": "⚙️ Настройки"}, {"text": "🛠 Разработка"}],
@@ -196,10 +196,12 @@ class Bot:
             del self.deals_by_id[min(self.deals_by_id)]
         return deal_id
 
-    async def send_deal(self, d, prefix="", cfg=None):
+    async def send_deal(self, d, prefix="", cfg=None, snap=None):
         cfg = cfg or self.cfg
+        snap = snap if snap is not None else self.last
         deal_id = self.remember_deal(d, cfg)
-        await self.photo_or_text(lambda: deal_card(d, cfg), prefix + fmt_deal(d, cfg), deal_markup(d, deal_id))
+        amounts = deal_amounts(d, cfg, snap) if snap else None
+        await self.photo_or_text(lambda: deal_card(d, cfg, amounts), prefix + fmt_deal(d, cfg), deal_markup(d, deal_id))
 
     async def mark_done(self, cq, deal_id):
         """Кнопка «✅ Сделал»: записать сделку в журнал (data/trades.db) и убрать кнопку."""
@@ -239,7 +241,7 @@ class Bot:
         elif not snap.deals:
             await self.send("Связок сейчас нет: все объявления отсеяны фильтрами.")
         else:
-            await self.send_deal(snap.deals[0], "🔥 ", cfg)
+            await self.send_deal(snap.deals[0], "🔥 ", cfg, snap)
 
     async def show_top(self, snap=None, cfg=None):
         snap = self.last if snap is None else snap
@@ -347,7 +349,7 @@ class Bot:
             if prev and now - prev[0] < self.cooldown and profit < prev[1] + self.repeat_step:
                 continue
             self.sent[key] = (now, profit)
-            await self.send_deal(d, "🔔 ")
+            await self.send_deal(d, "🔔 ", snap=snap)
 
     async def command_loop(self):
         offset = 0

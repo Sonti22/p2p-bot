@@ -153,6 +153,24 @@ def test_scan_drops_deal_when_depth_does_not_cover_amount(offline, monkeypatch):
     assert not snap.deals   # 20 000 доступного объёма не хватает на круг в 50 000
 
 
+def test_deal_amounts_recomputes_profit_for_other_sums():
+    buy_ads = [make_ad("MEXC", "buy", 85.0, min_amt=1000, max_amt=20000, avail=20000 / 85.0)]
+    sell_ads = [make_ad("MEXC", "sell", 90.0, min_amt=1000, max_amt=500000, avail=10000)]
+    snap = p2p.Snapshot(88.0, "t", {}, {}, [], {}, {}, {}, spot=SPOT,
+                        groups={("MEXC", "buy", "USDT"): buy_ads, ("MEXC", "sell", "USDT"): sell_ads})
+    deal = (5.0, buy_ads[0], sell_ads[0], "внутри биржи")
+    out = p2p.deal_amounts(deal, cfg(), snap, amounts=(10_000, 50_000))
+    assert out[10_000] == pytest.approx((90.0 / 85.0 - 1) * 100)   # прибыль не зависит от суммы на одной цене
+    assert out[50_000] is None   # у объявления на покупку максимум 20 000 — на 50 000 глубины не хватает
+
+
+def test_deal_amounts_missing_group_is_none():
+    empty = p2p.Snapshot(88.0, "t", {}, {}, [], {}, {}, {})
+    deal = (5.0, make_ad("MEXC", "buy", 85.0), make_ad("MEXC", "sell", 90.0), "внутри биржи")
+    out = p2p.deal_amounts(deal, cfg(), empty, amounts=(50_000,))
+    assert out == {50_000: None}
+
+
 def test_scan_applies_auto_fee_for_bank_over_limit(offline, monkeypatch):
     async def fake_fetcher(s, cfg, side, asset):
         return [make_ad("Fake", side, 85.0 if side == "buy" else 90.0, pays=("T-Bank",))]
