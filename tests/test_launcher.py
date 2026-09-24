@@ -1,6 +1,6 @@
 """launcher.py: смоук не считает «тесты не запускались» успехом; бот не переживает launcher, второй launcher не стартует.
 
-Настоящие процессы, git, pip и Telegram не трогаем: подменяются _run, start_bot, _tasklist, git, notify.
+Настоящие процессы, git, pip и Telegram не трогаем: подменяются _run, start_bot, _proc_start, git, notify.
 """
 import os
 import re
@@ -129,6 +129,7 @@ def stand(monkeypatch, tmp_path):
     monkeypatch.setattr(launcher, "env_value", lambda key, default="": default)
     monkeypatch.setattr(launcher, "notify", lambda text: None)
     monkeypatch.setattr(launcher, "kill_orphan", lambda: None)
+    monkeypatch.setattr(launcher, "_proc_start", lambda pid: 111)
     monkeypatch.setattr(launcher.Launcher, "try_update", lambda self: False)
     monkeypatch.setattr(launcher.Launcher, "check_prs", lambda self: None)
     st = SimpleNamespace(procs=[], alive=True, sleeps=0, stop_at=2, exc=Stop, pid_seen=[])
@@ -157,7 +158,7 @@ def test_run_stops_bot_on_any_exit(stand):
     with pytest.raises(KeyboardInterrupt):
         launcher.Launcher().run()
     assert len(stand.procs) == 1 and stand.procs[0].terminated
-    assert stand.pid_seen == ["4242"]          # пока бот жив, pid лежит на диске для kill_orphan
+    assert stand.pid_seen == ["4242 111"]      # пока бот жив, pid и время старта лежат на диске для kill_orphan
     assert not stand.pid_file.exists()         # штатная остановка убирает pid-файл
 
 
@@ -209,60 +210,66 @@ def test_update_restarts_bot_once(stand, monkeypatch):
 
 @pytest.fixture
 def orphan(monkeypatch, tmp_path):
-    """tasklist видит процессы из st.alive (pid -> образ); os.kill «убивает», если st.killable."""
+    """st.alive: pid -> время старта живого процесса; os.kill «убивает», если st.killable."""
     monkeypatch.setattr(launcher, "PID_FILE", str(tmp_path / "bot.pid"))
     monkeypatch.setattr(launcher, "LOG_PATH", str(tmp_path / "launcher.log"))
-    st = SimpleNamespace(alive={}, killed=[], killable=True, pid_file=tmp_path / "bot.pid")
-
-    def tasklist(pid):
-        if pid in st.alive:
-            return f'"{st.alive[pid]}","{pid}","Console","1","10 000 K"\n'
-        return "INFO: No tasks are running which match the specified criteria.\n"
+    st = SimpleNamespace(alive={}, killed=[], killable=True, notes=[], pid_file=tmp_path / "bot.pid")
 
     def kill(pid, sig):
         st.killed.append(pid)
         if st.killable:
             st.alive.pop(pid, None)
 
-    monkeypatch.setattr(launcher, "_tasklist", tasklist)
+    monkeypatch.setattr(launcher, "_proc_start", lambda pid: st.alive.get(pid))
     monkeypatch.setattr(launcher.os, "kill", kill)
+    monkeypatch.setattr(launcher, "notify", st.notes.append)
     monkeypatch.setattr(launcher, "time", SimpleNamespace(time=time.time, strftime=time.strftime, sleep=lambda s: None))
     return st
 
 
 def test_kill_orphan_kills_live_bot(orphan):
-    orphan.alive[777] = os.path.basename(sys.executable)
-    orphan.pid_file.write_text("777")
+    orphan.alive[777] = 5
+    orphan.pid_file.write_text("777 5")
     launcher.kill_orphan()
     assert orphan.killed == [777] and not orphan.pid_file.exists()
 
 
-@pytest.mark.parametrize("content, image", [(None, None), ("мусор", None), ("777", None), ("777", "notepad.exe")])
-def test_kill_orphan_leaves_others(orphan, content, image):
-    """Нет файла, мусор, процесс уже мёртв, pid достался чужой программе — никого не трогаем."""
-    if image:
-        orphan.alive[777] = image
+@pytest.mark.parametrize("content, start", [(None, None), ("мусор", None), ("777 5", None), ("777 5", 6), ("777", 5)])
+def test_kill_orphan_leaves_others(orphan, content, start):
+    """Нет файла, мусор, процесс уже мёртв, pid достался чужой программе (другое время старта),
+    старый pid-файл без времени старта — никого не трогаем, устаревший файл убираем."""
+    if start is not None:
+        orphan.alive[777] = start
     if content is not None:
         orphan.pid_file.write_text(content)
     launcher.kill_orphan()
-    assert orphan.killed == []
+    assert orphan.killed == [] and not orphan.pid_file.exists()
 
 
 def test_kill_orphan_skips_own_pid(orphan):
     """pid из старого файла мог достаться самому новому launcher — себя не убиваем."""
-    orphan.alive[os.getpid()] = os.path.basename(sys.executable)
-    orphan.pid_file.write_text(str(os.getpid()))
+    orphan.alive[os.getpid()] = 5
+    orphan.pid_file.write_text(f"{os.getpid()} 5")
     launcher.kill_orphan()
     assert orphan.killed == [] and not orphan.pid_file.exists()
 
 
 def test_kill_orphan_refuses_second_bot_if_orphan_survives(orphan):
-    orphan.alive[777] = os.path.basename(sys.executable)
+    orphan.alive[777] = 5
     orphan.killable = False
-    orphan.pid_file.write_text("777")
+    orphan.pid_file.write_text("777 5")
     with pytest.raises(RuntimeError, match="777"):
         launcher.kill_orphan()
     assert orphan.pid_file.exists()              # следующий запуск launcher попробует снова
+    assert orphan.notes and "777" in orphan.notes[0]   # и владелец узнает в Telegram, а не только из лога
+
+
+@pytest.mark.skipif(os.name != "nt", reason="WinAPI — только Windows")
+def test_proc_start_real_process():
+    """Собственный процесс жив: время старта есть и стабильно; несуществующий pid — None."""
+    me = launcher._proc_start(os.getpid())
+    assert me and me == launcher._proc_start(os.getpid())
+    assert launcher._proc_start(0x7FFFFFF0) is None
 
 
 @pytest.mark.skipif(os.name != "nt", reason="замок через msvcrt — только Windows")

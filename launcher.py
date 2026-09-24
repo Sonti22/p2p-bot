@@ -168,11 +168,36 @@ def stop(proc):
             log(f"бот pid {proc.pid} не завершился после kill")
 
 
+def _proc_start(pid):
+    """Время старта живого процесса pid (FILETIME, Windows API); None — процесса нет, он завершился или
+    узнать нельзя. Пара «pid + время старта» однозначна: pid после смерти процесса достаётся другим."""
+    if os.name != "nt":
+        return None
+    import ctypes
+    from ctypes import wintypes
+    k = ctypes.WinDLL("kernel32", use_last_error=True)
+    k.OpenProcess.restype = wintypes.HANDLE
+    h = k.OpenProcess(0x1000, False, int(pid))   # PROCESS_QUERY_LIMITED_INFORMATION
+    if not h:
+        return None
+    try:
+        code = wintypes.DWORD()
+        if not k.GetExitCodeProcess(h, ctypes.byref(code)) or code.value != 259:   # 259 = STILL_ACTIVE
+            return None
+        t = [wintypes.FILETIME() for _ in range(4)]
+        if not k.GetProcessTimes(h, *(ctypes.byref(x) for x in t)):
+            return None
+        return (t[0].dwHighDateTime << 32) | t[0].dwLowDateTime
+    finally:
+        k.CloseHandle(h)
+
+
 def write_pid(pid):
+    """pid бота и время его старта — чтобы потом не убить чужой процесс, получивший тот же pid."""
     try:
         os.makedirs(os.path.dirname(PID_FILE), exist_ok=True)
         with open(PID_FILE, "w") as f:
-            f.write(str(pid))
+            f.write(f"{pid} {_proc_start(pid) or ''}".strip())
     except OSError as e:
         log(f"pid-файл: {e}")
 
@@ -184,32 +209,24 @@ def remove_pid():
         pass
 
 
-def _tasklist(pid):
-    """Строка tasklist о процессе pid (Windows); пусто, если узнать не удалось."""
-    if os.name != "nt":
-        return ""
-    try:
-        return subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"], capture_output=True,
-                              text=True, errors="replace", timeout=30).stdout
-    except (OSError, subprocess.TimeoutExpired) as e:
-        log(f"tasklist: {e}")
-        return ""
-
-
-def bot_alive(pid):
-    """Жив ли pid и это наш python. os.kill(pid, 0) на Windows не проверка: это Ctrl+C, а не опрос."""
-    return f'"{os.path.basename(sys.executable).lower()}","{pid}"' in _tasklist(pid).lower()
+def bot_alive(pid, start):
+    """Жив ли ИМЕННО тот процесс: pid совпал и время старта то же. Чужой процесс с тем же pid — не наш."""
+    return start is not None and _proc_start(pid) == start
 
 
 def kill_orphan():
     """Бот, переживший прошлый launcher (убит из Диспетчера задач): завершить до запуска нового.
-    Вызывать только под замком acquire_lock — иначе второй launcher убьёт бота первого."""
+    Вызывать только под замком acquire_lock — иначе второй launcher убьёт бота первого.
+    Убиваем, только если совпали pid и время старта из pid-файла; иначе файл устарел — просто удаляем."""
     try:
         with open(PID_FILE) as f:
-            pid = int(f.read().strip())
-    except (OSError, ValueError):
+            parts = f.read().split()
+        pid = int(parts[0])
+        start = int(parts[1]) if len(parts) > 1 else None
+    except (OSError, ValueError, IndexError):
+        remove_pid()
         return
-    if pid != os.getpid() and bot_alive(pid):
+    if pid != os.getpid() and bot_alive(pid, start):
         log(f"завершаю осиротевший бот pid {pid}")
         try:
             os.kill(pid, signal.SIGTERM)   # на Windows = TerminateProcess
@@ -217,10 +234,12 @@ def kill_orphan():
             log(f"не смог завершить pid {pid}: {e}")
         for _ in range(10):
             time.sleep(1)
-            if not bot_alive(pid):
+            if not bot_alive(pid, start):
                 break
         else:   # pid-файл оставляем: run.bat перезапустит launcher, и он попробует снова
-            raise RuntimeError(f"осиротевший бот pid {pid} не завершился — второй не запускаю")
+            msg = f"осиротевший бот pid {pid} не завершился — второй не запускаю"
+            notify(f"⚠️ Launcher: {msg}. Заверши его в Диспетчере задач.")
+            raise RuntimeError(msg)
     remove_pid()
 
 
