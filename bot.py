@@ -21,7 +21,7 @@ import presets
 import trades
 from cards import deal_card, history_card, history_compare_card, portfolio_card, top_chart
 from p2p import ALL_EXCHANGES, AMOUNT_MAX, AMOUNT_MIN, DEFAULT_ASSETS, ENV_PATH, LOG_PATH, Config, _money, _price, \
-    bank_liquidity, deal_amounts, fmt_ad, fmt_deal, fmt_top, load_env, maker_quote, parse_amount, \
+    _route_qty, bank_liquidity, deal_amounts, fmt_ad, fmt_deal, fmt_top, load_env, maker_quote, parse_amount, \
     profit_breakdown, reliability, scan, setup_logging, spot_url, traps_log, venue_url
 
 logger = logging.getLogger(__name__)
@@ -176,14 +176,48 @@ def save_env(key, value, path=ENV_PATH):
         f.write("\n".join(lines) + "\n")
 
 
-def deal_markup(d, deal_id=None):
+def _qty(x):
+    """Объём монеты для вставки в ордер: USDT — сотые, мелкие монеты — до 6 значащих."""
+    return f"{x:.2f}" if x >= 100 else f"{x:.6g}"
+
+
+def copy_buttons(d, cfg, snap):
+    """Кнопки «📋» (copy_text, Bot API 7.11): сумма круга в ₽ — вставить в ордер на покупку, объём монеты
+    на выходе маршрута — в ордер на продажу. Без snap объём не посчитать — только сумма."""
+    _, b, s, _ = d
+    row = [{"text": f"📋 {_money(cfg.amount)} {cfg.fiat}", "copy_text": {"text": f"{cfg.amount:g}"}}]
+    qty = _route_qty(b, s, cfg, snap.spot, snap.over_banks) if snap else None
+    if qty:
+        row.append({"text": f"📋 {_qty(qty)} {s.asset}", "copy_text": {"text": _qty(qty)}})
+    return row
+
+
+def plain_markup(markup):
+    """Обычные кнопки для клиента/сервера без Bot API 9.4: цвета (`style`) убираем, «📋» (copy_text) выкидываем."""
+    rows = []
+    for row in markup.get("inline_keyboard", []):
+        row = [{k: v for k, v in b.items() if k != "style"} for b in row if "copy_text" not in b]
+        if row:
+            rows.append(row)
+    return {"inline_keyboard": rows}
+
+
+def is_fancy(markup):
+    return any("style" in b or "copy_text" in b for row in (markup or {}).get("inline_keyboard", []) for b in row)
+
+
+def deal_markup(d, deal_id=None, cfg=None, snap=None):
+    """Кнопки под карточкой: купить (зелёная) / продать (красная) — `style` из Bot API 9.4, спот, «📋» копировать
+    сумму и объём (если передан cfg), шаги/сделал/скрыть (если сигнал запомнен), топ/обновить."""
     _, b, s, route = d
-    row = [{"text": f"{label} · {ad.ex}", "url": venue_url(ad)}
-           for ad, label in ((b, "🟢 Купить"), (s, "🔴 Продать")) if venue_url(ad)]
+    row = [{"text": f"{label} · {ad.ex}", "url": venue_url(ad), "style": style}
+           for ad, label, style in ((b, "🟢 Купить", "success"), (s, "🔴 Продать", "danger")) if venue_url(ad)]
     rows = [row] if row else []
     m = re.search(r"спот (\w+)→(\w+) на (\w+)", route)
     if m and spot_url(route):
         rows.append([{"text": f"🔁 Спот {m.group(1)}→{m.group(2)} · {m.group(3)}", "url": spot_url(route)}])
+    if cfg is not None:
+        rows.append(copy_buttons(d, cfg, snap))
     if deal_id is not None:
         rows.append([{"text": "📋 Шаги", "callback_data": f"steps:{deal_id}"},
                      {"text": "✅ Сделал", "callback_data": f"did:{deal_id}"}])
@@ -580,6 +614,7 @@ class Bot:
     def __init__(self, session, token, chat_id, cfg):
         self.s, self.token, self.chat_id, self.cfg = session, token, chat_id, cfg
         self.cooldown = int(os.getenv("COOLDOWN", 600))      # сек: не повторять ту же пару бирж
+        self.fancy = os.getenv("FANCY_BUTTONS", "1") != "0"   # цветные кнопки и «📋»; сам выключится при ошибке API
         self.repeat_step = float(os.getenv("REPEAT_STEP", 0.3))  # п.п. роста профита для досрочного повтора
         self.max_signals = int(os.getenv("MAX_SIGNALS", 3))      # сигналим только из топ-N
         self.last = None
@@ -609,13 +644,35 @@ class Bot:
                                timeout=aiohttp.ClientTimeout(total=40)) as r:
             return await r.json()
 
+    def markup(self, markup):
+        """Разметка под возможности сервера/клиента: без цветов и «📋», если они не поддерживаются."""
+        return markup if self.fancy or not markup else plain_markup(markup)
+
+    def _fancy_failed(self, r, markup):
+        """Отправка с цветными кнопками/«📋» не удалась: дальше шлём обычные кнопки и повторяем."""
+        if r.get("ok") or not self.fancy or not is_fancy(markup):
+            return False
+        self.fancy = False
+        logger.warning("Telegram: цветные кнопки/copy_text не поддерживаются, дальше обычные: %s", r.get("description"))
+        return True
+
     async def send(self, text, chat_id=None, markup=None):
         params = dict(chat_id=chat_id or self.chat_id, text=text, parse_mode="HTML", disable_web_page_preview=True)
         if markup:
-            params["reply_markup"] = markup
-        return await self.call("sendMessage", **params)
+            params["reply_markup"] = self.markup(markup)
+        r = await self.call("sendMessage", **params)
+        if self._fancy_failed(r, markup):
+            params["reply_markup"] = plain_markup(markup)
+            r = await self.call("sendMessage", **params)
+        return r
 
     async def send_photo(self, png, caption, markup=None):
+        r = await self._post_photo(png, caption, self.markup(markup))
+        if self._fancy_failed(r, markup):
+            r = await self._post_photo(png, caption, plain_markup(markup))
+        return r
+
+    async def _post_photo(self, png, caption, markup):
         form = aiohttp.FormData()
         form.add_field("chat_id", str(self.chat_id))
         form.add_field("caption", caption)
@@ -657,7 +714,7 @@ class Bot:
         rel = reliability(d, cfg, snap) if snap else None
         breakdown = profit_breakdown(d[1], d[2], cfg, snap.spot, snap.over_banks) if snap else None
         await self.photo_or_text(lambda: deal_card(d, cfg, amounts, rel, breakdown), prefix + fmt_deal(d, cfg, snap),
-                                 deal_markup(d, deal_id))
+                                 deal_markup(d, deal_id, cfg, snap))
 
     async def show_steps(self, cq, deal_id):
         """Кнопка «📋 Шаги»: отдельным сообщением пошаговый чек-лист маршрута."""
@@ -681,7 +738,7 @@ class Bot:
         await self.call("answerCallbackQuery", callback_query_id=cq["id"], text="Записано в журнал ✅")
         await self.send(f"Расчёт был {d[0]:+.2f}%. Какой вышел факт?", markup=fact_markup(trade_id))
         await self.call("editMessageReplyMarkup", chat_id=self.chat_id, message_id=cq["message"]["message_id"],
-                        reply_markup=deal_markup(d))
+                        reply_markup=self.markup(deal_markup(d, cfg=cfg, snap=snap)))
         if crossed:
             await self.send(f"⚠️ Через {bank} по СБП в этом месяце отправлено {_money(total)} ₽ — выше "
                             f"бесплатного лимита 100 000 ₽, дальше банк может взять комиссию до 0.5%. "
@@ -736,7 +793,7 @@ class Bot:
         blacklist.add(s.ex, s.nick)
         await self.call("answerCallbackQuery", callback_query_id=cq["id"], text="Скрыто, больше не покажу")
         await self.call("editMessageReplyMarkup", chat_id=self.chat_id, message_id=cq["message"]["message_id"],
-                        reply_markup=deal_markup(d))
+                        reply_markup=self.markup(deal_markup(d, cfg=cfg, snap=snap)))
 
     async def add_alert(self, arg):
         """Команда «/alert USDT sell 92 7d [vol 50000] [reliable] [repeat 1h]»: разобрать и создать
