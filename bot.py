@@ -10,11 +10,12 @@ import time
 import aiohttp
 
 import accounts
+import alerts
 import blacklist
 import trades
 from cards import deal_card, portfolio_card, top_chart
-from p2p import AMOUNT_MAX, AMOUNT_MIN, ENV_PATH, Config, _money, _price, deal_amounts, fmt_deal, fmt_top, load_env, \
-    parse_amount, profit_breakdown, reliability, scan, spot_url, venue_url
+from p2p import AMOUNT_MAX, AMOUNT_MIN, ENV_PATH, Config, _money, _price, deal_amounts, fmt_ad, fmt_deal, fmt_top, \
+    load_env, parse_amount, profit_breakdown, reliability, scan, spot_url, venue_url
 
 MENU = {"keyboard": [[{"text": "🔥 Лучшая сейчас"}, {"text": "📊 Топ связок"}],
                      [{"text": "⚙️ Настройки"}, {"text": "🛠 Разработка"}],
@@ -26,6 +27,8 @@ COMMANDS = [{"command": "best", "description": "Лучшая связка сей
             {"command": "top", "description": "Топ связок графиком"},
             {"command": "calc", "description": "Разовый расчёт под сумму, напр. /calc 20000"},
             {"command": "stats", "description": "Журнал сделок: день/неделя/месяц"},
+            {"command": "alert", "description": "Алерт на курс, напр. /alert USDT sell 92 7d"},
+            {"command": "alerts", "description": "Список алертов на курс"},
             {"command": "blacklist", "description": "Скрытые мерчанты и обменники"},
             {"command": "balance", "description": "Баланс по подключённым биржам"},
             {"command": "settings", "description": "Порог, сумма, пауза"},
@@ -201,6 +204,26 @@ def blacklist_view():
         name = EXCHANGE_NAMES.get(ex, ex)
         lines.append(f"{name}: {html.escape(nick)}")
         kb.append([{"text": f"🗑 {name}: {nick}"[:64], "callback_data": f"unbl:{entry_id}"}])
+    return "\n".join(lines), {"inline_keyboard": kb}
+
+
+ALERT_HELP = ("Формат: /alert USDT sell 92 7d — сообщу, когда надёжный покупатель или обменник даст "
+              "≥92 ₽ за USDT (для buy — ≤ порога) в течение 7 дней. Монета: одна из настроенных. "
+              "Срок: число + h/d/w (часы/дни/недели), не больше 90d.")
+
+
+def alerts_view(chat_id):
+    """Текст и кнопки «/alerts»: активные алерты чата с удалением."""
+    rows = alerts.list_all(chat_id)
+    if not rows:
+        return (f"🔔 <b>Алертов нет</b>\n\n{ALERT_HELP}", {"inline_keyboard": []})
+    lines = ["🔔 <b>Алерты на курс</b>", ""]
+    kb = []
+    for alert_id, asset, side, rate, expires_ts in rows:
+        label, cmp = ("продать", "≥") if side == "sell" else ("купить", "≤")
+        left_h = max(0, round((expires_ts - time.time()) / 3600))
+        lines.append(f"{asset} {label} {cmp}{rate:g} ₽ (осталось ~{left_h} ч)")
+        kb.append([{"text": f"🗑 {asset} {label} {cmp}{rate:g}"[:64], "callback_data": f"delalert:{alert_id}"}])
     return "\n".join(lines), {"inline_keyboard": kb}
 
 
@@ -398,6 +421,36 @@ class Bot:
         await self.call("editMessageReplyMarkup", chat_id=self.chat_id, message_id=cq["message"]["message_id"],
                         reply_markup=deal_markup(d))
 
+    async def add_alert(self, arg):
+        """Команда «/alert USDT sell 92 7d»: разобрать и создать одноразовый алерт на курс."""
+        m = re.fullmatch(r"(\w+)\s+(buy|sell)\s+([\d.,]+)\s+(\d+[hdw])", (arg or "").strip(), re.I)
+        if not m:
+            await self.send(ALERT_HELP)
+            return
+        asset, side, rate_s, dur_s = m.group(1).upper(), m.group(2).lower(), m.group(3), m.group(4).lower()
+        if asset not in self.cfg.assets:
+            await self.send(f"Монета {asset} не отслеживается ботом ({', '.join(self.cfg.assets)}).")
+            return
+        try:
+            rate = float(rate_s.replace(",", "."))
+        except ValueError:
+            await self.send("Курс должен быть числом.")
+            return
+        dur = alerts.parse_duration(dur_s)
+        if dur is None:
+            await self.send("Срок — число + h/d/w (часы/дни/недели), не больше 90d.")
+            return
+        alerts.add(self.chat_id, asset, side, rate, time.time() + dur)
+        label, cmp = ("продать", "≥") if side == "sell" else ("купить", "≤")
+        await self.send(f"🔔 Алерт создан: {asset} {label} {cmp}{rate:g} ₽, срок {dur_s}. Список — /alerts.")
+
+    async def check_alerts(self, snap):
+        """Сработавшие алерты по текущему снимку → сообщение в тот чат, где алерт создан."""
+        for alert_id, chat_id, asset, side, rate, price, ad in alerts.due(snap):
+            label, cmp = ("продать", "≥") if side == "sell" else ("купить", "≤")
+            await self.send(f"🔔 <b>Алерт сработал:</b> {asset} можно {label} по {_price(price)} ₽ "
+                            f"({cmp}{rate:g}) — {fmt_ad(ad)}", chat_id=chat_id)
+
     def stats_view(self):
         st = trades.stats()
         labels = (("day", "За сегодня"), ("week", "За неделю"), ("month", "За месяц"))
@@ -535,6 +588,7 @@ class Bot:
                 self.last = await scan(self.s, self.cfg)
                 if self.chat_id:
                     await self.check_venues(self.last)
+                    await self.check_alerts(self.last)
                     if not self.paused:
                         await self.notify(self.last)
             except Exception as e:
@@ -691,6 +745,12 @@ class Bot:
             text, kb = blacklist_view()
             await self.call("editMessageText", chat_id=self.chat_id, message_id=cq["message"]["message_id"],
                             text=text, parse_mode="HTML", reply_markup=kb)
+        elif data.startswith("delalert:"):
+            alerts.remove(int(data[9:]), self.chat_id)
+            await self.call("answerCallbackQuery", callback_query_id=cq["id"], text="Алерт удалён")
+            text, kb = alerts_view(self.chat_id)
+            await self.call("editMessageText", chat_id=self.chat_id, message_id=cq["message"]["message_id"],
+                            text=text, parse_mode="HTML", reply_markup=kb)
         elif data == "amt_custom":
             self.awaiting_amount = True
             await self.send(f"Введи сумму круга текстом, например 20000 или 1,5 млн "
@@ -740,6 +800,14 @@ class Bot:
                 await self.send("Нужна сумма: /calc 20000")
         elif cmd == "/stats":
             await self.send(self.stats_view())
+        elif cmd == "/alert":
+            if arg:
+                await self.add_alert(arg)
+            else:
+                await self.send(ALERT_HELP)
+        elif cmd == "/alerts":
+            text, kb = alerts_view(self.chat_id)
+            await self.send(text, markup=kb)
         elif cmd == "/blacklist":
             text, kb = blacklist_view()
             await self.send(text, markup=kb)
