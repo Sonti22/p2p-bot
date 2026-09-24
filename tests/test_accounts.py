@@ -558,6 +558,65 @@ def test_kucoin_history_reads_paginated_items():
     assert hist == [{"kind": "deposit", "asset": "USDT", "amount": 30.0, "ts": 1700000000.0}]
 
 
+def test_mexc_spot_trades_merges_symbols_and_sorts_by_time():
+    session = _UrlJsonSession({
+        "symbol=USDCUSDT": [],
+        "symbol=BTCUSDT": [{"isBuyer": True, "qty": "0.001", "price": "60000", "time": 1700000000000}],
+        "symbol=ETHUSDT": [{"isBuyer": False, "qty": "0.2", "price": "3000", "time": 1700000005000}],
+        "symbol=TONUSDT": [],
+    })
+    hist = asyncio.run(accounts.mexc_spot_trades(session, "k", "s"))
+    assert hist == [
+        {"kind": "trade", "asset": "ETH", "side": "sell", "amount": 0.2, "price": 3000.0, "ts": 1700000005.0},
+        {"kind": "trade", "asset": "BTC", "side": "buy", "amount": 0.001, "price": 60000.0, "ts": 1700000000.0},
+    ]
+
+
+def test_mexc_spot_trades_returns_none_when_no_symbol_has_trades():
+    session = _UrlJsonSession({sym: [] for sym in accounts.SPOT_TRADE_SYMBOLS})
+    assert asyncio.run(accounts.mexc_spot_trades(session, "k", "s")) is None
+
+
+def test_kucoin_spot_trades_reads_fills_without_symbol():
+    session = _JsonSession({"code": "200000", "data": {"items": [
+        {"symbol": "TON-USDT", "side": "buy", "size": "12.5", "price": "5.1", "createdAt": 1700000000000}]}})
+    hist = asyncio.run(accounts.kucoin_spot_trades(session, "k", "s", "pp"))
+    assert hist == [{"kind": "trade", "asset": "TON", "side": "buy", "amount": 12.5, "price": 5.1, "ts": 1700000000.0}]
+
+
+def test_kucoin_spot_trades_returns_none_when_no_items():
+    session = _JsonSession({"code": "200000", "data": {"items": []}})
+    assert asyncio.run(accounts.kucoin_spot_trades(session, "k", "s", "pp")) is None
+
+
+def test_account_history_mexc_falls_back_to_spot_trades(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    accounts.save_key("mexc", "k", "s")
+    session = _UrlJsonSession({
+        "capital/deposit/hisrec": [],
+        "capital/withdraw/history": [],
+        "symbol=USDCUSDT": [],
+        "symbol=BTCUSDT": [{"isBuyer": True, "qty": "0.001", "price": "60000", "time": 1700000000000}],
+        "symbol=ETHUSDT": [],
+        "symbol=TONUSDT": [],
+    })
+    hist = asyncio.run(accounts.account_history(session, "mexc"))
+    assert hist == [{"kind": "trade", "asset": "BTC", "side": "buy", "amount": 0.001, "price": 60000.0, "ts": 1700000000.0}]
+
+
+def test_account_history_kucoin_falls_back_to_spot_trades(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    accounts.save_key("kucoin", "k", "s", passphrase="pp")
+    session = _UrlJsonSession({
+        "api/v1/deposits": {"code": "200000", "data": {"items": []}},
+        "api/v1/withdrawals": {"code": "200000", "data": {"items": []}},
+        "api/v1/fills": {"code": "200000", "data": {"items": [
+            {"symbol": "TON-USDT", "side": "sell", "size": "3", "price": "5.2", "createdAt": 1700000000000}]}},
+    })
+    hist = asyncio.run(accounts.account_history(session, "kucoin"))
+    assert hist == [{"kind": "trade", "asset": "TON", "side": "sell", "amount": 3.0, "price": 5.2, "ts": 1700000000.0}]
+
+
 def test_account_history_dispatches_bybit_to_p2p_orders(tmp_path, monkeypatch):
     monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
     accounts.save_key("bybit", "k", "s")
