@@ -610,6 +610,44 @@ def test_check_accounts_first_poll_is_silent_then_new_items_notify(tmp_path, mon
     assert len(texts(bot)) == 1       # повтор той же истории не шлём
 
 
+def test_deal_markup_has_steps_button():
+    kb = B.deal_markup(deal(), deal_id=7)["inline_keyboard"]
+    buttons = [b for row in kb for b in row]
+    assert any(b.get("callback_data") == "steps:7" for b in buttons)
+
+
+def test_steps_view_lists_route_prices_and_breakdown():
+    d = deal(5.0)
+    _, b, s, _ = d
+    text = B.steps_view(d, p2p.Config(amount=70000), snap([d]))
+    assert f"по {p2p._price(b.price)}" in text and f"по {p2p._price(s.price)}" in text
+    assert "Чистыми" in text
+    assert "перепроверь перед сделкой" in text
+
+
+def test_steps_view_shows_spot_rate_for_cross_asset_leg():
+    d = deal(5.0, s_asset="ETH", route="спот USDT→ETH на Bybit (−0.1%)")
+    sp = {"Bybit": {"USDT": (1.0, 1.0), "ETH": (2500.0, 2501.0)}}
+    snapshot = p2p.Snapshot(88.0, "test", {}, {}, [d], {}, {}, {}, spot=sp)
+    text = B.steps_view(d, p2p.Config(amount=70000), snapshot)
+    assert "курс 2500/2501" in text
+
+
+def test_show_steps_sends_message():
+    bot = Stub(p2p.Config())
+    d = deal(5.0)
+    deal_id = bot.remember_deal(d, snap=snap([d]))
+    asyncio.run(bot.show_steps({"id": "1"}, deal_id))
+    assert "Шаги связки" in texts(bot)[-1]
+
+
+def test_show_steps_unknown_id_not_sent():
+    bot = Stub(p2p.Config())
+    asyncio.run(bot.show_steps({"id": "1"}, 999))
+    method, params = bot.out[-1]
+    assert method == "answerCallbackQuery" and "устарел" in params["text"]
+
+
 def test_check_accounts_skips_exchanges_without_saved_key(tmp_path, monkeypatch):
     monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
     calls = []
