@@ -240,6 +240,69 @@ def test_unbl_callback_removes_entry(tmp_path, monkeypatch):
     assert method == "editMessageText" and "пуст" in params["text"].lower()
 
 
+def test_add_alert_creates_entry(tmp_path, monkeypatch):
+    db = str(tmp_path / "alerts.db")
+    monkeypatch.setattr(B.alerts, "add", functools.partial(B.alerts.add, path=db))
+    bot = Stub(p2p.Config())
+    asyncio.run(bot.handle("/alert USDT sell 92 7d"))
+    rows = B.alerts.list_all("1", path=db)
+    assert [(a, s, r) for _, a, s, r, _ in rows] == [("USDT", "sell", 92.0)]
+    assert "Алерт создан" in texts(bot)[-1]
+
+
+def test_add_alert_bad_format_sends_help():
+    bot = Stub(p2p.Config())
+    asyncio.run(bot.handle("/alert USDT sell"))
+    assert "Формат" in texts(bot)[-1]
+
+
+def test_add_alert_unknown_asset():
+    bot = Stub(p2p.Config(assets=["USDT"]))
+    asyncio.run(bot.handle("/alert BTC sell 92 7d"))
+    assert "не отслеживается" in texts(bot)[-1]
+
+
+def test_add_alert_bad_duration():
+    bot = Stub(p2p.Config())
+    asyncio.run(bot.handle("/alert USDT sell 92 999d"))
+    assert "Срок" in texts(bot)[-1]
+
+
+def test_alerts_command_lists_entries(tmp_path, monkeypatch):
+    db = str(tmp_path / "alerts.db")
+    monkeypatch.setattr(B.alerts, "list_all", functools.partial(B.alerts.list_all, path=db))
+    B.alerts.add("1", "USDT", "sell", 92.0, time.time() + 86400, path=db)
+    bot = Stub(p2p.Config())
+    asyncio.run(bot.handle("/alerts"))
+    assert "USDT" in texts(bot)[-1]
+
+
+def test_alerts_command_empty():
+    bot = Stub(p2p.Config())
+    asyncio.run(bot.handle("/alerts"))
+    assert "нет" in texts(bot)[-1].lower()
+
+
+def test_delalert_callback_removes_entry(tmp_path, monkeypatch):
+    db = str(tmp_path / "alerts.db")
+    monkeypatch.setattr(B.alerts, "list_all", functools.partial(B.alerts.list_all, path=db))
+    monkeypatch.setattr(B.alerts, "remove", functools.partial(B.alerts.remove, path=db))
+    alert_id = B.alerts.add("1", "USDT", "sell", 92.0, time.time() + 86400, path=db)
+    bot = Stub(p2p.Config())
+    asyncio.run(bot.on_callback({"id": "1", "data": f"delalert:{alert_id}", "message": {"message_id": 3}}))
+    assert B.alerts.list_all("1", path=db) == []
+    method, params = bot.out[-1]
+    assert method == "editMessageText" and "нет" in params["text"].lower()
+
+
+def test_check_alerts_sends_message(monkeypatch):
+    ad = make_ad("MEXC", "sell", 93.0)
+    monkeypatch.setattr(B.alerts, "due", lambda snap: [(1, "1", "USDT", "sell", 92.0, 93.0, ad)])
+    bot = Stub(p2p.Config())
+    asyncio.run(bot.check_alerts(snap([])))
+    assert "Алерт сработал" in texts(bot)[-1]
+
+
 def test_mark_done_unknown_id_not_logged(monkeypatch):
     logged = []
     monkeypatch.setattr(B.trades, "log_trade", lambda *a, **k: logged.append(a))
