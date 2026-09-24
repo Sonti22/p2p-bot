@@ -471,8 +471,8 @@ def _signal_ok(a, cfg, blocked=frozenset()):
 
 def _stack(ads, amount):
     """Сложить объявления по цене (ads отсортированы: лучшая цена первой), пока не наберётся amount
-    в фиате — не только верхнее объявление. Возвращает синтетическое Ad со средневзвешенной ценой,
-    None — если суммарной глубины меньше amount."""
+    в фиате — не только верхнее объявление. Возвращает синтетическое Ad со средневзвешенной ценой
+    и объединёнными условиями использованных объявлений, None — если суммарной глубины меньше amount."""
     remaining, qty, used = amount, 0.0, []
     for a in ads:
         if remaining <= 0:
@@ -486,10 +486,11 @@ def _stack(ads, amount):
     if remaining > 0.01 or not used:
         return None
     one = len(used) == 1
+    terms = "; ".join(dict.fromkeys(a.terms.strip() for a in used if a.terms and a.terms.strip()))
     return Ad(used[0].ex, used[0].side, amount / qty, amount, sum(a.max_amt for a in used), qty,
               sorted(set(p for a in used for p in a.pays)), used[0].nick if one else f"{len(used)} объявл.",
               min(a.orders for a in used), min(a.rate for a in used), used[0].url if one else "",
-              used[0].asset, used[0].net if one else "")
+              used[0].asset, used[0].net if one else "", terms=terms)
 
 
 def _same_venue(b, s):
