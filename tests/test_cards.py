@@ -11,6 +11,17 @@ def test_deal_card_renders():
     assert cards.deal_card(d, p2p.Config())[:8] == PNG
 
 
+def test_deal_card_renders_with_amount_breakdown():
+    d = (6.5, make_ad("Bybit", "buy", 85.0), make_ad("MEXC", "sell", 91.0, asset="USDC"), "внутри биржи")
+    amounts = {50_000: 1.2, 100_000: 0.9, 300_000: None}
+    assert cards.deal_card(d, p2p.Config(), amounts)[:8] == PNG
+
+
+def test_amounts_line_formats_missing_depth_as_dash():
+    line = cards._amounts_line({50_000: 1.23, 300_000: None})
+    assert "50к +1.23%" in line and "300к —" in line
+
+
 def test_top_chart_renders_empty_and_full():
     empty = p2p.Snapshot(88.0, "t", {}, {}, [], {}, {}, {})
     full = p2p.Snapshot(88.0, "t", {}, {}, [(3.0, make_ad(), make_ad(side="sell", price=90.0), "внутри биржи")], {}, {}, {})

@@ -73,7 +73,15 @@ def _side_box(d, x, y, w, h, title, color, ad):
     d.text((x + 20, y + 190), _fit(", ".join(ad.pays), _font(22), w - 40), font=_font(22), fill=MUTED)
 
 
-def deal_card(deal, cfg):
+def _amounts_line(amounts):
+    parts = []
+    for amt, val in amounts.items():
+        label = f"{amt // 1000}к"
+        parts.append(f"{label} {val:+.2f}%" if val is not None else f"{label} —")
+    return "На другую сумму: " + " · ".join(parts)
+
+
+def deal_card(deal, cfg, amounts=None):
     profit, b, s, route = deal
     W, H = 1080, 640
     img = Image.new("RGB", (W, H), BG)
@@ -88,6 +96,8 @@ def deal_card(deal, cfg):
     d.text((36, 58), big, font=f_big, fill=color)
     d.text((56 + f_big.getlength(big), 108), f"чистыми на {_money(cfg.amount)} ₽", font=_font(30), fill=MUTED)
     d.text((40, 180), f"{b.ex} {b.asset}  →  {s.ex} {s.asset}", font=_font(30, "semi"), fill=TEXT)
+    if amounts:
+        d.text((40, 212), _fit(_amounts_line(amounts), _font(18), W - 80), font=_font(18), fill=MUTED)
 
     y, h = 240, 240
     _side_box(d, 40, y, 360, h, "КУПИТЬ", GREEN, b)
