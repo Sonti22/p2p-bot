@@ -1,6 +1,8 @@
 """Алерты на целевой курс: /alert USDT sell 92 7d — сообщить, когда надёжный покупатель/обменник
-даёт нужную цену, до истечения срока. SQLite data/alerts.db. Одноразовые: срабатывают один раз
-и удаляются (режим «повторно» и условия объёма/надёжности — следующим пунктом очереди)."""
+даёт нужную цену, до истечения срока. SQLite data/alerts.db. По умолчанию одноразовые: срабатывают
+один раз и удаляются. С «repeat <кулдаун>» алерт не удаляется по сроку — ждёт следующего скана и
+может сработать снова не раньше, чем пройдёт кулдаун с прошлого срабатывания (условия объёма/
+надёжности — следующим пунктом очереди)."""
 import os
 import re
 import sqlite3
@@ -17,7 +19,14 @@ def _connect(path):
     con = sqlite3.connect(path)
     con.execute("CREATE TABLE IF NOT EXISTS alerts ("
                 "id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id TEXT, asset TEXT, side TEXT, "
-                "rate REAL, created_ts REAL, expires_ts REAL)")
+                "rate REAL, created_ts REAL, expires_ts REAL, "
+                "repeat_cooldown REAL, last_fired_ts REAL)")
+    cols = {row[1] for row in con.execute("PRAGMA table_info(alerts)")}
+    if "repeat_cooldown" not in cols:   # апгрейд базы, созданной до режима «повторно»
+        con.execute("ALTER TABLE alerts ADD COLUMN repeat_cooldown REAL")
+    if "last_fired_ts" not in cols:
+        con.execute("ALTER TABLE alerts ADD COLUMN last_fired_ts REAL")
+    con.commit()
     return con
 
 
@@ -30,12 +39,14 @@ def parse_duration(text):
     return sec if 0 < sec <= MAX_DURATION else None
 
 
-def add(chat_id, asset, side, rate, expires_ts, path=DB_PATH):
-    """Создать алерт, вернуть его id."""
+def add(chat_id, asset, side, rate, expires_ts, path=DB_PATH, repeat_cooldown=None):
+    """Создать алерт, вернуть его id. repeat_cooldown (сек) — режим «повторно»: алерт не удаляется
+    по срабатыванию, а может сработать снова не раньше, чем пройдёт кулдаун; None — одноразовый."""
     con = _connect(path)
     with con:
-        cur = con.execute("INSERT INTO alerts (chat_id, asset, side, rate, created_ts, expires_ts) "
-                          "VALUES (?, ?, ?, ?, ?, ?)", (chat_id, asset, side, rate, time.time(), expires_ts))
+        cur = con.execute("INSERT INTO alerts (chat_id, asset, side, rate, created_ts, expires_ts, "
+                          "repeat_cooldown) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                          (chat_id, asset, side, rate, time.time(), expires_ts, repeat_cooldown))
         alert_id = cur.lastrowid
     con.close()
     return alert_id
@@ -46,15 +57,16 @@ def _prune_expired(con, now):
 
 
 def list_all(chat_id, path=DB_PATH, now=None):
-    """Активные алерты чата [(id, asset, side, rate, expires_ts), ...] — для /alerts; попутно чистит истёкшие."""
+    """Активные алерты чата [(id, asset, side, rate, expires_ts, repeat_cooldown), ...] — для /alerts;
+    попутно чистит истёкшие."""
     now = time.time() if now is None else now
     if not os.path.exists(path):
         return []
     con = _connect(path)
     with con:
         _prune_expired(con, now)
-    rows = con.execute("SELECT id, asset, side, rate, expires_ts FROM alerts WHERE chat_id = ? ORDER BY id",
-                       (chat_id,)).fetchall()
+    rows = con.execute("SELECT id, asset, side, rate, expires_ts, repeat_cooldown FROM alerts "
+                       "WHERE chat_id = ? ORDER BY id", (chat_id,)).fetchall()
     con.close()
     return rows
 
@@ -70,16 +82,21 @@ def remove(alert_id, chat_id, path=DB_PATH):
 def due(snap, path=DB_PATH, now=None):
     """Сработавшие алерты по текущему снимку: [(id, chat_id, asset, side, rate, price, Ad), ...].
     Цена берётся из snap.best (объявления уже прошли фильтры usable() — мин. сделок/отзывов, отсев
-    аномалий, блэклист). Срабатывает раз — сразу удаляется; истёкшие тоже удаляются."""
+    аномалий, блэклист). Одноразовый алерт (repeat_cooldown is NULL) сразу удаляется. Алерт «повторно»
+    не удаляется по сроку — ждёт следующего скана и срабатывает снова не раньше, чем пройдёт кулдаун
+    с прошлого срабатывания; истёкшие (expires_ts) удаляются в любом режиме."""
     now = time.time() if now is None else now
     if not os.path.exists(path):
         return []
     con = _connect(path)
     with con:
         _prune_expired(con, now)
-    rows = con.execute("SELECT id, chat_id, asset, side, rate FROM alerts").fetchall()
-    fired = []
-    for alert_id, chat_id, asset, side, rate in rows:
+    rows = con.execute("SELECT id, chat_id, asset, side, rate, repeat_cooldown, last_fired_ts "
+                       "FROM alerts").fetchall()
+    fired, one_shot, repeat_fired = [], [], []
+    for alert_id, chat_id, asset, side, rate, cooldown, last_fired in rows:
+        if cooldown is not None and last_fired is not None and now - last_fired < cooldown:
+            continue   # алерт «повторно» ещё «отдыхает» после прошлого срабатывания
         best_ad, best_price = None, None
         for (ex, ad_side, ad_asset), ad in snap.best.items():
             if ad_side != side or ad_asset != asset:
@@ -91,8 +108,12 @@ def due(snap, path=DB_PATH, now=None):
         ok = best_price >= rate if side == "sell" else best_price <= rate
         if ok:
             fired.append((alert_id, chat_id, asset, side, rate, best_price, best_ad))
-    if fired:
+            (repeat_fired if cooldown is not None else one_shot).append(alert_id)
+    if one_shot:
         with con:
-            con.executemany("DELETE FROM alerts WHERE id = ?", [(f[0],) for f in fired])
+            con.executemany("DELETE FROM alerts WHERE id = ?", [(i,) for i in one_shot])
+    if repeat_fired:
+        with con:
+            con.executemany("UPDATE alerts SET last_fired_ts = ? WHERE id = ?", [(now, i) for i in repeat_fired])
     con.close()
     return fired
