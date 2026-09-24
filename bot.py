@@ -327,6 +327,34 @@ def account_view(ex):
     return text, {"inline_keyboard": kb}
 
 
+ONBOARD_BANKS = trades.SBP_BANKS  # банки для шага 2/3 онбординга — тот же список, что и в лимитах СБП
+
+
+def onboarding_amount_view():
+    """Шаг 1/3 онбординга («/start» в первый раз): сумма круга — те же пресеты, что и в «⚙️ Настройки»."""
+    text = "👋 <b>Настроим бота за 3 шага.</b>\n\nШаг 1/3 — сумма одного круга сделки в рублях."
+    kb = [[{"text": f"{v // 1000}к", "callback_data": f"onb_amt:{v}"} for v in AMOUNT_PRESETS]]
+    return text, {"inline_keyboard": kb}
+
+
+def onboarding_banks_view(selected):
+    """Шаг 2/3: банки, которыми пользуется человек (сохранится в INCLUDE_PAY). Можно выбрать несколько
+    или не выбрать ни одного — тогда бот покажет связки по всем банкам."""
+    mark = lambda on, t: ("✅ " if on else "⬜ ") + t
+    kb = [[{"text": mark(name in selected, name), "callback_data": f"onb_bank:{name}"}] for name in ONBOARD_BANKS]
+    kb.append([{"text": "Дальше ➡️", "callback_data": "onb_bank_next"}])
+    text = ("Шаг 2/3 — какими банками пользуешься (можно несколько). Ничего не выбрал — покажу связки по всем "
+            "банкам.\nПоменять можно потом в «⚙️ Настройки → 🎛 Фильтры».")
+    return text, {"inline_keyboard": kb}
+
+
+def onboarding_min_view():
+    """Шаг 3/3: порог сигнала — те же пресеты, что и в «⚙️ Настройки»."""
+    text = "Шаг 3/3 — с какой чистой прибыли присылать сигнал."
+    kb = [[{"text": f"{v}%", "callback_data": f"onb_min:{v}"} for v in MIN_PRESETS]]
+    return text, {"inline_keyboard": kb}
+
+
 def filters_view(cfg):
     """Текст и кнопки «🎛 Фильтры»: переключатели монет/площадок (✅/⬜) + пресеты. Нельзя выключить
     последнюю монету или площадку. Изменения пишутся в .env и применяются со следующего скана."""
@@ -677,6 +705,7 @@ class Bot:
         self.awaiting_preset_name = False  # ждём имя пресета текстом после «💾 Сохранить как пресет»
         self.awaiting_key = None      # {"ex":.., "step": "key"/"secret", "key":..} — ждём ключ биржи
         self.awaiting_fact = None     # id сделки — ждём фактический результат текстом после «✏️ ввести число»
+        self.onboarding = None   # {"step": "amount"/"banks"/"min", "banks": set()} — мастер первого /start
         self.sent = {}
         self.live_msg = {}   # (ex,asset,ex,asset) -> последнее сообщение сигнала для «живой карточки» (editMessage)
         self.live = {}                                            # (ex,asset,ex,asset) -> {"first": ts, "streak": n}
@@ -1504,7 +1533,7 @@ class Bot:
             save_env("TG_CHAT_ID", chat)
             logger.info("chat_id сохранён в .env: %s", chat)
             await self.setup_topics()
-            await self.welcome()
+            await self.start_onboarding()
         elif chat == self.chat_id:
             text = (msg.get("text") or "").strip()
             if self.awaiting_key and text and text not in BUTTONS and not text.startswith("/"):
@@ -1519,8 +1548,53 @@ class Bot:
                         "🛠 как развивается бот, ❓ как работать.",
                         markup=MENU)
 
+    async def start_onboarding(self):
+        """Мастер первого «/start»: 3 шага кнопками (сумма → банки → порог сигнала) вместо сразу
+        общего приветствия — дальше как обычно."""
+        self.onboarding = {"step": "amount", "banks": set()}
+        text, kb = onboarding_amount_view()
+        await self.send(text, markup=kb)
+
+    async def handle_onboarding(self, cq, data):
+        """Обработка кнопки текущего шага онбординга; клик по кнопке чужого/уже пройденного шага — игнор."""
+        ob = self.onboarding
+        if ob is None:
+            return
+        mid = cq["message"]["message_id"]
+        if data.startswith("onb_amt:") and ob["step"] == "amount":
+            self.cfg.amount = float(data[len("onb_amt:"):])
+            save_env("AMOUNT", f"{self.cfg.amount:.0f}")
+            ob["step"] = "banks"
+            text, kb = onboarding_banks_view(ob["banks"])
+            await self.call("editMessageText", chat_id=self.chat_id, message_id=mid,
+                            text=text, parse_mode="HTML", reply_markup=kb)
+        elif data.startswith("onb_bank:") and ob["step"] == "banks":
+            name = data[len("onb_bank:"):]
+            ob["banks"].symmetric_difference_update({name})
+            text, kb = onboarding_banks_view(ob["banks"])
+            await self.call("editMessageText", chat_id=self.chat_id, message_id=mid,
+                            text=text, parse_mode="HTML", reply_markup=kb)
+        elif data == "onb_bank_next" and ob["step"] == "banks":
+            self.cfg.include_pay = [b.lower() for b in ob["banks"]]
+            save_env("INCLUDE_PAY", ",".join(self.cfg.include_pay))
+            ob["step"] = "min"
+            text, kb = onboarding_min_view()
+            await self.call("editMessageText", chat_id=self.chat_id, message_id=mid,
+                            text=text, parse_mode="HTML", reply_markup=kb)
+        elif data.startswith("onb_min:") and ob["step"] == "min":
+            self.cfg.min_profit = float(data[len("onb_min:"):])
+            save_env("MIN_PROFIT", f"{self.cfg.min_profit:g}")
+            self.onboarding = None
+            await self.call("editMessageText", chat_id=self.chat_id, message_id=mid, parse_mode="HTML",
+                            text="✅ Готово! Сумму, банки и порог сигнала можно поменять в «⚙️ Настройки».")
+            await self.welcome()
+
     async def on_callback(self, cq):
         data = cq.get("data", "")
+        if data.startswith("onb_"):
+            await self.call("answerCallbackQuery", callback_query_id=cq["id"])
+            await self.handle_onboarding(cq, data)
+            return
         if data != "amt_custom":
             self.awaiting_amount = False   # любая другая кнопка сбрасывает ожидание суммы
         if not data.startswith("acc_add:"):
