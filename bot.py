@@ -231,10 +231,13 @@ def _qty(x):
 
 def copy_buttons(d, cfg, snap):
     """Кнопки «📋» (copy_text, Bot API 7.11): сумма круга в ₽ — вставить в ордер на покупку, объём монеты
-    на выходе маршрута — в ордер на продажу. Без snap объём не посчитать — только сумма."""
+    на выходе маршрута — в ордер на продажу. Без snap объём не посчитать — только сумма.
+    Объём — фактический выход маршрута, без запаса на курс (он занижает оценку прибыли, но не сам
+    выход монеты — продавать придётся всё, что реально пришло; запас виден отдельной строкой в
+    маршруте карточки)."""
     _, b, s, _ = d
     row = [{"text": f"📋 {_money(cfg.amount)} {cfg.fiat}", "copy_text": {"text": f"{cfg.amount:g}"}}]
-    qty = _route_qty(b, s, cfg, snap.spot, snap.over_banks) if snap else None
+    qty = _route_qty(b, s, cfg, snap.spot, snap.over_banks, disable=frozenset({"risk"})) if snap else None
     if qty:
         row.append({"text": f"📋 {_qty(qty)} {s.asset}", "copy_text": {"text": _qty(qty)}})
     return row
