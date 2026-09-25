@@ -85,6 +85,8 @@ def _patch_paper_db(monkeypatch, db):
     monkeypatch.setattr(B.paper, "open_cycles", functools.partial(B.paper.open_cycles, path=db))
     monkeypatch.setattr(B.paper, "init_balance", functools.partial(B.paper.init_balance, path=db))
     monkeypatch.setattr(B.paper, "start_cycle", functools.partial(B.paper.start_cycle, path=db))
+    monkeypatch.setattr(B.paper, "finish_cycle", functools.partial(B.paper.finish_cycle, path=db))
+    monkeypatch.setattr(B.paper, "set_stage", functools.partial(B.paper.set_stage, path=db))
 
 
 def test_paper_cycle_starts_on_signal_when_enabled(monkeypatch, tmp_path):
@@ -138,6 +140,75 @@ def test_paper_cycle_skips_when_slot_full(monkeypatch, tmp_path):
     asyncio.run(bot.notify(snap_groups([deal(5)])))
     assert len(paper.open_cycles(path=db)) == 1   # новый круг не завёлся
     assert not [t for t in texts(bot) if "Сухой прогон" in t]
+
+
+def test_process_paper_cycles_waits_before_pay_minutes(monkeypatch, tmp_path):
+    monkeypatch.setenv("PAPER_PAY_MINUTES", "5")
+    db = str(tmp_path / "paper.db")
+    _patch_paper_db(monkeypatch, db)
+    buy, sell = make_ad("Bybit", "buy", 85.0), make_ad("MEXC", "sell", 90.0)
+    cid = paper.start_cycle(10000, buy, sell, "route", 2.0, path=db, ts=time.time())
+    bot = Stub(p2p.Config(min_profit=2.0))
+    asyncio.run(bot.process_paper_cycles(snap_groups([deal(5)])))
+    c = paper.get_cycle(cid, path=db)
+    assert c["stage"] == "buy" and c["result"] is None   # рано — ещё не прошло PAPER_PAY_MINUTES
+
+
+def test_process_paper_cycles_advances_when_ad_still_there(monkeypatch, tmp_path):
+    monkeypatch.setenv("PAPER_PAY_MINUTES", "5")
+    db = str(tmp_path / "paper.db")
+    _patch_paper_db(monkeypatch, db)
+    buy, sell = make_ad("Bybit", "buy", 85.0), make_ad("MEXC", "sell", 90.0)
+    cid = paper.start_cycle(10000, buy, sell, "route", 2.0, path=db, ts=time.time() - 400)
+    bot = Stub(p2p.Config(min_profit=2.0))
+    s = snap_groups([deal(5)])   # groups: (Bybit, buy, USDT) -> [та же связка, цена 85.0]
+    asyncio.run(bot.process_paper_cycles(s))
+    c = paper.get_cycle(cid, path=db)
+    assert c["stage"] == "transfer" and c["result"] is None
+    assert not [t for t in texts(bot) if "сорвался" in t]
+
+
+def test_process_paper_cycles_fails_when_ad_gone(monkeypatch, tmp_path):
+    monkeypatch.setenv("PAPER_PAY_MINUTES", "5")
+    db = str(tmp_path / "paper.db")
+    _patch_paper_db(monkeypatch, db)
+    buy, sell = make_ad("Bybit", "buy", 85.0), make_ad("MEXC", "sell", 90.0)
+    cid = paper.start_cycle(10000, buy, sell, "route", 2.0, path=db, ts=time.time() - 400)
+    bot = Stub(p2p.Config(min_profit=2.0))
+    s = p2p.Snapshot(88.0, "test", {}, {}, [], {}, {}, {}, groups={})   # объявление исчезло из стакана
+    asyncio.run(bot.process_paper_cycles(s))
+    c = paper.get_cycle(cid, path=db)
+    assert c["stage"] == "buy" and c["result"] == "failed_buy" and c["realized_pct"] == 0.0
+    msgs = [t for t in texts(bot) if "сорвался" in t]
+    assert len(msgs) == 1 and "исчезло" in msgs[0]
+
+
+def test_process_paper_cycles_fails_when_price_worse(monkeypatch, tmp_path):
+    monkeypatch.setenv("PAPER_PAY_MINUTES", "5")
+    db = str(tmp_path / "paper.db")
+    _patch_paper_db(monkeypatch, db)
+    buy, sell = make_ad("Bybit", "buy", 85.0), make_ad("MEXC", "sell", 90.0)
+    cid = paper.start_cycle(10000, buy, sell, "route", 2.0, path=db, ts=time.time() - 400)
+    bot = Stub(p2p.Config(min_profit=2.0))
+    worse = make_ad("Bybit", "buy", 86.0)   # тот же мерчант, цена выросла — хуже плана
+    s = p2p.Snapshot(88.0, "test", {}, {}, [], {}, {}, {}, groups={("Bybit", "buy", "USDT"): [worse]})
+    asyncio.run(bot.process_paper_cycles(s))
+    c = paper.get_cycle(cid, path=db)
+    assert c["stage"] == "buy" and c["result"] == "failed_buy"
+    msgs = [t for t in texts(bot) if "сорвался" in t]
+    assert len(msgs) == 1 and "цена ушла" in msgs[0]
+
+
+def test_process_paper_cycles_noop_without_chat_id(monkeypatch, tmp_path):
+    db = str(tmp_path / "paper.db")
+    _patch_paper_db(monkeypatch, db)
+    buy, sell = make_ad("Bybit", "buy", 85.0), make_ad("MEXC", "sell", 90.0)
+    cid = paper.start_cycle(10000, buy, sell, "route", 2.0, path=db, ts=time.time() - 400)
+    bot = Stub(p2p.Config(min_profit=2.0))
+    bot.chat_id = None
+    asyncio.run(bot.process_paper_cycles(snap_groups([deal(5)])))
+    c = paper.get_cycle(cid, path=db)
+    assert c["stage"] == "buy" and c["result"] is None   # без chat_id стадии не проверяем
 
 
 def test_paper_cycle_skips_when_depth_insufficient(monkeypatch, tmp_path):

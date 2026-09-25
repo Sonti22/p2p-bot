@@ -1397,6 +1397,7 @@ class Bot:
                     await self.check_venues(self.last)
                     await self.check_alerts(self.last)
                     await self.check_networks()
+                    await self.process_paper_cycles(self.last)
                     await self.quiet_and_pause_tick(self.last)
                     await self.update_market_status(self.last)
             except Exception as e:
@@ -1588,6 +1589,26 @@ class Bot:
         qty = settings["amount"] / b.price
         await self.send(f"🧪 <b>Сухой прогон</b>: купил бы {_money(qty)} {b.asset} у {html.escape(b.nick)} "
                         f"по {_price(b.price)} ₽, оплата {bank}", topic="signals")
+
+    async def process_paper_cycles(self, snap):
+        """Сухой прогон: стадия buy открытых виртуальных кругов — через PAPER_PAY_MINUTES проверяем
+        по свежему снимку (paper.check_buy_stage), что объявление покупки ещё есть и цена не хуже
+        плана; иначе круг сорван (failed_buy). Стадии transfer/sell — следующая задача очереди."""
+        if not self.chat_id:
+            return
+        pay_minutes = paper.settings()["pay_minutes"]
+        for cycle in paper.open_cycles():
+            if cycle["stage"] != "buy":
+                continue
+            action, note = paper.check_buy_stage(cycle, snap, pay_minutes)
+            if action == "wait":
+                continue
+            if action == "fail":
+                paper.finish_cycle(cycle["id"], "failed_buy", 0.0, note)
+                await self.send(f"🧪 Сухой прогон: круг #{cycle['id']} сорвался на покупке — {note}",
+                                topic="signals")
+            else:
+                paper.set_stage(cycle["id"], "transfer")
 
     async def notify(self, snap):
         now = time.time()
