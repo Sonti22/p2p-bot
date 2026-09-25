@@ -1591,24 +1591,46 @@ class Bot:
                         f"по {_price(b.price)} ₽, оплата {bank}", topic="signals")
 
     async def process_paper_cycles(self, snap):
-        """Сухой прогон: стадия buy открытых виртуальных кругов — через PAPER_PAY_MINUTES проверяем
-        по свежему снимку (paper.check_buy_stage), что объявление покупки ещё есть и цена не хуже
-        плана; иначе круг сорван (failed_buy). Стадии transfer/sell — следующая задача очереди."""
+        """Сухой прогон: стадии открытых виртуальных кругов по свежему снимку/справочникам, без сети.
+        buy — через PAPER_PAY_MINUTES объявление покупки ещё на месте и цена не хуже плана; transfer —
+        через PAPER_TRANSFER_MINUTES вывод всё ещё возможен (fees/netstatus); sell — объявление продажи
+        на месте, глубина хватает, цена не хуже плана — круг завершается с прибылью по факту цены
+        продажи. Любая стадия не прошла — круг сорван (failed_buy/failed_transfer/failed_sell)."""
         if not self.chat_id:
             return
-        pay_minutes = paper.settings()["pay_minutes"]
+        settings = paper.settings()
         for cycle in paper.open_cycles():
-            if cycle["stage"] != "buy":
-                continue
-            action, note = paper.check_buy_stage(cycle, snap, pay_minutes)
-            if action == "wait":
-                continue
-            if action == "fail":
-                paper.finish_cycle(cycle["id"], "failed_buy", 0.0, note)
-                await self.send(f"🧪 Сухой прогон: круг #{cycle['id']} сорвался на покупке — {note}",
-                                topic="signals")
-            else:
-                paper.set_stage(cycle["id"], "transfer")
+            if cycle["stage"] == "buy":
+                action, note = paper.check_buy_stage(cycle, snap, settings["pay_minutes"])
+                if action == "wait":
+                    continue
+                if action == "fail":
+                    paper.finish_cycle(cycle["id"], "failed_buy", 0.0, note)
+                    await self.send(f"🧪 Сухой прогон: круг #{cycle['id']} сорвался на покупке — {note}",
+                                    topic="signals")
+                else:
+                    paper.set_stage(cycle["id"], "transfer")
+            elif cycle["stage"] == "transfer":
+                action, note = paper.check_transfer_stage(cycle, self.cfg, settings["transfer_minutes"])
+                if action == "wait":
+                    continue
+                if action == "fail":
+                    paper.finish_cycle(cycle["id"], "failed_transfer", 0.0, note)
+                    await self.send(f"🧪 Сухой прогон: круг #{cycle['id']} сорвался на переводе — {note}",
+                                    topic="signals")
+                else:
+                    paper.set_stage(cycle["id"], "sell")
+            elif cycle["stage"] == "sell":
+                action, note, price = paper.check_sell_stage(cycle, snap)
+                if action == "fail":
+                    paper.finish_cycle(cycle["id"], "failed_sell", 0.0, note)
+                    await self.send(f"🧪 Сухой прогон: круг #{cycle['id']} сорвался на продаже — {note}",
+                                    topic="signals")
+                else:
+                    rp = paper.realized_pct(cycle, price)
+                    paper.finish_cycle(cycle["id"], "done", rp)
+                    await self.send(f"🧪 Сухой прогон: круг #{cycle['id']} завершён — план "
+                                    f"{cycle['planned_pct']:.2f}%, факт {rp:.2f}%", topic="signals")
 
     async def notify(self, snap):
         now = time.time()
