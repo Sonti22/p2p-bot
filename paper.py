@@ -467,6 +467,16 @@ def report_rows(path=DB_PATH):
     return out
 
 
+def first_start(path=DB_PATH):
+    """Время старта самого первого круга (epoch) — начало окна сравнения с реальными сделками; None — кругов нет."""
+    if not os.path.exists(path):
+        return None
+    con = _connect(path)
+    ts, = con.execute("SELECT MIN(ts_start) FROM cycles").fetchone()
+    con.close()
+    return ts
+
+
 def label_stats(path=DB_PATH):
     """Итоги завершённых кругов по метке надёжности на старте (✅/⚠️/🪤, p2p.reliability): сколько
     кругов, сколько исполнилось, средний план и факт исполнившихся — видно, оправдывает ли себя метка."""

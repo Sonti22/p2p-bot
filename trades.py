@@ -1,6 +1,7 @@
 """Журнал сделок: SQLite data/trades.db — время, связка, сумма, расчётный %. Пишется по кнопке «✅ Сделал».
 Факт (реальный результат сделки) — необязательное поле `fact`, вводится кнопками или числом после
-«✅ Сделал»; `/stats` показывает расчёт vs факт."""
+«✅ Сделал»; `/stats` показывает расчёт vs факт, `/export` выгружает журнал в CSV."""
+import csv
 import datetime
 import os
 import re
@@ -9,6 +10,12 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(HERE, "data", "trades.db")
+EXPORT_CSV_PATH = os.path.join(HERE, "data", "trades_export.csv")
+# Колонки выгрузки /export; ники мерчантов — только если в базе уже есть buy_nick/sell_nick.
+EXPORT_COLUMNS = ("Дата и время (МСК)", "Площадка покупки", "Монета покупки", "Площадка продажи", "Монета продажи",
+                  "Сумма, ₽", "Расчёт, %", "Факт, %", "Результат по факту, ₽", "Банк", "Как платили")
+EXPORT_NICK_COLUMNS = ("Мерчант покупки", "Мерчант продажи")
+KIND_NAMES = {"intra": "внутри банка", "sbp": "СБП"}
 PERIODS = {"day": 86400, "week": 7 * 86400, "month": 30 * 86400}
 MSK = datetime.timezone(datetime.timedelta(hours=3))
 # Банк по названию способа оплаты на площадках: каноническое имя → куски названий (латиница/кириллица,
@@ -298,3 +305,76 @@ def stats(path=DB_PATH, now=None):
                        "fact_count": fact_count, "avg_fact": avg_fact, "avg_diff": avg_diff}
     con.close()
     return out
+
+
+def facts_by_pair(since=0.0, path=DB_PATH):
+    """Реальные сделки с введённым фактом не старше `since` по связке площадка/монета покупки → площадка/монета
+    продажи — для сравнения с сухим прогоном в `/paper report`:
+    {(buy_ex, buy_asset, sell_ex, sell_asset): {"count", "avg_fact"}}."""
+    if not os.path.exists(path):
+        return {}
+    con = _connect(path)
+    rows = con.execute("SELECT buy_ex, buy_asset, sell_ex, sell_asset, COUNT(*), AVG(fact) FROM trades "
+                       "WHERE fact IS NOT NULL AND ts >= ? GROUP BY buy_ex, buy_asset, sell_ex, sell_asset",
+                       (since,)).fetchall()
+    con.close()
+    return {tuple(r[:4]): {"count": r[4], "avg_fact": r[5]} for r in rows}
+
+
+def period_start(period, now=None):
+    """Начало периода /export по МСК: «month» — 1-е число текущего месяца, «year» — 1 января (год до сегодня)."""
+    now = time.time() if now is None else now
+    dt = datetime.datetime.fromtimestamp(now, MSK).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    return (dt.replace(month=1) if period == "year" else dt).timestamp()
+
+
+def export_rows(since, path=DB_PATH):
+    """Сделки журнала с `since` по времени — словари со всеми колонками таблицы, какие есть в базе
+    (buy_nick/sell_nick могут быть, а могут и не быть — читаем через SELECT *)."""
+    if not os.path.exists(path):
+        return []
+    con = _connect(path)
+    con.row_factory = sqlite3.Row
+    rows = con.execute("SELECT * FROM trades WHERE ts >= ? ORDER BY ts", (since,)).fetchall()
+    con.close()
+    return [dict(r) for r in rows]
+
+
+def fact_rub(row):
+    """Результат сделки по факту в ₽ (сумма × факт %); None — факт не введён."""
+    return None if row.get("fact") is None else row["amount"] * row["fact"] / 100
+
+
+def export_summary(rows):
+    """Сводка выгрузки: {"count", "amount" (оборот ₽), "result" (сумма результатов по факту, ₽), "no_fact"}."""
+    results = [fact_rub(r) for r in rows]
+    return {"count": len(rows), "amount": sum(r["amount"] or 0 for r in rows),
+            "result": sum(x for x in results if x is not None), "no_fact": results.count(None)}
+
+
+def _csv_text(value):
+    """Текст с площадки (ник мерчанта) в ячейку CSV: в начале «=», «+», «-», «@» Excel принял бы за формулу —
+    такой текст экранируем «'»."""
+    text = str(value or "")
+    return "'" + text if text[:1] in ("=", "+", "-", "@", "\t", "\r") else text
+
+
+def write_export_csv(rows, path=EXPORT_CSV_PATH):
+    """Выгрузка сделок (export_rows) в CSV для банка (запрос документов по 115-ФЗ) и для 3-НДФЛ: «;» и UTF-8 с BOM —
+    так файл сразу открывается по колонкам в русском Excel."""
+    nicks = bool(rows) and "buy_nick" in rows[0] and "sell_nick" in rows[0]
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.writer(f, delimiter=";")
+        w.writerow(EXPORT_COLUMNS + (EXPORT_NICK_COLUMNS if nicks else ()) + ("Маршрут",))
+        for r in rows:
+            fact, rub = r.get("fact"), fact_rub(r)
+            bank, kind = r.get("bank") or "", r.get("kind") or ""
+            line = [datetime.datetime.fromtimestamp(r["ts"], MSK).strftime("%Y-%m-%d %H:%M"),
+                    r["buy_ex"], r["buy_asset"], r["sell_ex"], r["sell_asset"], f"{r['amount']:.2f}",
+                    f"{r['profit']:.2f}", "" if fact is None else f"{fact:.2f}", "" if rub is None else f"{rub:.2f}",
+                    BANK_NAMES.get(bank, bank), KIND_NAMES.get(kind, kind)]
+            if nicks:
+                line += [_csv_text(r.get("buy_nick")), _csv_text(r.get("sell_nick"))]
+            w.writerow(line + [r.get("route") or ""])
+    return path
