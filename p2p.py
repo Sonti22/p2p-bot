@@ -1240,17 +1240,26 @@ async def scan(s, cfg, force_alt=False):
 DEPTH_AMOUNTS = (50_000, 100_000, 300_000)   # суммы круга для разбивки прибыли в карточке связки
 
 
-def deal_amounts(deal, cfg, snap, amounts=DEPTH_AMOUNTS):
-    """Прибыль % той же связки на другие суммы круга: пересобрать те же объявления стакана
-    (snap.groups) под каждую сумму — покупку через _stack, продажу под выход монеты (_match).
-    None для суммы, на которую не хватает глубины."""
+def deal_for_amount(deal, cfg, snap, amount):
+    """Пересобрать ту же связку (те же объявления стакана snap.groups — покупка через _stack,
+    продажа под выход монеты в _match) под другую сумму круга, а не cfg.amount. Вся связка
+    (прибыль %, b, s, маршрут), не только процент — для сухого прогона (paper.py), которому
+    нужны объявления по сумме PAPER_AMOUNT. None — глубины на эту сумму не хватает."""
     _, b, s, _ = deal
     buy_ads = _same_net(snap.groups.get((b.ex, "buy", b.asset), []), b)
     sell_ads = _same_net(snap.groups.get((s.ex, "sell", s.asset), []), s)
+    bb = _stack(buy_ads, amount)
+    if not bb:
+        return None
+    return _match(bb, sell_ads, dataclasses.replace(cfg, amount=amount), snap.spot, snap.over_banks)
+
+
+def deal_amounts(deal, cfg, snap, amounts=DEPTH_AMOUNTS):
+    """Прибыль % той же связки на другие суммы круга (см. deal_for_amount). None для суммы,
+    на которую не хватает глубины."""
     out = {}
     for amount in amounts:
-        bb = _stack(buy_ads, amount)
-        d = _match(bb, sell_ads, dataclasses.replace(cfg, amount=amount), snap.spot, snap.over_banks) if bb else None
+        d = deal_for_amount(deal, cfg, snap, amount)
         out[amount] = d[0] if d else None
     return out
 

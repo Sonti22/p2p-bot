@@ -14,6 +14,7 @@ import bot as B
 import blacklist
 import history
 import p2p
+import paper
 import presets
 import trades
 from helpers import make_ad
@@ -40,6 +41,13 @@ def deal(profit=3.0, s_ex="MEXC", s_asset="USDT", route="перевод −0.2 U
 
 def snap(deals):
     return p2p.Snapshot(88.0, "test", {}, {}, deals, {}, {}, {})
+
+
+def snap_groups(deals):
+    """Как snap(), но со стаканом (snap.groups) под первую связку — для deal_for_amount/сухого прогона."""
+    b, s = deals[0][1], deals[0][2]
+    groups = {(b.ex, "buy", b.asset): [b], (s.ex, "sell", s.asset): [s]}
+    return p2p.Snapshot(88.0, "test", {}, {}, deals, {}, {}, {}, groups=groups)
 
 
 def err_snap(errors):
@@ -71,6 +79,79 @@ def test_below_threshold_not_sent(monkeypatch):
     bot = Stub(p2p.Config(min_profit=5.0))
     asyncio.run(bot.notify(snap([deal(3)])))
     assert not bot.out
+
+
+def _patch_paper_db(monkeypatch, db):
+    monkeypatch.setattr(B.paper, "open_cycles", functools.partial(B.paper.open_cycles, path=db))
+    monkeypatch.setattr(B.paper, "init_balance", functools.partial(B.paper.init_balance, path=db))
+    monkeypatch.setattr(B.paper, "start_cycle", functools.partial(B.paper.start_cycle, path=db))
+
+
+def test_paper_cycle_starts_on_signal_when_enabled(monkeypatch, tmp_path):
+    monkeypatch.setattr(B, "deal_card", lambda d, c, a=None, r=None, breakdown=None: b"png")
+    monkeypatch.setenv("PAPER", "1")
+    monkeypatch.setenv("PAPER_AMOUNT", "10000")
+    monkeypatch.setenv("PAPER_MAX_OPEN", "1")
+    db = str(tmp_path / "paper.db")
+    _patch_paper_db(monkeypatch, db)
+    bot = Stub(p2p.Config(min_profit=2.0))
+    bot.live_scans = 1
+    bot.guests = {"999"}   # гостям про сухой прогон — ничего
+    ds = [deal(5)]
+    asyncio.run(bot.notify(snap_groups(ds)))
+    cycles = paper.open_cycles(path=db)
+    assert len(cycles) == 1
+    c = cycles[0]
+    assert c["stage"] == "buy" and c["result"] is None
+    assert c["buy_ex"] == "Bybit" and c["buy_price"] == 85.0 and c["amount"] == 10000.0
+    paper_msgs = [t for t in texts(bot) if "Сухой прогон" in t]
+    assert len(paper_msgs) == 1
+    assert "T-Bank" in paper_msgs[0]
+    # запросы sendMessage не несут явный chat_id гостя — сообщение только владельцу
+    assert all(p.get("chat_id") in (None, bot.chat_id) for m, p in bot.out
+              if m == "sendMessage" and "Сухой прогон" in p.get("text", ""))
+
+
+def test_paper_cycle_off_by_default(monkeypatch, tmp_path):
+    monkeypatch.setattr(B, "deal_card", lambda d, c, a=None, r=None, breakdown=None: b"png")
+    monkeypatch.delenv("PAPER", raising=False)
+    db = str(tmp_path / "paper.db")
+    _patch_paper_db(monkeypatch, db)
+    bot = Stub(p2p.Config(min_profit=2.0))
+    bot.live_scans = 1
+    asyncio.run(bot.notify(snap_groups([deal(5)])))
+    assert not paper.open_cycles(path=db)
+    assert not [t for t in texts(bot) if "Сухой прогон" in t]
+
+
+def test_paper_cycle_skips_when_slot_full(monkeypatch, tmp_path):
+    monkeypatch.setattr(B, "deal_card", lambda d, c, a=None, r=None, breakdown=None: b"png")
+    monkeypatch.setenv("PAPER", "1")
+    monkeypatch.setenv("PAPER_AMOUNT", "10000")
+    monkeypatch.setenv("PAPER_MAX_OPEN", "1")
+    db = str(tmp_path / "paper.db")
+    _patch_paper_db(monkeypatch, db)
+    buy, sell = make_ad("Bybit", "buy", 85.0), make_ad("MEXC", "sell", 90.0)
+    paper.start_cycle(10000, buy, sell, "route", 2.0, path=db)   # слот уже занят
+    bot = Stub(p2p.Config(min_profit=2.0))
+    bot.live_scans = 1
+    asyncio.run(bot.notify(snap_groups([deal(5)])))
+    assert len(paper.open_cycles(path=db)) == 1   # новый круг не завёлся
+    assert not [t for t in texts(bot) if "Сухой прогон" in t]
+
+
+def test_paper_cycle_skips_when_depth_insufficient(monkeypatch, tmp_path):
+    monkeypatch.setattr(B, "deal_card", lambda d, c, a=None, r=None, breakdown=None: b"png")
+    monkeypatch.setenv("PAPER", "1")
+    monkeypatch.setenv("PAPER_AMOUNT", "10000000")   # больше глубины стакана в снимке
+    monkeypatch.setenv("PAPER_MAX_OPEN", "1")
+    db = str(tmp_path / "paper.db")
+    _patch_paper_db(monkeypatch, db)
+    bot = Stub(p2p.Config(min_profit=2.0))
+    bot.live_scans = 1
+    asyncio.run(bot.notify(snap_groups([deal(5)])))
+    assert not paper.open_cycles(path=db)
+    assert not [t for t in texts(bot) if "Сухой прогон" in t]
 
 
 def test_notify_threshold_before_top_n(monkeypatch):
