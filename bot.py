@@ -141,6 +141,7 @@ MARKET_STATUS_INTERVAL = 60  # сек: не чаще обновляем закр
 MSK = timezone(timedelta(hours=3))                    # тихие часы и /pause считаем по МСК, не по времени ПК
 PAUSE_PRESETS = {"30m": 1800, "1h": 3600, "3h": 3 * 3600}  # аргументы /pause -> секунды
 PAPER_STAGE_LABELS = {"buy": "оплата", "transfer": "перевод", "sell": "продажа"}
+PAPER_AMOUNTS = (10000, 20000)   # суммы круга сухого прогона на кнопках /paper
 
 
 def account_poll_interval():
@@ -1205,9 +1206,20 @@ class Bot:
                 mark = "⚠️ " if total >= trades.BANK_LIMIT else ""
                 lines.append(f"{mark}{bank}: {_money(total)} ₽ / {_money(trades.BANK_LIMIT)} ₽")
         lines.append("")
-        lines.append("/paper on|off — включить/выключить · /paper amount 20000 — сумма круга · "
-                    "/paper report — отчёт по площадкам и парам + CSV")
+        lines.append("Кнопки ниже; то же командами: /paper on, /paper off, /paper amount 20000, /paper report")
         return "\n".join(lines)
+
+    def paper_markup(self):
+        """Кнопки под сводкой «/paper»: включить/выключить, сумма круга, отчёт. Ссылка «/paper» в тексте
+        отправляет команду без аргумента, поэтому включать прогон нужно кнопкой, а не набором «/paper on»."""
+        s = paper.settings()
+        toggle = ({"text": "⏹ Выключить", "callback_data": "paper_set:off"} if s["on"]
+                  else {"text": "▶️ Включить", "callback_data": "paper_set:on"})
+        amounts = [{"text": ("✓ " if s["amount"] == a else "") + f"{_money(a)} ₽", "callback_data": f"paper_amt:{a}"}
+                   for a in PAPER_AMOUNTS]
+        return {"inline_keyboard": [[toggle], amounts,
+                                    [{"text": "📊 Отчёт + CSV", "callback_data": "paper_report"},
+                                     {"text": "🔄 Обновить", "callback_data": "paper"}]]}
 
     def paper_report_view(self, rows):
         """Текст «/paper report»: по каждой связке площадка/монета покупки → площадка/монета продажи —
@@ -1262,7 +1274,7 @@ class Bot:
                 path = paper.write_report_csv(rows)
                 await self.send_document(path, "Отчёт сухого прогона (CSV)")
         else:
-            await self.send(self.paper_view())
+            await self.send(self.paper_view(), markup=self.paper_markup())
 
     async def show_best(self, snap=None, cfg=None):
         snap = self.last if snap is None else snap
@@ -2182,7 +2194,17 @@ class Bot:
         elif data == "status":
             await self.send(self.status_view())
         elif data == "paper":
-            await self.send(self.paper_view())
+            await self.send(self.paper_view(), markup=self.paper_markup())
+        elif data.startswith(("paper_set:", "paper_amt:")):
+            key, value = data.split(":", 1)
+            if key == "paper_set" and value in ("on", "off"):
+                save_env("PAPER", "1" if value == "on" else "0")
+            elif key == "paper_amt" and value in {str(a) for a in PAPER_AMOUNTS}:
+                save_env("PAPER_AMOUNT", value)
+            await self.call("editMessageText", chat_id=self.chat_id, message_id=cq["message"]["message_id"],
+                            text=self.paper_view(), parse_mode="HTML", reply_markup=self.paper_markup())
+        elif data == "paper_report":
+            await self.cmd_paper("report")
         elif data.startswith("paper_ladder:"):
             amount = float(data[len("paper_ladder:"):])
             save_env("PAPER_AMOUNT", f"{amount:.0f}")
