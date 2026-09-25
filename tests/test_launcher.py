@@ -2,11 +2,14 @@
 
 Настоящие процессы, git, gh, pip и Telegram не трогаем: подменяются _run, start_bot, _proc_start, git, gh, notify.
 """
+import http.client
+import io
 import json
 import os
 import re
 import sys
 import time
+import urllib.error
 from types import SimpleNamespace
 
 import pytest
@@ -44,29 +47,29 @@ def fake_run(monkeypatch, tmp_path, *answers):
 
 def test_smoke_compile_error_stops_before_tests(monkeypatch, tmp_path):
     calls = fake_run(monkeypatch, tmp_path, (["py_compile"], R(1, err="SyntaxError: bad")))
-    assert launcher.smoke() == (False, "SyntaxError: bad")
+    assert launcher.smoke() == (False, "SyntaxError: bad", False)   # ошибка кода — без повтора
     assert calls == [["py_compile", "ok.py"]]
 
 
 def test_smoke_passes_and_fails_by_pytest(monkeypatch, tmp_path):
     fake_run(monkeypatch, tmp_path, (["py_compile"], R()), (PYTEST, R(0, "5 passed")))
-    assert launcher.smoke() == (True, "5 passed")
+    assert launcher.smoke() == (True, "5 passed", False)
     fake_run(monkeypatch, tmp_path, (["py_compile"], R()), (PYTEST, R(1, "FAILED tests/test_x.py::test_y")))
-    ok, text = launcher.smoke()
-    assert not ok and "FAILED tests/test_x.py" in text
+    ok, text, retry = launcher.smoke()
+    assert not ok and "FAILED tests/test_x.py" in text and not retry
 
 
 def test_smoke_no_tests_is_failure(monkeypatch, tmp_path):
     """Код 5 (коммит стёр tests/) раньше считался успехом."""
     fake_run(monkeypatch, tmp_path, (["py_compile"], R()), (PYTEST, R(5, "no tests ran in 0.00s")))
-    ok, text = launcher.smoke()
-    assert not ok and "ни одного теста" in text
+    ok, text, retry = launcher.smoke()
+    assert not ok and "ни одного теста" in text and not retry
 
 
 def test_smoke_installs_missing_pytest_and_reruns(monkeypatch, tmp_path):
     calls = fake_run(monkeypatch, tmp_path, (["py_compile"], R()), (PYTEST, R(1, err=NO_MOD)), (PIP, R()),
                      (PYTEST, R(0, "5 passed")))
-    assert launcher.smoke() == (True, "5 passed")
+    assert launcher.smoke() == (True, "5 passed", False)
     assert calls[2] == PIP and sum(c[:len(PYTEST)] == PYTEST for c in calls) == 2
 
 
@@ -74,15 +77,15 @@ def test_smoke_pip_failure_is_failure(monkeypatch, tmp_path):
     """Без pytest раньше возвращалось (True, "") — обновление «проверено» без единого теста."""
     fake_run(monkeypatch, tmp_path, (["py_compile"], R()), (PYTEST, R(1, err=NO_MOD)),
              (PIP, R(1, err="ERROR: Could not install packages")))
-    ok, text = launcher.smoke()
-    assert not ok and "pip install -r requirements.txt" in text and "Could not install" in text
+    ok, text, retry = launcher.smoke()
+    assert not ok and "pip install -r requirements.txt" in text and "Could not install" in text and not retry
 
 
 def test_smoke_pytest_still_missing_after_pip(monkeypatch, tmp_path):
     fake_run(monkeypatch, tmp_path, (["py_compile"], R()), (PYTEST, R(1, err=NO_MOD)), (PIP, R()),
              (PYTEST, R(1, err=NO_MOD)))
-    ok, text = launcher.smoke()
-    assert not ok and "pip install -r requirements.txt" in text
+    ok, text, retry = launcher.smoke()
+    assert not ok and "pip install -r requirements.txt" in text and not retry
 
 
 def test_smoke_own_basetemp_removed_after(monkeypatch, tmp_path):
@@ -98,8 +101,8 @@ def test_smoke_own_basetemp_removed_after(monkeypatch, tmp_path):
         return R(0, "5 passed")
 
     monkeypatch.setattr(launcher, "_run", run)
-    assert launcher.smoke() == (True, "5 passed")
-    assert launcher.smoke() == (True, "5 passed")
+    assert launcher.smoke() == (True, "5 passed", False)
+    assert launcher.smoke() == (True, "5 passed", False)
     (arg1, base1, existed1), (_, base2, _) = seen
     assert arg1.startswith("--basetemp=") and os.path.basename(base1).startswith("p2p-smoke-") and existed1
     assert base1 != base2 and not os.path.exists(base1) and not os.path.exists(base2)
@@ -117,12 +120,27 @@ def test_smoke_basetemp_removed_on_error(monkeypatch, tmp_path):
         return R()
 
     monkeypatch.setattr(launcher, "_run", run)
-    ok, text = launcher.smoke()
-    assert not ok and "WinError 1455" in text
+    ok, text, retry = launcher.smoke()
+    assert not ok and "WinError 1455" in text and retry     # сбой ОС — повторить стоит
     fail[0] = RuntimeError("неожиданное")
     with pytest.raises(RuntimeError):
         launcher.smoke()
     assert len(bases) == 2 and not any(os.path.exists(b) for b in bases)
+
+
+@pytest.mark.parametrize("stage, out, retry", [
+    ("pytest", "FAILED tests/test_x.py::test_y - PermissionError: [WinError 32] файл занят", True),
+    ("pytest", "FAILED tests/test_x.py::test_y - OSError: [Errno 24] Too many open files", True),
+    ("pytest", "FAILED tests/test_x.py::test_y - AssertionError: assert 1 == 2", False),
+    ("py_compile", "[WinError 32] Процесс не может получить доступ к файлу: '__pycache__\\bot.cpython-310.pyc'", True),
+    ("py_compile", "SyntaxError: invalid syntax", False)])
+def test_smoke_retry_only_os_failures(monkeypatch, tmp_path, stage, out, retry):
+    """Повторять стоит только сбой ОС под нагрузкой; падение теста или SyntaxError — сразу откат."""
+    if stage == "pytest":
+        fake_run(monkeypatch, tmp_path, (["py_compile"], R()), (PYTEST, R(1, out)))
+    else:
+        fake_run(monkeypatch, tmp_path, (["py_compile"], R(1, err=out)))
+    assert launcher.smoke() == (False, out, retry)
 
 
 def test_requirements_include_pytest():
@@ -259,22 +277,44 @@ def test_minutes_checked_once_a_day(stand, monkeypatch):
     assert calls == [1]
 
 
-# --- try_update: повтор смоука, обновления только документации ---
+# --- try_update: переход ровно на проверенный коммит, повтор смоука, обновления только документации ---
 
-HEAD, REMOTE = "a" * 40, "b" * 40
+HEAD, R1, R2 = "a" * 40, "b" * 40, "c" * 40
 
 
 @pytest.fixture
 def upd(monkeypatch, tmp_path):
-    """try_update без git и Telegram: st.files — что изменилось в HEAD..origin/main, st.smokes — ответы smoke()."""
-    monkeypatch.setattr(launcher, "LOG_PATH", str(tmp_path / "launcher.log"))
-    st = SimpleNamespace(files="bot.py", smokes=[], smoked=0, git=[], notes=[])
-    answers = {"rev-parse HEAD": HEAD, "rev-parse origin/main": REMOTE, "rev-list --count HEAD..origin/main": "1"}
+    """try_update без настоящего git и Telegram — модель репозитория: st.head — HEAD папки бота, st.github — main
+    на GitHub; fetch запоминает его как origin/main, pull берёт с GitHub то, что там сейчас, merge и reset — ровно
+    названный sha. st.after_fetch — «облако запушило ещё коммит» сразу после fetch. st.files — вывод
+    diff --no-renames, st.renamed — что показал бы diff с поиском переименований. st.smokes — ответы smoke()."""
+    paths = {"LOG_PATH": tmp_path / "launcher.log", "LAST_GOOD": tmp_path / ".last_good"}
+    for name, value in paths.items():
+        monkeypatch.setattr(launcher, name, str(value))
+    st = SimpleNamespace(head=HEAD, github=R1, origin=None, files=["bot.py"], renamed=None, after_fetch=None,
+                         diverged=False, smokes=[], smoked=0, git=[], notes=[], dev=[], last_good=paths["LAST_GOOD"])
 
     def git(*args, check=True):
-        cmd = " ".join(args)
-        st.git.append(cmd)
-        return st.files if args[0] == "diff" else answers.get(cmd, "")
+        st.git.append(" ".join(args))
+        if args[0] == "fetch":
+            st.origin = st.github
+            if st.after_fetch:
+                st.after_fetch()
+        elif args[0] == "rev-parse":
+            return st.head if args[1] == "HEAD" else st.origin
+        elif args[0] == "rev-list":
+            a, b = args[-1].split("..")
+            return "0" if a == b else "1"
+        elif args[0] == "diff":
+            names = st.files if "--no-renames" in args else (st.renamed or st.files)
+            return "".join(n + "\0" for n in names) if "-z" in args else "\n".join(names)
+        elif args[0] == "merge" and st.diverged:
+            raise RuntimeError(f"git {' '.join(args)}: fatal: Not possible to fast-forward, aborting.")
+        elif args[0] == "pull":
+            st.head = st.github
+        elif args[0] in ("merge", "reset"):
+            st.head = args[-1]
+        return ""
 
     def smoke():
         st.smoked += 1
@@ -284,48 +324,105 @@ def upd(monkeypatch, tmp_path):
     monkeypatch.setattr(launcher, "clean_tree", lambda: True)
     monkeypatch.setattr(launcher, "smoke", smoke)
     monkeypatch.setattr(launcher, "notify", st.notes.append)
+    monkeypatch.setattr(launcher, "write_dev_status", lambda: st.dev.append(st.head))
     monkeypatch.setattr(launcher, "roadmap_progress", lambda: (0, 0, ""))
     monkeypatch.setattr(launcher, "repo_url", lambda: "repo")
     st.log = lambda: (tmp_path / "launcher.log").read_text(encoding="utf-8")
     return st
 
 
+def test_update_lands_exactly_on_checked_commit(upd):
+    """Между fetch и переходом облако запушило R2 с кодом: pull сходил бы в origin заново и поставил R2 без смоука
+    (diff считался для R1 — только .md). Теперь переход ровно на R1, а R2 — следующей проверкой, со смоуком."""
+    upd.files = ["ROADMAP.md"]
+    upd.after_fetch = lambda: setattr(upd, "github", R2)
+    lau = launcher.Launcher()
+    assert lau.try_update() is False and upd.head == R1 and upd.smoked == 0
+    assert f"diff --no-renames --name-only -z {HEAD} {R1}" in upd.git and f"merge --ff-only --quiet {R1}" in upd.git
+    assert not any(c.startswith("pull") for c in upd.git)
+    upd.after_fetch, upd.files, upd.smokes = None, ["bot.py"], [(True, "5 passed", False)]
+    assert lau.try_update() is True and upd.head == R2 and upd.smoked == 1
+    assert f"diff --no-renames --name-only -z {R1} {R2}" in upd.git
+
+
+def test_update_diverged_branches_notify(upd):
+    upd.diverged = True
+    lau = launcher.Launcher()
+    assert lau.try_update() is False and upd.head == HEAD and upd.smoked == 0 and R1 in lau.bad
+    assert len(upd.notes) == 1 and "ветки разошлись" in upd.notes[0]
+
+
+def test_update_rename_to_md_is_not_docs_only(upd):
+    """helper.py → HELPER.md: с поиском переименований diff показал бы только HELPER.md — «одна документация»,
+    хотя код удалён. Без переименований виден и удалённый helper.py — обычное обновление со смоуком."""
+    upd.files, upd.renamed = ["HELPER.md", "helper.py"], ["HELPER.md"]
+    upd.smokes = [(True, "5 passed", False)]
+    assert launcher.Launcher().try_update() is True and upd.smoked == 1
+
+
 def test_update_smoke_retry_keeps_good_commit(upd):
     """Смоук упал на WinError под нагрузкой, повтор прошёл — раньше коммит откатывался и больше не ставился."""
-    upd.smokes = [(False, "E   PermissionError: [WinError 32] файл занят\n1 failed in 3.1s"), (True, "5 passed")]
+    upd.smokes = [(False, "E   PermissionError: [WinError 32] файл занят\n1 failed in 3.1s", True),
+                  (True, "5 passed", False)]
     lau = launcher.Launcher()
     assert lau.try_update() is True               # бот перезапустится на новой версии
     assert upd.smoked == 2 and not any(c.startswith("reset") for c in upd.git) and not lau.bad
     assert len(upd.notes) == 1 and upd.notes[0].startswith("🔄")
-    assert "не прошёл, повторяю" in upd.log() and "WinError 32" in upd.log()
+    assert "сбой ОС, повторяю" in upd.log() and "WinError 32" in upd.log()
 
 
 def test_update_smoke_fails_twice_rolls_back(upd):
-    upd.smokes = [(False, "FAILED tests/test_x.py::test_a"), (False, "FAILED tests/test_x.py::test_b")]
+    upd.smokes = [(False, "PermissionError: [WinError 5] test_a", True), (False, "PermissionError: test_b", True)]
     lau = launcher.Launcher()
     assert lau.try_update() is False
-    assert upd.smoked == 2 and f"reset --hard {HEAD}" in upd.git and REMOTE in lau.bad
+    assert upd.smoked == 2 and f"reset --hard {HEAD}" in upd.git and upd.head == HEAD and R1 in lau.bad
     assert len(upd.notes) == 1 and "не прошло проверку" in upd.notes[0] and "test_b" in upd.notes[0]
     assert lau.try_update() is False and upd.smoked == 2   # забракованный коммит больше не проверяем
 
 
+@pytest.mark.parametrize("err", ["FAILED tests/test_x.py::test_a - AssertionError",
+                                 "смоук-тест не завершился за отведённое время",
+                                 "pytest не нашёл ни одного теста (tests/ удалён или пуст?)"])
+def test_update_code_failure_not_retried(upd, err):
+    """Падение теста, таймаут, нет тестов — повтор ничего не даст, а присмотр за ботом стоял бы вдвое дольше."""
+    upd.smokes = [(False, err, False)]
+    lau = launcher.Launcher()
+    assert lau.try_update() is False
+    assert upd.smoked == 1 and f"reset --hard {HEAD}" in upd.git and R1 in lau.bad and err in upd.notes[0]
+
+
 def test_update_docs_only_no_smoke_no_restart(upd):
-    upd.files = "README.md\nROADMAP.md"
-    assert launcher.Launcher().try_update() is False      # бот не перезапускаем
-    assert "pull --ff-only --quiet origin main" in upd.git and upd.smoked == 0
-    assert not any(c.startswith("reset") for c in upd.git)
-    assert upd.notes == [f"📝 Обновлена документация ({REMOTE[:7]}), бот не перезапускал"]
-    assert "только документация" in upd.log() and "ROADMAP.md" in upd.log()
+    upd.files = ["README.md", "docs/заметки.md"]  # -z: путь как есть, без кавычек и \ooo
+    upd.last_good.write_text(HEAD)
+    lau = launcher.Launcher()
+    assert lau.try_update() is False              # бот не перезапускаем
+    assert upd.head == R1 and upd.smoked == 0 and not any(c.startswith("reset") for c in upd.git)
+    assert upd.notes == [f"📝 Обновлена документация ({R1[:7]}), бот не перезапускал"]
+    assert "только документация" in upd.log() and "заметки.md" in upd.log()
+    assert upd.dev == [R1]                        # «🛠 Разработка» — с новой версией
+    assert upd.last_good.read_text() == R1        # работающий бот и есть новая версия
+    lau.rollback()                                # падения потом: раньше «откат» на тот же код со старыми .md
+    assert upd.head == R1 and R1 not in lau.bad and not any(c.startswith("reset") for c in upd.git)
+
+
+@pytest.mark.parametrize("good", [None, "d" * 40])
+def test_update_docs_only_keeps_other_last_good(upd, good):
+    """.last_good нет или там более старая версия (текущая ещё не проработала STABLE_AFTER) — не трогаем."""
+    upd.files = ["README.md"]
+    if good:
+        upd.last_good.write_text(good)
+    assert launcher.Launcher().try_update() is False
+    assert (upd.last_good.read_text() if upd.last_good.exists() else None) == good
 
 
 def test_update_code_and_docs_goes_through_smoke(upd):
-    upd.files = "ROADMAP.md\nbot.py"
-    upd.smokes = [(True, "5 passed")]
+    upd.files = ["ROADMAP.md", "bot.py"]
+    upd.smokes = [(True, "5 passed", False)]
     assert launcher.Launcher().try_update() is True
-    assert upd.smoked == 1 and "pull --ff-only --quiet origin main" in upd.git and upd.notes[0].startswith("🔄")
+    assert upd.smoked == 1 and upd.head == R1 and upd.notes[0].startswith("🔄")
 
 
-# --- уведомления дублируются в launcher.log ---
+# --- уведомления дублируются в launcher.log, секреты в лог не попадают ---
 
 def test_notify_copied_to_log_one_line(monkeypatch, tmp_path):
     """Откаты раньше были видны только в Telegram; без TG_TOKEN — вообще нигде."""
@@ -341,47 +438,97 @@ def test_notify_copied_to_log_one_line(monkeypatch, tmp_path):
     assert len(lines[0].split("уведомление: ", 1)[1]) == 300
 
 
-def test_notify_log_has_no_secrets(monkeypatch, tmp_path):
-    """Токен бота — только в URL запроса: даже если ошибка отправки процитирует URL, в лог токен не попадёт.
-    Логин:пароль в ссылке из текста уведомления тоже вырезается."""
+@pytest.mark.parametrize("error, logged", [
+    (lambda url: http.client.InvalidURL(f"URL can't contain control characters. {url!r} (found at least '\\t')"),
+     "telegram: InvalidURL"),
+    (lambda url: urllib.error.HTTPError(url, 401, f"Unauthorized {url}", None, None), "telegram: HTTPError 401")])
+def test_notify_log_has_no_secrets(monkeypatch, tmp_path, error, logged):
+    """Токен с управляющим символом (TG_TOKEN=<токен><TAB># …): InvalidURL цитирует repr URL с \\t, и прежняя
+    замена str(e).replace(token) не срабатывала — токен уходил в launcher.log. Текст ошибки больше не пишем:
+    только тип и код HTTP. Логин:пароль в ссылке из текста уведомления тоже вырезается."""
     log = tmp_path / "launcher.log"
     monkeypatch.setattr(launcher, "LOG_PATH", str(log))
-    env = {"TG_TOKEN": "123:fake-token-for-test", "TG_CHAT_ID": "42"}
+    env = {"TG_TOKEN": "123:fake-token-for-test\t# бот", "TG_CHAT_ID": "42"}
     monkeypatch.setattr(launcher, "env_value", lambda key, default="": env.get(key, default))
     sent = []
 
     class Opener:
         def open(self, url, data, timeout):
             sent.append(url)
-            raise ValueError(f"URL can't contain control characters. {url!r}")
+            raise error(url)
 
     monkeypatch.setattr(launcher.urllib.request, "build_opener", lambda *handlers: Opener())
     launcher.notify("🔄 Бот обновился\nssh://deploy:hunter2@host/repo.git")
     text = log.read_text(encoding="utf-8")
     assert sent and "fake-token-for-test" in sent[0]      # токен ушёл только в запрос
-    assert "fake-token-for-test" not in text and "hunter2" not in text
-    assert "telegram: URL can't contain" in text and "ssh://***@host" in text
+    assert "fake-token" not in text and "hunter2" not in text
+    assert text.rstrip().endswith(logged) and "ssh://***@host" in text
+
+
+def test_log_masks_bot_token_and_url_passwords(monkeypatch, tmp_path):
+    """Страховка для любых строк лога (ошибки git, gh, текст исключений): /bot<токен> и логин:пароль в ссылках."""
+    log = tmp_path / "launcher.log"
+    monkeypatch.setattr(launcher, "LOG_PATH", str(log))
+    launcher.log("URL can't contain control characters. '/bot123:fake-token\\t#x/sendMessage'")
+    launcher.log(RuntimeError("git fetch --quiet origin main: fatal: unable to access 'ssh://deploy:hunter2@host/r/'"))
+    launcher.log("FAILED tests/test_bot.py::test_x")   # обычные строки с «bot» не портим
+    text = log.read_text(encoding="utf-8")
+    assert "fake-token" not in text and "hunter2" not in text
+    assert "'/bot***/sendMessage'" in text and "ssh://***@host/r/" in text and "tests/test_bot.py::test_x" in text
+
+
+def test_log_survives_non_utf8_stdout(monkeypatch, tmp_path):
+    """Уведомления с emoji теперь идут и в лог: вывод в cp1251 (не через run.bat) не должен ронять notify."""
+    log = tmp_path / "launcher.log"
+    out = io.TextIOWrapper(io.BytesIO(), encoding="cp1251")
+    monkeypatch.setattr(launcher, "LOG_PATH", str(log))
+    monkeypatch.setattr(launcher.sys, "stdout", out)
+    launcher.log("уведомление: 📝 Обновлена документация")
+    out.seek(0)
+    assert "уведомление: ? Обновлена документация" in out.read()
+    assert "📝 Обновлена документация" in log.read_text(encoding="utf-8")   # в файле — как есть
+
+
+def test_env_value_strips_comment_after_any_space(monkeypatch, tmp_path):
+    """TG_TOKEN=<токен><TAB># комментарий: раньше комментарий после табуляции попадал в значение, а с ним в URL."""
+    monkeypatch.setattr(launcher, "HERE", str(tmp_path))
+    (tmp_path / ".env").write_text("TG_TOKEN=123:fake-token\t# бот\nTG_CHAT_ID=42 # чат\nUPDATE_EVERY=60\n",
+                                   encoding="utf-8")
+    assert launcher.env_value("TG_TOKEN") == "123:fake-token"
+    assert launcher.env_value("TG_CHAT_ID") == "42" and launcher.env_value("UPDATE_EVERY") == "60"
+    assert launcher.env_value("NOPE", "d") == "d"
 
 
 # --- минуты GitHub Actions ---
 
 @pytest.fixture
 def minutes(monkeypatch, tmp_path):
-    """check_minutes без сети: gh отвечает st.used минут Actions за месяц; квота из .env — st.free."""
+    """check_minutes без сети: gh отвечает st.used минут Actions за месяц в приватных репозиториях владельца
+    (плюс публичный репозиторий и строки, которые не минуты Actions); квота из .env — st.free.
+    st.fail = (кусок аргументов gh, исключение) — этот вызов gh падает."""
     monkeypatch.setattr(launcher, "LOG_PATH", str(tmp_path / "launcher.log"))
     monkeypatch.setattr(launcher.shutil, "which", lambda name: "gh")
-    st = SimpleNamespace(used=0, free="", fail=None, calls=[], notes=[])
+    st = SimpleNamespace(used=0, free="", private="p2p-bot\nprivate-tool", fail=None, calls=[], notes=[])
 
     def gh(*args):
         st.calls.append(args)
-        if st.fail:
-            raise st.fail
+        if st.fail and st.fail[0] in " ".join(args):
+            raise st.fail[1]
         if args[1] == "user":
             return "owner"
-        return json.dumps({"usageItems": [   # минуты Linux и Windows плюс строки, которые не минуты Actions
-            {"product": "actions", "sku": "actions_linux", "unitType": "Minutes", "quantity": st.used - 10},
-            {"product": "actions", "sku": "actions_windows", "unitType": "Minutes", "quantity": 10},
-            {"product": "actions", "sku": "actions_storage", "unitType": "GigabyteHours", "quantity": 5000},
+        if "--paginate" in args:
+            return st.private
+        return json.dumps({"usageItems": [
+            {"product": "actions", "sku": "actions_linux", "unitType": "Minutes", "quantity": st.used - 30,
+             "repositoryName": "owner/p2p-bot"},
+            {"product": "actions", "sku": "actions_windows", "unitType": "Minutes", "quantity": 5,   # ×2
+             "repositoryName": "owner/private-tool"},
+            {"product": "actions", "sku": "actions_macos", "unitType": "Minutes", "quantity": 2,     # ×10
+             "repositoryName": "p2p-bot"},
+            {"product": "actions", "sku": "actions_linux", "unitType": "Minutes", "quantity": 5000,  # публичный
+             "repositoryName": "owner/public-site"},
+            {"product": "actions", "sku": "actions_storage", "unitType": "GigabyteHours", "quantity": 5000,
+             "repositoryName": "owner/p2p-bot"},
             {"product": "copilot", "sku": "copilot_premium_request", "unitType": "Requests", "quantity": 5000}]})
 
     monkeypatch.setattr(launcher, "gh", gh)
@@ -393,13 +540,22 @@ def minutes(monkeypatch, tmp_path):
 
 
 def test_minutes_below_80_silent(minutes):
+    """Публичные репозитории (5000 мин) квоту не тратят — считаются только приватные, Windows ×2, macOS ×10."""
     minutes.used = 1500
     launcher.Launcher().check_minutes()
     year, month = map(int, time.strftime("%Y %m").split())
     assert minutes.notes == []
-    assert minutes.calls == [("api", "user", "--jq", ".login"),
-                             ("api", f"users/owner/settings/billing/usage?year={year}&month={month}")]
+    assert minutes.calls == [
+        ("api", "user", "--jq", ".login"),
+        ("api", "--paginate", "user/repos?visibility=private&affiliation=owner&per_page=100", "--jq", ".[].name"),
+        ("api", f"users/owner/settings/billing/usage?year={year}&month={month}")]
     assert "1500 из 2000 (75%)" in minutes.log()
+
+
+def test_minutes_no_private_repos_nothing_counts(minutes):
+    minutes.used, minutes.private = 1990, ""
+    launcher.Launcher().check_minutes()
+    assert minutes.notes == [] and "0 из 2000 (0%)" in minutes.log()
 
 
 def test_minutes_80_then_95_once_each(minutes):
@@ -448,12 +604,15 @@ def test_minutes_without_gh_does_nothing(minutes, monkeypatch):
     assert minutes.calls == [] and minutes.notes == []
 
 
-@pytest.mark.parametrize("fail", [RuntimeError("gh api user: timeout"), ValueError("Expecting value")])
+@pytest.mark.parametrize("fail", [("user --jq", RuntimeError("gh api user: timeout")),
+                                  ("user/repos", RuntimeError("gh api user/repos: HTTP 403")),
+                                  ("billing", ValueError("Expecting value"))])
 def test_minutes_errors_only_logged(minutes, fail):
-    """Нет прав у gh на billing, таймаут, мусор вместо JSON — только строка в логе, launcher работает дальше."""
+    """Нет прав у gh на billing или список репозиториев, таймаут, мусор вместо JSON — проверка пропускается,
+    только строка в логе; launcher работает дальше."""
     minutes.used, minutes.fail = 1990, fail
     launcher.Launcher().check_minutes()
-    assert minutes.notes == [] and f"минуты GitHub Actions: {type(fail).__name__}" in minutes.log()
+    assert minutes.notes == [] and f"минуты GitHub Actions: {type(fail[1]).__name__}" in minutes.log()
 
 
 # --- бот-сирота от убитого извне launcher ---

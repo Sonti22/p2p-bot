@@ -1,12 +1,13 @@
 """Запускает бота, сам подтягивает обновления из GitHub и откатывается, если новая версия падает.
 
 Запуск: python launcher.py (через run.bat). Защищённый файл: правится только вручную, не облачным Claude.
-- каждые UPDATE_EVERY сек: git fetch; есть новое в origin/main и папка чистая → pull → смоук-тест
+- каждые UPDATE_EVERY сек: git fetch; есть новое в origin/main и папка чистая → merge --ff-only ровно на
+  полученный sha → смоук-тест
   (компиляция + pytest; нет pytest — ставит его, не вышло или тестов нет — провал) →
-  перезапуск бота и сообщение в Telegram; смоук не прошёл дважды подряд → возврат на прежний коммит;
-  изменились только .md — pull без смоука и без перезапуска бота;
-- раз в сутки: минуты GitHub Actions за месяц, предупреждение на 80% и 95% квоты;
-- все уведомления дублируются в logs/launcher.log;
+  перезапуск бота и сообщение в Telegram; смоук не прошёл → возврат на прежний коммит (сбой ОС под нагрузкой —
+  после одного повтора); изменились только .md — переход без смоука и без перезапуска бота;
+- раз в сутки: минуты GitHub Actions за месяц (приватные репозитории), предупреждение на 80% и 95% квоты;
+- все уведомления дублируются в logs/launcher.log (без токена бота и паролей из ссылок);
 - бот падает быстрее CRASH_WINDOW сек CRASH_LIMIT раза подряд → откат на последнюю рабочую версию;
 - один launcher на папку (замок logs/launcher.lock, второй выходит с кодом 3); бот не переживает launcher:
   при любом выходе из run() он останавливается, а бот-сирота убитого извне launcher (pid в logs/bot.pid)
@@ -21,6 +22,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -39,12 +41,22 @@ LOG_PATH = os.path.join(HERE, "logs", "launcher.log")
 PID_FILE = os.path.join(HERE, "logs", "bot.pid")
 LOCK_PATH = os.path.join(HERE, "logs", "launcher.lock")
 NO_PYTEST = "pytest не установлен и не ставится сам — выполните вручную: pip install -r requirements.txt"
+TRANSIENT = ("WinError", "PermissionError", "OSError")   # в выводе смоука: сбой ОС под нагрузкой, а не ошибка кода
 _lock_fd = None   # дескриптор замка держим открытым до конца процесса
 
 
+def _mask(text):
+    """Токен бота из URL Telegram (/bot<токен>/…) и логин:пароль из ссылок — не в консоль и не в launcher.log."""
+    return re.sub(r"/bot[^/\s'\"]*", "/bot***", re.sub(r"://[^/\s@]+@", "://***@", str(text)))
+
+
 def log(msg):
-    line = f"{time.strftime('%d.%m %H:%M:%S')} [launcher] {msg}"
-    print(line, flush=True)
+    line = f"{time.strftime('%d.%m %H:%M:%S')} [launcher] {_mask(msg)}"
+    try:
+        print(line, flush=True)
+    except UnicodeEncodeError:   # вывод не в UTF-8 (запуск не через run.bat): emoji из уведомлений — «?», а не падение
+        enc = sys.stdout.encoding or "ascii"
+        print(line.encode(enc, "replace").decode(enc), flush=True)
     try:   # журнал на диске: чтобы после зависания/падения было видно, где остановились
         os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
         if os.path.exists(LOG_PATH) and os.path.getsize(LOG_PATH) > 1_000_000:
@@ -82,16 +94,16 @@ def env_value(key, default=""):
     try:
         with open(os.path.join(HERE, ".env"), encoding="utf-8") as f:
             for line in f:
-                if line.startswith(key + "="):
-                    return line.split("=", 1)[1].split(" #")[0].strip()
+                if line.startswith(key + "="):   # комментарий после любого пробела, в том числе табуляции
+                    return re.split(r"\s#", line.split("=", 1)[1], 1)[0].strip()
     except OSError:
         pass
     return default
 
 
 def notify(text):
-    # копия в launcher.log: откаты видно и без Telegram. Одной строкой, коротко, логин:пароль из ссылок вырезан
-    log("уведомление: " + re.sub(r"://[^/\s@]+@", "://***@", " ⏎ ".join(text.strip().splitlines()))[:300])
+    # копия в launcher.log: откаты видно и без Telegram. Одной строкой и коротко; маска — до обрезки
+    log("уведомление: " + _mask(" ⏎ ".join(text.strip().splitlines()))[:300])
     token, chat = env_value("TG_TOKEN"), env_value("TG_CHAT_ID")
     if not (token and chat):
         return
@@ -99,8 +111,8 @@ def notify(text):
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))   # мимо системного прокси
     try:
         opener.open(f"https://api.telegram.org/bot{token}/sendMessage", data, timeout=20)
-    except Exception as e:   # токен есть только в URL — если ошибка его процитирует, в лог он не попадёт
-        log(f"telegram: {str(e).replace(token, '***')}")
+    except Exception as e:   # текст ошибки не пишем: он может процитировать URL с токеном
+        log(f"telegram: {type(e).__name__}" + (f" {e.code}" if isinstance(e, urllib.error.HTTPError) else ""))
 
 
 def clean_tree():
@@ -146,7 +158,8 @@ def _run(args, timeout):
 
 def smoke():
     """Компиляция и тесты новой версии до перезапуска бота. Без pytest или без единого теста — провал:
-    иначе обновление считалось бы проверенным, хотя тесты не запускались."""
+    иначе обновление считалось бы проверенным, хотя тесты не запускались.
+    → (прошёл, хвост вывода, стоит ли повторить: сбой ОС под нагрузкой, а не ошибка в коде или таймаут)."""
     tmp = ""
     try:
         files = [f for f in os.listdir(HERE) if f.endswith(".py")]
@@ -154,27 +167,28 @@ def smoke():
         tmp = tempfile.mkdtemp(prefix="p2p-smoke-")
         tests = ["pytest", "-q", "-x", "-p", "no:cacheprovider", f"--basetemp={tmp}"]
         r = _run(["py_compile", *files], 120)
-        if r.returncode:
-            return False, r.stderr[-500:]
+        if r.returncode:   # SyntaxError — ошибка кода; PermissionError при записи .pyc под нагрузкой — сбой ОС
+            return False, r.stderr[-500:], any(m in r.stderr for m in TRANSIENT)
         r = _run(tests, 600)
         if "No module named pytest" in r.stderr:   # ставим только сам pytest и повторяем один раз
             log("pytest не установлен — ставлю")
             p = _run(["pip", "install", "-q", "pytest"], 300)
             if p.returncode:
-                return False, NO_PYTEST + "\n" + p.stderr[-300:]
+                return False, NO_PYTEST + "\n" + p.stderr[-300:], False
             r = _run(tests, 600)
     except subprocess.TimeoutExpired:
-        return False, "смоук-тест не завершился за отведённое время"
+        return False, "смоук-тест не завершился за отведённое время", False
     except OSError as e:   # не запустился (WinError под нагрузкой) — провал попытки, а не исключение посреди обновления
-        return False, f"смоук-тест не запустился: {e}"
+        return False, f"смоук-тест не запустился: {e}", True
     finally:
         if tmp:
             shutil.rmtree(tmp, ignore_errors=True)
     if "No module named pytest" in r.stderr:
-        return False, NO_PYTEST
+        return False, NO_PYTEST, False
     if r.returncode == 5:
-        return False, "pytest не нашёл ни одного теста (tests/ удалён или пуст?)"
-    return r.returncode == 0, (r.stdout + r.stderr)[-500:]
+        return False, "pytest не нашёл ни одного теста (tests/ удалён или пуст?)", False
+    out = r.stdout + r.stderr
+    return r.returncode == 0, out[-500:], r.returncode != 0 and any(m in out for m in TRANSIENT)
 
 
 def start_bot():
@@ -328,15 +342,23 @@ class Launcher:
         try:
             year, month = map(int, time.strftime("%Y %m").split())
             login = gh("api", "user", "--jq", ".login")
+            # квоту тратят только приватные репозитории владельца: в публичных Actions бесплатны
+            private = set(gh("api", "--paginate", "user/repos?visibility=private&affiliation=owner&per_page=100",
+                             "--jq", ".[].name").split())
             usage = json.loads(gh("api", f"users/{login}/settings/billing/usage?year={year}&month={month}"))
-            used = sum(i.get("quantity") or 0 for i in usage.get("usageItems") or []
-                       if str(i.get("unitType")).lower() == "minutes" and str(i.get("product")).lower() == "actions")
+            used = 0
+            for i in usage.get("usageItems") or []:
+                sku = str(i.get("sku")).lower()
+                if (str(i.get("product")).lower() == "actions" and str(i.get("unitType")).lower() == "minutes"
+                        and str(i.get("repositoryName")).split("/")[-1] in private):   # "owner/repo" или "repo"
+                    # минуты Windows списываются из квоты ×2, macOS ×10
+                    used += (i.get("quantity") or 0) * (10 if "macos" in sku else 2 if "windows" in sku else 1)
             free = int(env_value("GH_ACTIONS_FREE_MIN", "2000") or 2000)
             pct = used * 100 / free
         except Exception as e:
             log(f"минуты GitHub Actions: {type(e).__name__}: {e}")
             return
-        log(f"минуты GitHub Actions: {used:.0f} из {free} ({int(pct)}%)")
+        log(f"минуты GitHub Actions (приватные репозитории): {used:.0f} из {free} ({int(pct)}%)")
         level = 95 if pct >= 95 else 80 if pct >= 80 else 0
         key = f"{year}-{month:02d}"
         if level > (self.minutes_warned[1] if self.minutes_warned[0] == key else 0):
@@ -352,7 +374,7 @@ class Launcher:
         except RuntimeError as e:
             log(e)
             return False
-        if remote in self.bad or git("rev-list", "--count", "HEAD..origin/main") == "0":
+        if remote in self.bad or git("rev-list", "--count", f"{head}..{remote}") == "0":
             return False
         if not clean_tree():
             if not self.warned_dirty:
@@ -360,22 +382,32 @@ class Launcher:
                 self.warned_dirty = True
             return False
         self.warned_dirty = False
-        changes = git("log", "--pretty=format:• %s", "HEAD..origin/main", check=False).splitlines()[:10]
-        files = git("diff", "--name-only", "HEAD", "origin/main", check=False).splitlines()
-        try:
-            git("pull", "--ff-only", "--quiet", "origin", "main")
+        changes = git("log", "--pretty=format:• %s", f"{head}..{remote}", check=False).splitlines()[:10]
+        # --no-renames: иначе helper.py → HELPER.md выглядит как «изменён только .md»; -z — пути без кавычек
+        files = git("diff", "--no-renames", "--name-only", "-z", head, remote, check=False).split("\0")
+        files = [f for f in files if f]
+        try:   # ровно на проверенный sha: pull сходил бы в origin заново и мог принести ещё не проверенный коммит
+            git("merge", "--ff-only", "--quiet", remote)
         except RuntimeError as e:
             notify(f"⚠️ Не смог обновиться (ветки разошлись): {e}")
             self.bad.add(remote)
             return False
         if files and all(f.endswith(".md") for f in files):   # код не менялся: ни смоука, ни перезапуска бота
             log(f"только документация ({remote[:7]}): {', '.join(files)[:200]}")
+            try:   # бот работает дальше: рабочая версия — новая, иначе откат при падениях «вернул» бы тот же код
+                   # со старыми .md и забраковал бы этот коммит
+                if os.path.exists(LAST_GOOD) and open(LAST_GOOD).read().strip() == head:
+                    with open(LAST_GOOD, "w") as f:
+                        f.write(remote)
+            except OSError as e:
+                log(f"last_good: {e}")
             notify(f"📝 Обновлена документация ({remote[:7]}), бот не перезапускал")
+            write_dev_status()   # кнопка «🛠 Разработка» — с новой версией и списком коммитов
             return False
-        ok, err = smoke()
-        if not ok:   # под нагрузкой Windows смоук изредка падает сам (WinError): хороший коммит — не с одной попытки
-            log(f"смоук {remote[:7]} не прошёл, повторяю: " + " ⏎ ".join(err.strip().splitlines())[-300:])
-            ok, err = smoke()
+        ok, err, transient = smoke()
+        if not ok and transient:   # сбой ОС под нагрузкой (WinError) — повтор, а не брак хорошего коммита навсегда
+            log(f"смоук {remote[:7]}: сбой ОС, повторяю: " + " ⏎ ".join(err.strip().splitlines())[-300:])
+            ok, err, _ = smoke()
         if not ok:
             git("reset", "--hard", head)
             self.bad.add(remote)
