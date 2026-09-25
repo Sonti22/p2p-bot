@@ -99,6 +99,45 @@ def test_finish_cycle_failed_defaults_to_zero_realized(tmp_path):
     assert paper.get_balance(path=db) == 10000    # срыв — баланс не поменялся
 
 
+def _cycle_snap(buy_ex="Bybit", buy_asset="USDT", ads=()):
+    import p2p
+    groups = {(buy_ex, "buy", buy_asset): list(ads)} if ads else {}
+    return p2p.Snapshot(88.0, "test", {}, {}, [], {}, {}, {}, groups=groups)
+
+
+def test_check_buy_stage_waits_before_pay_minutes():
+    cycle = {"ts_stage": 1000.0, "buy_ex": "Bybit", "buy_asset": "USDT", "buy_nick": "nick", "buy_price": 85.0}
+    action, note = paper.check_buy_stage(cycle, _cycle_snap(), pay_minutes=5, now=1100.0)   # прошло 100с < 300с
+    assert action == "wait" and note == ""
+
+
+def test_check_buy_stage_advances_when_ad_still_there_at_same_or_better_price():
+    cycle = {"ts_stage": 1000.0, "buy_ex": "Bybit", "buy_asset": "USDT", "buy_nick": "nick", "buy_price": 85.0}
+    ad = make_ad("Bybit", "buy", 84.5)   # nick по умолчанию "nick", цена даже лучше плана
+    action, note = paper.check_buy_stage(cycle, _cycle_snap(ads=[ad]), pay_minutes=5, now=1400.0)
+    assert action == "advance" and note == ""
+
+
+def test_check_buy_stage_fails_when_ad_gone():
+    cycle = {"ts_stage": 1000.0, "buy_ex": "Bybit", "buy_asset": "USDT", "buy_nick": "nick", "buy_price": 85.0}
+    action, note = paper.check_buy_stage(cycle, _cycle_snap(), pay_minutes=5, now=1400.0)
+    assert action == "fail" and "исчезло" in note
+
+
+def test_check_buy_stage_fails_when_price_worse():
+    cycle = {"ts_stage": 1000.0, "buy_ex": "Bybit", "buy_asset": "USDT", "buy_nick": "nick", "buy_price": 85.0}
+    ad = make_ad("Bybit", "buy", 86.0)   # тот же мерчант, но цена выросла — хуже плана покупки
+    action, note = paper.check_buy_stage(cycle, _cycle_snap(ads=[ad]), pay_minutes=5, now=1400.0)
+    assert action == "fail" and "цена ушла" in note
+
+
+def test_check_buy_stage_ignores_different_merchant():
+    cycle = {"ts_stage": 1000.0, "buy_ex": "Bybit", "buy_asset": "USDT", "buy_nick": "other", "buy_price": 85.0}
+    ad = make_ad("Bybit", "buy", 84.0)   # цена ок, но не тот мерчант — не считается тем же объявлением
+    action, note = paper.check_buy_stage(cycle, _cycle_snap(ads=[ad]), pay_minutes=5, now=1400.0)
+    assert action == "fail" and "исчезло" in note
+
+
 def test_finish_cycle_missing_id_returns_false_and_no_balance_change(tmp_path):
     db = str(tmp_path / "paper.db")
     paper.init_balance(10000, path=db)

@@ -1,7 +1,7 @@
 """Сухой прогон (paper trading) — этап 1 полуавтомата: виртуальные круги без реальных денег,
-чтобы увидеть, что бот сделал бы сам, и сравнить план с фактом. Только хранилище и движок —
-запуск круга по сигналу, проверка стадий по свежим снимкам и команда /paper делаются в
-следующих задачах очереди.
+чтобы увидеть, что бот сделал бы сам, и сравнить план с фактом. Хранилище, движок и запуск круга
+по сигналу уже есть; проверка стадий transfer/sell по свежим снимкам (сейчас готова только buy)
+и команда /paper — в следующих задачах очереди.
 
 SQLite data/paper.db, таблицы:
   cycles  — один виртуальный круг: сумма, объявления покупки/продажи на момент старта, маршрут,
@@ -135,6 +135,29 @@ def set_stage(cycle_id, stage, path=DB_PATH, ts=None):
         con.execute("UPDATE cycles SET stage = ?, ts_stage = ? WHERE id = ?",
                     (stage, ts if ts is not None else time.time(), cycle_id))
     con.close()
+
+
+def check_buy_stage(cycle, snap, pay_minutes, now=None):
+    """Проверка исполнимости стадии buy по свежему снимку (только чтение snap.groups, без сети и
+    без записи в БД — решение применяет вызывающий). Раньше PAPER_PAY_MINUTES с начала круга не
+    ждём. После — ищем в текущем стакане покупки то же объявление (тот же мерчант): нет — цена
+    ушла хуже плана.
+
+    Возвращает (action, note):
+      "wait"    — ещё не прошло pay_minutes, ничего не решаем;
+      "advance" — объявление на месте, цена не хуже плана — можно переходить к transfer;
+      "fail"    — объявление исчезло или цена ушла хуже плана (result станет failed_buy).
+    """
+    now = now if now is not None else time.time()
+    if now - cycle["ts_stage"] < pay_minutes * 60:
+        return "wait", ""
+    ads = snap.groups.get((cycle["buy_ex"], "buy", cycle["buy_asset"]), [])
+    ad = next((a for a in ads if a.nick == cycle["buy_nick"]), None)
+    if ad is None:
+        return "fail", "объявление покупки исчезло"
+    if ad.price > cycle["buy_price"]:
+        return "fail", f"цена ушла: было {cycle['buy_price']:g} ₽, стало {ad.price:g} ₽"
+    return "advance", ""
 
 
 def finish_cycle(cycle_id, result, realized_pct=0.0, note="", path=DB_PATH, ts=None):
