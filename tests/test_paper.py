@@ -224,3 +224,60 @@ def test_finish_cycle_missing_id_returns_false_and_no_balance_change(tmp_path):
     paper.init_balance(10000, path=db)
     assert paper.finish_cycle(999, "done", realized_pct=5.0, path=db) is False
     assert paper.get_balance(path=db) == 10000
+
+
+def test_stats_empty_db(tmp_path):
+    db = str(tmp_path / "paper.db")
+    st = paper.stats(path=db)
+    assert st["day"] == {"total": 0, "done": 0, "failed": 0, "failed_by_reason": {}, "avg_diff": None}
+    assert st["week"]["total"] == 0 and st["all"]["total"] == 0
+
+
+def test_stats_counts_done_and_failed(tmp_path):
+    db = str(tmp_path / "paper.db")
+    buy, sell = make_ad("Bybit", "buy", 85.0), make_ad("MEXC", "sell", 90.0)
+    now = time.time()
+    cid1 = paper.start_cycle(10000, buy, sell, "route", 2.0, path=db, ts=now)
+    paper.finish_cycle(cid1, "done", realized_pct=2.5, path=db, ts=now)   # факт лучше плана на 0.5 п.п.
+    cid2 = paper.start_cycle(10000, buy, sell, "route", 2.0, path=db, ts=now)
+    paper.finish_cycle(cid2, "failed_sell", realized_pct=0.0, note="цена ушла", path=db, ts=now)
+    st = paper.stats(path=db, now=now)
+    assert st["day"] == {"total": 2, "done": 1, "failed": 1,
+                         "failed_by_reason": {"failed_sell": 1}, "avg_diff": pytest.approx(0.5)}
+    assert st["all"] == st["day"]   # оба круга сегодня же
+
+
+def test_stats_day_excludes_older_cycle(tmp_path):
+    db = str(tmp_path / "paper.db")
+    buy, sell = make_ad("Bybit", "buy", 85.0), make_ad("MEXC", "sell", 90.0)
+    now = time.time()
+    old = now - 8 * 86400   # больше недели назад — не попадает ни в день, ни в неделю
+    cid = paper.start_cycle(10000, buy, sell, "route", 2.0, path=db, ts=old)
+    paper.finish_cycle(cid, "done", realized_pct=2.0, path=db, ts=old)
+    st = paper.stats(path=db, now=now)
+    assert st["day"]["total"] == 0 and st["week"]["total"] == 0
+    assert st["all"]["total"] == 1   # но за всё время — виден
+
+
+def test_stats_open_cycle_not_counted(tmp_path):
+    db = str(tmp_path / "paper.db")
+    buy, sell = make_ad("Bybit", "buy", 85.0), make_ad("MEXC", "sell", 90.0)
+    paper.start_cycle(10000, buy, sell, "route", 2.0, path=db)   # ещё открыт, result IS NULL
+    st = paper.stats(path=db)
+    assert st["all"]["total"] == 0
+
+
+def test_balance_change_no_db():
+    assert paper.balance_change(path="/nonexistent/paper.db") == 0.0
+
+
+def test_balance_change_sums_finished_cycles(tmp_path):
+    db = str(tmp_path / "paper.db")
+    buy, sell = make_ad("Bybit", "buy", 85.0), make_ad("MEXC", "sell", 90.0)
+    paper.init_balance(10000, path=db)
+    cid1 = paper.start_cycle(10000, buy, sell, "route", 2.0, path=db)
+    paper.finish_cycle(cid1, "done", realized_pct=2.0, path=db)      # +200
+    cid2 = paper.start_cycle(10000, buy, sell, "route", 2.0, path=db)
+    paper.finish_cycle(cid2, "failed_buy", realized_pct=0.0, path=db)  # +0
+    assert paper.balance_change(path=db) == pytest.approx(200.0)
+    assert paper.get_balance(path=db) == pytest.approx(10200.0)

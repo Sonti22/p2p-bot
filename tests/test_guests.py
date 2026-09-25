@@ -83,7 +83,7 @@ def test_guest_gets_market_commands_but_not_settings(monkeypatch):
     assert not any("callback_data" in b and b["callback_data"].startswith(("did:", "steps:", "bl:"))
                    for b in buttons(photo["reply_markup"]))
     assert not bot.deals_by_id                              # гость не заводит сделок в памяти владельца
-    for cmd in ("/settings", "/balance", "/stats", "/alerts", "/dev", "/logs", "/pause", "/amount 100000"):
+    for cmd in ("/settings", "/balance", "/stats", "/paper", "/alerts", "/dev", "/logs", "/pause", "/amount 100000"):
         asyncio.run(bot.on_update(msg(42, cmd)))
         assert sent(bot)[-1]["chat_id"] == "42" and sent(bot)[-1]["text"] == B.GUEST_DENIED, cmd
     assert bot.cfg.amount == 50000 and not bot.paused
