@@ -245,6 +245,21 @@ def test_listed_directory_without_receiver_net_blocks_route():
     assert p2p._withdraw(_cfg(), "HTX", "ETH", "", "BitPapa") == (0.002, "ERC20")
 
 
+def test_static_table_net_ignored_when_live_directory_lacks_it():
+    # у MEXC в fees.json (табличные комиссии) есть TRC20, но живой справочник знает про MEXC и в нём
+    # TRC20 сейчас нет вовсе (не просто закрыт, а отсутствует в списке сетей) — табличная запись устарела,
+    # маршрута на BitPapa (принимает только TRC20) быть не должно, а не «табличная комиссия — сойдёт».
+    assert "TRC20" in p2p.WITHDRAW[("MEXC", "USDT")]
+    netstatus._apply("MEXC", "USDT", {"BEP20": {"dep": True, "wd": True, "fee": 0.5},
+                                      "ERC20": {"dep": True, "wd": True, "fee": 2.0}})
+    b, s = make_ad("MEXC", "buy", 88.0), make_ad("BitPapa", "sell", 94.0)
+    assert p2p._withdraw(_cfg(), "MEXC", "USDT", "", "BitPapa") is None
+    assert p2p._route(b, s, _cfg(), SPOT) is None
+    # Bybit сеть TRC20 не требует — берётся живая BEP20 из справочника, табличная TRC20 не всплывает
+    fee, net = p2p._withdraw(_cfg(), "MEXC", "USDT", "", "Bybit")
+    assert net == "BEP20" and fee == pytest.approx(0.5)
+
+
 def test_exchanger_to_exchange_checks_receiver_deposit():
     b, s = make_ad("BestChange", "buy", 88.0, net="TRC20"), make_ad("MEXC", "sell", 90.0)
     netstatus._apply("MEXC", "USDT", {"TRC20": {"dep": False, "wd": True, "fee": 1.0}})

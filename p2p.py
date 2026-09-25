@@ -597,14 +597,17 @@ def _withdraw(cfg, sender, asset, net="", receiver="", qty=None):
     """Комиссия вывода монеты с биржи и сеть. Сеть задана (её требует обменник) — берём её,
     иначе самую дешёвую из тех, что принимает получатель. None — открытой сети нет: у отправителя
     закрыт вывод или у получателя ввод (по живому справочнику netstatus; неизвестно = не мешаем),
-    либо справочник отправителя известен и все его сети закрыты (или нет сети, которую принимает
-    получатель), либо сумма вывода (qty) ниже минимума биржи в этой сети. Нет сведений — запасная
-    комиссия."""
+    либо справочник отправителя известен (живой или табличный fees.json) и все его сети закрыты
+    (или нет сети, которую принимает получатель), либо сумма вывода (qty) ниже минимума биржи в
+    этой сети. Нет сведений вовсе — запасная комиссия."""
     table = dict(WITHDRAW.get((sender, asset), {}))
     for n in netstatus.open_nets(sender, asset):       # живой справочник дополняет таблицу и переопределяет её
         fee = netstatus.live_fee(sender, asset, n)
         if fee is not None:
             table[n] = fee
+    listed = netstatus.known_nets(sender, asset)
+    if listed:      # живой справочник знает про отправителя — сеть, которой в нём нет, табличная
+        table = {n: f for n, f in table.items() if n in listed}   # запись fees.json не спасает (устарела)
 
     def ok(n):
         if qty is not None:
@@ -618,6 +621,8 @@ def _withdraw(cfg, sender, asset, net="", receiver="", qty=None):
     accepts = (lambda n: n in need) if need else (lambda n: True)   # которые в этой сети реально ходят (BC_COINS)
 
     if net:
+        if listed and net not in listed:
+            return None   # справочник есть, а такой сети в нём нет — как закрытая
         return (table.get(net, cfg.transfer_fees.get(asset, 0)), net) if ok(net) else None
     allowed = {n: f for n, f in table.items() if accepts(n)}
     if allowed:
@@ -626,7 +631,6 @@ def _withdraw(cfg, sender, asset, net="", receiver="", qty=None):
             return None
         best = min(cand, key=cand.get)
         return cand[best], best
-    listed = netstatus.known_nets(sender, asset)
     known = [n for n in listed if accepts(n)]
     if known and not any(ok(n) for n in known):
         return None   # справочник есть, и во всех его сетях вывод (или ввод у получателя) закрыт
