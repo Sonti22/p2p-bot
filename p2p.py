@@ -1315,38 +1315,54 @@ def spot_url(route):
 RELIABLE, RISKY, TRAP = "✅ надёжно", "⚠️ риск", "🪤 ловушка"
 
 
-def reliability(deal, cfg, snap):
-    """Метка надёжности связки и причины: очки риска за отклонение цены от ориентира, мерчанта
-    у порога фильтра по сделкам/отзывам, число переводов/конвертаций в маршруте, волатильную
-    монету и спред ≥5%. 0 очков — надёжно, 1-2 — риск, 3+ — похоже на ловушку."""
+def _risks(deal, cfg, snap):
+    """Риски связки: [(вес, причина)] — отклонение цены от ориентира (ближе к отсеву — тяжелее), мерчант у
+    порога фильтра по сделкам/отзывам, рискованные условия, число переводов/конвертаций, волатильная монета,
+    спред ≥5% и «обменник → обменник» (оба конца на BestChange: курсы с условиями, AML-проверки и заморозки)."""
     profit, b, s, route = deal
-    reasons = []
+    risks = []
     for ad, side in ((b, "покупка"), (s, "продажа")):
         ref = snap.refs.get(ad.asset)
         if ref:
             dev = abs(ad.price / ref - 1) * 100
             if dev >= cfg.max_dev * 0.6:
-                reasons.append(f"{side}: цена {dev:.1f}% от ориентира (отсев >{cfg.max_dev:g}%)")
+                risks.append((2 if dev >= cfg.max_dev * 0.8 else 1,
+                              f"{side}: цена {dev:.1f}% от ориентира (отсев >{cfg.max_dev:g}%)"))
         if ad.orders < cfg.min_orders * 1.5 or ad.rate < cfg.min_rate + 1:
-            reasons.append(f"{side}: мерчант у порога фильтра ({ad.orders} сделок/{ad.rate:.0f}%)")
+            risks.append((1, f"{side}: мерчант у порога фильтра ({ad.orders} сделок/{ad.rate:.0f}%)"))
         risky = [n for n in terms_flags(ad.terms)[1] if n in TERMS_RISKY]
         if risky:
-            reasons.append(f"{side}: условия — {', '.join(risky)}")
+            risks.append((2, f"{side}: условия — {', '.join(risky)}"))
     steps = route.split(" → ") if route else []
     transfers = sum(1 for st in steps if "перевод" in st or "спот" in st or "через" in st)
     if transfers >= 2:
-        reasons.append(f"{transfers} перевода/конвертации в маршруте")
+        risks.append((1, f"{transfers} перевода/конвертации в маршруте"))
     vol = next((a for a in (b.asset, s.asset) if cfg.risk_buffer.get(a)), None)
     if vol:
-        reasons.append(f"{vol} — волатильная монета, курс может уйти за время сделки")
+        risks.append((1, f"{vol} — волатильная монета, курс может уйти за время сделки"))
     if profit >= 5:
-        reasons.append(f"спред {profit:.1f}% ≥5% — часто плата за риск")
+        risks.append((2, f"спред {profit:.1f}% ≥5% — часто плата за риск"))
+    if b.ex == "BestChange" and s.ex == "BestChange":
+        risks.append((2, "обменник → обменник: у выгодных курсов часто условия, AML-проверка и заморозка — "
+                         "проверь оба обменника"))
+    return risks
+
+
+def reliability(deal, cfg, snap):
+    """Метка надёжности связки и причины (_risks): 0 причин — надёжно, 1-2 — риск, 3+ — похоже на ловушку."""
+    reasons = [r for _, r in _risks(deal, cfg, snap)]
     label = TRAP if len(reasons) >= 3 else RISKY if reasons else RELIABLE
     return label, reasons
 
 
-def fmt_reliability(label, reasons):
-    return label if not reasons else f"{label} ({'; '.join(reasons)})"
+def reliability_index(deal, cfg, snap):
+    """Индекс надёжности 0–10 для карточки: 10 минус веса рисков (_risks), не ниже 0."""
+    return max(0, 10 - sum(w for w, _ in _risks(deal, cfg, snap)))
+
+
+def fmt_reliability(label, reasons, index=None):
+    head = label if index is None else f"{label} · надёжность {index}/10"
+    return head if not reasons else f"{head} ({'; '.join(reasons)})"
 
 
 def _money(x):
@@ -1370,7 +1386,7 @@ def fmt_deal(d, cfg, snap=None):
     profit, b, s, route = d
     text = (f"<b>{profit:+.2f}%</b> на {_money(cfg.amount)} {cfg.fiat} ({route})\n")
     if snap is not None:
-        text += html.escape(fmt_reliability(*reliability(d, cfg, snap))) + "\n"
+        text += html.escape(fmt_reliability(*reliability(d, cfg, snap), reliability_index(d, cfg, snap))) + "\n"
     return text + f"Купить: {fmt_ad(b)}\nПродать: {fmt_ad(s)}"
 
 
