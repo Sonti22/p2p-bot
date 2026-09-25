@@ -54,22 +54,25 @@ def save_topics(topics, path=None):
 
 MENU = {"keyboard": [[{"text": "🔥 Лучшая сейчас"}, {"text": "📊 Топ связок"}],
                      [{"text": "⚙️ Настройки"}, {"text": "🛠 Разработка"}],
-                     [{"text": "❓ Как работать"}]],
+                     [{"text": "❓ Как работать"}, {"text": "🛡 Безопасность"}]],
         "resize_keyboard": True, "is_persistent": True}
 BUTTONS = {"🔥 Лучшая сейчас": "/best", "📊 Топ связок": "/top", "⚙️ Настройки": "/settings",
-           "🛠 Разработка": "/dev", "❓ Как работать": "/help"}
+           "🛠 Разработка": "/dev", "❓ Как работать": "/help", "🛡 Безопасность": "/safety"}
 
 # Гости (TG_GUESTS в .env): получают сигналы и рыночные команды; настройки, ключи, журнал, алерты — только
 # владельцу. REPLY_CHAT живёт в контексте задачи command_loop: фоновые циклы (скан, аккаунты) его не видят
 # и шлют владельцу, даже если в этот момент обрабатывается команда гостя.
 REPLY_CHAT = contextvars.ContextVar("reply_chat", default=None)
-GUEST_MENU = {"keyboard": [[{"text": "🔥 Лучшая сейчас"}, {"text": "📊 Топ связок"}], [{"text": "❓ Как работать"}]],
+GUEST_MENU = {"keyboard": [[{"text": "🔥 Лучшая сейчас"}, {"text": "📊 Топ связок"}],
+                           [{"text": "❓ Как работать"}, {"text": "🛡 Безопасность"}]],
               "resize_keyboard": True, "is_persistent": True}
-GUEST_CMDS = {"/start", "/help", "/best", "/top", "/calc", "/banks", "/maker", "/fees", "/history", "/backtest"}
+GUEST_CMDS = {"/start", "/help", "/best", "/top", "/calc", "/banks", "/maker", "/fees", "/history", "/backtest",
+              "/safety"}
 GUEST_CALLBACKS = {"best", "top"}
-GUEST_DENIED = "🔒 Это только для владельца бота. Тебе доступны: /best, /top, /calc, /banks, /maker, /fees, /history."
+GUEST_DENIED = ("🔒 Это только для владельца бота. Тебе доступны: /best, /top, /calc, /banks, /maker, /fees, /history, "
+                "/safety.")
 GUEST_WELCOME = ("👋 <b>Владелец открыл тебе доступ.</b>\n\nБуду присылать 🔔 карточки связок, как и ему. "
-                 "Команды: 🔥 лучшая связка, 📊 топ, /calc &lt;сумма&gt;, /banks, /maker, /fees, /history. "
+                 "Команды: 🔥 лучшая связка, 📊 топ, /calc &lt;сумма&gt;, /banks, /maker, /fees, /history, 🛡 /safety. "
                  "Настройки, ключи бирж и журнал сделок — только у владельца.")
 ACCESS_HINT = ("🔒 Бот приватный. Твой id: <code>{chat}</code> — попроси владельца выполнить "
                "<code>/allow {chat}</code>, и я начну отвечать.")
@@ -79,6 +82,7 @@ COMMANDS = [{"command": "best", "description": "Лучшая связка сей
             {"command": "backtest", "description": "Бэктест маршрута по истории спредов (7/30 дней)"},
             {"command": "calc", "description": "Разовый расчёт под сумму, напр. /calc 20000"},
             {"command": "stats", "description": "Журнал сделок: день/неделя/месяц, расчёт vs факт"},
+            {"command": "export", "description": "Журнал сделок в CSV для банка и 3-НДФЛ: /export month|year"},
             {"command": "paper", "description": "Сухой прогон: круги, статистика, /paper on|off|amount|report"},
             {"command": "mybanks", "description": "Мои банки и бесплатные лимиты СБП"},
             {"command": "fav", "description": "Избранные маршруты"},
@@ -97,6 +101,7 @@ COMMANDS = [{"command": "best", "description": "Лучшая связка сей
             {"command": "status", "description": "Версия, аптайм, последний скан, ошибки площадок"},
             {"command": "logs", "description": "Последние строки лога (logs/bot.log)"},
             {"command": "guests", "description": "Гости: кому ещё слать сигналы (/allow id, /deny id)"},
+            {"command": "safety", "description": "Безопасность: 115-ФЗ, блокировки карт, правила сделки"},
             {"command": "help", "description": "Как работать с сигналами"}]
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEV_STATUS = os.path.join(HERE, ".dev_status.json")   # пишет launcher.py при каждом запуске
@@ -112,7 +117,8 @@ GUIDE = ("<b>Как работать с сигналом</b>\n\n"
          "• Оплата только от человека с ФИО как на бирже. Третьи лица — отказ.\n"
          "• Крипту отпускай, только когда деньги видны в банке. Чек и скриншот — не подтверждение.\n"
          "• Первая сделка с новым мерчантом или обменником — малой суммой.\n"
-         "• Спред от 5% часто плата за риск: читай условия мерчанта.\n\n"
+         "• Спред от 5% часто плата за риск: читай условия мерчанта.\n"
+         "• Законы, документы для банка, блокировки карт — /safety.\n\n"
          "<b>Что учтено в %</b>\n"
          "• Комиссия вывода по бирже и сети: бот берёт самую дешёвую сеть, у обменника — его сеть.\n"
          "• Спот 0,1% на бирже, где уже лежит монета.\n"
@@ -127,6 +133,27 @@ LINKS = {"inline_keyboard": [
     [{"text": "Bybit P2P", "url": "https://www.bybit.com/fiat/trade/otc/?actionType=1&token=USDT&fiat=RUB"},
      {"text": "MEXC P2P", "url": "https://www.mexc.com/ru-RU/buy-crypto/p2p?fiat=RUB"}],
     [{"text": "BestChange", "url": "https://www.bestchange.ru/"}, {"text": "BitPapa", "url": "https://bitpapa.com/ru"}]]}
+# «🛡 Безопасность» (/safety) — общая справка, доступна и гостям; только факты, без советов по обходу контроля банков.
+SAFETY = ("🛡 <b>Безопасность P2P</b> — справка, не юридическая консультация.\n\n"
+          "<b>115-ФЗ.</b> Банк может запросить документы по операциям и ограничить их. Храни историю ордеров "
+          "на биржах, TXID переводов и выписки банка.\n\n"
+          "<b>161-ФЗ и база ЦБ (ФинЦЕРТ).</b> Если банк счёл перевод мошенническим, данные могут попасть в базу ЦБ, "
+          "и банки ограничат карты и онлайн-банк. Заблокировали — запроси у банка основание и обжалуй блокировку "
+          "в официальном порядке.\n\n"
+          "<b>Приказ ЦБ ОД-2506.</b> С 01.01.2026 платёж новому получателю в течение 24 ч после перевода самому себе "
+          "больше 200 000 ₽ по СБП может быть задержан.\n\n"
+          "<b>Ст. 187 УК РФ.</b> С 05.07.2025 передать свою карту или доступ к онлайн-банку другим — преступление. "
+          "Никому не давай пользоваться своими картами.\n\n"
+          "<b>Правила сделки</b>\n"
+          "• Плати только со своих карт.\n"
+          "• Не принимай «оплату от третьих лиц».\n"
+          "• Крипту отпускай, только когда деньги реально пришли на счёт.\n\n"
+          "<b>282-ФЗ.</b> До 30.06.2027 P2P на своём аккаунте работает как раньше. С 01.07.2027 сделки резидентов "
+          "идут через посредников из реестра Банка России — проверь правила до этой даты.")
+EXPORT_PERIODS = {"month": "month", "месяц": "month", "year": "year", "год": "year"}
+EXPORT_HELP = "Формат: /export — сделки журнала за текущий месяц, /export year — с 1 января (МСК)."
+EXPORT_NOTE = ("Это выгрузка данных журнала, не налоговая консультация: состав документов и расчёт налога "
+               "сверяй с бухгалтером.")
 WAIT = "Первый скан ещё идёт, подожди пару секунд."
 MIN_PRESETS = (1, 2, 3, 5)
 AMOUNT_PRESETS = (25000, 50000, 100000, 200000)
@@ -1319,9 +1346,38 @@ class Bot:
                 if g["avg_realized_pct"] is not None:
                     line += f" / факт {g['avg_realized_pct']:+.2f}%"
                 lines.append(line)
+        lines += ["", *self.paper_vs_real_lines(rows)]
         lines.append("")
-        lines.append("📄 те же данные — файлом CSV ниже.")
+        lines.append("📄 разбор по связкам — файлом CSV ниже.")
         return "\n".join(lines)
+
+    def paper_vs_real_lines(self, rows):
+        """«Сухой прогон vs реальные сделки»: по тем же связкам, что в отчёте (report_rows), и за то же окно — с
+        первого круга до сейчас — средний факт исполнившихся кругов против среднего факта сделок журнала (где факт
+        введён). Реальных сделок с фактом нет — одна строка."""
+        since = paper.first_start() or 0.0
+        real = trades.facts_by_pair(since)
+        title = f"<b>Сухой прогон vs реальные сделки</b> (с {datetime.fromtimestamp(since, MSK):%d.%m.%Y})"
+        if not real:
+            return [f"{title}: реальных сделок с фактом за это время нет."]
+        lines = [title + ":"]
+        for r in rows:
+            g = real.get((r["buy_ex"], r["buy_asset"], r["sell_ex"], r["sell_asset"]))
+            if not g:
+                continue
+            line = f"{r['buy_ex']}→{r['sell_ex']} ({r['buy_asset']}→{r['sell_asset']}): "
+            if r["avg_realized_pct"] is None:
+                line += f"прогон — не исполнилось ни одного из {r['total']} кругов"
+            else:
+                line += f"прогон {r['avg_realized_pct']:+.2f}% ({r['done']} кругов)"
+            line += f" / реальные {g['avg_fact']:+.2f}% ({g['count']} сделок)"
+            if r["avg_realized_pct"] is not None:
+                line += f", разница {g['avg_fact'] - r['avg_realized_pct']:+.2f} п.п."
+            lines.append(line)
+        if len(lines) == 1:
+            n = sum(g["count"] for g in real.values())
+            return [f"{title}: реальные сделки с фактом ({n}) были по другим связкам."]
+        return lines
 
     async def cmd_paper(self, arg):
         """/paper — сводка сухого прогона; /paper on|off — включить/выключить; /paper amount 20000 —
@@ -1351,6 +1407,31 @@ class Bot:
                 await self.send_document(path, "Отчёт сухого прогона (CSV)")
         else:
             await self.send(self.paper_view(), markup=self.paper_markup())
+
+    async def cmd_export(self, arg):
+        """/export [month|year] — журнал сделок за календарный месяц (по умолчанию) или год до сегодня по МСК:
+        CSV-файл data/trades_export.csv (документы для банка по 115-ФЗ, данные для 3-НДФЛ) и короткая сводка."""
+        period = EXPORT_PERIODS.get((arg or "").strip().lower() or "month")
+        if period is None:
+            await self.send(EXPORT_HELP)
+            return
+        now = time.time()
+        since = trades.period_start(period, now)
+        span = f"с {datetime.fromtimestamp(since, MSK):%d.%m.%Y} по {datetime.fromtimestamp(now, MSK):%d.%m.%Y}"
+        rows = trades.export_rows(since)
+        if not rows:
+            await self.send(f"📤 Выгрузка {span}: сделок в журнале нет.")
+            return
+        await self.send_document(trades.write_export_csv(rows), f"Журнал сделок {span} (МСК), CSV")
+        s = trades.export_summary(rows)
+        result = f"{s['result']:+,.0f}".replace(",", " ")
+        lines = [f"📤 <b>Выгрузка журнала</b> {span} (МСК)",
+                 f"Сделок: {s['count']}, оборот {_money(s['amount'])} ₽",
+                 f"Результат по факту: {result} ₽",
+                 (f"Без факта: {s['no_fact']} из {s['count']} — их результат в сумму не вошёл." if s["no_fact"]
+                  else "Факт указан у всех сделок."),
+                 "", EXPORT_NOTE]
+        await self.send("\n".join(lines))
 
     async def show_best(self, snap=None, cfg=None):
         snap = self.last if snap is None else snap
@@ -2250,7 +2331,7 @@ class Bot:
             await self.send("Гостей нет. /allow @ник — доступ откроется с первого сообщения; "
                             "или, когда друг напишет боту, пришлю его id и команду /allow.")
             return
-        lines = ["👥 <b>Гости</b> (сигналы + /best, /top, /calc, /banks, /maker, /fees, /history):"]
+        lines = ["👥 <b>Гости</b> (сигналы + /best, /top, /calc, /banks, /maker, /fees, /history, /safety):"]
         lines += [f"• <code>{g}</code> — /deny {g}" for g in sorted(self.guests)]
         lines += [f"• {html.escape(u)} — ждёт первого сообщения боту, /deny {html.escape(u)}" for u in sorted(self.pending)]
         await self.send("\n".join(lines))
@@ -2516,6 +2597,10 @@ class Bot:
         elif cmd == "/fav":
             text, kb = self.favorites_view()
             await self.send(text, markup=kb)
+        elif cmd == "/export":
+            await self.cmd_export(arg)
+        elif cmd == "/safety":
+            await self.send(SAFETY)
         elif cmd == "/mybanks":
             text, kb = mybanks_view()
             await self.send(text, markup=kb, topic="settings")
