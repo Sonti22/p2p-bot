@@ -1,0 +1,38 @@
+{
+ "ads": [
+  {
+   "price": "83.20",
+   "limit_min": 1000.0,
+   "limit_max": 40000.0,
+   "limit_max_crypto": "480.769231",
+   "payment_method": {
+    "name": "Bank transfers"
+   },
+   "user": {
+    "user_name": "RubBuyerPro",
+    "trades_count": 60,
+    "completed_trades_count": 58,
+    "is_suspicious": false
+   },
+   "conditions": "Покупаю USDT, оплата в течение 10 минут.",
+   "for_identified_people": false
+  },
+  {
+   "price": "83.95",
+   "limit_min": 5000.0,
+   "limit_max": 90000.0,
+   "limit_max_crypto": "1072.185430",
+   "payment_method": {
+    "name": "Bank transfers"
+   },
+   "user": {
+    "user_name": "FastCashBuy",
+    "trades_count": 210,
+    "completed_trades_count": 205,
+    "is_suspicious": false
+   },
+   "conditions": "Работаю с первыми лицами, реквизиты в чате.",
+   "for_identified_people": false
+  }
+ ]
+}

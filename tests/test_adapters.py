@@ -30,6 +30,17 @@ def test_bybit_buy_and_sell_use_different_fixture_ads(offline):
     assert all(a.side == "sell" for a in sell)
 
 
+@pytest.mark.parametrize("name", ["htx", "kucoin", "mexc", "bitpapa"])
+def test_buy_and_sell_use_different_fixture_ads(offline, name):
+    """Как и у Bybit — HTX/KuCoin/MEXC/BitPapa кодируют сторону бота в URL (tradeType/side/type), и
+    фикстура должна отвечать разными объявлениями/мерчантами для buy и sell."""
+    buy = asyncio.run(p2p.FETCHERS[name](None, p2p.Config(), "buy", "USDT"))
+    sell = asyncio.run(p2p.FETCHERS[name](None, p2p.Config(), "sell", "USDT"))
+    assert buy and sell, name
+    assert {a.nick for a in buy}.isdisjoint({a.nick for a in sell}), name
+    assert all(a.side == "sell" for a in sell), name
+
+
 def test_spot_prices(offline):
     spot = asyncio.run(p2p.spot_prices(None, ["USDT", "BTC", "ETH", "USDC"]))
     for venue in ("Bybit", "MEXC", "HTX", "KuCoin"):
