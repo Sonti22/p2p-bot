@@ -14,6 +14,7 @@ from datetime import datetime, timedelta, timezone
 import aiohttp
 
 import accounts
+import favorites
 import alerts
 import blacklist
 import fees
@@ -80,6 +81,7 @@ COMMANDS = [{"command": "best", "description": "Лучшая связка сей
             {"command": "stats", "description": "Журнал сделок: день/неделя/месяц, расчёт vs факт"},
             {"command": "paper", "description": "Сухой прогон: круги, статистика, /paper on|off|amount|report"},
             {"command": "mybanks", "description": "Мои банки и бесплатные лимиты СБП"},
+            {"command": "fav", "description": "Избранные маршруты"},
             {"command": "alert", "description": "Алерт на курс, напр. /alert USDT sell 92 7d"},
             {"command": "alerts", "description": "Список алертов на курс"},
             {"command": "blacklist", "description": "Скрытые мерчанты и обменники"},
@@ -288,7 +290,9 @@ def deal_markup(d, deal_id=None, cfg=None, snap=None):
     if deal_id is not None:
         rows.append([{"text": "📋 Шаги", "callback_data": f"steps:{deal_id}"},
                      {"text": "✅ Сделал", "callback_data": f"did:{deal_id}"}])
-        rows.append([{"text": "🚫 Не показывать", "callback_data": f"bl:{deal_id}"}])
+        fav = favorites.is_fav((b.ex, b.asset, s.ex, s.asset))
+        rows.append([{"text": "★ Убрать из избранного" if fav else "⭐ В избранное", "callback_data": f"fav:{deal_id}"},
+                     {"text": "🚫 Не показывать", "callback_data": f"bl:{deal_id}"}])
     rows.append([{"text": "📊 Все связки", "callback_data": "top"}, {"text": "🔄 Обновить", "callback_data": "best"}])
     return {"inline_keyboard": rows}
 
@@ -1792,7 +1796,9 @@ class Bot:
     def track_liveness(self, snap, now=None):
         """Сколько сканов подряд связка держится выше порога: минутный выброс не сигналим, устойчивую — да."""
         now = now or time.time()
-        alive = {self._deal_key(d) for d in snap.deals if d[0] >= self.cfg.min_profit}
+        favs, fav_min = favorites.keys(), favorites.fav_min_profit()
+        alive = {self._deal_key(d) for d in snap.deals
+                 if d[0] >= self.cfg.min_profit or (d[0] >= fav_min and favorites.key_str(self._deal_key(d)) in favs)}
         for key in alive:
             rec = self.live.get(key)
             if rec:
@@ -1962,7 +1968,56 @@ class Bot:
                     await self.send_deal(d, "🔔 " + self.held_label(d, now), snap=snap, chat_id=g)
                 except Exception as e:
                     logger.warning("сигнал гостю %s: %s", g, e)
+        await self.notify_favorites(snap, active, now)
         await self.mark_stale_deals(active)
+
+    async def notify_favorites(self, snap, active, now):
+        """⭐ Избранные маршруты: сигнал от FAV_MIN_PROFIT, даже ниже общего порога и вне топа MAX_SIGNALS; тот же
+        антидубль и «живость», что у обычных сигналов. Только владельцу. active дополняется — связка не «устареет»."""
+        favs, fav_min = favorites.keys(), favorites.fav_min_profit()
+        if not favs:
+            return
+        for d in snap.deals:
+            key = self._deal_key(d)
+            if key in active or favorites.key_str(key) not in favs or d[0] < fav_min or not self.is_confirmed(d):
+                continue
+            active.add(key)
+            prev = self.sent.get(key)
+            if prev and now - prev[0] < self.cooldown and d[0] < prev[1] + self.repeat_step:
+                await self.update_live_card(key, d, snap, now)
+                continue
+            try:
+                r = await self.send_deal(d, "⭐ " + self.held_label(d, now), snap=snap, topic="signals")
+            except Exception as e:
+                logger.warning("signal send error: %s", accounts.api_error_text(e))
+                break
+            if delivery_final(r):
+                self.sent[key] = (now, d[0])
+
+    async def toggle_favorite(self, cq, data):
+        """Кнопка ⭐ на карточке: маршрут связки в избранное / из избранного; кнопка на карточке меняется."""
+        entry = self.deals_by_id.get(int(data[4:])) if data[4:].isdigit() else None
+        if not entry:
+            await self.call("answerCallbackQuery", callback_query_id=cq["id"], text="Сигнал устарел")
+            return
+        d, cfg, snap = entry
+        on = favorites.toggle(self._deal_key(d))
+        await self.call("answerCallbackQuery", callback_query_id=cq["id"],
+                        text=(f"⭐ В избранном: сигнал по маршруту от {favorites.fav_min_profit():g}%" if on
+                              else "Убрано из избранного"))
+        await self.call("editMessageReplyMarkup", chat_id=self.chat_id, message_id=cq["message"]["message_id"],
+                        reply_markup=self.markup(deal_markup(d, int(data[4:]), cfg, snap)))
+
+    def favorites_view(self):
+        """«/fav»: избранные маршруты и порог сигнала по ним; кнопки — убрать."""
+        favs = sorted(favorites.keys())
+        if not favs:
+            return ("⭐ Избранных маршрутов нет. Нажми «⭐ В избранное» под карточкой связки — по этому маршруту "
+                    f"сигнал будет приходить от {favorites.fav_min_profit():g}% (FAV_MIN_PROFIT), даже вне топа."), None
+        lines = [f"⭐ <b>Избранные маршруты</b> — сигнал от {favorites.fav_min_profit():g}%:", ""]
+        lines += [f"{i}. {html.escape(favorites.label(k))}" for i, k in enumerate(favs, 1)]
+        kb = [[{"text": f"✖ {i}. {favorites.label(k)}"[:60], "callback_data": f"favdel:{i}"}] for i, k in enumerate(favs, 1)]
+        return "\n".join(lines), {"inline_keyboard": kb}
 
     async def update_live_card(self, key, d, snap, now):
         """«Живая карточка»: вместо повторной отправки того же сигнала правим последнее сообщение по нему
@@ -2263,6 +2318,9 @@ class Bot:
             await self.call("answerCallbackQuery", callback_query_id=cq["id"])
             await self.handle_onboarding(cq, data)
             return
+        if data.startswith("fav:"):
+            await self.toggle_favorite(cq, data)
+            return
         if data != "amt_custom":
             self.awaiting_amount = False   # любая другая кнопка сбрасывает ожидание суммы
         if not data.startswith("acc_add:"):
@@ -2357,6 +2415,14 @@ class Bot:
             self.awaiting_amount = True
             await self.send(f"Введи сумму круга текстом, например 20000 или 1,5 млн "
                             f"(от {_money(AMOUNT_MIN)} до {_money(AMOUNT_MAX)} ₽).")
+        elif data.startswith("favdel:"):
+            favs = sorted(favorites.keys())
+            i = int(data[7:]) if data[7:].isdigit() else 0
+            if 1 <= i <= len(favs):
+                favorites.remove(favs[i - 1])
+            text, kb = self.favorites_view()
+            await self.call("editMessageText", chat_id=self.chat_id, message_id=cq["message"]["message_id"],
+                            text=text, parse_mode="HTML", reply_markup=kb)
         elif data == "mybanks":
             text, kb = mybanks_view()
             await self.send(text, markup=kb, topic="settings")
@@ -2447,6 +2513,9 @@ class Bot:
             await self.send(self.stats_view())
         elif cmd == "/paper":
             await self.cmd_paper(arg)
+        elif cmd == "/fav":
+            text, kb = self.favorites_view()
+            await self.send(text, markup=kb)
         elif cmd == "/mybanks":
             text, kb = mybanks_view()
             await self.send(text, markup=kb, topic="settings")
