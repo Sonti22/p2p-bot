@@ -20,13 +20,14 @@ import fees
 import history
 import jsonstore
 import netstatus
+import paper
 import presets
 import trades
 from cards import deal_card, history_card, history_compare_card, portfolio_card, top_chart
 from p2p import ALL_EXCHANGES, AMOUNT_MAX, AMOUNT_MIN, DEFAULT_ASSETS, ENV_PATH, LOG_PATH, MIN_PROFIT_MAX, \
-    MIN_PROFIT_MIN, Config, _money, _price, _route_qty, bank_liquidity, deal_amounts, fmt_ad, fmt_breakeven, \
-    fmt_deal, fmt_top, load_env, maker_quote, parse_amount, parse_min_profit, profit_breakdown, reliability, scan, \
-    setup_logging, spot_url, traps_log, venue_url
+    MIN_PROFIT_MIN, Config, _money, _price, _route_qty, bank_liquidity, deal_amounts, deal_for_amount, fmt_ad, \
+    fmt_breakeven, fmt_deal, fmt_top, load_env, maker_quote, parse_amount, parse_min_profit, profit_breakdown, \
+    reliability, scan, setup_logging, spot_url, traps_log, venue_url
 
 logger = logging.getLogger(__name__)
 
@@ -1567,9 +1568,31 @@ class Bot:
         minutes = max(1, int(((now or time.time()) - rec["first"]) / 60))
         return f"⏱ держится {minutes} мин · "
 
+    async def maybe_start_paper_cycle(self, deals, snap):
+        """Сухой прогон (paper.py): при сигнале выше порога и свободном слоте виртуально «берём»
+        лучшую связку на сумму PAPER_AMOUNT (глубина — на неё, а не на AMOUNT, через deal_for_amount/
+        _stack) и пишем круг в data/paper.db со стадией buy. Карточка — только владельцу, гостям
+        про сухой прогон ничего не идёт."""
+        settings = paper.settings()
+        if not settings["on"] or not self.chat_id or not deals:
+            return
+        if len(paper.open_cycles()) >= settings["max_open"]:
+            return
+        d = deal_for_amount(deals[0], self.cfg, snap, settings["amount"])
+        if d is None:
+            return   # глубины стакана на сумму сухого прогона не хватает
+        profit, b, s, route = d
+        paper.init_balance(settings["amount"])
+        paper.start_cycle(settings["amount"], b, s, route, profit)
+        bank = trades.sbp_bank(b.pays) or "—"
+        qty = settings["amount"] / b.price
+        await self.send(f"🧪 <b>Сухой прогон</b>: купил бы {_money(qty)} {b.asset} у {html.escape(b.nick)} "
+                        f"по {_price(b.price)} ₽, оплата {bank}", topic="signals")
+
     async def notify(self, snap):
         now = time.time()
         deals = self._signal_deals(snap)   # сначала порог, потом топ-N по надёжности
+        await self.maybe_start_paper_cycle(deals, snap)
         active = {self._deal_key(d) for d in deals}   # заранее: обрыв отправки не делает связки «устаревшими»
         for d in deals:
             profit = d[0]
