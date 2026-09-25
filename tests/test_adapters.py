@@ -21,6 +21,15 @@ def test_htx_unknown_coin_is_empty(offline):
     assert asyncio.run(p2p.htx(None, p2p.Config(), "buy", "TON")) == []
 
 
+def test_bybit_buy_and_sell_use_different_fixture_ads(offline):
+    """Тело POST несёт сторону запроса (side) — фикстура должна отвечать разными объявлениями/мерчантами
+    для buy и sell, как настоящий стакан Bybit, а не одним и тем же списком под обе стороны."""
+    buy = asyncio.run(p2p.bybit(None, p2p.Config(), "buy", "USDT"))
+    sell = asyncio.run(p2p.bybit(None, p2p.Config(), "sell", "USDT"))
+    assert {a.nick for a in buy}.isdisjoint({a.nick for a in sell})
+    assert all(a.side == "sell" for a in sell)
+
+
 def test_spot_prices(offline):
     spot = asyncio.run(p2p.spot_prices(None, ["USDT", "BTC", "ETH", "USDC"]))
     for venue in ("Bybit", "MEXC", "HTX", "KuCoin"):

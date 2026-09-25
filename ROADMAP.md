@@ -71,12 +71,24 @@
   целиком идёт в `Bot.notify()` — карточка первой отправленной связки сверяется с `p2p.reliability`/
   `fmt_reliability` того же снимка; второй тест той же связкой проверяет, что `ok:false` от Telegram в этом
   сквозном конвейере не тратит антидубль (`bot.sent`) — следующий вызов `notify()` повторяет отправку.)
-- [ ] Ответы Telegram `ok:false` в notify/alerts — прицельные тесты сверх сквозного конвейера (частично уже
-  покрыто `test_notify_not_marked_sent_when_not_ok`/`test_check_alerts_marks_only_delivered` в test_bot.py);
-  ENV-fallback ключей после удаления (сохранён ключ в `data/keys.json`, потом удалён — `accounts.keys()`
-  должен откатиться на `.env`, если он там есть, а не остаться пустым); разные объявления для разных сторон/
-  монет в фикстурах `tests/fixtures/*_ads.json` (сейчас часть фикстур переиспользует одни и те же объявления
-  под buy/sell и под разные монеты).
+- [x] Ответы Telegram `ok:false` в notify/alerts — прицельные тесты сверх сквозного конвейера; ENV-fallback
+  ключей после удаления; разные объявления для разных сторон/монет в фикстурах `tests/fixtures/*_ads.json`.
+  (2026-09-25 — проверка показала, что первые два пункта уже закрыты прошлыми запусками: ok:false у notify/
+  alerts/live-карточки/закреплённого статуса покрыт `test_notify_not_marked_sent_when_not_ok`,
+  `test_check_alerts_marks_only_delivered`, `test_check_alerts_keeps_alert_when_send_fails`,
+  `test_live_card_edit_failed_keeps_buttons_on_old_snapshot`, `test_update_market_status_recreates_after_edit_failure`
+  в test_bot.py/test_market_status.py; ENV-fallback ключей после удаления — `test_delete_key_blocks_env_fallback`
+  и соседние тесты в test_accounts.py подтверждают, что `accounts.delete_key` сознательно выключает ключ и в
+  `.env` пометкой `disabled` (так и задумано — иначе удалённый в боте ключ мог бы незаметно ожить), а не
+  «откатывается» на него. Реализована первая часть третьего пункта: Bybit buy/sell в offline-фикстуре
+  (`tests/conftest.py`) теперь отвечают разными объявлениями/мерчантами — `_bybit_ads` в conftest.py выбирает
+  `bybit_ads.json`/новый `tests/fixtures/bybit_ads_sell.json` по полю `side` в теле POST-запроса, раньше сторона
+  запроса игнорировалась и buy/sell получали один и тот же список; тест
+  `test_bybit_buy_and_sell_use_different_fixture_ads` в tests/test_adapters.py. Остаток — новой строкой ниже.)
+- [ ] Разные объявления для разных сторон/монет в фикстурах, часть 2: то же самое (buy ≠ sell) для HTX/KuCoin/
+  MEXC/BitPapa (сейчас только Bybit различает сторону — см. пункт выше) и разные ₽-цены для не-USDT монет
+  (BTC/ETH и т.п. — сейчас offline-фикстуры отдают одни и те же числа независимо от запрошенной монеты, хотя
+  реальные цены отличаются на порядки).
 - [ ] Кнопка «📋 объём» под карточкой: фактический выход монеты без запаса на курс (запас — отдельной строкой в подписи), иначе для BTC/ETH/TON предлагается продать на 0.3–0.7% меньше, чем выйдет.
 - [x] История аккаунтов: объединять депозиты, выводы и спот-сделки в одну ленту по времени, а не брать первый непустой источник (старые депозиты скрывают свежие события других типов). (2026-09-24 — `accounts._merge_hist` в accounts.py: `mexc_history`/`htx_history`/`kucoin_history` объединяют депозиты и выводы по времени вместо возврата первого непустого источника; `account_history` для MEXC/KuCoin дополнительно объединяет их со спот-сделками.)
 - [~] launcher (защищённый файл — делает владелец локально): накапливать падения бота через 60–600 с после старта для отката; список плохих коммитов — в файл; `pip install -r requirements.txt` при обновлении, если requirements изменился; замок `logs/launcher.lock` при ошибке открытия файла сейчас fail-open (работаем без замка) — сообщать в Telegram; при таймауте `pip install pytest` в smoke — отдельный текст ошибки.
@@ -346,6 +358,10 @@ _(облачный Claude добавляет сюда предложения, к
 - Площадки под санкциями или с сомнительным статусом (Garantex, Grinex, A7A5, ABCeX).
 
 ## Журнал
+- 2026-09-25 — offline-фикстура Bybit теперь различает buy/sell: `_bybit_ads` в tests/conftest.py выбирает
+  `bybit_ads.json`/новый `bybit_ads_sell.json` по полю `side` из тела POST-запроса вместо одного списка на
+  обе стороны; заодно проверено и подтверждено, что targeted-тесты `ok:false` у notify/alerts и ENV-fallback
+  ключей после удаления уже закрыты прошлыми запусками (без изменений в коде).
 - 2026-09-25 — сквозные тесты конвейера: `tests/test_e2e.py` гоняет `p2p.scan()` на офлайн-фикстурах до
   реального `Snapshot` (стакан через `_stack`, сортировка по `reliability`) и целиком отдаёт его в
   `Bot.notify()` — проверяет, что карточка сигнала совпадает с надёжностью снимка и что `ok:false` от
