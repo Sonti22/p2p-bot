@@ -3,7 +3,10 @@
 Запуск: python launcher.py (через run.bat). Защищённый файл: правится только вручную, не облачным Claude.
 - каждые UPDATE_EVERY сек: git fetch; есть новое в origin/main и папка чистая → pull → смоук-тест
   (компиляция + pytest; нет pytest — ставит его, не вышло или тестов нет — провал) →
-  перезапуск бота и сообщение в Telegram; смоук не прошёл → возврат на прежний коммит;
+  перезапуск бота и сообщение в Telegram; смоук не прошёл дважды подряд → возврат на прежний коммит;
+  изменились только .md — pull без смоука и без перезапуска бота;
+- раз в сутки: минуты GitHub Actions за месяц, предупреждение на 80% и 95% квоты;
+- все уведомления дублируются в logs/launcher.log;
 - бот падает быстрее CRASH_WINDOW сек CRASH_LIMIT раза подряд → откат на последнюю рабочую версию;
 - один launcher на папку (замок logs/launcher.lock, второй выходит с кодом 3); бот не переживает launcher:
   при любом выходе из run() он останавливается, а бот-сирота убитого извне launcher (pid в logs/bot.pid)
@@ -16,6 +19,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.parse
 import urllib.request
@@ -25,6 +29,9 @@ LAST_GOOD = os.path.join(HERE, ".last_good")
 DEV_STATUS = os.path.join(HERE, ".dev_status.json")   # для кнопки «🛠 Разработка» в боте
 STABLE_AFTER = 600            # сек работы, после которых версия считается рабочей
 CRASH_WINDOW, CRASH_LIMIT = 60, 3
+MINUTES_EVERY = 24 * 3600     # как часто смотреть минуты GitHub Actions
+MONTHS = ("январь", "февраль", "март", "апрель", "май", "июнь", "июль", "август", "сентябрь", "октябрь", "ноябрь",
+          "декабрь")
 
 
 LOG_PATH = os.path.join(HERE, "logs", "launcher.log")
@@ -59,6 +66,18 @@ def git(*args, check=True):
     return r.stdout.strip()
 
 
+def gh(*args):
+    """gh <args> → stdout; ошибка или таймаут — RuntimeError. В тестах подменяется."""
+    try:
+        r = subprocess.run(["gh", *args], cwd=HERE, capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", timeout=30)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"gh {' '.join(args)}: timeout")
+    if r.returncode:
+        raise RuntimeError(f"gh {' '.join(args)}: {r.stderr.strip()[:200]}")
+    return r.stdout.strip()
+
+
 def env_value(key, default=""):
     try:
         with open(os.path.join(HERE, ".env"), encoding="utf-8") as f:
@@ -71,6 +90,8 @@ def env_value(key, default=""):
 
 
 def notify(text):
+    # копия в launcher.log: откаты видно и без Telegram. Одной строкой, коротко, логин:пароль из ссылок вырезан
+    log("уведомление: " + re.sub(r"://[^/\s@]+@", "://***@", " ⏎ ".join(text.strip().splitlines()))[:300])
     token, chat = env_value("TG_TOKEN"), env_value("TG_CHAT_ID")
     if not (token and chat):
         return
@@ -78,8 +99,8 @@ def notify(text):
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))   # мимо системного прокси
     try:
         opener.open(f"https://api.telegram.org/bot{token}/sendMessage", data, timeout=20)
-    except Exception as e:
-        log(f"telegram: {e}")
+    except Exception as e:   # токен есть только в URL — если ошибка его процитирует, в лог он не попадёт
+        log(f"telegram: {str(e).replace(token, '***')}")
 
 
 def clean_tree():
@@ -126,9 +147,12 @@ def _run(args, timeout):
 def smoke():
     """Компиляция и тесты новой версии до перезапуска бота. Без pytest или без единого теста — провал:
     иначе обновление считалось бы проверенным, хотя тесты не запускались."""
-    files = [f for f in os.listdir(HERE) if f.endswith(".py")]
-    tests = ["pytest", "-q", "-x", "-p", "no:cacheprovider"]
+    tmp = ""
     try:
+        files = [f for f in os.listdir(HERE) if f.endswith(".py")]
+        # своя --basetemp: общий pytest-of-<user> делят все pytest на ПК, чужой запуск чистит его под нами (WinError)
+        tmp = tempfile.mkdtemp(prefix="p2p-smoke-")
+        tests = ["pytest", "-q", "-x", "-p", "no:cacheprovider", f"--basetemp={tmp}"]
         r = _run(["py_compile", *files], 120)
         if r.returncode:
             return False, r.stderr[-500:]
@@ -141,6 +165,11 @@ def smoke():
             r = _run(tests, 600)
     except subprocess.TimeoutExpired:
         return False, "смоук-тест не завершился за отведённое время"
+    except OSError as e:   # не запустился (WinError под нагрузкой) — провал попытки, а не исключение посреди обновления
+        return False, f"смоук-тест не запустился: {e}"
+    finally:
+        if tmp:
+            shutil.rmtree(tmp, ignore_errors=True)
     if "No module named pytest" in r.stderr:
         return False, NO_PYTEST
     if r.returncode == 5:
@@ -270,6 +299,8 @@ class Launcher:
         self.bad = set()          # коммиты, которые не прошли смоук или падали — не ставим повторно
         self.warned_dirty = False
         self.seen_prs = set()     # PR, о которых уже сообщили
+        self.minutes_at = 0.0     # когда последний раз смотрели минуты GitHub Actions
+        self.minutes_warned = ("", 0)   # (год-месяц, старший порог %, о котором уже предупредили)
 
     def check_prs(self):
         """Открытые PR = автомерж не прошёл (тесты/guard) — сообщить один раз со ссылкой."""
@@ -289,6 +320,30 @@ class Launcher:
                 notify(f"👀 PR #{pr['number']} ждёт ручной проверки (тесты или guard не пропустили автомерж):\n"
                        f"{pr['title']}\n{pr['url']}")
 
+    def check_minutes(self):
+        """Минуты GitHub Actions за месяц: кончатся — встанут CI и автомерж. Предупредить на 80% и на 95% квоты,
+        каждый порог — раз в месяц. Любая ошибка (у gh нет прав на billing, сеть) — только в лог."""
+        if not shutil.which("gh"):
+            return
+        try:
+            year, month = map(int, time.strftime("%Y %m").split())
+            login = gh("api", "user", "--jq", ".login")
+            usage = json.loads(gh("api", f"users/{login}/settings/billing/usage?year={year}&month={month}"))
+            used = sum(i.get("quantity") or 0 for i in usage.get("usageItems") or []
+                       if str(i.get("unitType")).lower() == "minutes" and str(i.get("product")).lower() == "actions")
+            free = int(env_value("GH_ACTIONS_FREE_MIN", "2000") or 2000)
+            pct = used * 100 / free
+        except Exception as e:
+            log(f"минуты GitHub Actions: {type(e).__name__}: {e}")
+            return
+        log(f"минуты GitHub Actions: {used:.0f} из {free} ({int(pct)}%)")
+        level = 95 if pct >= 95 else 80 if pct >= 80 else 0
+        key = f"{year}-{month:02d}"
+        if level > (self.minutes_warned[1] if self.minutes_warned[0] == key else 0):
+            self.minutes_warned = (key, level)
+            notify(f"⚠️ GitHub Actions: израсходовано {used:.0f} из {free} мин за {MONTHS[month - 1]} ({int(pct)}%). "
+                   "Когда минуты кончатся, CI и автомерж остановятся до 1-го числа.")
+
     def try_update(self):
         """True — код обновлён, бота нужно перезапустить."""
         try:
@@ -306,13 +361,21 @@ class Launcher:
             return False
         self.warned_dirty = False
         changes = git("log", "--pretty=format:• %s", "HEAD..origin/main", check=False).splitlines()[:10]
+        files = git("diff", "--name-only", "HEAD", "origin/main", check=False).splitlines()
         try:
             git("pull", "--ff-only", "--quiet", "origin", "main")
         except RuntimeError as e:
             notify(f"⚠️ Не смог обновиться (ветки разошлись): {e}")
             self.bad.add(remote)
             return False
+        if files and all(f.endswith(".md") for f in files):   # код не менялся: ни смоука, ни перезапуска бота
+            log(f"только документация ({remote[:7]}): {', '.join(files)[:200]}")
+            notify(f"📝 Обновлена документация ({remote[:7]}), бот не перезапускал")
+            return False
         ok, err = smoke()
+        if not ok:   # под нагрузкой Windows смоук изредка падает сам (WinError): хороший коммит — не с одной попытки
+            log(f"смоук {remote[:7]} не прошёл, повторяю: " + " ⏎ ".join(err.strip().splitlines())[-300:])
+            ok, err = smoke()
         if not ok:
             git("reset", "--hard", head)
             self.bad.add(remote)
@@ -370,6 +433,9 @@ class Launcher:
                         log("проверка обновлений")
                         try:
                             self.check_prs()
+                            if time.time() - self.minutes_at > MINUTES_EVERY:
+                                self.minutes_at = time.time()
+                                self.check_minutes()
                             updated = self.try_update()
                         except Exception as e:   # любая неожиданная ошибка не должна убивать цикл
                             log(f"ошибка проверки: {type(e).__name__}: {e}")
