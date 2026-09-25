@@ -149,3 +149,12 @@ def _clean_logging():
         root.removeHandler(h)
         h.close()
     p2p._log_handlers.clear()
+
+
+@pytest.fixture(autouse=True)
+def _restore_environ():
+    """save_env меняет os.environ — после каждого теста возвращаем окружение, чтобы настройки не протекали в другие."""
+    saved = dict(os.environ)
+    yield
+    os.environ.clear()
+    os.environ.update(saved)
