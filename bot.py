@@ -78,6 +78,7 @@ COMMANDS = [{"command": "best", "description": "Лучшая связка сей
             {"command": "backtest", "description": "Бэктест маршрута по истории спредов (7/30 дней)"},
             {"command": "calc", "description": "Разовый расчёт под сумму, напр. /calc 20000"},
             {"command": "stats", "description": "Журнал сделок: день/неделя/месяц, расчёт vs факт"},
+            {"command": "paper", "description": "Сухой прогон: круги, статистика, /paper on|off|amount"},
             {"command": "alert", "description": "Алерт на курс, напр. /alert USDT sell 92 7d"},
             {"command": "alerts", "description": "Список алертов на курс"},
             {"command": "blacklist", "description": "Скрытые мерчанты и обменники"},
@@ -138,6 +139,7 @@ LIVE_EDIT_INTERVAL = 30     # сек: не чаще обновляем карт�
 MARKET_STATUS_INTERVAL = 60  # сек: не чаще обновляем закреплённое сообщение «Статус рынка»
 MSK = timezone(timedelta(hours=3))                    # тихие часы и /pause считаем по МСК, не по времени ПК
 PAUSE_PRESETS = {"30m": 1800, "1h": 3600, "3h": 3 * 3600}  # аргументы /pause -> секунды
+PAPER_STAGE_LABELS = {"buy": "оплата", "transfer": "перевод", "sell": "продажа"}
 
 
 def account_poll_interval():
@@ -682,7 +684,9 @@ def dev_view(status_path=DEV_STATUS, roadmap_path=os.path.join(HERE, "ROADMAP.md
                  [{"text": "✅ Проверки (CI)", "url": f"{repo}/actions"}, {"text": "📋 План", "url": f"{repo}/blob/main/ROADMAP.md"}]]
     if routine:
         rows.append([{"text": "☁️ Облачные запуски", "url": routine}])
-    rows.append([{"text": "📟 Статус", "callback_data": "status"}, {"text": "🔄 Обновить", "callback_data": "dev"}])
+    rows.append([{"text": "🧪 Сухой прогон", "callback_data": "paper"},
+                 {"text": "📟 Статус", "callback_data": "status"}])
+    rows.append([{"text": "🔄 Обновить", "callback_data": "dev"}])
     return "\n".join(lines), {"inline_keyboard": rows}
 
 
@@ -1135,6 +1139,68 @@ class Bot:
         lines.append("\nОтмечай связку кнопкой «✅ Сделал» под сигналом — так она попадёт в журнал, "
                      "затем укажи факт кнопкой или числом, чтобы сравнить расчёт с реальным результатом.")
         return "\n".join(lines)
+
+    def paper_view(self):
+        """Текст «/paper»: настройки, открытые виртуальные круги, статистика за день/неделю/всё время
+        (исполнилось/сорвалось и почему, средний факт vs план) и виртуальный баланс с изменением с начала."""
+        s = paper.settings()
+        lines = ["🧪 <b>Сухой прогон</b>", "",
+                 f"Статус: {'🟢 включён' if s['on'] else '⚪ выключен'}, сумма круга {_money(s['amount'])} ₽", ""]
+        open_ = paper.open_cycles()
+        if not open_:
+            lines.append("Открытых кругов нет.")
+        else:
+            now = time.time()
+            for c in open_:
+                mins = (now - c["ts_stage"]) / 60
+                stage = PAPER_STAGE_LABELS.get(c["stage"], c["stage"])
+                lines.append(f"🔄 {c['buy_ex']}→{c['sell_ex']} ({c['buy_asset']}→{c['sell_asset']}): "
+                            f"стадия «{stage}» {mins:.0f} мин, план {c['planned_pct']:+.2f}%")
+        lines.append("")
+        st = paper.stats()
+        for key, label in (("day", "За сегодня"), ("week", "За неделю"), ("all", "За всё время")):
+            p = st[key]
+            if not p["total"]:
+                lines.append(f"{label}: кругов не было")
+                continue
+            line = f"{label}: {p['total']} кругов, исполнилось {p['done']}"
+            if p["failed"]:
+                reasons = ", ".join(f"{paper.FAIL_LABELS.get(r, r)} {n}" for r, n in p["failed_by_reason"].items())
+                line += f", сорвалось {p['failed']} ({reasons})"
+            if p["avg_diff"] is not None:
+                line += f", факт vs план {p['avg_diff']:+.2f} п.п."
+            lines.append(line)
+        balance = paper.get_balance()
+        if balance is not None:
+            change = paper.balance_change()
+            change_str = f"{change:+,.0f}".replace(",", " ")
+            lines.append("")
+            lines.append(f"Виртуальный баланс: {_money(balance)} ₽ (изменение с начала: {change_str} ₽)")
+        lines.append("")
+        lines.append("/paper on|off — включить/выключить · /paper amount 20000 — сумма круга")
+        return "\n".join(lines)
+
+    async def cmd_paper(self, arg):
+        """/paper — сводка сухого прогона; /paper on|off — включить/выключить; /paper amount 20000 —
+        сумма виртуального круга (баланс не сбрасывает, действует для новых кругов)."""
+        sub, _, rest = arg.strip().partition(" ")
+        sub = sub.lower()
+        if sub == "on":
+            save_env("PAPER", "1")
+            await self.send("🧪 Сухой прогон включён.")
+        elif sub == "off":
+            save_env("PAPER", "0")
+            await self.send("🧪 Сухой прогон выключен.")
+        elif sub == "amount":
+            amount = parse_amount(rest)
+            if amount is None:
+                await self.send(f"Не понял сумму. Пример: /paper amount 20000 "
+                                f"(от {_money(AMOUNT_MIN)} до {_money(AMOUNT_MAX)} ₽).")
+                return
+            save_env("PAPER_AMOUNT", f"{amount:.0f}")
+            await self.send(f"🧪 Сумма круга сухого прогона: {_money(amount)} ₽.")
+        else:
+            await self.send(self.paper_view())
 
     async def show_best(self, snap=None, cfg=None):
         snap = self.last if snap is None else snap
@@ -2001,6 +2067,8 @@ class Bot:
             await self.send(text, markup=kb)
         elif data == "status":
             await self.send(self.status_view())
+        elif data == "paper":
+            await self.send(self.paper_view())
         elif data == "balance":
             await self.balance()
         elif data.startswith("did:"):
@@ -2123,6 +2191,8 @@ class Bot:
                 await self.send("Нужна сумма: /calc 20000")
         elif cmd == "/stats":
             await self.send(self.stats_view())
+        elif cmd == "/paper":
+            await self.cmd_paper(arg)
         elif cmd == "/alert":
             if arg:
                 await self.add_alert(arg)

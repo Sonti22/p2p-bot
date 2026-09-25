@@ -1,7 +1,6 @@
 """Сухой прогон (paper trading) — этап 1 полуавтомата: виртуальные круги без реальных денег,
 чтобы увидеть, что бот сделал бы сам, и сравнить план с фактом. Хранилище, движок, запуск круга
-по сигналу и все три стадии (buy → transfer → sell) готовы; команда /paper — в следующей задаче
-очереди.
+по сигналу, все три стадии (buy → transfer → sell) и статистика для команды /paper готовы.
 
 SQLite data/paper.db, таблицы:
   cycles  — один виртуальный круг: сумма, объявления покупки/продажи на момент старта, маршрут,
@@ -11,6 +10,7 @@ SQLite data/paper.db, таблицы:
   balance — один виртуальный баланс: старт = PAPER_AMOUNT, меняется на realized_pct каждого
             завершённого круга.
 """
+import datetime
 import os
 import sqlite3
 import time
@@ -22,6 +22,9 @@ DB_PATH = os.path.join(HERE, "data", "paper.db")
 
 STAGES = ("buy", "transfer", "sell")
 RESULTS = ("done", "failed_buy", "failed_transfer", "failed_sell")
+MSK = datetime.timezone(datetime.timedelta(hours=3))
+STATS_WEEK = 7 * 86400
+FAIL_LABELS = {"failed_buy": "покупка", "failed_transfer": "перевод", "failed_sell": "продажа"}
 
 _COLUMNS = ("id", "ts_start", "amount", "buy_ex", "buy_asset", "buy_price", "buy_nick",
             "sell_ex", "sell_asset", "sell_price", "sell_nick", "route", "planned_pct",
@@ -222,3 +225,49 @@ def finish_cycle(cycle_id, result, realized_pct=0.0, note="", path=DB_PATH, ts=N
     con.close()
     apply_result(realized_pct, amount, path=path, ts=ts)
     return True
+
+
+def _day_start(ts):
+    """Начало календарных суток по МСК, в которые попадает `ts` (как trades._day_start)."""
+    dt = datetime.datetime.fromtimestamp(ts, MSK)
+    return dt.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+
+
+def stats(path=DB_PATH, now=None):
+    """{"day"/"week"/"all": {"total", "done", "failed", "failed_by_reason", "avg_diff"}} — для /paper.
+    Считаем по завершённым кругам (result IS NOT NULL): total — сколько завершилось, done — исполнились
+    полностью, failed/failed_by_reason — сколько и на какой стадии сорвалось, avg_diff — средняя
+    (факт − план) в п.п. по исполнившимся (None — исполнившихся ещё не было). «day» — календарные сутки
+    по МСК, «week» — последние 7 суток, «all» — за всё время."""
+    now = time.time() if now is None else now
+    starts = {"day": _day_start(now), "week": now - STATS_WEEK, "all": 0.0}
+    empty = {"total": 0, "done": 0, "failed": 0, "failed_by_reason": {}, "avg_diff": None}
+    if not os.path.exists(path):
+        return {p: dict(empty) for p in starts}
+    con = _connect(path)
+    out = {}
+    for period, start in starts.items():
+        rows = con.execute("SELECT result, planned_pct, realized_pct FROM cycles "
+                           "WHERE result IS NOT NULL AND ts_start >= ?", (start,)).fetchall()
+        done_diffs = [r - p for res, p, r in rows if res == "done"]
+        failed_by_reason = {}
+        for res, _, _ in rows:
+            if res != "done":
+                failed_by_reason[res] = failed_by_reason.get(res, 0) + 1
+        out[period] = {"total": len(rows), "done": len(done_diffs), "failed": len(rows) - len(done_diffs),
+                       "failed_by_reason": failed_by_reason,
+                       "avg_diff": sum(done_diffs) / len(done_diffs) if done_diffs else None}
+    con.close()
+    return out
+
+
+def balance_change(path=DB_PATH):
+    """На сколько виртуальный баланс изменился со старта — сумма результата всех завершённых кругов (₽);
+    то же самое, что (текущий баланс − стартовый), без отдельного хранения стартового значения."""
+    if not os.path.exists(path):
+        return 0.0
+    con = _connect(path)
+    total, = con.execute(
+        "SELECT COALESCE(SUM(amount * realized_pct / 100.0), 0) FROM cycles WHERE result IS NOT NULL").fetchone()
+    con.close()
+    return total

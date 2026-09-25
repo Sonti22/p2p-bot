@@ -88,6 +88,9 @@ def _patch_paper_db(monkeypatch, db):
     monkeypatch.setattr(B.paper, "start_cycle", functools.partial(B.paper.start_cycle, path=db))
     monkeypatch.setattr(B.paper, "finish_cycle", functools.partial(B.paper.finish_cycle, path=db))
     monkeypatch.setattr(B.paper, "set_stage", functools.partial(B.paper.set_stage, path=db))
+    monkeypatch.setattr(B.paper, "get_balance", functools.partial(B.paper.get_balance, path=db))
+    monkeypatch.setattr(B.paper, "balance_change", functools.partial(B.paper.balance_change, path=db))
+    monkeypatch.setattr(B.paper, "stats", functools.partial(B.paper.stats, path=db))
 
 
 def test_paper_cycle_starts_on_signal_when_enabled(monkeypatch, tmp_path):
@@ -1816,6 +1819,90 @@ def test_traps_view_empty():
     p2p.TRAPS_LOG.clear()
     text = B.traps_view()
     assert "Пока ни одной" in text
+
+
+def test_paper_view_off_no_cycles_no_balance(monkeypatch, tmp_path):
+    monkeypatch.delenv("PAPER", raising=False)
+    _patch_paper_db(monkeypatch, str(tmp_path / "paper.db"))
+    bot = Stub(p2p.Config())
+    text = bot.paper_view()
+    assert "⚪ выключен" in text
+    assert "Открытых кругов нет." in text
+    assert "За сегодня: кругов не было" in text
+    assert "Виртуальный баланс" not in text
+
+
+def test_paper_view_shows_open_cycle_and_stats(monkeypatch, tmp_path):
+    monkeypatch.setenv("PAPER", "1")
+    db = str(tmp_path / "paper.db")
+    _patch_paper_db(monkeypatch, db)
+    buy, sell = make_ad("Bybit", "buy", 85.0), make_ad("MEXC", "sell", 90.0)
+    now = time.time()
+    paper.start_cycle(10000, buy, sell, "route", 2.0, path=db, ts=now - 120)   # остаётся открытым
+    cid = paper.start_cycle(10000, buy, sell, "route", 2.0, path=db, ts=now)
+    paper.init_balance(10000, path=db)
+    paper.finish_cycle(cid, "failed_sell", realized_pct=0.0, note="цена ушла", path=db, ts=now)
+    text = Stub(p2p.Config()).paper_view()
+    assert "🟢 включён" in text
+    assert "Bybit→MEXC" in text and "стадия «оплата»" in text
+    assert "исполнилось 0" in text and "сорвалось 1 (продажа 1)" in text
+    assert "Виртуальный баланс: 10 000 ₽ (изменение с начала: +0 ₽)" in text
+
+
+def test_paper_view_avg_diff_and_balance_change(monkeypatch, tmp_path):
+    monkeypatch.setenv("PAPER", "1")
+    db = str(tmp_path / "paper.db")
+    _patch_paper_db(monkeypatch, db)
+    buy, sell = make_ad("Bybit", "buy", 85.0), make_ad("MEXC", "sell", 90.0)
+    paper.init_balance(10000, path=db)
+    cid = paper.start_cycle(10000, buy, sell, "route", 2.0, path=db)
+    paper.finish_cycle(cid, "done", realized_pct=2.5, path=db)
+    text = Stub(p2p.Config()).paper_view()
+    assert "исполнилось 1" in text and "факт vs план +0.50 п.п." in text
+    assert "Виртуальный баланс: 10 250 ₽ (изменение с начала: +250 ₽)" in text
+
+
+def test_cmd_paper_on_off_writes_env(monkeypatch, tmp_path):
+    env = tmp_path / ".env"
+    monkeypatch.setattr(B, "save_env", functools.partial(B.save_env, path=str(env)))
+    bot = Stub(p2p.Config())
+    asyncio.run(bot.cmd_paper("on"))
+    assert "PAPER=1" in env.read_text()
+    assert "включён" in texts(bot)[-1]
+    asyncio.run(bot.cmd_paper("off"))
+    assert "PAPER=0" in env.read_text()
+    assert "выключен" in texts(bot)[-1]
+
+
+def test_cmd_paper_amount_writes_env(monkeypatch, tmp_path):
+    env = tmp_path / ".env"
+    monkeypatch.setattr(B, "save_env", functools.partial(B.save_env, path=str(env)))
+    bot = Stub(p2p.Config())
+    asyncio.run(bot.cmd_paper("amount 20000"))
+    assert "PAPER_AMOUNT=20000" in env.read_text()
+    assert "20 000" in texts(bot)[-1]
+
+
+def test_cmd_paper_amount_bad_value():
+    bot = Stub(p2p.Config())
+    asyncio.run(bot.cmd_paper("amount не число"))
+    assert "Не понял сумму" in texts(bot)[-1]
+
+
+def test_cmd_paper_no_arg_shows_view(monkeypatch, tmp_path):
+    monkeypatch.delenv("PAPER", raising=False)
+    _patch_paper_db(monkeypatch, str(tmp_path / "paper.db"))
+    bot = Stub(p2p.Config())
+    asyncio.run(bot.cmd_paper(""))
+    assert "🧪 <b>Сухой прогон</b>" in texts(bot)[-1]
+
+
+def test_dispatch_paper_routes_to_cmd_paper(monkeypatch, tmp_path):
+    monkeypatch.delenv("PAPER", raising=False)
+    _patch_paper_db(monkeypatch, str(tmp_path / "paper.db"))
+    bot = Stub(p2p.Config())
+    asyncio.run(bot.dispatch("/paper", ""))
+    assert "🧪 <b>Сухой прогон</b>" in texts(bot)[-1]
 
 
 def test_traps_view_lists_reasons():
