@@ -52,6 +52,71 @@ def test_start_cycle_stores_ads_and_stage(tmp_path):
     assert c["amount"] == 10000 and c["ts_start"] == 1000.0 and c["ts_stage"] == 1000.0
 
 
+def test_start_cycle_stores_bank_from_buy_pays(tmp_path):
+    db = str(tmp_path / "paper.db")
+    buy = make_ad("Bybit", "buy", 85.0, pays=("T-Bank",))
+    sell = make_ad("MEXC", "sell", 90.0)
+    cid = paper.start_cycle(10000, buy, sell, "route", 2.0, path=db, ts=1000.0)
+    assert paper.get_cycle(cid, path=db)["bank"] == "T-Bank"
+
+
+def test_start_cycle_bank_empty_when_pay_method_unknown(tmp_path):
+    db = str(tmp_path / "paper.db")
+    buy = make_ad("Bybit", "buy", 85.0, pays=("Qiwi",))
+    sell = make_ad("MEXC", "sell", 90.0)
+    cid = paper.start_cycle(10000, buy, sell, "route", 2.0, path=db, ts=1000.0)
+    assert paper.get_cycle(cid, path=db)["bank"] == ""
+
+
+def test_bank_month_total_sums_cycles_of_that_bank_this_month(tmp_path):
+    db = str(tmp_path / "paper.db")
+    now = time.time()
+    buy_tb = make_ad("Bybit", "buy", 85.0, pays=("T-Bank",))
+    buy_alfa = make_ad("Bybit", "buy", 85.0, pays=("Alfa-bank",))
+    sell = make_ad("MEXC", "sell", 90.0)
+    paper.start_cycle(40000, buy_tb, sell, "route", 2.0, path=db, ts=now)
+    paper.start_cycle(15000, buy_tb, sell, "route", 2.0, path=db, ts=now)
+    paper.start_cycle(60000, buy_alfa, sell, "route", 2.0, path=db, ts=now)
+    assert paper.bank_month_total("T-Bank", path=db, now=now) == 55000
+    assert paper.bank_month_total("Alfa-bank", path=db, now=now) == 60000
+    assert paper.bank_month_total("VTB", path=db, now=now) == 0.0
+    assert paper.bank_month_total("", path=db, now=now) == 0.0
+
+
+def test_bank_month_total_excludes_previous_month(tmp_path):
+    db = str(tmp_path / "paper.db")
+    now = time.time()
+    prev_month = paper._month_start(now) - 86400   # день из прошлого календарного месяца
+    buy = make_ad("Bybit", "buy", 85.0, pays=("T-Bank",))
+    sell = make_ad("MEXC", "sell", 90.0)
+    paper.start_cycle(90000, buy, sell, "route", 2.0, path=db, ts=prev_month)
+    assert paper.bank_month_total("T-Bank", path=db, now=now) == 0.0
+    paper.start_cycle(40000, buy, sell, "route", 2.0, path=db, ts=now)
+    assert paper.bank_month_total("T-Bank", path=db, now=now) == 40000
+
+
+def test_banks_this_month_lists_only_banks_with_cycles(tmp_path):
+    db = str(tmp_path / "paper.db")
+    assert paper.banks_this_month(path=db) == {}
+    now = time.time()
+    buy_tb = make_ad("Bybit", "buy", 85.0, pays=("T-Bank",))
+    buy_unknown = make_ad("Bybit", "buy", 85.0, pays=("Qiwi",))
+    sell = make_ad("MEXC", "sell", 90.0)
+    paper.start_cycle(110000, buy_tb, sell, "route", 2.0, path=db, ts=now)
+    paper.start_cycle(5000, buy_unknown, sell, "route", 2.0, path=db, ts=now)
+    assert paper.banks_this_month(path=db, now=now) == {"T-Bank": 110000}
+
+
+def test_banks_this_month_excludes_previous_month(tmp_path):
+    db = str(tmp_path / "paper.db")
+    now = time.time()
+    prev_month = paper._month_start(now) - 86400
+    buy = make_ad("Bybit", "buy", 85.0, pays=("T-Bank",))
+    sell = make_ad("MEXC", "sell", 90.0)
+    paper.start_cycle(50000, buy, sell, "route", 2.0, path=db, ts=prev_month)
+    assert paper.banks_this_month(path=db, now=now) == {}
+
+
 def test_get_cycle_missing_returns_none(tmp_path):
     db = str(tmp_path / "paper.db")
     assert paper.get_cycle(1, path=db) is None

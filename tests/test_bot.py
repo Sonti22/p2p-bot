@@ -92,6 +92,7 @@ def _patch_paper_db(monkeypatch, db):
     monkeypatch.setattr(B.paper, "balance_change", functools.partial(B.paper.balance_change, path=db))
     monkeypatch.setattr(B.paper, "stats", functools.partial(B.paper.stats, path=db))
     monkeypatch.setattr(B.paper, "ladder_suggestion", functools.partial(B.paper.ladder_suggestion, path=db))
+    monkeypatch.setattr(B.paper, "banks_this_month", functools.partial(B.paper.banks_this_month, path=db))
 
 
 def test_paper_cycle_starts_on_signal_when_enabled(monkeypatch, tmp_path):
@@ -1861,6 +1862,26 @@ def test_paper_view_avg_diff_and_balance_change(monkeypatch, tmp_path):
     text = Stub(p2p.Config()).paper_view()
     assert "исполнилось 1" in text and "факт vs план +0.50 п.п." in text
     assert "Виртуальный баланс: 10 250 ₽ (изменение с начала: +250 ₽)" in text
+
+
+def test_paper_view_shows_bank_limit_progress(monkeypatch, tmp_path):
+    monkeypatch.setenv("PAPER", "1")
+    db = str(tmp_path / "paper.db")
+    _patch_paper_db(monkeypatch, db)
+    buy, sell = make_ad("Bybit", "buy", 85.0, pays=("T-Bank",)), make_ad("MEXC", "sell", 90.0)
+    paper.start_cycle(60000, buy, sell, "route", 2.0, path=db)
+    paper.start_cycle(60000, buy, sell, "route", 2.0, path=db)   # 120к — выше лимита 100к
+    text = Stub(p2p.Config()).paper_view()
+    assert "Лимит СБП за месяц (виртуальный оборот):" in text
+    assert "⚠️ T-Bank: 120 000 ₽ / 100 000 ₽" in text
+
+
+def test_paper_view_no_bank_section_when_no_cycles(monkeypatch, tmp_path):
+    monkeypatch.setenv("PAPER", "1")
+    db = str(tmp_path / "paper.db")
+    _patch_paper_db(monkeypatch, db)
+    text = Stub(p2p.Config()).paper_view()
+    assert "Лимит СБП" not in text
 
 
 def test_paper_digest_line_none_when_off(monkeypatch, tmp_path):

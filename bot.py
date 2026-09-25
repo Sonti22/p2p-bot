@@ -1178,6 +1178,13 @@ class Bot:
             change_str = f"{change:+,.0f}".replace(",", " ")
             lines.append("")
             lines.append(f"Виртуальный баланс: {_money(balance)} ₽ (изменение с начала: {change_str} ₽)")
+        banks = paper.banks_this_month()
+        if banks:
+            lines.append("")
+            lines.append("Лимит СБП за месяц (виртуальный оборот):")
+            for bank, total in sorted(banks.items(), key=lambda kv: -kv[1]):
+                mark = "⚠️ " if total >= trades.BANK_LIMIT else ""
+                lines.append(f"{mark}{bank}: {_money(total)} ₽ / {_money(trades.BANK_LIMIT)} ₽")
         lines.append("")
         lines.append("/paper on|off — включить/выключить · /paper amount 20000 — сумма круга")
         return "\n".join(lines)
