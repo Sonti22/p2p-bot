@@ -1862,6 +1862,34 @@ def test_paper_view_avg_diff_and_balance_change(monkeypatch, tmp_path):
     assert "Виртуальный баланс: 10 250 ₽ (изменение с начала: +250 ₽)" in text
 
 
+def test_paper_digest_line_none_when_off(monkeypatch, tmp_path):
+    monkeypatch.delenv("PAPER", raising=False)
+    _patch_paper_db(monkeypatch, str(tmp_path / "paper.db"))
+    assert Stub(p2p.Config()).paper_digest_line() is None
+
+
+def test_paper_digest_line_none_when_no_cycles_today(monkeypatch, tmp_path):
+    monkeypatch.setenv("PAPER", "1")
+    _patch_paper_db(monkeypatch, str(tmp_path / "paper.db"))
+    assert Stub(p2p.Config()).paper_digest_line() is None
+
+
+def test_paper_digest_line_summarizes_todays_cycles(monkeypatch, tmp_path):
+    monkeypatch.setenv("PAPER", "1")
+    db = str(tmp_path / "paper.db")
+    _patch_paper_db(monkeypatch, db)
+    buy, sell = make_ad("Bybit", "buy", 85.0), make_ad("MEXC", "sell", 90.0)
+    paper.init_balance(10000, path=db)
+    cid = paper.start_cycle(10000, buy, sell, "route", 2.0, path=db)
+    paper.finish_cycle(cid, "done", realized_pct=2.5, path=db)
+    cid2 = paper.start_cycle(10000, buy, sell, "route", 2.0, path=db)
+    paper.finish_cycle(cid2, "failed_sell", realized_pct=0.0, note="цена ушла", path=db)
+    line = Stub(p2p.Config()).paper_digest_line()
+    assert line.startswith("🧪 Сухой прогон за сутки: 2 кругов, исполнилось 1, сорвалось 1 (продажа 1)")
+    assert "факт vs план +0.50 п.п." in line
+    assert "баланс 10 250 ₽ (+250 ₽)" in line
+
+
 def test_cmd_paper_on_off_writes_env(monkeypatch, tmp_path):
     env = tmp_path / ".env"
     monkeypatch.setattr(B, "save_env", functools.partial(B.save_env, path=str(env)))
@@ -2339,6 +2367,37 @@ def test_night_digest_empty_when_nothing_above_threshold(monkeypatch):
     monkeypatch.setattr(B.time, "time", lambda: msk_ts(9, 0))
     asyncio.run(bot.quiet_and_pause_tick(snap([])))
     assert "связок выше порога не было" in texts(bot)[-1]
+
+
+def test_night_digest_includes_paper_summary_when_on(monkeypatch, tmp_path):
+    monkeypatch.setenv("PAPER", "1")
+    db = str(tmp_path / "paper.db")
+    _patch_paper_db(monkeypatch, db)
+    buy, sell = make_ad("Bybit", "buy", 85.0), make_ad("MEXC", "sell", 90.0)
+    paper.init_balance(10000, path=db)
+    cid = paper.start_cycle(10000, buy, sell, "route", 2.0, path=db)
+    paper.finish_cycle(cid, "done", realized_pct=2.5, path=db)
+
+    bot = Stub(p2p.Config(min_profit=2.0))
+    bot.quiet_on = True
+    monkeypatch.setattr(B.time, "time", lambda: msk_ts(2, 0))
+    asyncio.run(bot.quiet_and_pause_tick(snap([])))
+    monkeypatch.setattr(B.time, "time", lambda: msk_ts(9, 0))
+    asyncio.run(bot.quiet_and_pause_tick(snap([])))
+    msgs = texts(bot)
+    assert any("Сухой прогон за сутки" in m for m in msgs)
+
+
+def test_night_digest_skips_paper_summary_when_off(monkeypatch, tmp_path):
+    monkeypatch.delenv("PAPER", raising=False)
+    _patch_paper_db(monkeypatch, str(tmp_path / "paper.db"))
+    bot = Stub(p2p.Config(min_profit=2.0))
+    bot.quiet_on = True
+    monkeypatch.setattr(B.time, "time", lambda: msk_ts(2, 0))
+    asyncio.run(bot.quiet_and_pause_tick(snap([])))
+    monkeypatch.setattr(B.time, "time", lambda: msk_ts(9, 0))
+    asyncio.run(bot.quiet_and_pause_tick(snap([])))
+    assert not any("Сухой прогон за сутки" in m for m in texts(bot))
 
 
 def test_pause_command_no_arg_is_indefinite():
