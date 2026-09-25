@@ -46,6 +46,19 @@ def test_deal_markup_colors_and_copy():
     assert all("style" not in b for b in buttons(kb) if "callback_data" in b)   # служебные кнопки — без цвета
 
 
+def test_copy_qty_is_actual_output_without_risk_buffer():
+    # BTC: запас на курс 0.3% (DEFAULT_RISK) не должен занижать объём в кнопке «📋» — иначе продавать
+    # предлагается на 0.3% меньше, чем реально выйдет из маршрута
+    cfg = p2p.Config(amount=1_000_000)
+    b = make_ad("Bybit", "buy", 7_000_000.0, asset="BTC")
+    s = make_ad("Bybit", "sell", 7_100_000.0, asset="BTC")
+    d = (1.0, b, s, "внутри биржи")
+    kb = B.deal_markup(d, deal_id=1, cfg=cfg, snap=snap([d]))
+    copies = [x for x in buttons(kb) if "copy_text" in x]
+    qty = float(copies[1]["copy_text"]["text"])
+    assert abs(qty - cfg.amount / b.price) < 1e-5   # без вычета 0.3% запаса на курс
+
+
 def test_deal_markup_without_cfg_has_no_copy_buttons():
     kb = B.deal_markup(deal(), deal_id=1)
     assert not any("copy_text" in b for b in buttons(kb))
