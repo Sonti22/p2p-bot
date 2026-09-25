@@ -136,6 +136,64 @@ def set_fact(trade_id, fact_percent, path=DB_PATH):
     return cur.rowcount > 0
 
 
+# Автосопоставление истории биржи (accounts.account_history) со сделками журнала для автозаполнения факта.
+AUTO_MATCH_WINDOW = 1800          # сек — запись истории считается той самой сделкой, если она не дальше по времени
+AUTO_MATCH_AMOUNT_TOLERANCE = 0.25  # 25% — насколько сумма записи истории (в ₽) может отличаться от суммы круга
+
+
+def unmatched(path=DB_PATH, since=None):
+    """Сделки без введённого факта (для автосопоставления) не старше `since` (epoch, по умолчанию — все).
+    [{"id", "ts", "buy_ex", "buy_asset", "sell_ex", "sell_asset", "amount", "profit"}, ...]."""
+    if not os.path.exists(path):
+        return []
+    since = 0.0 if since is None else since
+    con = _connect(path)
+    rows = con.execute("SELECT id, ts, buy_ex, buy_asset, sell_ex, sell_asset, amount, profit FROM trades "
+                       "WHERE fact IS NULL AND ts >= ? ORDER BY ts", (since,)).fetchall()
+    con.close()
+    return [{"id": r[0], "ts": r[1], "buy_ex": r[2], "buy_asset": r[3], "sell_ex": r[4],
+             "sell_asset": r[5], "amount": r[6], "profit": r[7]} for r in rows]
+
+
+def _match_leg(hist, asset, side, ts, want_fiat, window, amount_tolerance):
+    """Ближайшая по времени запись истории биржи (`accounts.account_history`) для одной ноги сделки:
+    та же монета, та же сторона (buy/sell), цена есть (депозиты/выводы её не несут — не подтверждают
+    цену исполнения), сумма в ₽ (amount*price) не дальше `amount_tolerance` от суммы круга сделки,
+    само время — не дальше `window` секунд от времени сделки. Кандидатов несколько — берём ближайший
+    по времени. Ничего не подошло — None."""
+    asset = (asset or "").upper()
+    best, best_dt = None, None
+    for it in hist or []:
+        if (it.get("asset") or "").upper() != asset or it.get("side") != side:
+            continue
+        price = it.get("price") or 0
+        if price <= 0 or abs(it.get("ts", 0) - ts) > window:
+            continue
+        fiat = it.get("amount", 0) * price
+        if want_fiat and abs(fiat - want_fiat) > want_fiat * amount_tolerance:
+            continue
+        dt = abs(it["ts"] - ts)
+        if best is None or dt < best_dt:
+            best, best_dt = it, dt
+    return best
+
+
+def match_fact(trade, hist_by_ex, window=AUTO_MATCH_WINDOW, amount_tolerance=AUTO_MATCH_AMOUNT_TOLERANCE):
+    """Реализованный % прибыли по истории подключённых бирж для сделки журнала (`unmatched`), если в
+    истории нашлась и покупка, и продажа той же монеты рядом по времени и сумме — иначе None (нет ключа
+    у нужной биржи в этом опросе, движения ещё не видно, или сумма/время слишком не совпадают).
+    `hist_by_ex` — {биржа (в нижнем регистре): список записей `accounts.account_history` за этот опрос}."""
+    buy_hist = hist_by_ex.get((trade["buy_ex"] or "").lower())
+    sell_hist = hist_by_ex.get((trade["sell_ex"] or "").lower())
+    if buy_hist is None or sell_hist is None:
+        return None
+    buy = _match_leg(buy_hist, trade["buy_asset"], "buy", trade["ts"], trade["amount"], window, amount_tolerance)
+    sell = _match_leg(sell_hist, trade["sell_asset"], "sell", trade["ts"], trade["amount"], window, amount_tolerance)
+    if not buy or not sell:
+        return None
+    return (sell["price"] / buy["price"] - 1) * 100
+
+
 def stats(path=DB_PATH, now=None):
     """{"day"/"week"/"month": {"count", "amount", "avg_profit", "fact_count", "avg_fact", "avg_diff"}} —
     для /stats. «day» — календарные сутки по МСК, «month» — календарный месяц (как счётчик лимита СБП),

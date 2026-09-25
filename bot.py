@@ -1629,7 +1629,9 @@ class Bot:
 
         Первый опрос после старта только запоминает текущую историю (без сообщений, чтобы не спамить
         старыми записями) — дальше в Telegram уходят только записи, которых не было в прошлый раз.
-        Пустая история при успешном ответе ([]) — тоже первый опрос: первая же операция после неё придёт."""
+        Пустая история при успешном ответе ([]) — тоже первый опрос: первая же операция после неё придёт.
+        Заодно история этого опроса идёт на автосопоставление с журналом сделок (`self.auto_match_facts`)."""
+        hist_by_ex = {}
         for ex in accounts.ONBOARDABLE:
             if accounts.keys(ex) is None:
                 continue
@@ -1640,6 +1642,7 @@ class Bot:
                 continue
             if hist is None:   # ошибка / не ответил источник — базу не трогаем; [] — успешно пусто, это тоже база
                 continue
+            hist_by_ex[ex] = hist
             seen = self.acc_seen.get(ex)
             if seen is not None:
                 for it in hist:
@@ -1648,6 +1651,20 @@ class Bot:
             # объединяем, а не заменяем: если один источник сейчас не ответил, его записи из прошлых опросов
             # не должны после восстановления прийти как новые
             self.acc_seen[ex] = (seen or set()) | {hist_key(it) for it in hist}
+        if hist_by_ex:
+            await self.auto_match_facts(hist_by_ex)
+
+    async def auto_match_facts(self, hist_by_ex):
+        """Сделки журнала без факта (`trades.unmatched`) сверить с историей бирж этого опроса
+        (`trades.match_fact`) и заполнить факт автоматически, если нашлась и покупка, и продажа."""
+        since = time.time() - 86400  # не старше суток — дальше сопоставлять по времени уже нет смысла
+        for trade in trades.unmatched(since=since):
+            fact = trades.match_fact(trade, hist_by_ex)
+            if fact is None:
+                continue
+            trades.set_fact(trade["id"], fact)
+            await self.send(f"✅ автосопоставление сделки #{trade['id']}: факт {fact:+.2f}% "
+                            f"(расчёт был {trade['profit']:+.2f}%)", topic="journal")
 
     async def accounts_loop(self):
         while True:

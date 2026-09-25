@@ -147,3 +147,95 @@ def test_stats_reports_calc_vs_fact(tmp_path):
     assert st["day"]["fact_count"] == 1
     assert st["day"]["avg_fact"] == 1.5
     assert round(st["day"]["avg_diff"], 4) == -0.5
+
+
+def test_unmatched_lists_only_trades_without_fact_within_window(tmp_path):
+    db = str(tmp_path / "trades.db")
+    now = time.time()
+    id1, *_ = trades.log_trade(deal(2.0), 50000, path=db, ts=now)
+    id2, *_ = trades.log_trade(deal(3.0), 50000, path=db, ts=now - 2 * 86400)  # старее since
+    id3, *_ = trades.log_trade(deal(4.0), 50000, path=db, ts=now)
+    trades.set_fact(id3, 4.0, path=db)                                        # факт уже есть
+    out = trades.unmatched(path=db, since=now - 86400)
+    assert [t["id"] for t in out] == [id1]
+
+
+def test_unmatched_missing_db_is_empty_list(tmp_path):
+    assert trades.unmatched(path=str(tmp_path / "none.db")) == []
+
+
+def _trade_row(ts, buy_ex="Bybit", sell_ex="MEXC", asset="USDT", amount=50000.0, profit=2.0):
+    return {"id": 1, "ts": ts, "buy_ex": buy_ex, "buy_asset": asset, "sell_ex": sell_ex, "sell_asset": asset,
+            "amount": amount, "profit": profit}
+
+
+def test_match_fact_computes_realized_spread_from_both_legs():
+    now = time.time()
+    trade = _trade_row(now, amount=50000.0)
+    hist_by_ex = {
+        "bybit": [{"kind": "trade", "asset": "USDT", "side": "buy", "amount": 588.24, "price": 85.0, "ts": now}],
+        "mexc": [{"kind": "trade", "asset": "USDT", "side": "sell", "amount": 588.24, "price": 90.0, "ts": now + 60}],
+    }
+    fact = trades.match_fact(trade, hist_by_ex)
+    assert fact == (90.0 / 85.0 - 1) * 100
+
+
+def test_match_fact_none_when_exchange_history_not_fetched_this_poll():
+    trade = _trade_row(time.time())
+    assert trades.match_fact(trade, {"mexc": []}) is None        # bybit не опрашивался в этом цикле
+
+
+def test_match_fact_none_when_asset_or_side_does_not_match():
+    now = time.time()
+    trade = _trade_row(now)
+    hist_by_ex = {
+        "bybit": [{"asset": "BTC", "side": "buy", "amount": 1.0, "price": 85.0, "ts": now}],   # не та монета
+        "mexc": [{"asset": "USDT", "side": "buy", "amount": 588.24, "price": 90.0, "ts": now}],  # не та сторона
+    }
+    assert trades.match_fact(trade, hist_by_ex) is None
+
+
+def test_match_fact_ignores_deposit_without_price():
+    now = time.time()
+    trade = _trade_row(now)
+    hist_by_ex = {
+        "bybit": [{"kind": "deposit", "asset": "USDT", "amount": 588.24, "ts": now}],  # нет цены — не факт
+        "mexc": [{"kind": "trade", "asset": "USDT", "side": "sell", "amount": 588.24, "price": 90.0, "ts": now}],
+    }
+    assert trades.match_fact(trade, hist_by_ex) is None
+
+
+def test_match_fact_none_outside_time_window():
+    now = time.time()
+    trade = _trade_row(now)
+    hist_by_ex = {
+        "bybit": [{"asset": "USDT", "side": "buy", "amount": 588.24, "price": 85.0,
+                   "ts": now - trades.AUTO_MATCH_WINDOW - 60}],
+        "mexc": [{"asset": "USDT", "side": "sell", "amount": 588.24, "price": 90.0, "ts": now}],
+    }
+    assert trades.match_fact(trade, hist_by_ex) is None
+
+
+def test_match_fact_none_when_fiat_amount_too_different():
+    now = time.time()
+    trade = _trade_row(now, amount=50000.0)
+    hist_by_ex = {
+        # 10 USDT * 85 ₽ = 850 ₽ — совсем не похоже на круг в 50 000 ₽
+        "bybit": [{"asset": "USDT", "side": "buy", "amount": 10.0, "price": 85.0, "ts": now}],
+        "mexc": [{"asset": "USDT", "side": "sell", "amount": 588.24, "price": 90.0, "ts": now}],
+    }
+    assert trades.match_fact(trade, hist_by_ex) is None
+
+
+def test_match_fact_picks_closest_candidate_by_time():
+    now = time.time()
+    trade = _trade_row(now, amount=50000.0)
+    hist_by_ex = {
+        "bybit": [
+            {"asset": "USDT", "side": "buy", "amount": 588.24, "price": 84.0, "ts": now - 600},   # дальше
+            {"asset": "USDT", "side": "buy", "amount": 588.24, "price": 85.0, "ts": now + 30},     # ближе
+        ],
+        "mexc": [{"asset": "USDT", "side": "sell", "amount": 588.24, "price": 90.0, "ts": now}],
+    }
+    fact = trades.match_fact(trade, hist_by_ex)
+    assert fact == (90.0 / 85.0 - 1) * 100
