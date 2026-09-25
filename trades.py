@@ -11,10 +11,42 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(HERE, "data", "trades.db")
 PERIODS = {"day": 86400, "week": 7 * 86400, "month": 30 * 86400}
 MSK = datetime.timezone(datetime.timedelta(hours=3))
-# Банки, через которые обычно идёт оплата P2P-мерчанту по СБП (определяем по способу оплаты объявления).
-# Свободный лимит СБП физлицу — 100 тыс. ₽ в календарный месяц НА КАЖДЫЙ банк, дальше — комиссия до 0.5%.
-SBP_BANKS = ("Sberbank", "T-Bank", "Alfa-bank", "VTB", "SBP")
+# Банк по названию способа оплаты на площадках: каноническое имя → куски названий (латиница/кириллица,
+# нижний регистр). Площадки пишут по-разному: «Tinkoff»/«T-Bank»/«Т-Банк», «VTB Bank», «OZON Bank»…
+BANK_ALIASES = {
+    "T-Bank": ("t-bank", "tbank", "tinkoff", "т-банк", "тинькоф"),
+    "Sberbank": ("sber", "сбер"),
+    "Alfa-bank": ("alfa", "альфа"),
+    "VTB": ("vtb", "втб"),
+    "Rosselkhozbank": ("rosselkhoz", "rshb", "россельхоз", "рсхб"),
+    "MTS Bank": ("mts", "мтс"),
+    "Raiffeisen": ("raiffeisen", "райффайзен"),
+    "Gazprombank": ("gazprom", "газпром"),
+    "Ozon Bank": ("ozon", "озон"),
+    "Yandex Bank": ("yandex", "яндекс"),
+    "PSB": ("promsvyaz", "psb", "промсвязь", "псб"),
+    "Sovcombank": ("sovcom", "sovkom", "совком", "halva", "халва"),
+    "Pochta Bank": ("pochta", "почта"),
+    "Rosbank": ("rosbank", "росбанк"),
+    "OTP Bank": ("otp", "отп"),
+    "Uralsib": ("uralsib", "уралсиб"),
+    "Ak Bars": ("ak bars", "акбарс", "ак барс"),
+    "Russian Standard": ("russian standard", "русский стандарт"),
+    "Otkritie": ("otkritie", "открытие"),
+    "Home Credit": ("home credit", "хоум"),
+}
+BANK_NAMES = {"T-Bank": "Т-Банк", "Sberbank": "Сбер", "Alfa-bank": "Альфа", "VTB": "ВТБ", "Rosselkhozbank": "Россельхоз",
+              "MTS Bank": "МТС Банк", "Raiffeisen": "Райффайзен", "Gazprombank": "Газпромбанк", "Ozon Bank": "Озон Банк",
+              "Yandex Bank": "Яндекс Банк", "PSB": "ПСБ", "Sovcombank": "Совкомбанк", "SBP": "СБП"}
+SBP_WORDS = ("sbp", "сбп", "fast bank transfer", "fast payment")
+# Свои банки владельца (OWN_BANKS в .env): с них платим по СБП — в этом порядке; «*» — у владельца есть карта
+# и в любом другом банке, так что перевод мерчанту в любой распознанный банк идёт внутри банка.
+DEFAULT_OWN_BANKS = "T-Bank,Sberbank,Alfa-bank,VTB,Rosselkhozbank,MTS Bank,*"
+# Бесплатный лимит СБП другим людям — 100 тыс. ₽ в календарный месяц НА КАЖДЫЙ банк-отправитель (правило ЦБ),
+# дальше комиссия до 0.5%. Банки дают больше: ВТБ с 01.07.2026 — 300 тыс. на базовом тарифе, Т-Банк с Pro —
+# 300 тыс., с Premium — без лимита. Свой тариф — SBP_FREE_LIMITS в .env («T-Bank:300000,VTB:inf»).
 BANK_LIMIT = 100_000.0
+DEFAULT_FREE_LIMITS = {"VTB": 300_000.0}
 SBP_OVER_FEE = 0.5  # % — комиссия банка сверх бесплатного лимита СБП (до 0.5%)
 # Без единицы измерения короткое число похоже на проценты (типичный профит связки — единицы процентов),
 # длинное — на рубли (типичная сумма выигрыша за круг — сотни-тысячи ₽).
@@ -30,12 +62,14 @@ def _connect(path):
     con.execute("CREATE TABLE IF NOT EXISTS trades ("
                 "id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, route TEXT, "
                 "buy_ex TEXT, buy_asset TEXT, sell_ex TEXT, sell_asset TEXT, "
-                "amount REAL, profit REAL, bank TEXT DEFAULT '', fact REAL DEFAULT NULL)")
+                "amount REAL, profit REAL, bank TEXT DEFAULT '', fact REAL DEFAULT NULL, kind TEXT DEFAULT '')")
     cols = [r[1] for r in con.execute("PRAGMA table_info(trades)")]
     if "bank" not in cols:
         con.execute("ALTER TABLE trades ADD COLUMN bank TEXT DEFAULT ''")
     if "fact" not in cols:
         con.execute("ALTER TABLE trades ADD COLUMN fact REAL DEFAULT NULL")
+    if "kind" not in cols:   # '' — старые записи: банк брался из объявления и всегда считался в лимит СБП
+        con.execute("ALTER TABLE trades ADD COLUMN kind TEXT DEFAULT ''")
     return con
 
 
@@ -58,14 +92,60 @@ def parse_fact(text, amount):
     return None
 
 
-def sbp_bank(pays):
-    """Банк из способов оплаты объявления, если он совпадает с известным (иначе '' — не отслеживаем)."""
-    for p in pays:
-        pl = p.lower()
-        for name in SBP_BANKS:
-            if name.lower() in pl:
-                return name
+def bank_of(pay):
+    """Каноническое имя банка по названию способа оплаты («Tinkoff», «Т-Банк» → T-Bank); '' — не банк."""
+    pl = (pay or "").lower()
+    for bank, keys in BANK_ALIASES.items():
+        if any(k in pl for k in keys):
+            return bank
     return ""
+
+
+def is_sbp(pay):
+    return any(w in (pay or "").lower() for w in SBP_WORDS)
+
+
+def own_banks():
+    """(свои банки по порядку, есть ли «*» — карта и в любом другом банке) из OWN_BANKS."""
+    items = [x.strip() for x in os.getenv("OWN_BANKS", DEFAULT_OWN_BANKS).split(",") if x.strip()]
+    return [bank_of(x) or x for x in items if x != "*"], "*" in items
+
+
+def free_limit(bank):
+    """Бесплатный лимит СБП банка в месяц, ₽ (inf — без лимита): SBP_FREE_LIMITS, иначе DEFAULT_FREE_LIMITS/BANK_LIMIT."""
+    limits = dict(DEFAULT_FREE_LIMITS)
+    for part in os.getenv("SBP_FREE_LIMITS", "").split(","):
+        name, _, val = part.partition(":")
+        try:
+            limits[bank_of(name) or name.strip()] = float(val)
+        except ValueError:
+            continue   # пустой или кривой кусок — пропускаем
+    return limits.get(bank, BANK_LIMIT)
+
+
+def pay_plan(pays, over=frozenset(), own=None):
+    """Как владелец заплатит мерчанту (kind, bank): «intra» — у мерчанта есть банк владельца, перевод внутри банка,
+    лимит СБП не тратится; «sbp» — мерчант принимает СБП или чужой банк: по СБП со своего банка — первого по
+    OWN_BANKS, у которого лимит ещё не исчерпан (over), иначе с первого; ("", "") — способ неизвестен."""
+    listed, star = own if own is not None else own_banks()
+    banks = [b for b in map(bank_of, pays) if b]
+    mine = next((b for b in banks if star or b in listed), "")
+    if mine:
+        return "intra", mine
+    if banks or any(map(is_sbp, pays)):
+        pool = listed or ["SBP"]
+        return "sbp", next((b for b in pool if b not in over), pool[0])
+    return "", ""
+
+
+def pay_label(kind, bank, pays=()):
+    """Как платим — для карточек: «внутри банка (Т-Банк)», «СБП с Т-Банк», иначе способы оплаты мерчанта."""
+    name = BANK_NAMES.get(bank, bank)
+    if kind == "intra":
+        return f"внутри банка ({name})"
+    if kind == "sbp":
+        return f"СБП с {name}"
+    return ", ".join(list(pays)[:3]) or "—"
 
 
 def _month_start(ts):
@@ -80,39 +160,40 @@ def _day_start(ts):
 
 
 def bank_month_total(bank, path=DB_PATH, now=None):
-    """Сумма отправленного через банк по СБП с начала текущего календарного месяца."""
+    """Сумма отправленного со своего банка по СБП с начала текущего календарного месяца (переводы внутри банка
+    лимит не тратят и не считаются; старые записи без kind — считаются, как и раньше)."""
     if not bank or not os.path.exists(path):
         return 0.0
     now = time.time() if now is None else now
     con = _connect(path)
-    total, = con.execute("SELECT COALESCE(SUM(amount), 0) FROM trades WHERE bank = ? AND ts >= ?",
-                         (bank, _month_start(now))).fetchone()
+    total, = con.execute("SELECT COALESCE(SUM(amount), 0) FROM trades WHERE bank = ? AND ts >= ? "
+                         "AND kind IN ('sbp', '')", (bank, _month_start(now))).fetchone()
     con.close()
     return total
 
 
 def banks_over_limit(banks, path=DB_PATH, now=None):
-    """Из списка банков — те, что уже набрали 100 тыс. ₽ за календарный месяц (лимит СБП исчерпан)."""
-    return {b for b in banks if b and bank_month_total(b, path, now) >= BANK_LIMIT}
+    """Из списка банков — те, что уже набрали свой бесплатный лимит СБП за календарный месяц (free_limit)."""
+    return {b for b in banks if b and bank_month_total(b, path, now) >= free_limit(b)}
 
 
 def log_trade(d, amount, path=DB_PATH, ts=None):
-    """Записать сделку: d — (profit %, buy Ad, sell Ad, маршрут), amount — сумма круга в фиате.
-    Возвращает (id сделки — для ввода факта, банк, сумма за месяц с этой сделкой, пересёк ли лимит
-    100 тыс. этой сделкой)."""
+    """Записать сделку: d — (profit %, buy Ad, sell Ad, маршрут), amount — сумма круга в фиате. Как платили —
+    pay_plan (внутри банка или СБП со своего банка, у которого лимит ещё есть). Возвращает (id сделки — для
+    ввода факта, банк, сумма по СБП за месяц с этой сделкой, пересёк ли этой сделкой бесплатный лимит банка)."""
     profit, b, s, route = d
     ts = ts if ts is not None else time.time()
-    bank = sbp_bank(b.pays)
-    prev = bank_month_total(bank, path, ts) if bank else 0.0
+    kind, bank = pay_plan(b.pays, over=banks_over_limit(own_banks()[0], path, ts))
+    prev = bank_month_total(bank, path, ts) if kind == "sbp" else 0.0
     con = _connect(path)
     with con:
-        cur = con.execute("INSERT INTO trades (ts, route, buy_ex, buy_asset, sell_ex, sell_asset, amount, profit, bank) "
-                          "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                          (ts, route, b.ex, b.asset, s.ex, s.asset, amount, profit, bank))
+        cur = con.execute("INSERT INTO trades (ts, route, buy_ex, buy_asset, sell_ex, sell_asset, amount, profit, bank, "
+                          "kind) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                          (ts, route, b.ex, b.asset, s.ex, s.asset, amount, profit, bank, kind))
     trade_id = cur.lastrowid
     con.close()
-    total = prev + amount
-    crossed = bool(bank) and prev < BANK_LIMIT <= total
+    total = prev + amount if kind == "sbp" else 0.0
+    crossed = kind == "sbp" and prev < free_limit(bank) <= total
     return trade_id, bank, total, crossed
 
 

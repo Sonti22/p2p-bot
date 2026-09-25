@@ -79,6 +79,7 @@ COMMANDS = [{"command": "best", "description": "Лучшая связка сей
             {"command": "calc", "description": "Разовый расчёт под сумму, напр. /calc 20000"},
             {"command": "stats", "description": "Журнал сделок: день/неделя/месяц, расчёт vs факт"},
             {"command": "paper", "description": "Сухой прогон: круги, статистика, /paper on|off|amount|report"},
+            {"command": "mybanks", "description": "Мои банки и бесплатные лимиты СБП"},
             {"command": "alert", "description": "Алерт на курс, напр. /alert USDT sell 92 7d"},
             {"command": "alerts", "description": "Список алертов на курс"},
             {"command": "blacklist", "description": "Скрытые мерчанты и обменники"},
@@ -417,7 +418,7 @@ def account_view(ex):
     return text, {"inline_keyboard": kb}
 
 
-ONBOARD_BANKS = trades.SBP_BANKS  # банки для шага 2/3 онбординга — тот же список, что и в лимитах СБП
+ONBOARD_BANKS = ("Sberbank", "T-Bank", "Alfa-bank", "VTB", "SBP")  # шаг 2/3 онбординга — фильтр способов оплаты
 
 
 def onboarding_amount_view():
@@ -729,6 +730,67 @@ HISTORY_MARKUP = {"inline_keyboard": [
     [{"text": "📉 Бэктест", "callback_data": "backtest"}]]}
 
 
+MY_BANKS = ("T-Bank", "Sberbank", "Alfa-bank", "VTB", "Rosselkhozbank", "MTS Bank", "Ozon Bank", "Gazprombank",
+            "Raiffeisen", "Yandex Bank")
+# Тарифы, от которых зависит бесплатный лимит СБП в месяц (исследование 25.09.2026; проверь в приложении банка)
+SBP_TARIFFS = {"T-Bank": ((100_000, "база"), (300_000, "Pro"), (float("inf"), "Premium")),
+               "VTB": ((300_000, "база"), (float("inf"), "Привилегия")),
+               "Gazprombank": ((100_000, "база"), (200_000, "Бонус Плюс")),
+               "Ozon Bank": ((100_000, "база"), (5_000_000, "Ultra"))}
+
+
+def _limit_text(limit):
+    return "без лимита" if limit == float("inf") else f"{_money(limit)} ₽"
+
+
+def _limit_key(limit):
+    return "inf" if limit == float("inf") else str(int(limit))
+
+
+def mybanks_view():
+    """«🏦 Мои банки»: с каких банков владелец платит (порядок = очерёдность оплаты по СБП), есть ли карты и в
+    остальных банках (перевод мерчанту в его банк — внутри банка) и бесплатный лимит СБП каждого по тарифу."""
+    listed, star = trades.own_banks()
+    lines = ["🏦 <b>Мои банки и лимиты СБП</b>", "",
+             "Есть у мерчанта твой банк — перевод внутри банка, лимит СБП не тратится. Мерчант принимает только СБП "
+             "или чужой банк — бот считает оплату по СБП с первого твоего банка, у которого бесплатный лимит за "
+             "месяц ещё не исчерпан.", ""]
+    for b in listed:
+        lines.append(f"• {trades.BANK_NAMES.get(b, b)} — бесплатно по СБП {_limit_text(trades.free_limit(b))} в месяц")
+    lines.append(f"• {'✅' if star else '➖'} карты и в любом другом банке")
+    kb = [[{"text": ("✅ " if b in listed else "") + trades.BANK_NAMES.get(b, b), "callback_data": f"ownbank:{b}"}
+           for b in MY_BANKS[i:i + 3]] for i in range(0, len(MY_BANKS), 3)]
+    kb.append([{"text": ("✅ " if star else "") + "Остальные банки тоже мои", "callback_data": "ownbank:*"}])
+    for bank, tariffs in SBP_TARIFFS.items():
+        if bank in listed:
+            cur = trades.free_limit(bank)
+            kb.append([{"text": ("✅ " if cur == lim else "") + f"{trades.BANK_NAMES[bank]}: {name}",
+                        "callback_data": f"sbplim:{bank}:{_limit_key(lim)}"} for lim, name in tariffs])
+    return "\n".join(lines), {"inline_keyboard": kb}
+
+
+def apply_mybanks(data):
+    """Кнопки «🏦 Мои банки»: ownbank:<банк>/ownbank:* — добавить/убрать банк; sbplim:<банк>:<лимит> — тариф.
+    Значения не из списков кнопок игнорируются."""
+    kind, _, rest = data.partition(":")
+    if kind == "ownbank":
+        listed, star = trades.own_banks()
+        if rest == "*":
+            star = not star
+        elif rest in MY_BANKS:
+            listed = [b for b in listed if b != rest] if rest in listed else listed + [rest]
+        else:
+            return
+        save_env("OWN_BANKS", ",".join(listed + (["*"] if star else [])))
+    elif kind == "sbplim":
+        bank, _, val = rest.partition(":")
+        if bank not in SBP_TARIFFS or val not in {_limit_key(lim) for lim, _ in SBP_TARIFFS[bank]}:
+            return
+        limits = dict(p.split(":", 1) for p in os.getenv("SBP_FREE_LIMITS", "").split(",") if ":" in p)
+        limits[bank] = val
+        save_env("SBP_FREE_LIMITS", ",".join(f"{k}:{v}" for k, v in limits.items()))
+
+
 def fact_markup(trade_id):
     """Кнопки быстрого фактического результата под подтверждением «✅ Сделал»."""
     return {"inline_keyboard": [
@@ -1015,9 +1077,10 @@ class Bot:
         await self.call("editMessageReplyMarkup", chat_id=self.chat_id, message_id=cq["message"]["message_id"],
                         reply_markup=self.markup(deal_markup(d, cfg=cfg, snap=snap)))
         if crossed:
-            await self.send(f"⚠️ Через {bank} по СБП в этом месяце отправлено {_money(total)} ₽ — выше "
-                            f"бесплатного лимита 100 000 ₽, дальше банк может взять комиссию до 0.5%. "
-                            f"Для следующих сделок с этим мерчантом лучше выбрать другой банк.", topic="journal")
+            await self.send(f"⚠️ С {trades.BANK_NAMES.get(bank, bank)} по СБП в этом месяце отправлено "
+                            f"{_money(total)} ₽ — выше бесплатного лимита {_limit_text(trades.free_limit(bank))}, "
+                            f"дальше банк может взять комиссию до 0.5%. Оплату по СБП бот дальше считает со "
+                            f"следующего своего банка (🏦 Мои банки в настройках).", topic="journal")
 
     async def handle_fact_button(self, cq, data):
         """Кнопка быстрого факта («как расчёт»/«±0.5 п.п.»/«✏️ ввести число») под подтверждением сделки."""
@@ -1203,8 +1266,9 @@ class Bot:
             lines.append("")
             lines.append("Лимит СБП за месяц (виртуальный оборот):")
             for bank, total in sorted(banks.items(), key=lambda kv: -kv[1]):
-                mark = "⚠️ " if total >= trades.BANK_LIMIT else ""
-                lines.append(f"{mark}{bank}: {_money(total)} ₽ / {_money(trades.BANK_LIMIT)} ₽")
+                limit = trades.free_limit(bank)
+                mark = "⚠️ " if total >= limit else ""
+                lines.append(f"{mark}{trades.BANK_NAMES.get(bank, bank)}: {_money(total)} ₽ / {_limit_text(limit)}")
         lines.append("")
         lines.append("Кнопки ниже; то же командами: /paper on, /paper off, /paper amount 20000, /paper report")
         return "\n".join(lines)
@@ -1399,7 +1463,8 @@ class Bot:
               [{"text": mark(c.amount == v, f"{v // 1000}к"), "callback_data": f"amt:{v}"} for v in AMOUNT_PRESETS],
               [{"text": "✏️ Своя сумма", "callback_data": "amt_custom"}],
               [{"text": "🎛 Фильтры", "callback_data": "filters"}],
-              [{"text": "🔑 Мои биржи", "callback_data": "accounts"}],
+              [{"text": "🔑 Мои биржи", "callback_data": "accounts"},
+               {"text": "🏦 Мои банки", "callback_data": "mybanks"}],
               [{"text": "🌙 Тихие часы: выкл" if self.quiet_on else "🌙 Тихие часы: вкл",
                 "callback_data": "quiet_off" if self.quiet_on else "quiet_on"},
                {"text": "▶️ Возобновить" if pause_active else "⏸ Пауза",
@@ -1775,11 +1840,11 @@ class Bot:
             return
         profit, b, s, route = d
         paper.init_balance(settings["amount"])
-        paper.start_cycle(settings["amount"], b, s, route, profit, label=label)
-        bank = trades.sbp_bank(b.pays) or "—"
+        cycle = paper.get_cycle(paper.start_cycle(settings["amount"], b, s, route, profit, label=label)) or {}
+        pay = trades.pay_label(cycle.get("pay_kind", ""), cycle.get("bank", ""), b.pays)
         qty = settings["amount"] / b.price
         text = (f"🧪 <b>Сухой прогон</b>: купил бы {_money(qty)} {b.asset} у {html.escape(b.nick)} "
-                f"по {_price(b.price)} ₽, оплата {bank} · план {profit:.2f}% · {label}")
+                f"по {_price(b.price)} ₽, оплата: {html.escape(pay)} · план {profit:.2f}% · {label}")
         if reasons:
             text += "\n" + "\n".join(f"• {html.escape(r)}" for r in reasons)
         await self.send(text, topic="signals")
@@ -2278,6 +2343,14 @@ class Bot:
             self.awaiting_amount = True
             await self.send(f"Введи сумму круга текстом, например 20000 или 1,5 млн "
                             f"(от {_money(AMOUNT_MIN)} до {_money(AMOUNT_MAX)} ₽).")
+        elif data == "mybanks":
+            text, kb = mybanks_view()
+            await self.send(text, markup=kb, topic="settings")
+        elif data.startswith(("ownbank:", "sbplim:")):
+            apply_mybanks(data)
+            text, kb = mybanks_view()
+            await self.call("editMessageText", chat_id=self.chat_id, message_id=cq["message"]["message_id"],
+                            text=text, parse_mode="HTML", reply_markup=kb)
         elif data == "accounts":
             t, kb = accounts_view(self.cfg)
             await self.send(t, markup=kb)
@@ -2360,6 +2433,9 @@ class Bot:
             await self.send(self.stats_view())
         elif cmd == "/paper":
             await self.cmd_paper(arg)
+        elif cmd == "/mybanks":
+            text, kb = mybanks_view()
+            await self.send(text, markup=kb, topic="settings")
         elif cmd == "/alert":
             if arg:
                 await self.add_alert(arg)

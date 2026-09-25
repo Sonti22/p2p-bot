@@ -6,8 +6,13 @@ import trades
 from helpers import make_ad
 
 
-def deal(profit=2.0):
-    return profit, make_ad("Bybit", "buy", 85.0), make_ad("MEXC", "sell", 90.0), "перевод −0.2 USDT (BEP20) на MEXC"
+def deal(profit=2.0, pays=("T-Bank",)):
+    return profit, make_ad("Bybit", "buy", 85.0, pays=pays), make_ad("MEXC", "sell", 90.0), "перевод −0.2 USDT (BEP20) на MEXC"
+
+
+def sbp_deal(profit=2.0):
+    """Мерчант принимает только СБП — платим по СБП со своего банка, лимит тратится."""
+    return deal(profit, pays=("SBP - Fast Bank Transfer",))
 
 
 def test_log_and_stats_within_periods(tmp_path):
@@ -49,46 +54,78 @@ def test_stats_empty_db_missing_file(tmp_path):
                      "fact_count": 0, "avg_fact": None, "avg_diff": None} for s in st.values())
 
 
-def test_sbp_bank_detects_known_names():
-    assert trades.sbp_bank(["T-Bank", "Bank Account"]) == "T-Bank"
-    assert trades.sbp_bank(["SBP - Fast Bank Transfer"]) == "SBP"
-    assert trades.sbp_bank(["Bank Account", "Payeer"]) == ""
+def test_bank_of_knows_names_from_all_venues():
+    for pay, bank in (("Tinkoff", "T-Bank"), ("T-Bank", "T-Bank"), ("Т-Банк", "T-Bank"), ("Sberbank", "Sberbank"),
+                      ("VTB Bank", "VTB"), ("OZON Bank", "Ozon Bank"), ("Promsvyazbank", "PSB"), ("PSB", "PSB"),
+                      ("Rosselkhozbank", "Rosselkhozbank"), ("Raiffeisen Bank", "Raiffeisen"),
+                      ("Yandex Bank", "Yandex Bank"), ("Sovkombank", "Sovcombank"), ("Sovcombank", "Sovcombank"),
+                      ("Alfa-bank", "Alfa-bank"), ("МТС Банк", "MTS Bank")):
+        assert trades.bank_of(pay) == bank, pay
+    for pay in ("SBP - Fast Bank Transfer", "Bank Transfer", "Bank Account", "Cash Deposit to Bank", "Payeer"):
+        assert trades.bank_of(pay) == "", pay
+    assert trades.is_sbp("SBP - Fast Bank Transfer") and trades.is_sbp("СБП") and not trades.is_sbp("Tinkoff")
+
+
+def test_pay_plan_intra_sbp_and_unknown():
+    own = (["T-Bank", "Sberbank"], False)
+    assert trades.pay_plan(["Tinkoff"], own=own) == ("intra", "T-Bank")                 # свой банк — внутри банка
+    assert trades.pay_plan(["SBP - Fast Bank Transfer"], own=own) == ("sbp", "T-Bank")  # только СБП — с первого
+    assert trades.pay_plan(["SBP"], over={"T-Bank"}, own=own) == ("sbp", "Sberbank")    # лимит исчерпан — следующий
+    assert trades.pay_plan(["SBP"], over={"T-Bank", "Sberbank"}, own=own) == ("sbp", "T-Bank")   # все за лимитом
+    assert trades.pay_plan(["Raiffeisen Bank"], own=own) == ("sbp", "T-Bank")          # чужой банк — по СБП
+    assert trades.pay_plan(["Raiffeisen Bank"], own=(["T-Bank"], True)) == ("intra", "Raiffeisen")   # «*»
+    assert trades.pay_plan(["Payeer", "Bank Transfer"], own=own) == ("", "")
+
+
+def test_free_limit_defaults_and_owner_tariffs(monkeypatch):
+    monkeypatch.delenv("SBP_FREE_LIMITS", raising=False)
+    assert trades.free_limit("T-Bank") == 100000 and trades.free_limit("VTB") == 300000
+    monkeypatch.setenv("SBP_FREE_LIMITS", "T-Bank:300000,VTB:inf,кривое,Sberbank:")
+    assert trades.free_limit("T-Bank") == 300000 and trades.free_limit("VTB") == float("inf")
+    assert trades.free_limit("Sberbank") == 100000
+
+
+def test_intra_bank_trade_does_not_use_sbp_limit(tmp_path):
+    db = str(tmp_path / "trades.db")
+    _, bank, total, crossed = trades.log_trade(deal(pays=("Tinkoff",)), 150000, path=db, ts=time.time())
+    assert bank == "T-Bank" and total == 0 and not crossed
+    assert trades.bank_month_total("T-Bank", path=db) == 0
 
 
 def test_log_trade_warns_once_when_bank_crosses_limit(tmp_path):
     db = str(tmp_path / "trades.db")
     now = time.time()
-    id1, _, total1, crossed1 = trades.log_trade(deal(), 60000, path=db, ts=now)      # 60к — ниже лимита
+    id1, _, total1, crossed1 = trades.log_trade(sbp_deal(), 60000, path=db, ts=now)      # 60к — ниже лимита
     assert total1 == 60000 and not crossed1
-    id2, bank2, total2, crossed2 = trades.log_trade(deal(), 60000, path=db, ts=now)  # 120к — пересекли 100к
+    id2, bank2, total2, crossed2 = trades.log_trade(sbp_deal(), 60000, path=db, ts=now)  # 120к — пересекли 100к
     assert bank2 == "T-Bank" and total2 == 120000 and crossed2
-    assert id2 != id1                                                           # каждая сделка — свой id
-    _, _, total3, crossed3 = trades.log_trade(deal(), 10000, path=db, ts=now)   # уже выше лимита, не повторяем
-    assert total3 == 130000 and not crossed3
+    assert id2 != id1                                                               # каждая сделка — свой id
+    _, bank3, total3, crossed3 = trades.log_trade(sbp_deal(), 10000, path=db, ts=now)   # Т-Банк за лимитом —
+    assert bank3 == "Sberbank" and total3 == 10000 and not crossed3                      # платим со следующего
 
 
 def test_log_trade_no_bank_when_pay_method_unknown(tmp_path):
     db = str(tmp_path / "trades.db")
     d = (2.0, make_ad("Bybit", "buy", 85.0, pays=("Payeer",)), make_ad("MEXC", "sell", 90.0), "маршрут")
     _, bank, total, crossed = trades.log_trade(d, 500000, path=db, ts=time.time())
-    assert bank == "" and total == 500000 and not crossed
+    assert bank == "" and total == 0 and not crossed
 
 
 def test_banks_over_limit_only_lists_banks_at_or_above_limit(tmp_path):
     db = str(tmp_path / "trades.db")
     now = time.time()
-    trades.log_trade(deal(), 60000, path=db, ts=now)          # T-Bank 60к — ниже лимита
-    trades.log_trade(deal(), 60000, path=db, ts=now)          # T-Bank 120к — уже выше
-    assert trades.banks_over_limit(["T-Bank", "SBP", ""], path=db, now=now) == {"T-Bank"}
+    trades.log_trade(sbp_deal(), 60000, path=db, ts=now)      # СБП с Т-Банка 60к — ниже лимита
+    trades.log_trade(sbp_deal(), 60000, path=db, ts=now)      # 120к — уже выше
+    assert trades.banks_over_limit(["T-Bank", "Sberbank", "VTB", ""], path=db, now=now) == {"T-Bank"}
 
 
 def test_bank_month_total_excludes_previous_month(tmp_path):
     db = str(tmp_path / "trades.db")
     now = time.time()
     prev_month = trades._month_start(now) - 86400   # день из прошлого календарного месяца
-    trades.log_trade(deal(), 90000, path=db, ts=prev_month)
+    trades.log_trade(sbp_deal(), 90000, path=db, ts=prev_month)
     assert trades.bank_month_total("T-Bank", path=db, now=now) == 0.0
-    trades.log_trade(deal(), 40000, path=db, ts=now)
+    trades.log_trade(sbp_deal(), 40000, path=db, ts=now)
     assert trades.bank_month_total("T-Bank", path=db, now=now) == 40000
 
 

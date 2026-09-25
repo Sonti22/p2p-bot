@@ -6,8 +6,9 @@ SQLite data/paper.db, таблицы:
   cycles  — один виртуальный круг: сумма, объявления покупки/продажи на момент старта, маршрут,
             плановая прибыль (%), текущая стадия (buy → transfer → sell, пока круг открыт),
             итог (result: done/failed_buy/failed_transfer/failed_sell, пока NULL — круг открыт),
-            реализованная прибыль (realized_pct) по ценам на момент стадий и банк оплаты (bank,
-            как trades.sbp_bank — для учёта виртуального оборота по лимиту СБП).
+            реализованная прибыль (realized_pct) по ценам на момент стадий, как платили (pay_kind:
+            intra — внутри банка, sbp — по СБП со своего банка, trades.pay_plan) и банк (bank) — для учёта
+            виртуального оборота по бесплатному лимиту СБП.
   balance — один виртуальный баланс: старт = PAPER_AMOUNT, меняется на realized_pct каждого
             завершённого круга.
 """
@@ -44,7 +45,7 @@ LADDER_DOWN_MIN_FAILED = 0.4   # доля сорвавшихся за недел
 
 _COLUMNS = ("id", "ts_start", "amount", "buy_ex", "buy_asset", "buy_price", "buy_nick",
             "sell_ex", "sell_asset", "sell_price", "sell_nick", "route", "planned_pct",
-            "stage", "ts_stage", "realized_pct", "result", "note", "bank", "label", "sell_fact")
+            "stage", "ts_stage", "realized_pct", "result", "note", "bank", "label", "sell_fact", "pay_kind")
 
 
 def settings():
@@ -70,9 +71,10 @@ def _connect(path):
                 "sell_ex TEXT, sell_asset TEXT, sell_price REAL, sell_nick TEXT, "
                 "route TEXT, planned_pct REAL, stage TEXT, ts_stage REAL, "
                 "realized_pct REAL DEFAULT NULL, result TEXT DEFAULT NULL, note TEXT DEFAULT '', "
-                "bank TEXT DEFAULT '', label TEXT DEFAULT '', sell_fact REAL DEFAULT NULL)")
+                "bank TEXT DEFAULT '', label TEXT DEFAULT '', sell_fact REAL DEFAULT NULL, pay_kind TEXT DEFAULT '')")
     cols = [r[1] for r in con.execute("PRAGMA table_info(cycles)")]
-    for col, ddl in (("bank", "TEXT DEFAULT ''"), ("label", "TEXT DEFAULT ''"), ("sell_fact", "REAL DEFAULT NULL")):
+    for col, ddl in (("bank", "TEXT DEFAULT ''"), ("label", "TEXT DEFAULT ''"), ("sell_fact", "REAL DEFAULT NULL"),
+                     ("pay_kind", "TEXT DEFAULT ''")):
         if col not in cols:   # база от прошлой версии — добавляем колонку, данные не трогаем
             con.execute(f"ALTER TABLE cycles ADD COLUMN {col} {ddl}")
     con.execute("CREATE TABLE IF NOT EXISTS balance (id INTEGER PRIMARY KEY CHECK (id = 1), "
@@ -116,19 +118,22 @@ def apply_result(realized_pct, amount, path=DB_PATH, ts=None):
 
 def start_cycle(amount, buy, sell, route, planned_pct, path=DB_PATH, ts=None, label=""):
     """Завести новый виртуальный круг со стадией buy. buy/sell — объявления покупки/продажи
-    (p2p.Ad) на момент старта. Банк оплаты (trades.sbp_bank по способам оплаты buy) пишется сразу —
-    в реальности рубли по СБП уходят в момент оплаты, до проверки стадии buy. label — метка надёжности
+    (p2p.Ad) на момент старта. Как платим (trades.pay_plan: внутри банка или по СБП со своего банка, у
+    которого виртуальный лимит ещё есть) пишется сразу — в реальности рубли уходят в момент оплаты, до
+    проверки стадии buy. label — метка надёжности
     связки на старте (p2p.reliability) — для разбора в отчёте. Возвращает id круга."""
     ts = ts if ts is not None else time.time()
-    bank = trades.sbp_bank(buy.pays)
+    own = trades.own_banks()[0]
+    over = {b for b in own if bank_month_total(b, path, ts) >= trades.free_limit(b)}
+    kind, bank = trades.pay_plan(buy.pays, over=over)
     con = _connect(path)
     with con:
         cur = con.execute(
-            "INSERT INTO cycles (ts_start, amount, buy_ex, buy_asset, buy_price, buy_nick, "
-            "sell_ex, sell_asset, sell_price, sell_nick, route, planned_pct, stage, ts_stage, bank, label) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'buy', ?, ?, ?)",
+            "INSERT INTO cycles (ts_start, amount, buy_ex, buy_asset, buy_price, buy_nick, sell_ex, sell_asset, "
+            "sell_price, sell_nick, route, planned_pct, stage, ts_stage, bank, label, pay_kind) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'buy', ?, ?, ?, ?)",
             (ts, amount, buy.ex, buy.asset, buy.price, buy.nick,
-             sell.ex, sell.asset, sell.price, sell.nick, route, planned_pct, ts, bank, label))
+             sell.ex, sell.asset, sell.price, sell.nick, route, planned_pct, ts, bank, label, kind))
         cycle_id = cur.lastrowid
     con.close()
     return cycle_id
@@ -266,15 +271,16 @@ def _month_start(ts):
 
 
 def bank_month_total(bank, path=DB_PATH, now=None):
-    """Сумма виртуальных «оплат» через банк с начала календарного месяца по МСК — как
+    """Сумма виртуальных «оплат» по СБП со своего банка с начала календарного месяца по МСК — как
     trades.bank_month_total, но по кругам сухого прогона (учитывает круг с момента старта, а не
-    только исполнившиеся: в реальности рубли по СБП уходят в момент оплаты)."""
+    только исполнившиеся: в реальности рубли уходят в момент оплаты). Переводы внутри банка лимит
+    не тратят; старые круги без pay_kind — считаются, как раньше."""
     if not bank or not os.path.exists(path):
         return 0.0
     now = time.time() if now is None else now
     con = _connect(path)
-    total, = con.execute("SELECT COALESCE(SUM(amount), 0) FROM cycles WHERE bank = ? AND ts_start >= ?",
-                         (bank, _month_start(now))).fetchone()
+    total, = con.execute("SELECT COALESCE(SUM(amount), 0) FROM cycles WHERE bank = ? AND ts_start >= ? "
+                         "AND pay_kind IN ('sbp', '')", (bank, _month_start(now))).fetchone()
     con.close()
     return total
 
@@ -282,14 +288,14 @@ def bank_month_total(bank, path=DB_PATH, now=None):
 def banks_this_month(path=DB_PATH, now=None):
     """{банк: сумма виртуальных «оплат» за календарный месяц} — только банки, через которые прошёл
     хоть один круг в этом месяце; для /paper — увидеть, на каком банке виртуальный оборот подходит
-    к бесплатному лимиту СБП (trades.BANK_LIMIT) до реальных денег. Только учёт, без советов по
+    к бесплатному лимиту СБП (trades.free_limit) до реальных денег. Только учёт, без советов по
     обходу лимита."""
     if not os.path.exists(path):
         return {}
     now = time.time() if now is None else now
     con = _connect(path)
-    rows = con.execute("SELECT DISTINCT bank FROM cycles WHERE bank != '' AND ts_start >= ?",
-                       (_month_start(now),)).fetchall()
+    rows = con.execute("SELECT DISTINCT bank FROM cycles WHERE bank != '' AND ts_start >= ? "
+                       "AND pay_kind IN ('sbp', '')", (_month_start(now),)).fetchall()
     con.close()
     return {b: bank_month_total(b, path, now) for (b,) in rows}
 

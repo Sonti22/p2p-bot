@@ -115,15 +115,25 @@ def test_pay_fee_applied():
     assert profit == pytest.approx(-0.5) and "банка" in route
 
 
-def test_pay_fee_auto_applied_when_bank_over_limit():
-    b, s = make_ad("MEXC", "buy", 88.0, pays=("T-Bank",)), make_ad("MEXC", "sell", 88.0)
+def test_pay_fee_auto_applied_when_bank_over_limit(monkeypatch):
+    monkeypatch.setenv("OWN_BANKS", "T-Bank")
+    b, s = make_ad("MEXC", "buy", 88.0, pays=("SBP",)), make_ad("MEXC", "sell", 88.0)   # мерчант — только СБП
     profit, route = p2p._route(b, s, cfg(), SPOT, over_banks={"T-Bank"})
     assert profit == pytest.approx(-trades.SBP_OVER_FEE)
-    assert "лимит СБП T-Bank исчерпан" in route
+    assert "лимит СБП Т-Банк исчерпан" in route
 
 
-def test_pay_fee_auto_skipped_when_bank_under_limit():
-    b, s = make_ad("MEXC", "buy", 88.0, pays=("T-Bank",)), make_ad("MEXC", "sell", 88.0)
+def test_intra_bank_payment_never_gets_sbp_fee(monkeypatch):
+    monkeypatch.setenv("OWN_BANKS", "T-Bank")
+    b, s = make_ad("MEXC", "buy", 88.0, pays=("Tinkoff",)), make_ad("MEXC", "sell", 88.0)   # внутри Т-Банка
+    profit, route = p2p._route(b, s, cfg(), SPOT, over_banks={"T-Bank"})
+    assert profit == pytest.approx(0.0) and "комиссия банка" not in route
+    assert p2p._route_qty(b, s, cfg(), SPOT, over_banks={"T-Bank"}) == p2p._route_qty(b, s, cfg(), SPOT)
+
+
+def test_pay_fee_auto_skipped_when_bank_under_limit(monkeypatch):
+    monkeypatch.setenv("OWN_BANKS", "T-Bank")
+    b, s = make_ad("MEXC", "buy", 88.0, pays=("SBP",)), make_ad("MEXC", "sell", 88.0)
     profit, route = p2p._route(b, s, cfg(), SPOT, over_banks=set())
     assert profit == pytest.approx(0.0)
     assert "комиссия банка" not in route
@@ -588,15 +598,16 @@ def test_profit_breakdown_unroutable_pair_is_none():
 
 def test_scan_applies_auto_fee_for_bank_over_limit(offline, monkeypatch):
     async def fake_fetcher(s, cfg, side, asset):
-        return [make_ad("Fake", side, 85.0 if side == "buy" else 90.0, pays=("T-Bank",))]
+        return [make_ad("Fake", side, 85.0 if side == "buy" else 90.0, pays=("SBP",))]
 
     monkeypatch.setitem(p2p.FETCHERS, "fake", fake_fetcher)
     monkeypatch.setattr(trades, "bank_month_total",
                         lambda bank, path=trades.DB_PATH, now=None: 150000.0 if bank == "T-Bank" else 0.0)
+    monkeypatch.setenv("OWN_BANKS", "T-Bank")
     c = p2p.Config(exchanges=["fake"], assets=["USDT"], min_orders=0, min_rate=0)
     snap = asyncio.run(p2p.scan(None, c))
     assert snap.deals
-    assert "лимит СБП T-Bank исчерпан" in snap.deals[0][3]
+    assert "лимит СБП Т-Банк исчерпан" in snap.deals[0][3]
 
 
 def test_spot_on_htx_and_kucoin_without_transfer():
