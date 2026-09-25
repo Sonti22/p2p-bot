@@ -1872,12 +1872,12 @@ def test_paper_view_shows_bank_limit_progress(monkeypatch, tmp_path):
     monkeypatch.setenv("PAPER", "1")
     db = str(tmp_path / "paper.db")
     _patch_paper_db(monkeypatch, db)
-    buy, sell = make_ad("Bybit", "buy", 85.0, pays=("T-Bank",)), make_ad("MEXC", "sell", 90.0)
+    buy, sell = make_ad("Bybit", "buy", 85.0, pays=("SBP",)), make_ad("MEXC", "sell", 90.0)
     paper.start_cycle(60000, buy, sell, "route", 2.0, path=db)
-    paper.start_cycle(60000, buy, sell, "route", 2.0, path=db)   # 120к — выше лимита 100к
+    paper.start_cycle(60000, buy, sell, "route", 2.0, path=db)   # 60к + 60к по СБП с Т-Банка — выше 100к
     text = Stub(p2p.Config()).paper_view()
     assert "Лимит СБП за месяц (виртуальный оборот):" in text
-    assert "⚠️ T-Bank: 120 000 ₽ / 100 000 ₽" in text
+    assert "⚠️ Т-Банк: 120 000 ₽ / 100 000 ₽" in text
 
 
 def test_paper_view_no_bank_section_when_no_cycles(monkeypatch, tmp_path):

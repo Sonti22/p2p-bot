@@ -747,8 +747,8 @@ def _route_qty(b, s, cfg, spot, over_banks=frozenset(), disable=frozenset()):
     издержек, которые надо считать нулевыми ('bank'/'withdraw'/'spot'/'risk') — для разложения
     прибыли на составляющие в profit_breakdown."""
     pay_fee = 0.0 if "bank" in disable else cfg.pay_fee
-    bank = trades.sbp_bank(b.pays)
-    if "bank" not in disable and bank in over_banks and pay_fee < trades.SBP_OVER_FEE:
+    kind, bank = trades.pay_plan(b.pays, over_banks)
+    if "bank" not in disable and kind == "sbp" and bank in over_banks and pay_fee < trades.SBP_OVER_FEE:
         pay_fee = trades.SBP_OVER_FEE
     qty = cfg.amount * (1 - pay_fee / 100) / b.price
     # вывод меньше минимума биржи в сети — сеть недоступна (как закрытая); при "withdraw" в disable
@@ -833,13 +833,14 @@ def _route_qty(b, s, cfg, spot, over_banks=frozenset(), disable=frozenset()):
 
 def _route(b, s, cfg, spot, over_banks=frozenset()):
     """Чистая прибыль % и шаги маршрута со всеми издержками; None, если связка невозможна.
-    over_banks — банки, уже превысившие месячный лимит СБП: комиссия банка выставляется автоматически,
-    даже если PAY_FEE в настройках не задан (или задан меньше)."""
+    over_banks — свои банки, уже исчерпавшие месячный лимит СБП: если платить мерчанту можно только по СБП и
+    все свои банки за лимитом (trades.pay_plan), комиссия банка выставляется автоматически, даже если PAY_FEE
+    в настройках не задан (или задан меньше). Перевод внутри банка лимит СБП не тратит."""
     steps = []
     pay_fee, auto_bank = cfg.pay_fee, ""
-    bank = trades.sbp_bank(b.pays)
-    if bank in over_banks and pay_fee < trades.SBP_OVER_FEE:
-        pay_fee, auto_bank = trades.SBP_OVER_FEE, bank
+    kind, bank = trades.pay_plan(b.pays, over_banks)
+    if kind == "sbp" and bank in over_banks and pay_fee < trades.SBP_OVER_FEE:
+        pay_fee, auto_bank = trades.SBP_OVER_FEE, trades.BANK_NAMES.get(bank, bank)
     if pay_fee:
         note = f" (лимит СБП {auto_bank} исчерпан)" if auto_bank else ""
         steps.append(f"комиссия банка −{pay_fee:g}%{note}")
@@ -1233,7 +1234,7 @@ async def scan(s, cfg, force_alt=False):
             if stacked:
                 buys.append(stacked)
 
-    over_banks = trades.banks_over_limit({trades.sbp_bank(b.pays) for b in buys})
+    over_banks = frozenset(trades.banks_over_limit(trades.own_banks()[0]))   # свои банки, у которых лимит СБП исчерпан
     deals = []
     for b in buys:
         for sl in sells:
