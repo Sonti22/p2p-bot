@@ -1043,6 +1043,46 @@ def maker_quote(groups, ex, asset, post_side):
     return price, counter_price, spread / counter_price * 100 + fee
 
 
+def maker_place(queue, price, post_side):
+    """Место своего объявления по цене `price` среди конкурентов `queue` — объявлений той же очереди
+    (для "buy_ad" — покупатели монеты, group[ex,"sell"]; для "sell_ad" — продавцы, group[ex,"buy"]),
+    лучшая цена первой. При равной цене конкурент выше: его объявление старше.
+    Возвращает (место с 1, всего объявлений вместе с моим, разрыв до 1-го места в ₽ — 0, если я первый)."""
+    if post_side == "buy_ad":
+        ahead = sum(1 for a in queue if a.price >= price - 1e-9)
+    elif post_side == "sell_ad":
+        ahead = sum(1 for a in queue if a.price <= price + 1e-9)
+    else:
+        raise ValueError(post_side)
+    return ahead + 1, len(queue) + 1, abs(queue[0].price - price) if ahead else 0.0
+
+
+def maker_neighbors(queue, place, n=5):
+    """До n конкурентов из `queue` вокруг своего места `place` (из maker_place): [(их место с учётом
+    моего объявления, Ad)] — окно сдвигается к краю, если я в начале или в конце очереди."""
+    i = place - 1
+    start = max(0, min(i - n // 2, len(queue) - n))
+    return [(j + 1 if j < i else j + 2, a) for j, a in enumerate(queue[start:start + n], start)]
+
+
+def book_spread(groups, ex, asset):
+    """Спред стакана площадки по лучшим объявлениям `groups` (прошли фильтры и отсев аномалий):
+    (аск — дешевле всех продают монету, бид — дороже всех покупают, (аск − бид) / бид в %).
+    None — нет одной из сторон."""
+    asks, bids = groups.get((ex, "buy", asset)), groups.get((ex, "sell", asset))
+    if not asks or not bids:
+        return None
+    ask, bid = asks[0].price, bids[0].price
+    return ask, bid, (ask - bid) / bid * 100
+
+
+def maker_round_fee(ex):
+    """Комиссия мейкера за круг «объявление на покупку + на продажу», % — по MAKER_FEE. None — площадки
+    в таблице нет: комиссия неизвестна, нулём её не считаем."""
+    fee = MAKER_FEE.get(ex)
+    return None if fee is None else fee.get("buy_ad", 0.0) + fee.get("sell_ad", 0.0)
+
+
 def bank_liquidity(groups, ex, asset):
     """{"buy"/"sell": {банк: (число объявлений, объём ₽)}} на площадке `ex` для `asset` — по объявлениям
     стакана (`groups`, как в `snap.groups`: уже прошли фильтры мерчанта и отсев аномалий). Объём
@@ -1074,6 +1114,7 @@ class Snapshot:
     groups: dict = field(default_factory=dict)      # (ex, side, asset) -> объявления стакана (отсортированы по цене)
     spot: dict = field(default_factory=dict)        # для deal_amounts: те же спот-цены, что использовал _route
     over_banks: frozenset = field(default_factory=frozenset)
+    book: dict = field(default_factory=dict)        # (ex, side, asset) -> вся выдача площадки до фильтров (/maker)
 
 
 _alt = {"t": 0.0, "ads": [], "errors": {}, "key": None}   # key — (монеты, площадки, сумма круга), под которые собран кэш
@@ -1237,6 +1278,16 @@ async def scan(s, cfg, force_alt=False):
             stacked = _stack(part, cfg.amount)
             if stacked:
                 buys.append(stacked)
+    # стакан, как его видят на площадке (первая страница выдачи, до своих фильтров мерчанта/оплаты), — место своего
+    # объявления в /maker; аномалии за MAX_DEV (ловушки, их показывает /traps) не в счёт — иначе «до 1-го» считалось бы
+    # до мусорной цены; обменники не нужны: на BestChange объявление не выставить
+    book = {}
+    for a in ads:
+        r = refs.get(a.asset)
+        if a.ex != "BestChange" and not (r and abs(a.price / r - 1) * 100 > cfg.max_dev):
+            book.setdefault((a.ex, a.side, a.asset), []).append(a)
+    for key, grp in book.items():
+        grp.sort(key=lambda a: a.price, reverse=(key[1] == "sell"))
 
     over_banks = frozenset(trades.banks_over_limit(trades.own_banks()[0]))   # свои банки, у которых лимит СБП исчерпан
     deals = []
@@ -1247,7 +1298,7 @@ async def scan(s, cfg, force_alt=False):
             d = _match(b, sl, cfg, spot, over_banks)
             if d:
                 deals.append(d)
-    snap = Snapshot(ref or 0, ref_src, refs, best, [], networks, dropped, errors, groups, spot, over_banks)
+    snap = Snapshot(ref or 0, ref_src, refs, best, [], networks, dropped, errors, groups, spot, over_banks, book)
     # сортировка «прибыль × надёжность»: каждая причина риска снимает risk_penalty п.п. с профита
     deals.sort(key=lambda d: d[0] - cfg.risk_penalty * len(reliability(d, cfg, snap)[1]), reverse=True)
     # обменники разных сетей дают по связке на одну и ту же пару площадок; бот сигналит по паре
