@@ -28,15 +28,32 @@ def _bybit_ads(body):
     return load("bybit_ads_sell.json" if (body or {}).get("side") == "0" else "bybit_ads.json")
 
 
+def _htx_ads(url):
+    """HTX кодирует сторону бота в query `tradeType` (значение — противоположная сторона стакана)."""
+    return load("htx_ads_sell.json" if "tradeType=buy" in url else "htx_ads.json")
+
+
+def _kucoin_ads(url):
+    return load("kucoin_ads_sell.json" if "side=BUY" in url else "kucoin_ads.json")
+
+
+def _mexc_ads(url):
+    return load("mexc_ads_sell.json" if "tradeType=BUY" in url else "mexc_ads.json")
+
+
+def _bitpapa_ads(url):
+    return load("bitpapa_ads_sell.json" if "type=buy" in url else "bitpapa_ads.json")
+
+
 # подстрока URL -> файл фикстуры (урезанные живые ответы площадок) или функция от URL
 ROUTES = [
     # спот-тикеры и справочники сетей — раньше общих правил по доменам htx.com / kucoin.com
     ("api.htx.com/market/tickers", "spot_htx.json"), ("api.kucoin.com/api/v1/market/allTickers", "spot_kucoin.json"),
     ("api.htx.com/v2/reference/currencies", _htx_currency), ("api.kucoin.com/api/v3/currencies/", _kucoin_currency),
     ("queryAllPaymentList", "bybit_pay.json"),
-    ("htx.com", "htx_ads.json"), ("kucoin.com", "kucoin_ads.json"),
+    ("htx.com", _htx_ads), ("kucoin.com", _kucoin_ads),
     ("payment/method", "mexc_pay.json"), ("common/coins", "mexc_coins.json"),
-    ("p2p.mexc.com/api/market", "mexc_ads.json"), ("bitpapa.com", "bitpapa_ads.json"),
+    ("p2p.mexc.com/api/market", _mexc_ads), ("bitpapa.com", _bitpapa_ads),
     ("api.bybit.com/v5/market/tickers", "spot_bybit.json"), ("api.mexc.com/api/v3/ticker", "spot_mexc.json"),
     ("rapira.net", "rapira.json"),
 ]
