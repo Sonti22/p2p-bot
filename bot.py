@@ -226,6 +226,9 @@ def save_env(key, value, path=ENV_PATH):
         lines.append(f"{key}={value}")
     with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
+    # и сразу в окружение процесса: PAPER, PAPER_AMOUNT и др. читаются через os.getenv при каждом обращении —
+    # без этого «/paper on» отвечал «включён», а работал только после перезапуска бота
+    os.environ[key] = str(value)
 
 
 def _qty(x):
