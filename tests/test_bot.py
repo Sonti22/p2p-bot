@@ -823,6 +823,44 @@ def test_hide_deal_tells_how_to_add_reason(tmp_path, monkeypatch):
     assert all(r[3] for r in rows)                                           # время добавления записано
 
 
+def _hide(monkeypatch, tmp_path, d):
+    """Нажать «🚫» под связкой d; вернуть ({(площадка, ник): id} из блэклиста, текст подтверждения, бот)."""
+    db = str(tmp_path / "blacklist.db")
+    monkeypatch.setattr(B.blacklist, "add", functools.partial(B.blacklist.add, path=db))
+    bot = Stub(p2p.Config())
+    asyncio.run(bot.hide_deal({"id": "1", "message": {"message_id": 9}}, bot.remember_deal(d)))
+    return {(ex, nick): entry_id for entry_id, ex, nick, *_ in blacklist.list_all(path=db)}, texts(bot)[-1], bot
+
+
+def _stack(ad, *nicks):
+    return dataclasses.replace(ad, nick=f"{len(nicks)} объявл.", nicks=nicks, parts=len(nicks))
+
+
+def test_hide_deal_stacked_buy_blacklists_every_merchant(tmp_path, monkeypatch):
+    b = _stack(make_ad("Bybit", "buy", 85.0), "Вася", "Петя", "Вася")        # Вася — два объявления стакана
+    rows, text, bot = _hide(monkeypatch, tmp_path, (3.0, b, make_ad("MEXC", "sell", 90.0), "маршрут"))
+    assert set(rows) == {("Bybit", "Вася"), ("Bybit", "Петя"), ("MEXC", "nick")}   # без «3 объявл.»
+    for (ex, nick), entry_id in rows.items():
+        assert f"{ex}: {nick} (id {entry_id})" in text
+    assert "объявл." not in text
+    assert bot.out[-1][0] == "editMessageReplyMarkup"
+
+
+def test_hide_deal_stacked_sell_blacklists_every_merchant(tmp_path, monkeypatch):
+    s = _stack(make_ad("BestChange", "sell", 90.0), "Обменник1 [TRC20]", "Обменник2 [TRC20]")
+    rows, text, _ = _hide(monkeypatch, tmp_path, (3.0, make_ad("Bybit", "buy", 85.0), s, "маршрут"))
+    assert set(rows) == {("Bybit", "nick"), ("BestChange", "Обменник1 [TRC20]"), ("BestChange", "Обменник2 [TRC20]")}
+    for (ex, nick), entry_id in rows.items():
+        assert f"{ex}: {nick} (id {entry_id})" in text
+
+
+def test_hide_deal_single_ad_unchanged(tmp_path, monkeypatch):
+    b = dataclasses.replace(make_ad("Bybit", "buy", 85.0), nicks=("nick",))  # одно объявление после _combined
+    rows, text, _ = _hide(monkeypatch, tmp_path, (3.0, b, make_ad("MEXC", "sell", 90.0), "маршрут"))
+    assert set(rows) == {("Bybit", "nick"), ("MEXC", "nick")}
+    assert text.count("(id ") == 2
+
+
 def test_blacklist_note_command_valid_and_invalid_id():
     entry_id = blacklist.add("Bybit", "Плохой")
     bot = Stub(p2p.Config())

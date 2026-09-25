@@ -1167,17 +1167,18 @@ class Bot:
         await self.save_fact(None, trade_id, row, fact)
 
     async def hide_deal(self, cq, deal_id):
-        """Кнопка «🚫 Не показывать»: занести обе стороны связки в блэклист, скан их больше не покажет."""
+        """Кнопка «🚫 Не показывать»: занести обе стороны связки в блэклист (у стакана — всех его мерчантов),
+        скан их больше не покажет."""
         entry = self.deals_by_id.pop(deal_id, None)
         if not entry:
             await self.call("answerCallbackQuery", callback_query_id=cq["id"], text="Сигнал устарел")
             return
         d, cfg, snap = entry
         _, b, s, _ = d
-        ids = [blacklist.add(a.ex, a.nick) for a in (b, s)]
+        # сторона из нескольких объявлений стакана («2 объявл.») — в список каждый настоящий мерчант из Ad.nicks
+        added = [(a.ex, nick, blacklist.add(a.ex, nick)) for a in (b, s) for nick in dict.fromkeys(a.nicks or (a.nick,))]
         await self.call("answerCallbackQuery", callback_query_id=cq["id"], text="Скрыто, больше не покажу")
-        hidden = ", ".join(f"{EXCHANGE_NAMES.get(a.ex, a.ex)}: {html.escape(a.nick)} (id {i})"
-                           for a, i in zip((b, s), ids))
+        hidden = ", ".join(f"{EXCHANGE_NAMES.get(ex, ex)}: {html.escape(nick)} (id {i})" for ex, nick, i in added)
         await self.send(f"🚫 В блэклисте: {hidden}.\n{BLACKLIST_NOTE_HELP}")
         await self.call("editMessageReplyMarkup", chat_id=self.chat_id, message_id=cq["message"]["message_id"],
                         reply_markup=self.markup(deal_markup(d, cfg=cfg, snap=snap)))
