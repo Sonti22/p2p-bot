@@ -100,9 +100,9 @@ def test_export_csv_columns_and_rows(tmp_path):
     trades.write_export_csv(rows, path=out)
     header, first, second = read_csv(out)
     assert header == list(trades.EXPORT_COLUMNS) + ["Маршрут"]
-    assert first == ["2026-09-10 12:30", "Bybit", "USDT", "MEXC", "USDT", "50000.00", "3.00", "2.00", "1000.00",
-                     "Т-Банк", "внутри банка", "перевод −0.2 USDT (BEP20) на MEXC"]
-    assert second[:9] == ["2026-09-11 08:05", "HTX", "USDT", "Bybit", "USDT", "20000.00", "1.50", "", ""]
+    assert first == ["2026-09-10 12:30", "Bybit", "USDT", "MEXC", "USDT", "50000,00", "3,00", "2,00", "1000,00",
+                     "Т-Банк", "внутри банка", "перевод −0.2 USDT (BEP20) на MEXC"]   # запятая — числа в русском Excel
+    assert second[:9] == ["2026-09-11 08:05", "HTX", "USDT", "Bybit", "USDT", "20000,00", "1,50", "", ""]
 
 
 def test_export_csv_includes_merchant_nicks_when_columns_exist(tmp_path):

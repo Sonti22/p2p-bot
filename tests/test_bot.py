@@ -877,11 +877,12 @@ def test_blacklist_note_command_valid_and_invalid_id():
     assert "📝 тянул с оплатой" in texts(bot)[-1]
 
 
-def test_owner_help_has_sbp_delay_note():
+def test_help_points_to_safety_where_sbp_delay_rule_lives():
+    """Правило ЦБ ОД-2506 — общая информация: одна справка для всех, само правило — в /safety."""
     bot = Stub(p2p.Config())
     asyncio.run(bot.handle("/help"))
-    assert "ОД-2506" in texts(bot)[-1] and "&gt; 200 000 ₽" in texts(bot)[-1]
-    assert "ОД-2506" not in B.GUIDE
+    assert "/safety" in texts(bot)[-1] and B.OWNER_GUIDE == B.GUIDE
+    assert "ОД-2506" in B.SAFETY and "200 000 ₽" in B.SAFETY
 
 
 def test_add_alert_creates_entry(tmp_path, monkeypatch):

@@ -129,9 +129,8 @@ GUIDE_BODY = ("<b>Как работать с сигналом</b>\n\n"
               "• НДФЛ с дохода от продажи крипты.\n"
               "• Проверки обменников (AML) и время: сделка может зависнуть.\n")
 GUIDE = GUIDE_BODY + "\nПлощадки:"
-# Справка владельца (он платит мерчантам со своих карт) — плюс строка про задержку СБП-переводов; гостям — GUIDE.
-OWNER_GUIDE = (GUIDE_BODY + "• С 01.01.2026 (приказ ЦБ ОД-2506) перевод новому получателю в течение суток после "
-               "перевода себе &gt; 200 000 ₽ через СБП банк может задержать.\n\nПлощадки:")
+# Справка одна для всех: правила ЦБ (ОД-2506 и др.) — общая информация, она в /safety (ссылка в GUIDE_BODY)
+OWNER_GUIDE = GUIDE
 LINKS = {"inline_keyboard": [
     [{"text": "Bybit P2P", "url": "https://www.bybit.com/fiat/trade/otc/?actionType=1&token=USDT&fiat=RUB"},
      {"text": "MEXC P2P", "url": "https://www.mexc.com/ru-RU/buy-crypto/p2p?fiat=RUB"}],
@@ -153,8 +152,10 @@ SAFETY = ("🛡 <b>Безопасность P2P</b> — справка, не ю�
           "• Крипту отпускай, только когда деньги реально пришли на счёт.\n\n"
           "<b>282-ФЗ.</b> До 30.06.2027 P2P на своём аккаунте работает как раньше. С 01.07.2027 сделки резидентов "
           "идут через посредников из реестра Банка России — проверь правила до этой даты.")
-EXPORT_PERIODS = {"month": "month", "месяц": "month", "year": "year", "год": "year"}
-EXPORT_HELP = "Формат: /export — сделки журнала за текущий месяц, /export year — с 1 января (МСК)."
+EXPORT_PERIODS = {"month": "month", "месяц": "month", "year": "year", "год": "year", "prev": "prev",
+                  "прошлый": "prev", "prevyear": "prevyear", "прошлыйгод": "prevyear"}
+EXPORT_HELP = ("Формат: /export — сделки журнала за текущий месяц; /export year — с 1 января; /export prev — "
+               "прошлый месяц; /export 2026 — весь 2026 год (для 3-НДФЛ); время — МСК.")
 EXPORT_NOTE = ("Это выгрузка данных журнала, не налоговая консультация: состав документов и расчёт налога "
                "сверяй с бухгалтером.")
 WAIT = "Первый скан ещё идёт, подожди пару секунд."
@@ -519,6 +520,9 @@ BLACKLIST_NOTE_HELP = ("Причина к записи: <code>/blacklist note &l
                        "/blacklist.")
 
 
+BLACKLIST_NOTE_SHOW, BLACKLIST_TEXT_MAX, BLACKLIST_BUTTONS_MAX = 60, 3800, 90   # лимиты Telegram: 4096 символов, 100 кнопок
+
+
 def blacklist_view(now=None):
     """Текст и кнопки «/blacklist»: список скрытых мерчантов/обменников — id, сколько дней в списке, причина —
     с удалением. Сами записи не снимаются: решает владелец."""
@@ -529,14 +533,18 @@ def blacklist_view(now=None):
     now = time.time() if now is None else now
     lines = ["🚫 <b>Блэклист</b>", "", "Скан больше не показывает связки с этими мерчантами и обменниками. "
              "Сами записи не снимаются — только кнопкой 🗑.", ""]
-    kb = []
-    for entry_id, ex, nick, added_ts, note in rows:
+    kb, size = [], sum(len(x) + 1 for x in lines) + len(BLACKLIST_NOTE_HELP) + 60
+    for i, (entry_id, ex, nick, added_ts, note) in enumerate(rows):
         name = EXCHANGE_NAMES.get(ex, ex)
         line = f"{name}: {html.escape(nick)} (id {entry_id})"
         if added_ts is not None:   # у записей из версии без даты возраст неизвестен
             line += f", в списке {max(0, int((now - added_ts) // 86400))} дн."
-        if note:
-            line += f" — 📝 {html.escape(note)}"
+        if note:   # полная причина — в /blacklist note; в списке коротко, чтобы влезть в 4096 символов Telegram
+            line += f" — 📝 {html.escape(note if len(note) <= BLACKLIST_NOTE_SHOW else note[:BLACKLIST_NOTE_SHOW] + '…')}"
+        if size + len(line) > BLACKLIST_TEXT_MAX or len(kb) >= BLACKLIST_BUTTONS_MAX:
+            lines.append(f"…и ещё {len(rows) - i} — сними часть записей кнопками 🗑, чтобы увидеть остальные.")
+            break
+        size += len(line) + 1
         lines.append(line)
         kb.append([{"text": f"🗑 {name}: {nick}"[:64], "callback_data": f"unbl:{entry_id}"}])
     lines += ["", BLACKLIST_NOTE_HELP]
@@ -1003,6 +1011,8 @@ class Bot:
         if self._fancy_failed(r, markup):
             params["reply_markup"] = plain_markup(markup)
             r = await self.call("sendMessage", **params)
+        if not r.get("ok"):
+            logger.warning("sendMessage: %s", r.get("description"))
         return r
 
     async def send_photo(self, png, caption, markup=None, topic=None, chat_id=None):
@@ -1450,14 +1460,16 @@ class Bot:
     async def cmd_export(self, arg):
         """/export [month|year] — журнал сделок за календарный месяц (по умолчанию) или год до сегодня по МСК:
         CSV-файл data/trades_export.csv (документы для банка по 115-ФЗ, данные для 3-НДФЛ) и короткая сводка."""
-        period = EXPORT_PERIODS.get((arg or "").strip().lower() or "month")
+        key = "".join((arg or "").lower().split()) or "month"
+        period = key if key.isdigit() and 2020 <= int(key) <= 2100 else EXPORT_PERIODS.get(key)
         if period is None:
             await self.send(EXPORT_HELP)
             return
         now = time.time()
-        since = trades.period_start(period, now)
-        span = f"с {datetime.fromtimestamp(since, MSK):%d.%m.%Y} по {datetime.fromtimestamp(now, MSK):%d.%m.%Y}"
-        rows = trades.export_rows(since)
+        since, until = trades.period_range(period, now)
+        last = (until - 1) if until is not None else now
+        span = f"с {datetime.fromtimestamp(since, MSK):%d.%m.%Y} по {datetime.fromtimestamp(last, MSK):%d.%m.%Y}"
+        rows = trades.export_rows(since, until=until)
         if not rows:
             await self.send(f"📤 Выгрузка {span}: сделок в журнале нет.")
             return
