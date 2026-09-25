@@ -14,6 +14,7 @@ SQLite data/paper.db, таблицы:
 """
 import csv
 import datetime
+import json
 import os
 import sqlite3
 import time
@@ -45,7 +46,8 @@ LADDER_DOWN_MIN_FAILED = 0.4   # доля сорвавшихся за недел
 
 _COLUMNS = ("id", "ts_start", "amount", "buy_ex", "buy_asset", "buy_price", "buy_nick",
             "sell_ex", "sell_asset", "sell_price", "sell_nick", "route", "planned_pct",
-            "stage", "ts_stage", "realized_pct", "result", "note", "bank", "label", "sell_fact", "pay_kind")
+            "stage", "ts_stage", "realized_pct", "result", "note", "bank", "label", "sell_fact", "pay_kind",
+            "sell_qty", "sell_net", "buy_nicks")
 
 
 def settings():
@@ -59,6 +61,8 @@ def settings():
         "max_open": int(os.getenv("PAPER_MAX_OPEN", 1)),
         # «🪤 ловушки» по умолчанию не берём — как не взял бы их автомат на этапе 2
         "traps": os.getenv("PAPER_TRAPS", "0").strip().lower() in ("1", "true", "yes", "on"),
+        # площадка круга не отвечает дольше — круг сорван (иначе занятый слот висел бы вечно)
+        "stale_minutes": float(os.getenv("PAPER_STALE_MINUTES", 30)),
     }
 
 
@@ -71,10 +75,12 @@ def _connect(path):
                 "sell_ex TEXT, sell_asset TEXT, sell_price REAL, sell_nick TEXT, "
                 "route TEXT, planned_pct REAL, stage TEXT, ts_stage REAL, "
                 "realized_pct REAL DEFAULT NULL, result TEXT DEFAULT NULL, note TEXT DEFAULT '', "
-                "bank TEXT DEFAULT '', label TEXT DEFAULT '', sell_fact REAL DEFAULT NULL, pay_kind TEXT DEFAULT '')")
+                "bank TEXT DEFAULT '', label TEXT DEFAULT '', sell_fact REAL DEFAULT NULL, pay_kind TEXT DEFAULT '', "
+                "sell_qty REAL DEFAULT NULL, sell_net TEXT DEFAULT '', buy_nicks TEXT DEFAULT '')")
     cols = [r[1] for r in con.execute("PRAGMA table_info(cycles)")]
     for col, ddl in (("bank", "TEXT DEFAULT ''"), ("label", "TEXT DEFAULT ''"), ("sell_fact", "REAL DEFAULT NULL"),
-                     ("pay_kind", "TEXT DEFAULT ''")):
+                     ("pay_kind", "TEXT DEFAULT ''"), ("sell_qty", "REAL DEFAULT NULL"), ("sell_net", "TEXT DEFAULT ''"),
+                     ("buy_nicks", "TEXT DEFAULT ''")):
         if col not in cols:   # база от прошлой версии — добавляем колонку, данные не трогаем
             con.execute(f"ALTER TABLE cycles ADD COLUMN {col} {ddl}")
     con.execute("CREATE TABLE IF NOT EXISTS balance (id INTEGER PRIMARY KEY CHECK (id = 1), "
@@ -116,12 +122,15 @@ def apply_result(realized_pct, amount, path=DB_PATH, ts=None):
     con.close()
 
 
-def start_cycle(amount, buy, sell, route, planned_pct, path=DB_PATH, ts=None, label=""):
+def start_cycle(amount, buy, sell, route, planned_pct, path=DB_PATH, ts=None, label="", sell_qty=None):
     """Завести новый виртуальный круг со стадией buy. buy/sell — объявления покупки/продажи
     (p2p.Ad) на момент старта. Как платим (trades.pay_plan: внутри банка или по СБП со своего банка, у
     которого виртуальный лимит ещё есть) пишется сразу — в реальности рубли уходят в момент оплаты, до
     проверки стадии buy. label — метка надёжности
-    связки на старте (p2p.reliability) — для разбора в отчёте. Возвращает id круга."""
+    связки на старте (p2p.reliability) — для разбора в отчёте. Для стадий запоминаем: sell_qty — сколько монеты
+    продажи выходит по маршруту (бот передаёт объём стека продажи из _match: после комиссий, без запаса на курс,
+    в монете продажи — и для межмонетных маршрутов; нет — оценка по плану, см. sell_qty()), sell_net — сеть обменника (стек продажи только этой сети), buy_nicks —
+    все мерчанты, из которых собрана покупка на сумму. Возвращает id круга."""
     ts = ts if ts is not None else time.time()
     own = trades.own_banks()[0]
     over = {b for b in own if bank_month_total(b, path, ts) >= trades.free_limit(b)}
@@ -130,10 +139,11 @@ def start_cycle(amount, buy, sell, route, planned_pct, path=DB_PATH, ts=None, la
     with con:
         cur = con.execute(
             "INSERT INTO cycles (ts_start, amount, buy_ex, buy_asset, buy_price, buy_nick, sell_ex, sell_asset, "
-            "sell_price, sell_nick, route, planned_pct, stage, ts_stage, bank, label, pay_kind) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'buy', ?, ?, ?, ?)",
+            "sell_price, sell_nick, route, planned_pct, stage, ts_stage, bank, label, pay_kind, sell_qty, sell_net, "
+            "buy_nicks) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'buy', ?, ?, ?, ?, ?, ?, ?)",
             (ts, amount, buy.ex, buy.asset, buy.price, buy.nick,
-             sell.ex, sell.asset, sell.price, sell.nick, route, planned_pct, ts, bank, label, kind))
+             sell.ex, sell.asset, sell.price, sell.nick, route, planned_pct, ts, bank, label, kind,
+             sell_qty, sell.net or "", json.dumps(list(buy.nicks or (buy.nick,)), ensure_ascii=False)))
         cycle_id = cur.lastrowid
     con.close()
     return cycle_id
@@ -173,22 +183,40 @@ def set_stage(cycle_id, stage, path=DB_PATH, ts=None):
     con.close()
 
 
-def check_buy_stage(cycle, snap, pay_minutes, now=None):
+def _venue_down(snap, ex, side, asset):
+    """Площадки в этом скане нет: запрос упал или она на паузе (snap.errors), либо её стакана нет вовсе —
+    по такому снимку решать о круге нельзя, ждём следующего."""
+    n = (ex or "").lower()
+    return (ex, side, asset) not in snap.groups or n in snap.errors or f"{n}/{asset}" in snap.errors
+
+
+def _stale(cycle, settings_minutes, now):
+    return now - cycle["ts_stage"] > settings_minutes * 60
+
+
+def check_buy_stage(cycle, snap, pay_minutes, now=None, stale_minutes=30.0):
     """Проверка исполнимости стадии buy по свежему снимку (только чтение snap.groups, без сети и
     без записи в БД — решение применяет вызывающий). Раньше PAPER_PAY_MINUTES с начала круга не
     ждём. После — ищем в текущем стакане покупки то же объявление (тот же мерчант): нет — мерчант
     ушёл/снял объявление, круг не состоялся. Цену не сравниваем: в ордере она фиксируется при создании.
+    Покупка собрана из нескольких объявлений (buy_nicks) — срыв, только если ушли все мерчанты. Площадка в
+    этом скане не ответила — ждём (дольше stale_minutes — срыв «площадка недоступна»).
 
     Возвращает (action, note):
-      "wait"    — ещё не прошло pay_minutes, ничего не решаем;
+      "wait"    — ещё не прошло pay_minutes или площадка не ответила, ничего не решаем;
       "advance" — объявление на месте — можно переходить к transfer;
-      "fail"    — объявление исчезло (result станет failed_buy).
+      "fail"    — все мерчанты покупки ушли (result станет failed_buy).
     """
     now = now if now is not None else time.time()
     if now - cycle["ts_stage"] < pay_minutes * 60:
         return "wait", ""
+    if _venue_down(snap, cycle["buy_ex"], "buy", cycle["buy_asset"]):
+        if _stale(cycle, max(stale_minutes, pay_minutes), now):
+            return "fail", f"площадка {cycle['buy_ex']} недоступна"
+        return "wait", ""
+    nicks = set(json.loads(cycle.get("buy_nicks") or "[]") or [cycle["buy_nick"]])
     ads = snap.groups.get((cycle["buy_ex"], "buy", cycle["buy_asset"]), [])
-    if not any(a.nick == cycle["buy_nick"] for a in ads):
+    if not any(a.nick in nicks for a in ads):
         return "fail", "объявление покупки исчезло"
     return "advance", ""
 
@@ -209,7 +237,15 @@ def check_transfer_stage(cycle, cfg, transfer_minutes, now=None):
     return "advance", ""
 
 
-def check_sell_stage(cycle, snap):
+def sell_qty(cycle):
+    """Сколько монеты продажи выходит по маршруту круга: сохранённый при старте объём стека продажи; у кругов
+    старой версии — оценка из плана (сумма × (1 + план) / плановая цена продажи)."""
+    if cycle.get("sell_qty"):
+        return cycle["sell_qty"]
+    return cycle["amount"] * (1 + cycle["planned_pct"] / 100) / cycle["sell_price"]
+
+
+def check_sell_stage(cycle, snap, now=None, stale_minutes=30.0):
     """Проверка стадии sell по свежему снимку (только чтение snap.groups, без сети и без записи
     в БД). Монета уже на площадке продажи — продаём тем, кто сейчас есть в стакане: цена — средняя по
     лучшим объявлениям на весь объём круга (p2p.sell_fill_price, тот же стек, что в _match), даже если
@@ -217,10 +253,18 @@ def check_sell_stage(cycle, snap):
     если покупателей на весь объём нет.
 
     Возвращает (action, note, price): price — фактическая цена продажи (для realized_pct) при
-    "advance", note — чем факт отличается от плана; "fail" — result станет failed_sell."""
+    "advance", note — чем факт отличается от плана; "fail" — result станет failed_sell; "wait" — площадка
+    продажи в этом скане не ответила (дольше stale_minutes — срыв). Объём — выход маршрута в монете продажи
+    (sell_qty), у обменника — только стакан той же сети (sell_net), что и в плане."""
+    now = now if now is not None else time.time()
+    if _venue_down(snap, cycle["sell_ex"], "sell", cycle["sell_asset"]):
+        if _stale(cycle, stale_minutes, now):
+            return "fail", f"площадка {cycle['sell_ex']} недоступна", None
+        return "wait", "", None
     ads = snap.groups.get((cycle["sell_ex"], "sell", cycle["sell_asset"]), [])
-    qty = cycle["amount"] / cycle["buy_price"]
-    price = p2p.sell_fill_price(ads, qty)
+    if cycle.get("sell_net"):
+        ads = [a for a in ads if a.net == cycle["sell_net"]]
+    price = p2p.sell_fill_price(ads, sell_qty(cycle))
     if price is None:
         return "fail", "не хватает глубины стакана продажи", None
     note = ""
@@ -231,11 +275,12 @@ def check_sell_stage(cycle, snap):
 
 
 def realized_pct(cycle, sell_price):
-    """Итоговая прибыль круга по факту: план (planned_pct) масштабируется на изменение цены продажи
-    относительно плана (цена покупки зафиксирована в ордере, вывод проверен на своей стадии — на
-    стадии sell меняется только цена продажи, в любую сторону)."""
-    ratio = sell_price / cycle["sell_price"]
-    return ((1 + cycle["planned_pct"] / 100) * ratio - 1) * 100
+    """Итоговая прибыль круга по факту: выручка за выход маршрута (sell_qty — уже после комиссий банка,
+    вывода и спота, без гипотетического запаса на курс) по фактической цене продажи против суммы круга.
+    Круги старой версии без sell_qty — план масштабируется на изменение цены продажи."""
+    if cycle.get("sell_qty"):
+        return (cycle["sell_qty"] * sell_price / cycle["amount"] - 1) * 100
+    return ((1 + cycle["planned_pct"] / 100) * sell_price / cycle["sell_price"] - 1) * 100
 
 
 def finish_cycle(cycle_id, result, realized_pct=0.0, note="", path=DB_PATH, ts=None, sell_fact=None):

@@ -13,7 +13,7 @@ def test_settings_defaults(monkeypatch):
         monkeypatch.delenv(k, raising=False)
     s = paper.settings()
     assert s == {"on": False, "amount": 10000.0, "pay_minutes": 5.0, "transfer_minutes": 3.0, "max_open": 1,
-                 "traps": False}
+                 "traps": False, "stale_minutes": 30.0}
 
 
 def test_settings_reads_env_each_call(monkeypatch):
@@ -172,7 +172,7 @@ def test_finish_cycle_failed_defaults_to_zero_realized(tmp_path):
 
 def _cycle_snap(buy_ex="Bybit", buy_asset="USDT", ads=()):
     import p2p
-    groups = {(buy_ex, "buy", buy_asset): list(ads)} if ads else {}
+    groups = {(buy_ex, "buy", buy_asset): list(ads)}   # площадка ответила (стакан может быть пустым)
     return p2p.Snapshot(88.0, "test", {}, {}, [], {}, {}, {}, groups=groups)
 
 
@@ -246,7 +246,7 @@ def _sell_cycle(sell_ex="MEXC", sell_asset="USDT", sell_nick="nick", sell_price=
 
 def _sell_snap(sell_ex="MEXC", sell_asset="USDT", ads=()):
     import p2p
-    groups = {(sell_ex, "sell", sell_asset): list(ads)} if ads else {}
+    groups = {(sell_ex, "sell", sell_asset): list(ads)}   # площадка ответила (стакан может быть пустым)
     return p2p.Snapshot(88.0, "test", {}, {}, [], {}, {}, {}, groups=groups)
 
 
@@ -278,7 +278,7 @@ def test_check_sell_stage_sells_at_worse_price_and_realizes_less():
 
 def test_check_sell_stage_uses_other_merchants_and_averages_depth():
     """Плановый мерчант ушёл — продаём тем, кто есть; объём не влезает в одно объявление — средняя цена."""
-    cycle = _sell_cycle()   # 10 000 ₽ / 85 ≈ 117,6 монеты
+    cycle = dict(_sell_cycle(), sell_qty=10000.0 / 85.0)   # выход маршрута ≈ 117,6 монеты
     a = p2p.Ad("MEXC", "sell", 91.0, 100, 5000, 50, ["T-Bank"], "other1", 200, 100.0, "", "USDT", "", "")
     b = p2p.Ad("MEXC", "sell", 89.0, 100, 500000, 1000, ["T-Bank"], "other2", 200, 100.0, "", "USDT", "", "")
     action, note, price = paper.check_sell_stage(cycle, _sell_snap(ads=[a, b]))

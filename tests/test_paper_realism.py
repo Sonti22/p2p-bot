@@ -20,8 +20,8 @@ def trap_deal():
 
 
 def good_deal():
-    b, s = ad("HTX", "buy", 87.5), ad("KuCoin", "sell", 90.0)
-    return 2.8, b, s, "перевод на KuCoin"
+    b, s = ad("HTX", "buy", 87.5), ad("KuCoin", "sell", 91.0)
+    return 3.9, b, s, "перевод на KuCoin"
 
 
 def snap_of(deals):

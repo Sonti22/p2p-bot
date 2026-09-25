@@ -232,6 +232,7 @@ class Ad:
     terms: str = ""  # условия мерчанта из объявления (remark/remarks/tradeTerms/conditions)
     all_pays: list = None  # исходные способы оплаты до фильтра _pays (объявление живёт в кэше _alt несколько сканов)
     parts: int = 1   # из скольких объявлений стакана собрано (_combined) — обменникам нужен свой перевод на каждого
+    nicks: tuple = ()  # ники всех объявлений, из которых собрано (_combined); у обычного объявления — пусто
 
 
 async def _json(s, method, url, body=None):
@@ -627,7 +628,8 @@ def _combined(used, price, total, qty):
     return Ad(used[0].ex, used[0].side, price, total, sum(a.max_amt for a in used), qty,
               sorted(set(p for a in used for p in a.pays)), used[0].nick if one else f"{len(used)} объявл.",
               min(a.orders for a in used), min(a.rate for a in used), used[0].url if one else "",
-              used[0].asset, nets.pop() if len(nets) == 1 else "", terms=terms, parts=len(used))
+              used[0].asset, nets.pop() if len(nets) == 1 else "", terms=terms, parts=len(used),
+              nicks=tuple(n for a in used for n in (a.nicks or (a.nick,))))
 
 
 def _net_parts(grp):

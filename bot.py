@@ -1830,8 +1830,8 @@ class Bot:
             if not self.is_confirmed(deal):
                 continue   # сигнала о ней ещё не было — выброс одного скана не берём
             d = deal_for_amount(deal, self.cfg, snap, settings["amount"])
-            if d is None:
-                continue   # глубины стакана на сумму сухого прогона не хватает
+            if d is None or d[0] < self.cfg.min_profit:
+                continue   # на сумму сухого прогона глубины не хватает или прибыль ниже порога
             label, reasons = reliability(d, self.cfg, snap)
             if label == TRAP and not settings["traps"]:
                 continue
@@ -1840,7 +1840,9 @@ class Bot:
             return
         profit, b, s, route = d
         paper.init_balance(settings["amount"])
-        cycle = paper.get_cycle(paper.start_cycle(settings["amount"], b, s, route, profit, label=label)) or {}
+        # s — стек продажи из _match: его объём (avail) = выход маршрута в монете продажи
+        cycle = paper.get_cycle(paper.start_cycle(settings["amount"], b, s, route, profit, label=label,
+                                                  sell_qty=s.avail)) or {}
         pay = trades.pay_label(cycle.get("pay_kind", ""), cycle.get("bank", ""), b.pays)
         qty = settings["amount"] / b.price
         text = (f"🧪 <b>Сухой прогон</b>: купил бы {_money(qty)} {b.asset} у {html.escape(b.nick)} "
@@ -1861,7 +1863,8 @@ class Bot:
         settings = paper.settings()
         for cycle in paper.open_cycles():
             if cycle["stage"] == "buy":
-                action, note = paper.check_buy_stage(cycle, snap, settings["pay_minutes"])
+                action, note = paper.check_buy_stage(cycle, snap, settings["pay_minutes"],
+                                                     stale_minutes=settings["stale_minutes"])
                 if action == "wait":
                     continue
                 if action == "fail":
@@ -1881,7 +1884,9 @@ class Bot:
                 else:
                     paper.set_stage(cycle["id"], "sell")
             elif cycle["stage"] == "sell":
-                action, note, price = paper.check_sell_stage(cycle, snap)
+                action, note, price = paper.check_sell_stage(cycle, snap, stale_minutes=settings["stale_minutes"])
+                if action == "wait":
+                    continue
                 if action == "fail":
                     paper.finish_cycle(cycle["id"], "failed_sell", 0.0, note)
                     await self.send(f"🧪 Сухой прогон: круг #{cycle['id']} сорвался на продаже — {note}",
