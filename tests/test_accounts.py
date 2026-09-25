@@ -1040,3 +1040,62 @@ def test_key_permissions_htx_unknown_key_and_kucoin_no_passphrase_are_unknown(tm
     other = {"code": 200, "data": [{"accessKey": "другой", "permission": "readOnly"}]}
     assert asyncio.run(accounts.key_permissions(_JsonSession(other), "htx")) == (None, "")
     assert asyncio.run(accounts.key_permissions(_JsonSession({}), "kucoin")) == (None, "")
+
+
+# verify_status/set_verified: статус последней проверки ключа для «🔑 Мои биржи» — отдельно от самого
+# результата verify()/key_permissions, только его запоминание между запусками.
+
+def test_verify_status_no_key_is_none(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    assert accounts.verify_status("bybit") == ("none", "")
+
+
+def test_verify_status_saved_key_never_checked_is_unknown(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    accounts.save_key("bybit", "k", "s")
+    assert accounts.verify_status("bybit") == ("unknown", "")
+
+
+def test_set_verified_ok_then_error_then_unknown(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    accounts.save_key("bybit", "k", "s")
+    accounts.set_verified("bybit", "ok")
+    assert accounts.verify_status("bybit") == ("ok", "")
+    accounts.set_verified("bybit", "error", "Invalid api_key")
+    assert accounts.verify_status("bybit") == ("error", "Invalid api_key")
+    accounts.set_verified("bybit", "unknown")
+    assert accounts.verify_status("bybit") == ("unknown", "")
+
+
+def test_set_verified_survives_process_restart(tmp_path, monkeypatch):
+    """Статус читается заново из data/keys.json, а не из памяти процесса."""
+    path = str(tmp_path / "keys.json")
+    monkeypatch.setattr(accounts, "KEYS_PATH", path)
+    accounts.save_key("mexc", "k", "s")
+    accounts.set_verified("mexc", "ok")
+    assert json.loads(open(path).read())["mexc"]["verified"] == "ok"
+    assert accounts.verify_status("mexc") == ("ok", "")
+
+
+def test_set_verified_resets_on_reconnect(tmp_path, monkeypatch):
+    """Новый ключ (переподключение) должен снова показывать «неизвестно», а не старое «ok»/«error»."""
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    accounts.save_key("bybit", "k", "s")
+    accounts.set_verified("bybit", "ok")
+    accounts.save_key("bybit", "k2", "s2")   # переподключили ключ
+    assert accounts.verify_status("bybit") == ("unknown", "")
+
+
+def test_set_verified_noop_without_saved_key(tmp_path, monkeypatch):
+    """Ключ не подключён (или уже удалён) — писать некуда, тихо ничего не делаем."""
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    accounts.set_verified("bybit", "ok")
+    assert accounts.verify_status("bybit") == ("none", "")
+
+
+def test_set_verified_noop_for_disabled_key(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    accounts.save_key("bybit", "k", "s")
+    accounts.delete_key("bybit")
+    accounts.set_verified("bybit", "ok")
+    assert accounts.verify_status("bybit") == ("none", "")
