@@ -1,8 +1,10 @@
 """Гости: доступ друга к сигналам и рыночным командам; настройки, ключи, журнал — только владельцу."""
 import asyncio
 
+import blacklist
 import bot as B
 import p2p
+import trades
 from helpers import make_ad
 
 
@@ -160,3 +162,19 @@ def test_background_send_unaffected_by_guest_context():
     asyncio.run(bot.send("фоновое сообщение"))
     assert sent(bot)[-1]["chat_id"] == "1"
     assert B.REPLY_CHAT.get() is None
+
+
+def test_guest_cannot_note_blacklist_and_gets_no_owner_risk_info():
+    """Причина в блэклисте, счётчик контрагентов в /stats и строка про СБП в справке — только владельцу."""
+    entry_id = blacklist.add("Bybit", "Плохой")
+    trades.log_trade(deal(), 10000)
+    bot = Stub(p2p.Config(), guests=["42"])
+    for cmd in (f"/blacklist note {entry_id} гость пишет", "/blacklist", "/stats"):
+        asyncio.run(bot.on_update(msg(42, cmd)))
+        assert sent(bot)[-1]["chat_id"] == "42" and sent(bot)[-1]["text"] == B.GUEST_DENIED, cmd
+    assert blacklist.list_all()[0][4] == ""
+    asyncio.run(bot.on_update(msg(42, "/help")))
+    assert sent(bot)[-1]["chat_id"] == "42" and "ОД-2506" not in sent(bot)[-1]["text"]
+    assert not any("Контрагенты" in p["text"] or "ОД-2506" in p["text"] for p in sent(bot) if p["chat_id"] == "42")
+    asyncio.run(bot.handle("/stats"))                                      # владельцу — блок есть
+    assert sent(bot)[-1]["chat_id"] == "1" and "Контрагенты по картам" in sent(bot)[-1]["text"]

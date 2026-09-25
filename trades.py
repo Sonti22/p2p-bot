@@ -61,6 +61,12 @@ FACT_PLAIN_AS_PERCENT_MAX = 50.0
 _FACT_PCT = re.compile(r"^([+-]?\d+(?:[.,]\d+)?)\s*%$")
 _FACT_RUB = re.compile(r"^([+-]?\d+(?:[.,]\d+)?)\s*(?:₽|руб\.?|р\.?)$", re.I)
 _FACT_PLAIN = re.compile(r"^([+-]?\d+(?:[.,]\d+)?)$")
+# Счётчик контрагентов по своей карте — только информация. Ориентир из методических рекомендаций ЦБ 16-МР:
+# больше 10 разных контрагентов в день или больше 50 в месяц — один из признаков, на которые смотрит банк.
+# ⚠️ в /stats — когда счётчик дошёл до COUNTERPARTY_WARN (80%) от ориентира.
+COUNTERPARTY_DAY = 10
+COUNTERPARTY_MONTH = 50
+COUNTERPARTY_WARN = 0.8
 
 
 def _connect(path):
@@ -69,7 +75,8 @@ def _connect(path):
     con.execute("CREATE TABLE IF NOT EXISTS trades ("
                 "id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, route TEXT, "
                 "buy_ex TEXT, buy_asset TEXT, sell_ex TEXT, sell_asset TEXT, "
-                "amount REAL, profit REAL, bank TEXT DEFAULT '', fact REAL DEFAULT NULL, kind TEXT DEFAULT '')")
+                "amount REAL, profit REAL, bank TEXT DEFAULT '', fact REAL DEFAULT NULL, kind TEXT DEFAULT '', "
+                "buy_nick TEXT DEFAULT '', sell_nick TEXT DEFAULT '')")
     cols = [r[1] for r in con.execute("PRAGMA table_info(trades)")]
     if "bank" not in cols:
         con.execute("ALTER TABLE trades ADD COLUMN bank TEXT DEFAULT ''")
@@ -77,6 +84,9 @@ def _connect(path):
         con.execute("ALTER TABLE trades ADD COLUMN fact REAL DEFAULT NULL")
     if "kind" not in cols:   # '' — старые записи: банк брался из объявления и всегда считался в лимит СБП
         con.execute("ALTER TABLE trades ADD COLUMN kind TEXT DEFAULT ''")
+    for col in ("buy_nick", "sell_nick"):   # '' — старые записи: мерчанты не записывались, в счётчик не идут
+        if col not in cols:
+            con.execute(f"ALTER TABLE trades ADD COLUMN {col} TEXT DEFAULT ''")
     return con
 
 
@@ -166,6 +176,51 @@ def _day_start(ts):
     return dt.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
 
 
+def _msk_month_start(ts):
+    """Начало календарного месяца по МСК — для счётчика контрагентов (сутки там тоже по МСК)."""
+    return datetime.datetime.fromtimestamp(_day_start(ts), MSK).replace(day=1).timestamp()
+
+
+def _nicks(ad):
+    """Ник(и) мерчанта для журнала: у связки, собранной из нескольких объявлений («2 объявл.»), — все ники
+    через «, » (Ad.nicks), иначе Ad.nick."""
+    return ", ".join(dict.fromkeys(ad.nicks)) if ad.nicks else ad.nick
+
+
+def month_banks(path=DB_PATH, now=None):
+    """Свои банки, с которых платили в сделках этого календарного месяца (МСК), по алфавиту — для /stats."""
+    if not os.path.exists(path):
+        return []
+    now = time.time() if now is None else now
+    con = _connect(path)
+    rows = con.execute("SELECT DISTINCT bank FROM trades WHERE bank != '' AND ts >= ? ORDER BY bank",
+                       (_msk_month_start(now),)).fetchall()
+    con.close()
+    return [r[0] for r in rows]
+
+
+def counterparties(bank, path=DB_PATH, now=None):
+    """(за сегодня, за месяц): сколько разных контрагентов — мерчантов покупки и продажи (buy_nick/sell_nick,
+    у собранной из стакана стороны — каждый ник) — в сделках с оплатой со своего банка `bank`. Сутки — по МСК
+    (_day_start), месяц — календарный по МСК. Контрагент — пара (площадка, ник). Только информация для /stats."""
+    if not bank or not os.path.exists(path):
+        return 0, 0
+    now = time.time() if now is None else now
+    day = _day_start(now)
+    con = _connect(path)
+    rows = con.execute("SELECT ts, buy_ex, buy_nick, sell_ex, sell_nick FROM trades WHERE bank = ? AND ts >= ?",
+                       (bank, _msk_month_start(now))).fetchall()
+    con.close()
+    today, month = set(), set()
+    for ts, buy_ex, buy_nick, sell_ex, sell_nick in rows:
+        who = {(ex, n.strip()) for ex, nicks in ((buy_ex, buy_nick), (sell_ex, sell_nick))
+               for n in (nicks or "").split(", ") if n.strip()}
+        month |= who
+        if ts >= day:
+            today |= who
+    return len(today), len(month)
+
+
 def bank_month_total(bank, path=DB_PATH, now=None):
     """Сумма отправленного со своего банка по СБП с начала текущего календарного месяца (переводы внутри банка
     лимит не тратят и не считаются; старые записи без kind — считаются, как и раньше)."""
@@ -186,7 +241,8 @@ def banks_over_limit(banks, path=DB_PATH, now=None):
 
 def log_trade(d, amount, path=DB_PATH, ts=None):
     """Записать сделку: d — (profit %, buy Ad, sell Ad, маршрут), amount — сумма круга в фиате. Как платили —
-    pay_plan (внутри банка или СБП со своего банка, у которого лимит ещё есть). Возвращает (id сделки — для
+    pay_plan (внутри банка или СБП со своего банка, у которого лимит ещё есть); ники мерчантов — в buy_nick/
+    sell_nick (счётчик контрагентов `counterparties`). Возвращает (id сделки — для
     ввода факта, банк, сумма по СБП за месяц с этой сделкой, пересёк ли этой сделкой бесплатный лимит банка)."""
     profit, b, s, route = d
     ts = ts if ts is not None else time.time()
@@ -195,8 +251,8 @@ def log_trade(d, amount, path=DB_PATH, ts=None):
     con = _connect(path)
     with con:
         cur = con.execute("INSERT INTO trades (ts, route, buy_ex, buy_asset, sell_ex, sell_asset, amount, profit, bank, "
-                          "kind) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                          (ts, route, b.ex, b.asset, s.ex, s.asset, amount, profit, bank, kind))
+                          "kind, buy_nick, sell_nick) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                          (ts, route, b.ex, b.asset, s.ex, s.asset, amount, profit, bank, kind, _nicks(b), _nicks(s)))
     trade_id = cur.lastrowid
     con.close()
     total = prev + amount if kind == "sbp" else 0.0

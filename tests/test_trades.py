@@ -1,3 +1,4 @@
+import dataclasses
 import datetime
 import sqlite3
 import time
@@ -276,3 +277,72 @@ def test_match_fact_picks_closest_candidate_by_time():
     }
     fact = trades.match_fact(trade, hist_by_ex)
     assert fact == (90.0 / 85.0 - 1) * 100
+
+
+def _cp_deal(buy_nick="b", sell_nick="s", pays=("T-Bank",), buy_nicks=(), sell_ex="MEXC"):
+    """Связка с заданными никами мерчантов; buy_nicks — покупка собрана из нескольких объявлений стакана."""
+    b = dataclasses.replace(make_ad("Bybit", "buy", 85.0, pays=pays), nick=buy_nick, nicks=tuple(buy_nicks))
+    s = dataclasses.replace(make_ad(sell_ex, "sell", 90.0), nick=sell_nick)
+    return 2.0, b, s, "маршрут"
+
+
+def test_log_trade_stores_merchant_nicks_and_stacked_nicks(tmp_path):
+    db = str(tmp_path / "trades.db")
+    trades.log_trade(_cp_deal("Вася", "Петя"), 10000, path=db, ts=time.time())
+    trades.log_trade(_cp_deal("2 объявл.", "Петя", buy_nicks=("a", "b", "a")), 10000, path=db, ts=time.time())
+    con = sqlite3.connect(db)
+    rows = con.execute("SELECT buy_nick, sell_nick FROM trades ORDER BY id").fetchall()
+    con.close()
+    assert rows == [("Вася", "Петя"), ("a, b", "Петя")]              # вместо «2 объявл.» — ники стакана
+
+
+def test_old_trades_db_is_migrated_with_nick_columns(tmp_path):
+    db = str(tmp_path / "trades.db")
+    con = sqlite3.connect(db)   # журнал прошлой версии: без buy_nick/sell_nick
+    con.execute("CREATE TABLE trades (id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, route TEXT, buy_ex TEXT, "
+                "buy_asset TEXT, sell_ex TEXT, sell_asset TEXT, amount REAL, profit REAL, bank TEXT DEFAULT '', "
+                "fact REAL DEFAULT NULL, kind TEXT DEFAULT '')")
+    con.execute("INSERT INTO trades (ts, route, buy_ex, buy_asset, sell_ex, sell_asset, amount, profit, bank, kind) "
+                "VALUES (?, 'r', 'Bybit', 'USDT', 'MEXC', 'USDT', 10000, 2.0, 'T-Bank', 'intra')", (time.time(),))
+    con.commit()
+    con.close()
+    assert trades.counterparties("T-Bank", path=db) == (0, 0)          # старая запись без ников — не в счёт
+    trades.log_trade(_cp_deal("Вася", "Петя"), 10000, path=db, ts=time.time())
+    assert trades.counterparties("T-Bank", path=db) == (2, 2)
+    assert trades.stats(path=db)["day"]["count"] == 2                   # старая сделка в журнале осталась
+
+
+def test_counterparties_dedup_and_bank_filter(tmp_path):
+    db = str(tmp_path / "trades.db")
+    now = time.time()
+    trades.log_trade(_cp_deal("Вася", "Петя"), 10000, path=db, ts=now)
+    trades.log_trade(_cp_deal("Вася", "Петя"), 10000, path=db, ts=now)                  # те же двое — не новые
+    trades.log_trade(_cp_deal("Вася", "Петя", sell_ex="HTX"), 10000, path=db, ts=now)   # Петя на HTX — другой
+    trades.log_trade(_cp_deal("Коля", "Женя", pays=("Sberbank",)), 10000, path=db, ts=now)  # другая карта
+    assert trades.counterparties("T-Bank", path=db, now=now) == (3, 3)
+    assert trades.counterparties("Sberbank", path=db, now=now) == (2, 2)
+    assert trades.counterparties("VTB", path=db, now=now) == (0, 0)
+    assert trades.counterparties("", path=db, now=now) == (0, 0)
+    assert trades.counterparties("T-Bank", path=str(tmp_path / "none.db")) == (0, 0)
+    assert trades.month_banks(path=db, now=now) == ["Sberbank", "T-Bank"]
+
+
+def test_counterparties_day_msk_vs_calendar_month(tmp_path):
+    db = str(tmp_path / "trades.db")
+    def at(*a):
+        return datetime.datetime(*a, tzinfo=trades.MSK).timestamp()
+
+    now = at(2026, 9, 25, 0, 30)                                           # чуть после полуночи МСК
+    trades.log_trade(_cp_deal("сегодня1", "сегодня2"), 10000, path=db, ts=at(2026, 9, 25, 0, 10))
+    trades.log_trade(_cp_deal("вчера", "сегодня2"), 10000, path=db, ts=at(2026, 9, 24, 23, 50))   # 40 мин назад
+    trades.log_trade(_cp_deal("август", "август2"), 10000, path=db, ts=at(2026, 8, 31, 23, 50))   # прошлый месяц
+    assert trades.counterparties("T-Bank", path=db, now=now) == (2, 3)
+    assert trades.month_banks(path=db, now=at(2026, 10, 1, 0, 5)) == []                 # новый месяц — пусто
+
+
+def test_counterparties_counts_each_nick_of_stacked_ad(tmp_path):
+    db = str(tmp_path / "trades.db")
+    now = time.time()
+    trades.log_trade(_cp_deal("3 объявл.", "Петя", buy_nicks=("a", "b", "c")), 10000, path=db, ts=now)
+    trades.log_trade(_cp_deal("a", "Петя"), 10000, path=db, ts=now)                     # «a» уже был в стакане
+    assert trades.counterparties("T-Bank", path=db, now=now) == (4, 4)

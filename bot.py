@@ -108,27 +108,30 @@ DEV_STATUS = os.path.join(HERE, ".dev_status.json")   # пишет launcher.py �
 DESCRIPTION = ("Сканирую P2P Bybit, MEXC, HTX, KuCoin, BitPapa и обменники BestChange. "
                "Присылаю связки USDT, USDC, BTC, ETH, TON за рубли: чистая прибыль, карточка, ссылки на площадки.")
 SHORT_DESCRIPTION = "Сигналы P2P-связок за рубли"
-GUIDE = ("<b>Как работать с сигналом</b>\n\n"
-         "1. «🟢 Купить» — откроется площадка. Найди мерчанта из карточки.\n"
-         "2. Если в маршруте есть спот — поменяй монету (кнопка «🔁 Спот»).\n"
-         "3. Переведи монету на площадку продажи: сеть и комиссия — в карточке.\n"
-         "4. «🔴 Продать» — продай мерчанту или обменнику из карточки.\n\n"
-         "<b>Безопасность</b>\n"
-         "• Оплата только от человека с ФИО как на бирже. Третьи лица — отказ.\n"
-         "• Крипту отпускай, только когда деньги видны в банке. Чек и скриншот — не подтверждение.\n"
-         "• Первая сделка с новым мерчантом или обменником — малой суммой.\n"
-         "• Спред от 5% часто плата за риск: читай условия мерчанта.\n"
-         "• Законы, документы для банка, блокировки карт — /safety.\n\n"
-         "<b>Что учтено в %</b>\n"
-         "• Комиссия вывода по бирже и сети: бот берёт самую дешёвую сеть, у обменника — его сеть.\n"
-         "• Спот 0,1% на бирже, где уже лежит монета.\n"
-         "• Запас на курс ETH 0,5%, TON 0,7%, BTC 0,3% — пока идут сделки и переводы.\n"
-         "• Комиссия банка — если задана PAY_FEE.\n\n"
-         "<b>Что НЕ учтено</b>\n"
-         "• СБП другим людям сверх 100 тыс. ₽/мес в банке — до 0,5%. Перевод по номеру карты в чужой банк — 1,5–2%.\n"
-         "• НДФЛ с дохода от продажи крипты.\n"
-         "• Проверки обменников (AML) и время: сделка может зависнуть.\n\n"
-         "Площадки:")
+GUIDE_BODY = ("<b>Как работать с сигналом</b>\n\n"
+              "1. «🟢 Купить» — откроется площадка. Найди мерчанта из карточки.\n"
+              "2. Если в маршруте есть спот — поменяй монету (кнопка «🔁 Спот»).\n"
+              "3. Переведи монету на площадку продажи: сеть и комиссия — в карточке.\n"
+              "4. «🔴 Продать» — продай мерчанту или обменнику из карточки.\n\n"
+              "<b>Безопасность</b>\n"
+              "• Оплата только от человека с ФИО как на бирже. Третьи лица — отказ.\n"
+              "• Крипту отпускай, только когда деньги видны в банке. Чек и скриншот — не подтверждение.\n"
+              "• Первая сделка с новым мерчантом или обменником — малой суммой.\n"
+              "• Спред от 5% часто плата за риск: читай условия мерчанта.\n"
+              "• Законы, документы для банка, блокировки карт — /safety.\n\n"
+              "<b>Что учтено в %</b>\n"
+              "• Комиссия вывода по бирже и сети: бот берёт самую дешёвую сеть, у обменника — его сеть.\n"
+              "• Спот 0,1% на бирже, где уже лежит монета.\n"
+              "• Запас на курс ETH 0,5%, TON 0,7%, BTC 0,3% — пока идут сделки и переводы.\n"
+              "• Комиссия банка — если задана PAY_FEE.\n\n"
+              "<b>Что НЕ учтено</b>\n"
+              "• СБП другим людям сверх 100 тыс. ₽/мес в банке — до 0,5%. Перевод по номеру карты в чужой банк — 1,5–2%.\n"
+              "• НДФЛ с дохода от продажи крипты.\n"
+              "• Проверки обменников (AML) и время: сделка может зависнуть.\n")
+GUIDE = GUIDE_BODY + "\nПлощадки:"
+# Справка владельца (он платит мерчантам со своих карт) — плюс строка про задержку СБП-переводов; гостям — GUIDE.
+OWNER_GUIDE = (GUIDE_BODY + "• С 01.01.2026 (приказ ЦБ ОД-2506) перевод новому получателю в течение суток после "
+               "перевода себе &gt; 200 000 ₽ через СБП банк может задержать.\n\nПлощадки:")
 LINKS = {"inline_keyboard": [
     [{"text": "Bybit P2P", "url": "https://www.bybit.com/fiat/trade/otc/?actionType=1&token=USDT&fiat=RUB"},
      {"text": "MEXC P2P", "url": "https://www.mexc.com/ru-RU/buy-crypto/p2p?fiat=RUB"}],
@@ -512,18 +515,31 @@ def presets_view(cfg):
     return "\n".join(lines), {"inline_keyboard": kb}
 
 
-def blacklist_view():
-    """Текст и кнопки «/blacklist»: список скрытых мерчантов/обменников с удалением."""
+BLACKLIST_NOTE_HELP = ("Причина к записи: <code>/blacklist note &lt;id&gt; &lt;текст&gt;</code> — id из списка "
+                       "/blacklist.")
+
+
+def blacklist_view(now=None):
+    """Текст и кнопки «/blacklist»: список скрытых мерчантов/обменников — id, сколько дней в списке, причина —
+    с удалением. Сами записи не снимаются: решает владелец."""
     rows = blacklist.list_all()
     if not rows:
         return ("🚫 <b>Блэклист пуст</b>\n\nКнопка «🚫 Не показывать» под сигналом добавляет сюда мерчанта "
                 "или обменника — скан больше не покажет связки с ним.", {"inline_keyboard": []})
-    lines = ["🚫 <b>Блэклист</b>", "", "Скан больше не показывает связки с этими мерчантами и обменниками.", ""]
+    now = time.time() if now is None else now
+    lines = ["🚫 <b>Блэклист</b>", "", "Скан больше не показывает связки с этими мерчантами и обменниками. "
+             "Сами записи не снимаются — только кнопкой 🗑.", ""]
     kb = []
-    for entry_id, ex, nick in rows:
+    for entry_id, ex, nick, added_ts, note in rows:
         name = EXCHANGE_NAMES.get(ex, ex)
-        lines.append(f"{name}: {html.escape(nick)}")
+        line = f"{name}: {html.escape(nick)} (id {entry_id})"
+        if added_ts is not None:   # у записей из версии без даты возраст неизвестен
+            line += f", в списке {max(0, int((now - added_ts) // 86400))} дн."
+        if note:
+            line += f" — 📝 {html.escape(note)}"
+        lines.append(line)
         kb.append([{"text": f"🗑 {name}: {nick}"[:64], "callback_data": f"unbl:{entry_id}"}])
+    lines += ["", BLACKLIST_NOTE_HELP]
     return "\n".join(lines), {"inline_keyboard": kb}
 
 
@@ -1151,18 +1167,31 @@ class Bot:
         await self.save_fact(None, trade_id, row, fact)
 
     async def hide_deal(self, cq, deal_id):
-        """Кнопка «🚫 Не показывать»: занести обе стороны связки в блэклист, скан их больше не покажет."""
+        """Кнопка «🚫 Не показывать»: занести обе стороны связки в блэклист (у стакана — всех его мерчантов),
+        скан их больше не покажет."""
         entry = self.deals_by_id.pop(deal_id, None)
         if not entry:
             await self.call("answerCallbackQuery", callback_query_id=cq["id"], text="Сигнал устарел")
             return
         d, cfg, snap = entry
         _, b, s, _ = d
-        blacklist.add(b.ex, b.nick)
-        blacklist.add(s.ex, s.nick)
+        # сторона из нескольких объявлений стакана («2 объявл.») — в список каждый настоящий мерчант из Ad.nicks
+        added = [(a.ex, nick, blacklist.add(a.ex, nick)) for a in (b, s) for nick in dict.fromkeys(a.nicks or (a.nick,))]
         await self.call("answerCallbackQuery", callback_query_id=cq["id"], text="Скрыто, больше не покажу")
+        hidden = ", ".join(f"{EXCHANGE_NAMES.get(ex, ex)}: {html.escape(nick)} (id {i})" for ex, nick, i in added)
+        await self.send(f"🚫 В блэклисте: {hidden}.\n{BLACKLIST_NOTE_HELP}")
         await self.call("editMessageReplyMarkup", chat_id=self.chat_id, message_id=cq["message"]["message_id"],
                         reply_markup=self.markup(deal_markup(d, cfg=cfg, snap=snap)))
+
+    async def blacklist_note(self, arg):
+        """«/blacklist note <id> <текст>» (только владелец): записать причину, почему мерчант в блэклисте."""
+        m = re.fullmatch(r"note\s+(\d+)\s+(.+)", (arg or "").strip(), re.I | re.S)
+        if not m:
+            await self.send(BLACKLIST_NOTE_HELP)
+        elif blacklist.set_note(int(m.group(1)), m.group(2)):
+            await self.send(f"📝 Причина записана (id {m.group(1)}). Список — /blacklist.")
+        else:
+            await self.send(f"В блэклисте нет записи с id {m.group(1)}. Список с id — /blacklist.")
 
     async def add_alert(self, arg):
         """Команда «/alert USDT sell 92 7d [vol 50000] [reliable] [repeat 1h]»: разобрать и создать
@@ -1252,6 +1281,16 @@ class Bot:
                 lines.append(line)
             else:
                 lines.append(f"{label}: сделок нет")
+        banks = trades.month_banks()
+        if banks:   # только информация: сколько разных мерчантов было по каждой своей карте
+            lines += ["", f"Контрагенты по картам (ориентир ЦБ 16-МР: &gt;{trades.COUNTERPARTY_DAY} в день, "
+                          f"&gt;{trades.COUNTERPARTY_MONTH} в месяц):"]
+            for bank in banks:
+                day, month = trades.counterparties(bank)
+                warn = [" ⚠️" if n >= trades.COUNTERPARTY_WARN * lim else ""
+                        for n, lim in ((day, trades.COUNTERPARTY_DAY), (month, trades.COUNTERPARTY_MONTH))]
+                lines.append(f"• {trades.BANK_NAMES.get(bank, bank)}: сегодня {day}{warn[0]}, "
+                             f"за месяц {month}{warn[1]}")
         lines.append("\nОтмечай связку кнопкой «✅ Сделал» под сигналом — так она попадёт в журнал, "
                      "затем укажи факт кнопкой или числом, чтобы сравнить расчёт с реальным результатом.")
         return "\n".join(lines)
@@ -2613,8 +2652,11 @@ class Bot:
             text, kb = alerts_view(self.chat_id)
             await self.send(text, markup=kb)
         elif cmd == "/blacklist":
-            text, kb = blacklist_view()
-            await self.send(text, markup=kb)
+            if arg.strip():
+                await self.blacklist_note(arg)
+            else:
+                text, kb = blacklist_view()
+                await self.send(text, markup=kb)
         elif cmd == "/traps":
             await self.send(traps_view())
         elif cmd == "/maker":
@@ -2654,7 +2696,7 @@ class Bot:
         elif cmd == "/resume":
             await self.cmd_resume()
         else:
-            await self.send(GUIDE, markup=LINKS)
+            await self.send(GUIDE if REPLY_CHAT.get() is not None else OWNER_GUIDE, markup=LINKS)
 
     async def drop_unsafe_key(self, ex, detail):
         """Ключ даёт больше, чем чтение: удалить его и попросить новый read-only."""

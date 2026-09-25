@@ -1,4 +1,5 @@
 import asyncio
+import dataclasses
 import functools
 import logging
 import os
@@ -794,6 +795,93 @@ def test_unbl_callback_removes_entry(tmp_path, monkeypatch):
     assert blacklist.list_all(path=db) == []
     method, params = bot.out[-1]
     assert method == "editMessageText" and "пуст" in params["text"].lower()
+
+
+def test_blacklist_view_shows_id_age_and_note():
+    now = time.time()
+    old = blacklist.add("Bybit", "Плохой", ts=now - 3 * 86400 - 60)
+    blacklist.set_note(old, "не <отпускал>")
+    fresh = blacklist.add("MEXC", "Новый", ts=now)
+    text, kb = B.blacklist_view(now=now)
+    assert f"Bybit: Плохой (id {old}), в списке 3 дн. — 📝 не &lt;отпускал&gt;" in text
+    assert f"MEXC: Новый (id {fresh}), в списке 0 дн.\n" in text                  # без причины — без «📝»
+    assert "/blacklist note &lt;id&gt; &lt;текст&gt;" in text
+    assert [b["callback_data"] for row in kb["inline_keyboard"] for b in row] == [f"unbl:{old}", f"unbl:{fresh}"]
+
+
+def test_hide_deal_tells_how_to_add_reason(tmp_path, monkeypatch):
+    db = str(tmp_path / "blacklist.db")
+    monkeypatch.setattr(B.blacklist, "add", functools.partial(B.blacklist.add, path=db))
+    bot = Stub(p2p.Config())
+    deal_id = bot.remember_deal(deal(5.0))
+    asyncio.run(bot.hide_deal({"id": "1", "message": {"message_id": 9}}, deal_id))
+    rows = blacklist.list_all(path=db)
+    ids = {ex: entry_id for entry_id, ex, *_ in rows}
+    text = texts(bot)[-1]
+    assert f"Bybit: nick (id {ids['Bybit']})" in text and f"MEXC: nick (id {ids['MEXC']})" in text
+    assert "/blacklist note &lt;id&gt; &lt;текст&gt;" in text
+    assert all(r[3] for r in rows)                                           # время добавления записано
+
+
+def _hide(monkeypatch, tmp_path, d):
+    """Нажать «🚫» под связкой d; вернуть ({(площадка, ник): id} из блэклиста, текст подтверждения, бот)."""
+    db = str(tmp_path / "blacklist.db")
+    monkeypatch.setattr(B.blacklist, "add", functools.partial(B.blacklist.add, path=db))
+    bot = Stub(p2p.Config())
+    asyncio.run(bot.hide_deal({"id": "1", "message": {"message_id": 9}}, bot.remember_deal(d)))
+    return {(ex, nick): entry_id for entry_id, ex, nick, *_ in blacklist.list_all(path=db)}, texts(bot)[-1], bot
+
+
+def _stack(ad, *nicks):
+    return dataclasses.replace(ad, nick=f"{len(nicks)} объявл.", nicks=nicks, parts=len(nicks))
+
+
+def test_hide_deal_stacked_buy_blacklists_every_merchant(tmp_path, monkeypatch):
+    b = _stack(make_ad("Bybit", "buy", 85.0), "Вася", "Петя", "Вася")        # Вася — два объявления стакана
+    rows, text, bot = _hide(monkeypatch, tmp_path, (3.0, b, make_ad("MEXC", "sell", 90.0), "маршрут"))
+    assert set(rows) == {("Bybit", "Вася"), ("Bybit", "Петя"), ("MEXC", "nick")}   # без «3 объявл.»
+    for (ex, nick), entry_id in rows.items():
+        assert f"{ex}: {nick} (id {entry_id})" in text
+    assert "объявл." not in text
+    assert bot.out[-1][0] == "editMessageReplyMarkup"
+
+
+def test_hide_deal_stacked_sell_blacklists_every_merchant(tmp_path, monkeypatch):
+    s = _stack(make_ad("BestChange", "sell", 90.0), "Обменник1 [TRC20]", "Обменник2 [TRC20]")
+    rows, text, _ = _hide(monkeypatch, tmp_path, (3.0, make_ad("Bybit", "buy", 85.0), s, "маршрут"))
+    assert set(rows) == {("Bybit", "nick"), ("BestChange", "Обменник1 [TRC20]"), ("BestChange", "Обменник2 [TRC20]")}
+    for (ex, nick), entry_id in rows.items():
+        assert f"{ex}: {nick} (id {entry_id})" in text
+
+
+def test_hide_deal_single_ad_unchanged(tmp_path, monkeypatch):
+    b = dataclasses.replace(make_ad("Bybit", "buy", 85.0), nicks=("nick",))  # одно объявление после _combined
+    rows, text, _ = _hide(monkeypatch, tmp_path, (3.0, b, make_ad("MEXC", "sell", 90.0), "маршрут"))
+    assert set(rows) == {("Bybit", "nick"), ("MEXC", "nick")}
+    assert text.count("(id ") == 2
+
+
+def test_blacklist_note_command_valid_and_invalid_id():
+    entry_id = blacklist.add("Bybit", "Плохой")
+    bot = Stub(p2p.Config())
+    asyncio.run(bot.handle(f"/blacklist note {entry_id} тянул с оплатой"))
+    assert "Причина записана" in texts(bot)[-1]
+    assert blacklist.list_all()[0][4] == "тянул с оплатой"
+    asyncio.run(bot.handle(f"/blacklist note {entry_id + 50} другое"))
+    assert f"нет записи с id {entry_id + 50}" in texts(bot)[-1]
+    for bad in ("/blacklist note abc текст", f"/blacklist note {entry_id}", "/blacklist что-то"):
+        asyncio.run(bot.handle(bad))
+        assert "/blacklist note &lt;id&gt;" in texts(bot)[-1], bad
+    assert blacklist.list_all()[0][4] == "тянул с оплатой"               # ни одна кривая команда не затёрла
+    asyncio.run(bot.handle("/blacklist"))
+    assert "📝 тянул с оплатой" in texts(bot)[-1]
+
+
+def test_owner_help_has_sbp_delay_note():
+    bot = Stub(p2p.Config())
+    asyncio.run(bot.handle("/help"))
+    assert "ОД-2506" in texts(bot)[-1] and "&gt; 200 000 ₽" in texts(bot)[-1]
+    assert "ОД-2506" not in B.GUIDE
 
 
 def test_add_alert_creates_entry(tmp_path, monkeypatch):
@@ -1820,6 +1908,27 @@ def test_stats_view_reports_counts(tmp_path, monkeypatch):
     text = bot.stats_view()
     assert "За сегодня: 1 сделок" in text and "За неделю: сделок нет" not in text
     assert "За месяц" in text
+
+
+def _nick_deal(buy_nick, sell_nick, pays=("T-Bank",)):
+    return 2.0, dataclasses.replace(make_ad("Bybit", "buy", 85.0, pays=pays), nick=buy_nick), \
+        dataclasses.replace(make_ad("MEXC", "sell", 90.0), nick=sell_nick), "маршрут"
+
+
+def test_stats_view_counterparties_block(tmp_path, monkeypatch):
+    db = str(tmp_path / "trades.db")
+    for name in ("stats", "month_banks", "counterparties"):
+        monkeypatch.setattr(B.trades, name, functools.partial(getattr(B.trades, name), path=db))
+    bot = Stub(p2p.Config())
+    assert "Контрагенты" not in bot.stats_view()                           # сделок нет — блока нет
+    now = time.time()
+    for i in range(4):                                                     # 8 разных мерчантов с Т-Банка —
+        trades.log_trade(_nick_deal(f"b{i}", f"s{i}"), 10000, path=db, ts=now)   # 80% от 10 в день
+    trades.log_trade(_nick_deal("b0", "s9", pays=("Sberbank",)), 10000, path=db, ts=now)
+    text = bot.stats_view()
+    assert "Контрагенты по картам (ориентир ЦБ 16-МР: &gt;10 в день, &gt;50 в месяц)" in text
+    assert "• Т-Банк: сегодня 8 ⚠️, за месяц 8\n" in text                   # за месяц 8 из 50 — без ⚠️
+    assert "• Сбер: сегодня 2, за месяц 2\n" in text
 
 
 def test_traps_view_empty():
