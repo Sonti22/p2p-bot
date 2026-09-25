@@ -605,6 +605,12 @@ def _stack_qty(ads, qty):
     return _combined(used, fiat / qty, fiat, qty)
 
 
+def sell_depth_ok(ads, qty):
+    """Хватает ли глубины стакана продажи (ads, лучшая цена первой) на qty монеты — та же проверка,
+    что и в _match при сборке связки; для стадии sell сухого прогона (paper.py)."""
+    return _stack_qty(ads, qty) is not None
+
+
 def _combined(used, price, total, qty):
     """Синтетическое Ad из использованных объявлений стакана: total — объём в фиате, qty — в монете;
     сеть сохраняем, если она у всех объявлений одна, условия мерчантов объединяем."""
@@ -686,6 +692,12 @@ def _withdraw(cfg, sender, asset, net="", receiver="", qty=None):
     if listed and not known and need and set(need) <= set(netstatus.KNOWN_NETS):
         return None   # справочник есть, а сети, которую принимает получатель (BitPapa — TRC20), в нём нет
     return cfg.transfer_fees.get(asset, 0), ""
+
+
+def withdraw_open(cfg, sender, asset, receiver=""):
+    """Есть ли у sender открытая сеть вывода asset (опционально — которую примет receiver); читает
+    fees.json/живой справочник netstatus, без сети. Для стадии transfer сухого прогона (paper.py)."""
+    return _withdraw(cfg, sender, asset, receiver=receiver) is not None
 
 
 def _hop(cfg, frm, frm_net, to, to_net, asset, qty=None, parts=1):

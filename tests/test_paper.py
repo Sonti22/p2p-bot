@@ -1,6 +1,8 @@
 import os
 import time
 
+import pytest
+
 import paper
 from helpers import make_ad
 
@@ -136,6 +138,85 @@ def test_check_buy_stage_ignores_different_merchant():
     ad = make_ad("Bybit", "buy", 84.0)   # цена ок, но не тот мерчант — не считается тем же объявлением
     action, note = paper.check_buy_stage(cycle, _cycle_snap(ads=[ad]), pay_minutes=5, now=1400.0)
     assert action == "fail" and "исчезло" in note
+
+
+def _cfg():
+    import p2p
+    c = p2p.Config()
+    c.risk_buffer, c.pay_fee = {}, 0.0
+    return c
+
+
+def test_check_transfer_stage_waits_before_transfer_minutes():
+    cycle = {"ts_stage": 1000.0, "buy_ex": "Bybit", "buy_asset": "USDT"}
+    action, note = paper.check_transfer_stage(cycle, _cfg(), transfer_minutes=3, now=1100.0)   # 100с < 180с
+    assert action == "wait" and note == ""
+
+
+def test_check_transfer_stage_advances_when_withdraw_open():
+    cycle = {"ts_stage": 1000.0, "buy_ex": "Bybit", "buy_asset": "USDT"}
+    action, note = paper.check_transfer_stage(cycle, _cfg(), transfer_minutes=3, now=1300.0)
+    assert action == "advance" and note == ""   # сведений о закрытии нет — не мешаем
+
+
+def test_check_transfer_stage_fails_when_withdraw_closed():
+    import netstatus
+    netstatus._apply("Bybit", "USDT", {n: {"dep": True, "wd": False, "fee": 1.0}
+                                        for n in ("TRC20", "BEP20", "ERC20", "TON")})
+    cycle = {"ts_stage": 1000.0, "buy_ex": "Bybit", "buy_asset": "USDT"}
+    action, note = paper.check_transfer_stage(cycle, _cfg(), transfer_minutes=3, now=1300.0)
+    assert action == "fail" and "закрыт" in note
+
+
+def _sell_cycle(sell_ex="MEXC", sell_asset="USDT", sell_nick="nick", sell_price=90.0,
+                buy_price=85.0, amount=10000.0):
+    return {"sell_ex": sell_ex, "sell_asset": sell_asset, "sell_nick": sell_nick,
+            "sell_price": sell_price, "buy_price": buy_price, "amount": amount, "planned_pct": 2.0}
+
+
+def _sell_snap(sell_ex="MEXC", sell_asset="USDT", ads=()):
+    import p2p
+    groups = {(sell_ex, "sell", sell_asset): list(ads)} if ads else {}
+    return p2p.Snapshot(88.0, "test", {}, {}, [], {}, {}, {}, groups=groups)
+
+
+def test_check_sell_stage_advances_when_ad_still_there_at_same_or_better_price():
+    cycle = _sell_cycle()
+    ad = make_ad("MEXC", "sell", 91.0, avail=10000)   # цена даже лучше плана, глубины хватает
+    action, note, price = paper.check_sell_stage(cycle, _sell_snap(ads=[ad]))
+    assert action == "advance" and note == "" and price == 91.0
+
+
+def test_check_sell_stage_fails_when_ad_gone():
+    cycle = _sell_cycle()
+    action, note, price = paper.check_sell_stage(cycle, _sell_snap())
+    assert action == "fail" and "исчезло" in note and price is None
+
+
+def test_check_sell_stage_fails_when_price_worse():
+    cycle = _sell_cycle()
+    ad = make_ad("MEXC", "sell", 89.0)   # тот же мерчант, цена упала — хуже плана продажи
+    action, note, price = paper.check_sell_stage(cycle, _sell_snap(ads=[ad]))
+    assert action == "fail" and "цена ушла" in note and price is None
+
+
+def test_check_sell_stage_fails_when_depth_insufficient():
+    cycle = _sell_cycle()
+    ad = make_ad("MEXC", "sell", 90.0, min_amt=1000, max_amt=1000, avail=1000 / 90.0)   # глубины мало
+    action, note, price = paper.check_sell_stage(cycle, _sell_snap(ads=[ad]))
+    assert action == "fail" and "глубины" in note and price is None
+
+
+def test_realized_pct_matches_planned_when_sell_price_unchanged():
+    cycle = _sell_cycle(sell_price=90.0)
+    assert paper.realized_pct(cycle, 90.0) == pytest.approx(2.0)
+
+
+def test_realized_pct_higher_when_sell_price_better():
+    cycle = _sell_cycle(sell_price=90.0)
+    rp = paper.realized_pct(cycle, 91.0)   # продали дороже плана — факт лучше плана
+    assert rp > 2.0
+    assert rp == pytest.approx((1.02 * 91.0 / 90.0 - 1) * 100)
 
 
 def test_finish_cycle_missing_id_returns_false_and_no_balance_change(tmp_path):

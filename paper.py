@@ -1,7 +1,7 @@
 """Сухой прогон (paper trading) — этап 1 полуавтомата: виртуальные круги без реальных денег,
-чтобы увидеть, что бот сделал бы сам, и сравнить план с фактом. Хранилище, движок и запуск круга
-по сигналу уже есть; проверка стадий transfer/sell по свежим снимкам (сейчас готова только buy)
-и команда /paper — в следующих задачах очереди.
+чтобы увидеть, что бот сделал бы сам, и сравнить план с фактом. Хранилище, движок, запуск круга
+по сигналу и все три стадии (buy → transfer → sell) готовы; команда /paper — в следующей задаче
+очереди.
 
 SQLite data/paper.db, таблицы:
   cycles  — один виртуальный круг: сумма, объявления покупки/продажи на момент старта, маршрут,
@@ -14,6 +14,8 @@ SQLite data/paper.db, таблицы:
 import os
 import sqlite3
 import time
+
+import p2p
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(HERE, "data", "paper.db")
@@ -158,6 +160,49 @@ def check_buy_stage(cycle, snap, pay_minutes, now=None):
     if ad.price > cycle["buy_price"]:
         return "fail", f"цена ушла: было {cycle['buy_price']:g} ₽, стало {ad.price:g} ₽"
     return "advance", ""
+
+
+def check_transfer_stage(cycle, cfg, transfer_minutes, now=None):
+    """Проверка стадии transfer по свежему справочнику (только чтение fees.json/netstatus через
+    p2p.withdraw_open, без сети и без записи в БД). Раньше PAPER_TRANSFER_MINUTES с начала стадии
+    не ждём. После — проверяем, что вывод buy_asset с buy_ex всё ещё возможен (известна комиссия,
+    сеть открыта) — иначе перевод сорвался бы в реальности.
+
+    Возвращает (action, note) как check_buy_stage: "wait"/"advance"/"fail" (result станет
+    failed_transfer)."""
+    now = now if now is not None else time.time()
+    if now - cycle["ts_stage"] < transfer_minutes * 60:
+        return "wait", ""
+    if not p2p.withdraw_open(cfg, cycle["buy_ex"], cycle["buy_asset"]):
+        return "fail", f"вывод {cycle['buy_asset']} с {cycle['buy_ex']} закрыт"
+    return "advance", ""
+
+
+def check_sell_stage(cycle, snap):
+    """Проверка стадии sell по свежему снимку (только чтение snap.groups, без сети и без записи
+    в БД). Объявление продажи (тот же мерчант) должно быть на месте, цена — не хуже плана, а
+    глубина стакана — хватать на объём круга (p2p.sell_depth_ok, как в _match при сборке связки).
+
+    Возвращает (action, note, price): price — цена продажи на момент проверки (для realized_pct),
+    только при "advance"; "fail" — result станет failed_sell."""
+    ads = snap.groups.get((cycle["sell_ex"], "sell", cycle["sell_asset"]), [])
+    ad = next((a for a in ads if a.nick == cycle["sell_nick"]), None)
+    if ad is None:
+        return "fail", "объявление продажи исчезло", None
+    if ad.price < cycle["sell_price"]:
+        return "fail", f"цена ушла: было {cycle['sell_price']:g} ₽, стало {ad.price:g} ₽", None
+    qty = cycle["amount"] / cycle["buy_price"]
+    if not p2p.sell_depth_ok(ads, qty):
+        return "fail", "не хватает глубины стакана продажи", None
+    return "advance", "", ad.price
+
+
+def realized_pct(cycle, sell_price):
+    """Итоговая прибыль круга по факту: план (planned_pct) масштабируется на изменение цены продажи
+    относительно плана (buy и вывод уже проверены на своих стадиях по цене/сети не хуже плана —
+    цена продажи на стадии sell единственная, что могла измениться в лучшую сторону)."""
+    ratio = sell_price / cycle["sell_price"]
+    return ((1 + cycle["planned_pct"] / 100) * ratio - 1) * 100
 
 
 def finish_cycle(cycle_id, result, realized_pct=0.0, note="", path=DB_PATH, ts=None):
