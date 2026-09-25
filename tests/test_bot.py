@@ -91,6 +91,7 @@ def _patch_paper_db(monkeypatch, db):
     monkeypatch.setattr(B.paper, "get_balance", functools.partial(B.paper.get_balance, path=db))
     monkeypatch.setattr(B.paper, "balance_change", functools.partial(B.paper.balance_change, path=db))
     monkeypatch.setattr(B.paper, "stats", functools.partial(B.paper.stats, path=db))
+    monkeypatch.setattr(B.paper, "ladder_suggestion", functools.partial(B.paper.ladder_suggestion, path=db))
 
 
 def test_paper_cycle_starts_on_signal_when_enabled(monkeypatch, tmp_path):
@@ -1900,6 +1901,89 @@ def test_cmd_paper_on_off_writes_env(monkeypatch, tmp_path):
     asyncio.run(bot.cmd_paper("off"))
     assert "PAPER=0" in env.read_text()
     assert "выключен" in texts(bot)[-1]
+
+
+def _fill_ladder_cycles(db, done=18, failed=2, ts=None):
+    buy, sell = make_ad("Bybit", "buy", 85.0), make_ad("MEXC", "sell", 90.0)
+    for _ in range(done):
+        cid = paper.start_cycle(10000, buy, sell, "route", 2.0, path=db, ts=ts)
+        paper.finish_cycle(cid, "done", realized_pct=2.0, path=db, ts=ts)
+    for _ in range(failed):
+        cid = paper.start_cycle(10000, buy, sell, "route", 2.0, path=db, ts=ts)
+        paper.finish_cycle(cid, "failed_sell", realized_pct=0.0, note="цена ушла", path=db, ts=ts)
+
+
+def test_check_paper_ladder_sends_up_suggestion_with_button(monkeypatch, tmp_path):
+    monkeypatch.setenv("PAPER", "1")
+    monkeypatch.setenv("PAPER_AMOUNT", "10000")
+    db = str(tmp_path / "paper.db")
+    _patch_paper_db(monkeypatch, db)
+    _fill_ladder_cycles(db)   # 20 кругов, срывов 10%, факт == план — критерии выполнены
+    bot = Stub(p2p.Config())
+    asyncio.run(bot.check_paper_ladder())
+    msgs = [(t, p.get("reply_markup")) for m, p in bot.out if m == "sendMessage"
+            for t in [p["text"]] if "20 000" in t]
+    assert len(msgs) == 1
+    text, markup = msgs[0]
+    assert "стабилен" in text
+    assert markup["inline_keyboard"][0][0]["callback_data"] == "paper_ladder:20000"
+
+
+def test_check_paper_ladder_sends_down_suggestion(monkeypatch, tmp_path):
+    monkeypatch.setenv("PAPER", "1")
+    monkeypatch.setenv("PAPER_AMOUNT", "20000")
+    db = str(tmp_path / "paper.db")
+    _patch_paper_db(monkeypatch, db)
+    now = time.time()
+    _fill_ladder_cycles(db, done=2, failed=3, ts=now)   # неделя: 60% сорвалось > 40%
+    bot = Stub(p2p.Config())
+    asyncio.run(bot.check_paper_ladder())
+    msgs = [t for t in texts(bot) if "10 000" in t]
+    assert len(msgs) == 1 and "срывов" in msgs[0]
+
+
+def test_check_paper_ladder_respects_cooldown(monkeypatch, tmp_path):
+    monkeypatch.setenv("PAPER", "1")
+    monkeypatch.setenv("PAPER_AMOUNT", "10000")
+    db = str(tmp_path / "paper.db")
+    _patch_paper_db(monkeypatch, db)
+    _fill_ladder_cycles(db)
+    bot = Stub(p2p.Config())
+    asyncio.run(bot.check_paper_ladder())
+    asyncio.run(bot.check_paper_ladder())   # второй раз сразу — кулдаун не прошёл
+    msgs = [t for t in texts(bot) if "20 000" in t]
+    assert len(msgs) == 1
+
+
+def test_check_paper_ladder_noop_when_off(monkeypatch, tmp_path):
+    monkeypatch.delenv("PAPER", raising=False)
+    db = str(tmp_path / "paper.db")
+    _patch_paper_db(monkeypatch, db)
+    _fill_ladder_cycles(db)
+    bot = Stub(p2p.Config())
+    asyncio.run(bot.check_paper_ladder())
+    assert not bot.out
+
+
+def test_check_paper_ladder_noop_without_chat_id(monkeypatch, tmp_path):
+    monkeypatch.setenv("PAPER", "1")
+    monkeypatch.setenv("PAPER_AMOUNT", "10000")
+    db = str(tmp_path / "paper.db")
+    _patch_paper_db(monkeypatch, db)
+    _fill_ladder_cycles(db)
+    bot = Stub(p2p.Config())
+    bot.chat_id = None
+    asyncio.run(bot.check_paper_ladder())
+    assert not bot.out
+
+
+def test_paper_ladder_callback_saves_env_and_confirms(monkeypatch, tmp_path):
+    env = tmp_path / ".env"
+    monkeypatch.setattr(B, "save_env", functools.partial(B.save_env, path=str(env)))
+    bot = Stub(p2p.Config())
+    asyncio.run(bot.on_callback({"id": "1", "data": "paper_ladder:20000", "message": {"message_id": 9}}))
+    assert "PAPER_AMOUNT=20000" in env.read_text()
+    assert "20 000" in texts(bot)[-1]
 
 
 def test_cmd_paper_amount_writes_env(monkeypatch, tmp_path):
