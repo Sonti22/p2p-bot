@@ -1,9 +1,11 @@
-import functools
-import importlib
+import inspect
 import json
 import logging
 import os
 import re
+import shutil
+import sys
+import tempfile
 
 import pytest
 
@@ -120,24 +122,152 @@ def _clean_netstatus():
     netstatus.reset()
 
 
-# Файлы из data/ живого бота. Смоук-тест launcher гоняет тесты в папке бота: без подмены тесты видят
-# подключённые ключи владельца (и падают — обновление откатывается) и могут дописать что-то в его базы.
-DATA_PATHS = [("accounts", "KEYS_PATH", "keys.json"), ("bot", "TOPICS_PATH", "topics.json"),
-              ("alerts", "DB_PATH", "alerts.db"), ("blacklist", "DB_PATH", "blacklist.db"),
-              ("history", "DB_PATH", "history.db"), ("paper", "DB_PATH", "paper.db"),
-              ("presets", "PRESETS_PATH", "presets.json"), ("trades", "DB_PATH", "trades.db")]
+# Изоляция от состояния живого бота. Смоук-тест launcher гоняет тесты в его папке: там data/ (ключи владельца,
+# базы, отчёты), logs/, .env и .dev_status.json. Без изоляции тесты видят это состояние (и падают — обновление
+# молча откатывается) и могут его испортить. Две линии защиты:
+# 1) подмена: константы модулей и классов бота и значения аргументов по умолчанию (`path=DB_PATH` фиксируется
+#    при импорте), ведущие в состояние, направляем во временную папку — на всю сессию (код сборки тестов,
+#    фикстуры module/session) и заново пустую на каждый тест;
+# 2) сторож: audit hook роняет тест при любом open/sqlite3.connect/rename/remove внутри состояния бота — ловит
+#    то, что подмена не нашла (путь, собранный при вызове, словари, partial и т. п.).
+# launcher в поиск не входит: у его тестов свои подмены. Корень не сканируем по glob — посторонний скрипт в папке
+# бота не должен выполняться при загрузке тестов; берём модули, которые импортирует сам бот.
+import bot as _bot  # noqa: E402,F401  (тянет все модули бота)
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+STATE_DIRS = ("data", "logs")                                     # каталоги состояния целиком
+STATE_ROOT_FILES = (".env", ".dev_status.json", ".last_good")     # файлы состояния в корне бота
+
+
+def _norm(path):
+    return os.path.normcase(os.path.normpath(path))
+
+
+_STATE_PREFIXES = [_norm(os.path.join(ROOT, d)) for d in STATE_DIRS]
+_STATE_ROOT_ABS = {_norm(os.path.join(ROOT, f)) for f in STATE_ROOT_FILES}
+
+
+def _in_state(full):
+    n = _norm(full)
+    return n in _STATE_ROOT_ABS or any(n == d or n.startswith(d + os.sep) for d in _STATE_PREFIXES)
+
+
+def _state_rel(value):
+    """Путь состояния бота относительно его папки ("data/keys.json", "data", ".env") или None. Относительный
+    путь считаем от папки бота — так его видят бот и смоук-тест. Нужен разделитель: "data" без него — не путь."""
+    if isinstance(value, os.PathLike):
+        value = os.fspath(value)
+    if not isinstance(value, str) or "://" in value or "\n" in value or not ("/" in value or os.sep in value):
+        return None
+    full = os.path.normpath(value if os.path.isabs(value) else os.path.join(ROOT, value))
+    return os.path.relpath(full, ROOT).replace(os.sep, "/") if _in_state(full) else None
+
+
+def _classes(owner, module_name):
+    for obj in list(vars(owner).values()):
+        if inspect.isclass(obj) and obj.__module__ == module_name:
+            yield obj
+            yield from _classes(obj, module_name)
+
+
+def _functions(owner, module_name):
+    """Функции и методы (вместе со слоями декораторов через __wrapped__) — у них пути бывают по умолчанию."""
+    for obj in list(vars(owner).values()):
+        obj = getattr(obj, "__func__", obj)   # staticmethod/classmethod
+        while inspect.isfunction(obj) and obj.__module__ == module_name:
+            yield obj
+            obj = getattr(obj, "__wrapped__", None)
+
+
+# Исходные значения собираем при первом просмотре модуля: подмены ниже строятся от них, а не от текущих
+STATE_FILES = {}   # {исходный путь: путь относительно временной папки} — для отчёта и проверок
+_ATTRS = {}        # {(модуль или класс, имя): исходное значение}
+_FUNCS = {}        # {функция: (исходные __defaults__, __kwdefaults__)}
+_CHECKED = set()   # имена уже просмотренных модулей sys.modules (любых, не только бота)
+
+
+def _scan():
+    """Досмотреть новые модули из папки бота (кроме launcher)."""
+    for name, mod in list(sys.modules.items()):
+        if name in _CHECKED:
+            continue
+        _CHECKED.add(name)
+        f = getattr(mod, "__file__", None)
+        if not f or name == "launcher" or _norm(os.path.dirname(os.path.abspath(f))) != _norm(ROOT):
+            continue
+        for owner in (mod, *_classes(mod, name)):
+            for attr, value in list(vars(owner).items()):
+                if _state_rel(value):
+                    STATE_FILES[os.fspath(value)] = _state_rel(value)
+                    _ATTRS[(owner, attr)] = value
+            for func in _functions(owner, name):
+                defaults, kwdefaults = func.__defaults__ or (), func.__kwdefaults__ or {}
+                if any(_state_rel(d) for d in (*defaults, *kwdefaults.values())):
+                    _FUNCS[func] = (func.__defaults__, func.__kwdefaults__)
+
+
+def _redirect(mp, root):
+    """Всё найденное состояние бота — в папку root (через monkeypatch mp, откат — его undo)."""
+    def moved(value):
+        rel = _state_rel(value)
+        if rel is None:
+            return value
+        new = os.path.join(str(root), *rel.split("/"))
+        return type(value)(new) if isinstance(value, os.PathLike) else new
+
+    for d in STATE_DIRS:
+        os.makedirs(os.path.join(str(root), d), exist_ok=True)
+    for (owner, attr), value in _ATTRS.items():
+        mp.setattr(owner, attr, moved(value))
+    for func, (defaults, kwdefaults) in _FUNCS.items():
+        if defaults:
+            mp.setattr(func, "__defaults__", tuple(moved(d) for d in defaults))
+        if kwdefaults:
+            mp.setattr(func, "__kwdefaults__", {k: moved(v) for k, v in kwdefaults.items()})
+
+
+_GUARD = {"on": False}
+_GUARD_EVENTS = {"open", "sqlite3.connect", "os.rename", "os.remove", "os.rmdir", "os.mkdir", "os.truncate",
+                 "os.listdir", "os.scandir", "shutil.rmtree", "shutil.copyfile", "shutil.move"}
+
+
+def _guard(event, args):
+    """Audit hook: тест не должен касаться состояния живого бота — ни читать, ни писать. Исключение
+    возникает до самой операции, так что файл не открывается и не меняется. Путь проверяем от текущей папки."""
+    if not _GUARD["on"] or event not in _GUARD_EVENTS:
+        return
+    for arg in args[:2]:
+        if isinstance(arg, bytes):
+            arg = os.fsdecode(arg)
+        if isinstance(arg, os.PathLike):
+            arg = os.fspath(arg)
+        if isinstance(arg, str) and arg and arg != ":memory:" and _in_state(os.path.abspath(arg)):
+            raise PermissionError(f"тест обращается к состоянию живого бота ({event}: {arg}) — подмени путь "
+                                  f"на tmp_path или добавь его в изоляцию в tests/conftest.py")
+
+
+_scan()
+_SESSION_MP = pytest.MonkeyPatch()
+_SESSION_ROOT = tempfile.mkdtemp(prefix="p2p-botstate-")
+_redirect(_SESSION_MP, _SESSION_ROOT)
+sys.addaudithook(_guard)   # снять hook нельзя — выключаем флагом в pytest_unconfigure
+_GUARD["on"] = True
+
+
+def pytest_unconfigure(config):
+    _GUARD["on"] = False
+    _SESSION_MP.undo()
+    shutil.rmtree(_SESSION_ROOT, ignore_errors=True)
 
 
 @pytest.fixture(autouse=True)
 def _isolated_data(tmp_path_factory, monkeypatch):
-    """Каждый тест работает с пустой data/ во временной папке, а не с data/ из текущей; .env бота тоже не трогаем.
-    Папка своя, а не внутри tmp_path: тесты вроде jsonstore проверяют, что в tmp_path нет лишних файлов."""
-    data = tmp_path_factory.mktemp("botdata")
-    for module, attr, name in DATA_PATHS:
-        monkeypatch.setattr(importlib.import_module(module), attr, str(data / name))
-    bot = importlib.import_module("bot")
-    monkeypatch.setattr(bot, "save_env", functools.partial(bot.save_env, path=str(data / ".env")))
-    return data
+    """Каждый тест — с пустыми data/ и logs/ и без .env во временной папке. Папка своя, а не tmp_path: тесты
+    вроде jsonstore проверяют, что в tmp_path пусто. Модули, которые тест импортировал сам, досматриваем тут."""
+    _scan()
+    root = tmp_path_factory.mktemp("botstate")
+    _redirect(monkeypatch, root)
+    return root / "data"
 
 
 @pytest.fixture(autouse=True)
