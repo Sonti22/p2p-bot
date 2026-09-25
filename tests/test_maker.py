@@ -163,3 +163,15 @@ def test_maker_view_length_with_all_venues():
     worst = B.maker_view(_full_book(("Raiffeisenbank", "SBP - Fast Bank Transfer", "Tinkoff", "Sberbank"),
                                     100000, 1500000, 123456.78, 123456), cfg, "USDT")
     assert worst.count("⚠️ лимиты не пересекаются") == 5 and _tg_len(worst) < 4096
+
+
+def test_remembered_deals_do_not_keep_the_full_book():
+    """Полный стакан (Snapshot.book) нужен /maker только по свежему снимку — 200 запомненных сделок его не держат."""
+    import bot as B
+    from test_bot import Stub
+    bot = Stub(p2p.Config())
+    ad = p2p.Ad("Bybit", "buy", 85.0, 1000, 500000, 1e4, ["SBP"], "m", 1000, 100.0)
+    snap = p2p.Snapshot(88.0, "t", {}, {}, [], {}, {}, {}, book={("Bybit", "buy", "USDT"): [ad]})
+    deal_id = bot.remember_deal((2.0, ad, ad, "r"), snap=snap)
+    kept = bot.deals_by_id[deal_id][2]
+    assert kept.book == {} and snap.book and kept.groups is snap.groups

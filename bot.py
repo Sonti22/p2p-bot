@@ -1136,6 +1136,8 @@ class Bot:
         """Запомнить связку под кнопками «✅ Сделал»/«📋 Шаги»; хранится ограниченное число последних."""
         cfg = copy.deepcopy(cfg or self.cfg)   # снимок настроек (и списков): старая карточка не увидит новые сумму/порог
         snap = snap if snap is not None else self.last
+        if snap is not None and snap.book:   # полный стакан нужен только /maker по свежему снимку — не держим его в 200 сделках
+            snap = dataclasses.replace(snap, book={})
         deal_id, self.next_deal_id = self.next_deal_id, self.next_deal_id + 1
         self.deals_by_id[deal_id] = (d, cfg, snap)
         if len(self.deals_by_id) > 200:
