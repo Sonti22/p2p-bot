@@ -187,7 +187,8 @@ def test_scan_drops_blacklisted_merchant(offline, monkeypatch):
 
 def test_scan_removes_venue_entirely_when_all_merchants_blacklisted(offline, monkeypatch):
     c = p2p.Config(exchanges=["bybit", "htx", "kucoin", "mexc", "bitpapa"], assets=["USDT"], min_orders=0, min_rate=0)
-    nicks = {i["nickName"] for i in load("bybit_ads.json")["result"]["items"]}
+    # buy и sell на Bybit отдают разных мерчантов (bybit_ads.json/bybit_ads_sell.json) — блокируем обоих
+    nicks = {i["nickName"] for f in ("bybit_ads.json", "bybit_ads_sell.json") for i in load(f)["result"]["items"]}
     monkeypatch.setattr(p2p.blacklist, "blocked", lambda: {("Bybit", n) for n in nicks})
     after = asyncio.run(p2p.scan(None, c))
     assert ("Bybit", "buy", "USDT") not in after.best

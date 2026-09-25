@@ -21,12 +21,19 @@ def _kucoin_currency(url):
     return {"code": "200000", "data": d or {}}
 
 
+def _bybit_ads(body):
+    """Объявления Bybit различаются по стороне запроса (`side` в теле POST): "1" — бот покупает
+    (площадке отдаём объявления продавцов), "0" — бот продаёт (объявления покупателей), у них разные
+    цены и мерчанты, как в реальном стакане."""
+    return load("bybit_ads_sell.json" if (body or {}).get("side") == "0" else "bybit_ads.json")
+
+
 # подстрока URL -> файл фикстуры (урезанные живые ответы площадок) или функция от URL
 ROUTES = [
     # спот-тикеры и справочники сетей — раньше общих правил по доменам htx.com / kucoin.com
     ("api.htx.com/market/tickers", "spot_htx.json"), ("api.kucoin.com/api/v1/market/allTickers", "spot_kucoin.json"),
     ("api.htx.com/v2/reference/currencies", _htx_currency), ("api.kucoin.com/api/v3/currencies/", _kucoin_currency),
-    ("queryAllPaymentList", "bybit_pay.json"), ("otc/item/online", "bybit_ads.json"),
+    ("queryAllPaymentList", "bybit_pay.json"),
     ("htx.com", "htx_ads.json"), ("kucoin.com", "kucoin_ads.json"),
     ("payment/method", "mexc_pay.json"), ("common/coins", "mexc_coins.json"),
     ("p2p.mexc.com/api/market", "mexc_ads.json"), ("bitpapa.com", "bitpapa_ads.json"),
@@ -44,6 +51,8 @@ def load(name):
 def offline(monkeypatch):
     """Все запросы площадок отвечают фикстурами; сеть в тестах не нужна."""
     async def fake_json(s, method, url, body=None):
+        if "otc/item/online" in url:   # тело POST несёт сторону запроса — отдельно от ROUTES (там только url)
+            return _bybit_ads(body)
         for part, name in ROUTES:
             if part in url:
                 return name(url) if callable(name) else load(name)
