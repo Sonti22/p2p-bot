@@ -1,0 +1,63 @@
+{
+ "result": {
+  "items": [
+   {
+    "price": "223096.48",
+    "minAmount": "50000.00",
+    "maxAmount": "75000.00",
+    "lastQuantity": "0.755254",
+    "payments": [
+     "90"
+    ],
+    "nickName": "Bitoxovich",
+    "recentOrderNum": 2,
+    "recentExecuteRate": 100,
+    "remark": "🏢 Москва | Пресненская набережная 12\n🏢 Санкт-Петербург | Большая Зеленина 24\n💰 Свои офисы | Комфорт | Конфиденциальность \n💵 | ₽ | $ | € | RUB | USD | EUR |\n✍️ T"
+   },
+   {
+    "price": "223994.14",
+    "minAmount": "50000.00",
+    "maxAmount": "50000.00",
+    "lastQuantity": "0.227256",
+    "payments": [
+     "90"
+    ],
+    "nickName": "PLUG_ex",
+    "recentOrderNum": 141,
+    "recentExecuteRate": 100,
+    "remark": "💰 ОБМЕННИК В ЦЕНТРЕ МОСКВЫ ЗА НАЛИЧНЫЕ  ₽ | $ | € \n🏛️ Премиум офис, лучший курс, бесплатная парковка\n📞 Мобильный | Telegram | WhatsApp: +7 (925) 695-19-97\n✍️ Te"
+   },
+   {
+    "price": "224416.57",
+    "minAmount": "1000.00",
+    "maxAmount": "90000.00",
+    "lastQuantity": "0.699571",
+    "payments": [
+     "18",
+     "40",
+     "90",
+     "14"
+    ],
+    "nickName": "VaSa",
+    "recentOrderNum": 384,
+    "recentExecuteRate": 100,
+    "remark": "⚡️БЫСТРАЯ СДЕЛКА ПО РЕКВИЗИТАМ СЧЕТА БЕЗ БЛОКИРОВОК БАНКА И РИСКА⚡️\n\n🛡️БЕЗОПАСНО:\n    🏆4000+ положительных отзывов | 0 плохих за всё время работы!\n    🏦ИП | соо"
+   },
+   {
+    "price": "224416.57",
+    "minAmount": "1000.00",
+    "maxAmount": "50000.00",
+    "lastQuantity": "0.761404",
+    "payments": [
+     "18",
+     "40",
+     "14"
+    ],
+    "nickName": "FuckGG",
+    "recentOrderNum": 261,
+    "recentExecuteRate": 100,
+    "remark": "💙 Быстрая и безопасная сделка 💙\n\n💙 ИП l Полное соответствие 115-ФЗ, 161-ФЗl Никаких блокировок 💙\n\n💙 Помощь новичкам на всех этапах оплаты.\n\n💙Принимаю оплату от "
+   }
+  ]
+ }
+}

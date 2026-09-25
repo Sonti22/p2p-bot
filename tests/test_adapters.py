@@ -41,6 +41,27 @@ def test_buy_and_sell_use_different_fixture_ads(offline, name):
     assert all(a.side == "sell" for a in sell), name
 
 
+@pytest.mark.parametrize("name", ["bybit", "htx", "kucoin", "mexc", "bitpapa"])
+@pytest.mark.parametrize("asset,low,high", [("BTC", 1_000_000, 50_000_000), ("ETH", 50_000, 1_000_000)])
+def test_ads_price_matches_requested_coin(offline, name, asset, low, high):
+    """Раньше все площадки отдавали в offline-тестах одни и те же ₽-числа независимо от запрошенной
+    монеты (реальные цены BTC/ETH отличаются от USDT на порядки) — конфтест теперь разбирает монету
+    из запроса каждой площадки (coinId/currency/tokenId/crypto_currency_code) и подставляет фикстуру
+    с ценами нужного порядка."""
+    ads = asyncio.run(p2p.FETCHERS[name](None, p2p.Config(), "buy", asset))
+    assert ads, name
+    for a in ads:
+        assert a.asset == asset and low < a.price < high, (name, a.price)
+
+
+@pytest.mark.parametrize("name", ["bybit", "htx", "kucoin", "mexc", "bitpapa"])
+def test_ads_btc_and_eth_use_different_prices_than_usdt(offline, name):
+    usdt = asyncio.run(p2p.FETCHERS[name](None, p2p.Config(), "buy", "USDT"))
+    btc = asyncio.run(p2p.FETCHERS[name](None, p2p.Config(), "buy", "BTC"))
+    eth = asyncio.run(p2p.FETCHERS[name](None, p2p.Config(), "buy", "ETH"))
+    assert max(a.price for a in usdt) < min(a.price for a in eth) < min(a.price for a in btc), name
+
+
 def test_spot_prices(offline):
     spot = asyncio.run(p2p.spot_prices(None, ["USDT", "BTC", "ETH", "USDC"]))
     for venue in ("Bybit", "MEXC", "HTX", "KuCoin"):

@@ -176,6 +176,16 @@ def test_scan_offline_keeps_prices_near_reference(offline):
     assert scores == sorted(scores, reverse=True)   # отсортировано по прибыли с поправкой на надёжность
 
 
+def test_scan_offline_btc_prices_near_reference(offline):
+    """Фикстуры BTC (разобранные по монете из запроса, см. tests/conftest.py) должны давать цены
+    у ₽-ориентира BTC (ref × спот-курс BTC/USDT), а не у ориентира USDT на порядки ниже."""
+    c = p2p.Config(exchanges=["bybit", "htx", "kucoin", "mexc", "bitpapa"], assets=["BTC"], min_orders=0, min_rate=0)
+    snap = asyncio.run(p2p.scan(None, c))
+    assert snap.refs["BTC"] > 1_000_000 and not snap.errors
+    for a in snap.best.values():
+        assert abs(a.price / snap.refs["BTC"] - 1) * 100 <= c.max_dev
+
+
 def test_scan_drops_blacklisted_merchant(offline, monkeypatch):
     c = p2p.Config(exchanges=["bybit", "htx", "kucoin", "mexc", "bitpapa"], assets=["USDT"], min_orders=0, min_rate=0)
     before = asyncio.run(p2p.scan(None, c))

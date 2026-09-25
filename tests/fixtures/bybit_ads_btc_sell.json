@@ -1,0 +1,61 @@
+{
+ "result": {
+  "items": [
+   {
+    "price": "7432817",
+    "minAmount": "50000.00",
+    "maxAmount": "80000.00",
+    "lastQuantity": "0.025202",
+    "payments": [
+     "14"
+    ],
+    "nickName": "RubleMaster",
+    "recentOrderNum": 320,
+    "recentExecuteRate": 99.5,
+    "remark": "Быстрая оплата, работаю без задержек."
+   },
+   {
+    "price": "7461982",
+    "minAmount": "10000.00",
+    "maxAmount": "60000.00",
+    "lastQuantity": "0.010801",
+    "payments": [
+     "18",
+     "90"
+    ],
+    "nickName": "NochnoyObmen",
+    "recentOrderNum": 45,
+    "recentExecuteRate": 97.0,
+    "remark": "Оплата только по реквизитам из чата."
+   },
+   {
+    "price": "7491147",
+    "minAmount": "1000.00",
+    "maxAmount": "120000.00",
+    "lastQuantity": "0.042003",
+    "payments": [
+     "14",
+     "40",
+     "784"
+    ],
+    "nickName": "TopExchanger",
+    "recentOrderNum": 512,
+    "recentExecuteRate": 100,
+    "remark": "Проверенный мерчант, сделки одним платежом."
+   },
+   {
+    "price": "7507812",
+    "minAmount": "5000.00",
+    "maxAmount": "45000.00",
+    "lastQuantity": "0.008401",
+    "payments": [
+     "18"
+    ],
+    "nickName": "VechernyKurs",
+    "recentOrderNum": 88,
+    "recentExecuteRate": 98.2,
+    "remark": "Работаю вечерами, отвечаю быстро."
+   }
+  ]
+ }
+}

@@ -1,0 +1,50 @@
+{
+ "items": [
+  {
+   "floatPrice": "232601.18",
+   "limitMinQuote": "15000",
+   "limitMaxQuote": "400000",
+   "currencyBalanceQuantity": "2.348311",
+   "adPayTypes": [
+    {
+     "id": "67a1e9e84c84a600014e5aa1",
+     "bankName": null,
+     "payTypeCode": "BANK",
+     "payQrcodePic": null,
+     "payTypeNumber": null,
+     "subBranch": null,
+     "reservedFields": null,
+     "payTypeNameEn": "BANK",
+     "color": "#00B47D"
+    }
+   ],
+   "nickName": "NochnoyKurs",
+   "dealOrderNum": "980",
+   "dealOrderRate": "98.10%",
+   "remarks": "Покупаю USDT, оплата по СБП, реквизиты в чате."
+  },
+  {
+   "floatPrice": "233129.22",
+   "limitMinQuote": "10000",
+   "limitMaxQuote": "300000",
+   "currencyBalanceQuantity": "1.704609",
+   "adPayTypes": [
+    {
+     "id": "67ff9e128a145700016c1122",
+     "bankName": null,
+     "payTypeCode": "BANK_TRANSFER",
+     "payQrcodePic": null,
+     "payTypeNumber": null,
+     "subBranch": null,
+     "reservedFields": null,
+     "payTypeNameEn": "Bank Transfer",
+     "color": "#00B47D"
+    }
+   ],
+   "nickName": "SpeedBuyerRu",
+   "dealOrderNum": "2210",
+   "dealOrderRate": "99.05%",
+   "remarks": "Быстрый выкуп, оплата в течение 5 минут."
+  }
+ ]
+}

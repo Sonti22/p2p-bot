@@ -1,0 +1,195 @@
+{
+ "items": [
+  {
+   "floatPrice": "240257.74",
+   "limitMinQuote": "20000",
+   "limitMaxQuote": "700000",
+   "currencyBalanceQuantity": "3.030079",
+   "adPayTypes": [
+    {
+     "id": "66c1e9e84c84a600014e5ed5",
+     "bankName": null,
+     "payTypeCode": "BANK",
+     "payQrcodePic": null,
+     "payTypeNumber": null,
+     "subBranch": null,
+     "reservedFields": null,
+     "payTypeNameEn": "BANK",
+     "color": "#00B47D"
+    },
+    {
+     "id": "697725f0a543c90001fcca79",
+     "bankName": null,
+     "payTypeCode": "BANK_TRANSFER",
+     "payQrcodePic": null,
+     "payTypeNumber": null,
+     "subBranch": null,
+     "reservedFields": null,
+     "payTypeNameEn": "Bank Transfer",
+     "color": "#00B47D"
+    },
+    {
+     "id": "697bde384fdee3000155ff48",
+     "bankName": null,
+     "payTypeCode": "OTHER",
+     "payQrcodePic": null,
+     "payTypeNumber": null,
+     "subBranch": null,
+     "reservedFields": "{\"payTypeName\":\"Любой ваш банк\"}",
+     "payTypeNameEn": "Other",
+     "color": "#00B47D"
+    }
+   ],
+   "nickName": "Dr.Crypto01",
+   "dealOrderNum": "6646",
+   "dealOrderRate": "99.31%",
+   "remarks": "Здравствуйте!\nПринимаю переводы из всех банков РФ.\nРеквизиты предоставляю в чате. \nРаботаю исключительно с первыми лицами и однофамильцами.\nПока объявление акти"
+  },
+  {
+   "floatPrice": "240284.15",
+   "limitMinQuote": "20000",
+   "limitMaxQuote": "650000",
+   "currencyBalanceQuantity": "2.227213",
+   "adPayTypes": [
+    {
+     "id": "68ff9e128a145700016c7a57",
+     "bankName": null,
+     "payTypeCode": "BANK",
+     "payQrcodePic": null,
+     "payTypeNumber": null,
+     "subBranch": null,
+     "reservedFields": null,
+     "payTypeNameEn": "BANK",
+     "color": "#00B47D"
+    },
+    {
+     "id": "68ff9e3d8989770001e8d8dd",
+     "bankName": null,
+     "payTypeCode": "BANK_TRANSFER",
+     "payQrcodePic": null,
+     "payTypeNumber": null,
+     "subBranch": null,
+     "reservedFields": null,
+     "payTypeNameEn": "Bank Transfer",
+     "color": "#00B47D"
+    }
+   ],
+   "nickName": "Doveriai_usdt ",
+   "dealOrderNum": "1572",
+   "dealOrderRate": "99.30%",
+   "remarks": "Привет! \n\n— ПЛАТЕЖ НЕ ДЕЛИМ (только в редких случаях)\n— Строго от первого лица /однофамильцы.\n— Любой банк РФ.\n— Скрин чека в чат.\n— Реквизиты дам в чате.\n— Отп"
+  },
+  {
+   "floatPrice": "240336.95",
+   "limitMinQuote": "20000",
+   "limitMaxQuote": "999999",
+   "currencyBalanceQuantity": "3.147865",
+   "adPayTypes": [
+    {
+     "id": "68a9c5698386840001564e72",
+     "bankName": null,
+     "payTypeCode": "BANK",
+     "payQrcodePic": null,
+     "payTypeNumber": null,
+     "subBranch": null,
+     "reservedFields": null,
+     "payTypeNameEn": "BANK",
+     "color": "#00B47D"
+    },
+    {
+     "id": "68ef540ee444e80001ec7182",
+     "bankName": null,
+     "payTypeCode": "BANK_TRANSFER",
+     "payQrcodePic": null,
+     "payTypeNumber": null,
+     "subBranch": null,
+     "reservedFields": null,
+     "payTypeNameEn": "Bank Transfer",
+     "color": "#00B47D"
+    },
+    {
+     "id": "69aa8702c71ea20001b88191",
+     "bankName": null,
+     "payTypeCode": "OTHER",
+     "payQrcodePic": null,
+     "payTypeNumber": null,
+     "subBranch": null,
+     "reservedFields": "{\"payTypeName\":\"Реквизиты в чате\"}",
+     "payTypeNameEn": "Other",
+     "color": "#00B47D"
+    },
+    {
+     "id": "69b99961c618de0001c7d729",
+     "bankName": null,
+     "payTypeCode": "MOBILE_TOP-UP",
+     "payQrcodePic": null,
+     "payTypeNumber": null,
+     "subBranch": null,
+     "reservedFields": null,
+     "payTypeNameEn": "Mobile Top-up",
+     "color": "#00B47D"
+    }
+   ],
+   "nickName": "Kleopatra_usdt",
+   "dealOrderNum": "3842",
+   "dealOrderRate": "99.30%",
+   "remarks": "БЫСТРЫЙ ОБМЕН | ЛЮБЫЕ ОБЪЕМЫ\nПривет! Давай проведем сделку максимально быстро и комфортно.\nРаботаю со всеми банками РФ. Есть большой запас ликвидности — готов к"
+  },
+  {
+   "floatPrice": "240680.18",
+   "limitMinQuote": "9000",
+   "limitMaxQuote": "215475",
+   "currencyBalanceQuantity": "0.331134",
+   "adPayTypes": [
+    {
+     "id": "649a87dd8f4ad80001f0b62a",
+     "bankName": null,
+     "payTypeCode": "BANK_TRANSFER",
+     "payQrcodePic": null,
+     "payTypeNumber": null,
+     "subBranch": null,
+     "reservedFields": null,
+     "payTypeNameEn": "Bank Transfer",
+     "color": "#00B47D"
+    },
+    {
+     "id": "660417a47dad0d0001cdee11",
+     "bankName": null,
+     "payTypeCode": "BANK",
+     "payQrcodePic": null,
+     "payTypeNumber": null,
+     "subBranch": null,
+     "reservedFields": null,
+     "payTypeNameEn": "BANK",
+     "color": "#00B47D"
+    },
+    {
+     "id": "69a9363ffda7960001102889",
+     "bankName": null,
+     "payTypeCode": "MOBILE_TOP-UP",
+     "payQrcodePic": null,
+     "payTypeNumber": null,
+     "subBranch": null,
+     "reservedFields": null,
+     "payTypeNameEn": "Mobile Top-up",
+     "color": "#00B47D"
+    },
+    {
+     "id": "69a936fb64cb6100014a2c5a",
+     "bankName": null,
+     "payTypeCode": "OTHER",
+     "payQrcodePic": null,
+     "payTypeNumber": null,
+     "subBranch": null,
+     "reservedFields": "{\"payTypeName\":\"сбп все банки \"}",
+     "payTypeNameEn": "Other",
+     "color": "#00B47D"
+    }
+   ],
+   "nickName": "Bulat16",
+   "dealOrderNum": "6005",
+   "dealOrderRate": "97.30%",
+   "remarks": "\nПринимаю платежи по СБП (по номеру телефона) с любых банков.\nПереводы на российские банки!\nРаботаю в основном с владельцем карты - первого лица.\nОт 3-х лиц при"
+  }
+ ]
+}
