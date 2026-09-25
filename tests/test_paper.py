@@ -413,3 +413,52 @@ def test_ladder_suggestion_none_when_week_failure_ok(monkeypatch, tmp_path):
     now = time.time()
     _fill_cycles(db, done=4, failed=1, ts=now)   # 5 за неделю, срывов 20% <= 40%
     assert paper.ladder_suggestion(path=db, now=now) is None
+
+
+def test_report_rows_empty_without_db():
+    assert paper.report_rows(path="/nonexistent/paper.db") == []
+
+
+def test_report_rows_groups_by_venue_pair_and_computes_plan_vs_fact(tmp_path):
+    db = str(tmp_path / "paper.db")
+    buy, sell = make_ad("Bybit", "buy", 85.0), make_ad("MEXC", "sell", 90.0)
+    now = time.time()
+    c1 = paper.start_cycle(10000, buy, sell, "route", 2.0, path=db, ts=now)
+    paper.finish_cycle(c1, "done", realized_pct=2.5, path=db, ts=now + 360)   # 6 мин
+    c2 = paper.start_cycle(10000, buy, sell, "route", 2.0, path=db, ts=now)
+    paper.finish_cycle(c2, "done", realized_pct=1.5, path=db, ts=now + 240)   # 4 мин
+    c3 = paper.start_cycle(10000, buy, sell, "route", 2.0, path=db, ts=now)
+    paper.finish_cycle(c3, "failed_sell", realized_pct=0.0,
+                       note="не хватает глубины стакана продажи", path=db, ts=now)
+    c4 = paper.start_cycle(10000, buy, sell, "route", 2.0, path=db, ts=now)
+    paper.finish_cycle(c4, "failed_buy", realized_pct=0.0, note="объявление покупки исчезло",
+                       path=db, ts=now)
+    other_buy, other_sell = make_ad("HTX", "buy", 85.0), make_ad("KuCoin", "sell", 90.0)
+    c5 = paper.start_cycle(10000, other_buy, other_sell, "route", 1.0, path=db, ts=now)
+    paper.finish_cycle(c5, "done", realized_pct=1.0, path=db, ts=now + 120)
+    cid_open = paper.start_cycle(10000, buy, sell, "route", 2.0, path=db, ts=now)   # открыт — не считается
+
+    rows = paper.report_rows(path=db)
+    assert len(rows) == 2   # (Bybit,MEXC) и (HTX,KuCoin), открытый круг c_open не попал
+    row = next(r for r in rows if r["buy_ex"] == "Bybit")
+    assert row["buy_asset"] == "USDT" and row["sell_ex"] == "MEXC" and row["sell_asset"] == "USDT"
+    assert row["total"] == 4 and row["done"] == 2 and row["failed"] == 2
+    assert row["failed_by_reason"] == {"failed_sell": 1, "failed_buy": 1}
+    assert row["depth_shortfall"] == 1
+    assert row["avg_planned_pct"] == 2.0
+    assert row["avg_realized_pct"] == 2.0   # (2.5+1.5)/2
+    assert row["avg_duration_min"] == 5.0   # (6+4)/2
+
+
+def test_write_report_csv_writes_expected_columns(tmp_path):
+    db = str(tmp_path / "paper.db")
+    csv_path = str(tmp_path / "report.csv")
+    buy, sell = make_ad("Bybit", "buy", 85.0), make_ad("MEXC", "sell", 90.0)
+    cid = paper.start_cycle(10000, buy, sell, "route", 2.0, path=db)
+    paper.finish_cycle(cid, "done", realized_pct=2.5, path=db)
+    rows = paper.report_rows(path=db)
+    out_path = paper.write_report_csv(rows, path=csv_path)
+    assert out_path == csv_path
+    text = open(csv_path, encoding="utf-8").read()
+    assert "buy_ex,buy_asset,sell_ex,sell_asset,total,done,failed" in text
+    assert "Bybit,USDT,MEXC,USDT,1,1,0" in text

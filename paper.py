@@ -11,6 +11,7 @@ SQLite data/paper.db, таблицы:
   balance — один виртуальный баланс: старт = PAPER_AMOUNT, меняется на realized_pct каждого
             завершённого круга.
 """
+import csv
 import datetime
 import os
 import sqlite3
@@ -21,6 +22,10 @@ import trades
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(HERE, "data", "paper.db")
+REPORT_CSV_PATH = os.path.join(HERE, "data", "paper_report.csv")
+REPORT_COLUMNS = ("buy_ex", "buy_asset", "sell_ex", "sell_asset", "total", "done", "failed",
+                   "depth_shortfall", "avg_planned_pct", "avg_realized_pct", "avg_duration_min",
+                   "failed_by_reason")
 
 STAGES = ("buy", "transfer", "sell")
 RESULTS = ("done", "failed_buy", "failed_transfer", "failed_sell")
@@ -351,6 +356,59 @@ def ladder_suggestion(path=DB_PATH, now=None):
         if failed / len(week_rows) > LADDER_DOWN_MIN_FAILED:
             return {"action": "down", "amount": LADDER_LOW}
     return None
+
+
+def report_rows(path=DB_PATH):
+    """План/факт, срывы по причинам, средняя длительность круга и нехватка глубины стакана —
+    по каждой связке площадка/монета покупки → площадка/монета продажи (для `/paper report` и
+    экспорта CSV). Только завершённые круги (result IS NOT NULL); depth_shortfall считает срывы
+    на продаже с причиной «не хватает глубины стакана продажи» (текст из check_sell_stage)."""
+    if not os.path.exists(path):
+        return []
+    con = _connect(path)
+    rows = con.execute(
+        "SELECT buy_ex, buy_asset, sell_ex, sell_asset, result, planned_pct, realized_pct, "
+        "ts_start, ts_stage, note FROM cycles WHERE result IS NOT NULL").fetchall()
+    con.close()
+    groups = {}
+    for buy_ex, buy_asset, sell_ex, sell_asset, result, planned, realized, ts_start, ts_stage, note in rows:
+        g = groups.setdefault((buy_ex, buy_asset, sell_ex, sell_asset), {
+            "total": 0, "done": 0, "failed_by_reason": {}, "depth_shortfall": 0,
+            "planned": [], "realized_done": [], "duration_done": []})
+        g["total"] += 1
+        g["planned"].append(planned)
+        if result == "done":
+            g["done"] += 1
+            g["realized_done"].append(realized)
+            g["duration_done"].append(ts_stage - ts_start)
+        else:
+            g["failed_by_reason"][result] = g["failed_by_reason"].get(result, 0) + 1
+            if result == "failed_sell" and "не хватает глубины" in (note or ""):
+                g["depth_shortfall"] += 1
+    out = []
+    for (buy_ex, buy_asset, sell_ex, sell_asset), g in sorted(groups.items()):
+        out.append({
+            "buy_ex": buy_ex, "buy_asset": buy_asset, "sell_ex": sell_ex, "sell_asset": sell_asset,
+            "total": g["total"], "done": g["done"], "failed": g["total"] - g["done"],
+            "failed_by_reason": g["failed_by_reason"], "depth_shortfall": g["depth_shortfall"],
+            "avg_planned_pct": sum(g["planned"]) / len(g["planned"]) if g["planned"] else None,
+            "avg_realized_pct": sum(g["realized_done"]) / len(g["realized_done"]) if g["realized_done"] else None,
+            "avg_duration_min": (sum(g["duration_done"]) / len(g["duration_done"]) / 60)
+                                 if g["duration_done"] else None,
+        })
+    return out
+
+
+def write_report_csv(rows, path=REPORT_CSV_PATH):
+    """Экспорт report_rows() в CSV (по умолчанию data/paper_report.csv) для `/paper report`."""
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(REPORT_COLUMNS)
+        for r in rows:
+            reasons = ";".join(f"{FAIL_LABELS.get(k, k)}:{v}" for k, v in r["failed_by_reason"].items())
+            w.writerow([r[c] for c in REPORT_COLUMNS[:-1]] + [reasons])
+    return path
 
 
 def balance_change(path=DB_PATH):
