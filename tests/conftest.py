@@ -1,3 +1,5 @@
+import functools
+import importlib
 import json
 import logging
 import os
@@ -116,6 +118,26 @@ def _clean_netstatus():
     netstatus.reset()
     yield
     netstatus.reset()
+
+
+# Файлы из data/ живого бота. Смоук-тест launcher гоняет тесты в папке бота: без подмены тесты видят
+# подключённые ключи владельца (и падают — обновление откатывается) и могут дописать что-то в его базы.
+DATA_PATHS = [("accounts", "KEYS_PATH", "keys.json"), ("bot", "TOPICS_PATH", "topics.json"),
+              ("alerts", "DB_PATH", "alerts.db"), ("blacklist", "DB_PATH", "blacklist.db"),
+              ("history", "DB_PATH", "history.db"), ("paper", "DB_PATH", "paper.db"),
+              ("presets", "PRESETS_PATH", "presets.json"), ("trades", "DB_PATH", "trades.db")]
+
+
+@pytest.fixture(autouse=True)
+def _isolated_data(tmp_path_factory, monkeypatch):
+    """Каждый тест работает с пустой data/ во временной папке, а не с data/ из текущей; .env бота тоже не трогаем.
+    Папка своя, а не внутри tmp_path: тесты вроде jsonstore проверяют, что в tmp_path нет лишних файлов."""
+    data = tmp_path_factory.mktemp("botdata")
+    for module, attr, name in DATA_PATHS:
+        monkeypatch.setattr(importlib.import_module(module), attr, str(data / name))
+    bot = importlib.import_module("bot")
+    monkeypatch.setattr(bot, "save_env", functools.partial(bot.save_env, path=str(data / ".env")))
+    return data
 
 
 @pytest.fixture(autouse=True)
