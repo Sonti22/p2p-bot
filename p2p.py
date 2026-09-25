@@ -1278,11 +1278,13 @@ async def scan(s, cfg, force_alt=False):
             stacked = _stack(part, cfg.amount)
             if stacked:
                 buys.append(stacked)
-    # стакан, как его видят на площадке (первая страница выдачи, до своих фильтров мерчанта/оплаты/аномалий), —
-    # место своего объявления в /maker; обменники не нужны: на BestChange объявление не выставить
+    # стакан, как его видят на площадке (первая страница выдачи, до своих фильтров мерчанта/оплаты), — место своего
+    # объявления в /maker; аномалии за MAX_DEV (ловушки, их показывает /traps) не в счёт — иначе «до 1-го» считалось бы
+    # до мусорной цены; обменники не нужны: на BestChange объявление не выставить
     book = {}
     for a in ads:
-        if a.ex != "BestChange":
+        r = refs.get(a.asset)
+        if a.ex != "BestChange" and not (r and abs(a.price / r - 1) * 100 > cfg.max_dev):
             book.setdefault((a.ex, a.side, a.asset), []).append(a)
     for key, grp in book.items():
         grp.sort(key=lambda a: a.price, reverse=(key[1] == "sell"))

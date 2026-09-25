@@ -105,8 +105,9 @@ def _offline_snap():
 def test_scan_keeps_whole_book_including_filtered_ads(offline):
     cfg, snap = _offline_snap()
     book = [a.price for a in snap.book[("Bybit", "buy", "USDT")]]
-    assert book == sorted(book) and 84.5 in book                      # продавцы: дешевле — выше
-    assert 84.5 not in [a.price for a in snap.groups[("Bybit", "buy", "USDT")]]   # 2 сделки — отсеян своим фильтром
+    assert book == sorted(book) and 84.84 in book                     # продавцы: дешевле — выше
+    assert 84.84 not in [a.price for a in snap.groups[("Bybit", "buy", "USDT")]]  # отсеян своим фильтром оплаты
+    assert 84.5 not in book                 # 4.1% ниже ориентира 88.15 (MAX_DEV 4%) — ловушка, в место не считаем
     assert not [k for k in snap.book if k[0] == "BestChange"]
 
 
@@ -114,11 +115,11 @@ def test_maker_book_counts_ads_hidden_by_own_filters_and_gap(offline):
     cfg, snap = _offline_snap()
     price, _, _ = p2p.maker_quote(snap.groups, "Bybit", "USDT", "sell_ad")   # 85.00 − шаг = 84.99
     text = "\n".join(B.maker_book_lines(snap, cfg, "Bybit", "USDT", "sell_ad", price))
-    assert "Место в стакане: 3-е из 5, до 1-го 0.49 ₽ (0.58%)" in text   # впереди 84.50 и 84.84 из выдачи
+    assert "Место в стакане: 2-е из 4, до 1-го 0.15 ₽ (0.18%)" in text   # впереди 84.84 из выдачи; 84.50 — ловушка
     lines = text.splitlines()
-    mine = lines.index("▶ 3. 84.99 ₽ — ты")
-    assert lines[mine - 2].startswith("1. 84.50 ₽") and lines[mine - 1].startswith("2. 84.84 ₽")
-    assert lines[mine + 1].startswith("4. 85.00 ₽") and "384 сд/100%" in lines[mine + 1]
+    mine = lines.index("▶ 2. 84.99 ₽ — ты")
+    assert lines[mine - 1].startswith("1. 84.84 ₽")
+    assert lines[mine + 1].startswith("3. 85.00 ₽") and "384 сд/100%" in lines[mine + 1]
     assert "Спред Bybit: купить 85.00 / продать 89.90 ₽ → -5.45%; после комиссии мейкера за круг (0.30%) " \
            "остаётся -5.75%" in text
 
@@ -127,10 +128,9 @@ def test_maker_book_marks_limits_not_overlapping_amount(offline):
     cfg, snap = _offline_snap()
     text = "\n".join(B.maker_book_lines(snap, cfg, "BitPapa", "USDT", "sell_ad", 86.99))
     rivals = [ln for ln in text.splitlines() if ln[:1].isdigit()]
-    assert [ln.split(" ₽")[0] for ln in rivals] == ["1. 85.85", "3. 87.00", "4. 90.00", "5. 92.10"]
+    assert [ln.split(" ₽")[0] for ln in rivals] == ["1. 85.85", "3. 87.00", "4. 90.00"]   # 92.10 — за MAX_DEV
     warned = [ln for ln in rivals if ln.endswith("⚠️ лимиты не пересекаются")]
     assert len(warned) == 3                                      # 85 ₽, 600 ₽, 2 000–6 283 ₽ — мимо 50 000
-    assert "20 000–103 486 ₽" in rivals[-1] and "⚠️" not in rivals[-1]
     assert "Спред" not in text                                   # у BitPapa в фикстуре нет второй стороны
 
 
@@ -175,3 +175,26 @@ def test_remembered_deals_do_not_keep_the_full_book():
     deal_id = bot.remember_deal((2.0, ad, ad, "r"), snap=snap)
     kept = bot.deals_by_id[deal_id][2]
     assert kept.book == {} and snap.book and kept.groups is snap.groups
+
+
+def test_live_card_update_keeps_lean_snapshot(monkeypatch):
+    """Живая карточка перезаписывает запомненную сделку свежим снимком — тоже без полного стакана."""
+    import time
+    import bot as B
+    from test_bot import Stub, deal
+    monkeypatch.setattr(B, "deal_card", lambda d, c, a=None, r=None, breakdown=None: b"png")
+    bot = Stub(p2p.Config(min_profit=2.0))
+    bot.live_scans = 1
+
+    async def send_photo(png, caption, markup=None, topic=None, chat_id=None):
+        bot.out.append(("sendPhoto", {"caption": caption}))
+        return {"ok": True, "result": {"message_id": 77}}
+    bot.send_photo = send_photo
+    ad = p2p.Ad("Bybit", "buy", 85.0, 1000, 500000, 1e4, ["SBP"], "m", 1000, 100.0)
+    book = {("Bybit", "buy", "USDT"): [ad] * 20}
+    snap = lambda ds: p2p.Snapshot(88.0, "t", {}, {}, ds, {}, {}, {}, book=book)
+    asyncio.run(bot.notify(snap([deal(5.0)])))
+    for live in bot.live_msg.values():
+        live["last_edit"] = time.time() - B.LIVE_EDIT_INTERVAL - 1
+    asyncio.run(bot.notify(snap([deal(5.1)])))
+    assert all(entry[2].book == {} for entry in bot.deals_by_id.values())

@@ -897,6 +897,12 @@ def apply_mybanks(data):
         save_env("SBP_FREE_LIMITS", ",".join(f"{k}:{v}" for k, v in limits.items()))
 
 
+def _lean(snap):
+    """Снимок без полного стакана (Snapshot.book): он нужен только /maker по свежему снимку — запомненные сделки
+    (до 200) и живые карточки его не держат."""
+    return dataclasses.replace(snap, book={}) if snap is not None and snap.book else snap
+
+
 def fact_markup(trade_id):
     """Кнопки быстрого фактического результата под подтверждением «✅ Сделал»."""
     return {"inline_keyboard": [
@@ -1136,8 +1142,7 @@ class Bot:
         """Запомнить связку под кнопками «✅ Сделал»/«📋 Шаги»; хранится ограниченное число последних."""
         cfg = copy.deepcopy(cfg or self.cfg)   # снимок настроек (и списков): старая карточка не увидит новые сумму/порог
         snap = snap if snap is not None else self.last
-        if snap is not None and snap.book:   # полный стакан нужен только /maker по свежему снимку — не держим его в 200 сделках
-            snap = dataclasses.replace(snap, book={})
+        snap = _lean(snap)
         deal_id, self.next_deal_id = self.next_deal_id, self.next_deal_id + 1
         self.deals_by_id[deal_id] = (d, cfg, snap)
         if len(self.deals_by_id) > 200:
@@ -2225,7 +2230,7 @@ class Bot:
         # подпись теперь по новой связке и текущим настройкам — кнопки «✅ Сделал»/«📋 Шаги»/«🚫» этого
         # сообщения тоже, иначе в журнал уйдёт сумма, которой на карточке уже нет
         if r.get("ok") and live.get("deal_id") in self.deals_by_id:
-            self.deals_by_id[live["deal_id"]] = (d, copy.deepcopy(self.cfg), snap)
+            self.deals_by_id[live["deal_id"]] = (d, copy.deepcopy(self.cfg), _lean(snap))
 
     async def mark_stale_deals(self, active):
         """Связка пропала из топа — один раз пометить последний сигнал по ней «⌛ устарел»."""
