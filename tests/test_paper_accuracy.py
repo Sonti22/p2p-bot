@@ -38,8 +38,11 @@ def test_composite_buy_fails_only_when_all_merchants_are_gone():
     cid = paper.start_cycle(10000, stacked, ad("KuCoin", "sell", 91.0), "r", 3.0, ts=1000.0)
     c = paper.get_cycle(cid)
     assert set(json.loads(c["buy_nicks"])) == {"merchA", "merchB"}
-    only_b = snap({("HTX", "buy", "USDT"): [b]})
-    assert paper.check_buy_stage(c, only_b, pay_minutes=5, now=1400.0)[0] == "advance"   # один ещё на месте
+    only_b = snap({("HTX", "buy", "USDT"): [b]})       # остался один на 6 000 ₽ из 10 000 — сумму не покрыть
+    action, note = paper.check_buy_stage(c, only_b, pay_minutes=5, now=1400.0)
+    assert action == "fail" and "не покрывают" in note
+    b_big = ad("HTX", "buy", 87.6, "merchB", max_amt=20000)   # тот же мерчант поднял лимит — остаток покрывает
+    assert paper.check_buy_stage(c, snap({("HTX", "buy", "USDT"): [b_big]}), pay_minutes=5, now=1400.0)[0] == "advance"
     nobody = snap({("HTX", "buy", "USDT"): [ad("HTX", "buy", 88.0, "other")]})
     assert paper.check_buy_stage(c, nobody, pay_minutes=5, now=1400.0) == ("fail", "объявление покупки исчезло")
 
@@ -73,7 +76,7 @@ def test_venue_error_waits_then_fails_when_stale():
     assert paper.check_sell_stage(c, down, now=1400.0)[0] == "wait"
     paused = snap({("MEXC", "buy", "USDT"): [ad("MEXC", "buy", 87.0, "m")]}, errors={"mexc": "пауза до 23:10"})
     assert paper.check_buy_stage(c, paused, pay_minutes=5, now=1400.0) == ("wait", "")
-    late = 1000.0 + 31 * 60
+    late = 1000.0 + 5 * 60 + 31 * 60   # 30 минут отсчитываются после окна оплаты
     assert paper.check_buy_stage(c, down, pay_minutes=5, now=late)[0] == "fail"
     action, note, _ = paper.check_sell_stage(c, down, now=late)
     assert action == "fail" and "недоступна" in note
@@ -123,3 +126,76 @@ def test_bot_stores_route_output_and_network_at_start(monkeypatch):
     d = p2p.deal_for_amount(deal, bot.cfg, sn, 10000)
     assert abs(c["sell_qty"] - d[2].avail) < 1e-9 and c["sell_qty"] < 10000 / 87.5   # после комиссий
     assert json.loads(c["buy_nicks"]) == ["m"]
+
+
+def test_empty_book_without_venue_error_is_decided_at_once():
+    """Площадка ответила, годных объявлений нет (группы нет, ошибки нет) — не «площадка недоступна», а обычный итог."""
+    c = {"ts_stage": 1000.0, "buy_ex": "HTX", "buy_asset": "USDT", "buy_nick": "m", "buy_nicks": '["m"]', "amount": 10000.0,
+         "sell_ex": "KuCoin", "sell_asset": "USDT", "sell_price": 90.0, "sell_net": "", "buy_price": 87.0,
+         "planned_pct": 2.0, "sell_qty": 113.0}
+    assert paper.check_buy_stage(c, snap({}), pay_minutes=5, now=1400.0) == ("fail", "объявление покупки исчезло")
+    action, note, _ = paper.check_sell_stage(c, snap({}), now=1400.0)
+    assert action == "fail" and "глубины" in note
+
+
+def test_venue_error_right_after_pay_window_waits():
+    """PAPER_PAY_MINUTES = PAPER_STALE_MINUTES: сбой площадки на первой проверке — ждём, а не срыв."""
+    c = {"ts_stage": 1000.0, "buy_ex": "MEXC", "buy_asset": "USDT", "buy_nick": "m", "buy_nicks": '["m"]',
+         "amount": 10000.0}
+    down = snap({}, errors={"mexc/USDT": "TimeoutError: "})
+    assert paper.check_buy_stage(c, down, pay_minutes=30, now=1000.0 + 30 * 60 + 20, stale_minutes=30) == ("wait", "")
+
+
+def test_transfer_stage_checks_only_real_transfers():
+    import netstatus
+    netstatus._apply("Bybit", "USDT", {n: {"dep": True, "wd": False, "fee": 1.0} for n in ("TRC20", "BEP20", "ERC20", "TON")})
+    cfg = p2p.Config()
+    same = {"ts_stage": 1000.0, "buy_ex": "Bybit", "buy_asset": "USDT", "sell_ex": "Bybit"}
+    assert paper.check_transfer_stage(same, cfg, transfer_minutes=3, now=1300.0) == ("advance", "")   # внутри биржи
+    from_exchanger = {"ts_stage": 1000.0, "buy_ex": "BestChange", "buy_asset": "USDT", "sell_ex": "Bybit"}
+    assert paper.check_transfer_stage(from_exchanger, cfg, transfer_minutes=3, now=1300.0) == ("advance", "")
+    out = {"ts_stage": 1000.0, "buy_ex": "Bybit", "buy_asset": "USDT", "sell_ex": "MEXC"}
+    assert paper.check_transfer_stage(out, cfg, transfer_minutes=3, now=1300.0)[0] == "fail"
+
+
+def test_simple_route_filter():
+    b, s = ad("Bybit", "buy", 87.0), ad("MEXC", "sell", 90.0)
+    assert paper.simple_route((3.0, b, s, "перевод −1 USDT (TRC20) на MEXC"))
+    assert not paper.simple_route((3.0, ad("Bybit", "buy", 6e6, asset="BTC"), s, "спот BTC→USDT на Bybit (−0.1%)"))
+    assert not paper.simple_route((3.0, b, s, "спот USDT→TON на Bybit (−0.1%) → перевод … → спот TON→USDT на MEXC"))
+
+
+def test_spot_routes_are_not_taken_into_dry_run(monkeypatch):
+    monkeypatch.setattr(B, "deal_card", lambda d, c, a=None, r=None, breakdown=None: b"png")
+    monkeypatch.setenv("PAPER", "1")
+    monkeypatch.setenv("PAPER_AMOUNT", "10000")
+    b, s = ad("Bybit", "buy", 6_000_000.0, asset="BTC"), ad("Bybit", "sell", 93.0)
+    deal = (5.0, b, s, "спот BTC→USDT на Bybit (−0.1%)")
+    sn = p2p.Snapshot(88.0, "t", {}, {}, [deal], {}, {}, {},
+                      groups={("Bybit", "buy", "BTC"): [b], ("Bybit", "sell", "USDT"): [s]})
+    bot = Stub(p2p.Config(min_profit=2.0))
+    bot.live_scans = 1
+    asyncio.run(bot.maybe_start_paper_cycle([deal], sn))
+    assert not paper.open_cycles()
+
+
+def test_virtually_exhausted_sbp_limit_puts_fee_into_plan_and_volume(monkeypatch):
+    """Виртуальный оборот прогона исчерпал бесплатный лимит СБП всех своих банков — комиссия 0,5% в плане и объёме."""
+    monkeypatch.setattr(B, "deal_card", lambda d, c, a=None, r=None, breakdown=None: b"png")
+    monkeypatch.setenv("PAPER", "1")
+    monkeypatch.setenv("PAPER_AMOUNT", "10000")
+    monkeypatch.setenv("OWN_BANKS", "T-Bank")
+    monkeypatch.setenv("SBP_FREE_LIMITS", "T-Bank:10000")
+    b, s = ad("HTX", "buy", 87.5, "m"), ad("KuCoin", "sell", 91.0, "k")
+    old = paper.start_cycle(10000, b, s, "r", 3.0)                 # 10 000 ₽ по СБП с Т-Банка — лимит исчерпан
+    paper.finish_cycle(old, "done", 1.0)
+    deal = (3.9, b, s, "r")
+    sn = p2p.Snapshot(88.0, "t", {"USDT": 88.0}, {}, [deal], {}, {}, {},
+                      groups={("HTX", "buy", "USDT"): [b], ("KuCoin", "sell", "USDT"): [s]})
+    bot = Stub(p2p.Config(min_profit=2.0))
+    bot.live_scans = 1
+    asyncio.run(bot.maybe_start_paper_cycle([deal], sn))
+    (c,) = paper.open_cycles()
+    no_fee = p2p.deal_for_amount(deal, bot.cfg, sn, 10000)
+    assert c["pay_kind"] == "sbp" and c["planned_pct"] < no_fee[0] - 0.4
+    assert c["sell_qty"] < no_fee[2].avail

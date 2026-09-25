@@ -183,15 +183,16 @@ def set_stage(cycle_id, stage, path=DB_PATH, ts=None):
     con.close()
 
 
-def _venue_down(snap, ex, side, asset):
-    """Площадки в этом скане нет: запрос упал или она на паузе (snap.errors), либо её стакана нет вовсе —
-    по такому снимку решать о круге нельзя, ждём следующего."""
+def _venue_down(snap, ex, asset):
+    """Площадка в этом скане не ответила: запрос упал или она на паузе (snap.errors) — по такому снимку решать
+    о круге нельзя, ждём следующего. Ответила, но годных объявлений нет (группы нет) — это пустой стакан."""
     n = (ex or "").lower()
-    return (ex, side, asset) not in snap.groups or n in snap.errors or f"{n}/{asset}" in snap.errors
+    return n in snap.errors or f"{n}/{asset}" in snap.errors
 
 
-def _stale(cycle, settings_minutes, now):
-    return now - cycle["ts_stage"] > settings_minutes * 60
+def _stale(cycle, stale_minutes, now, after=0.0):
+    """Площадка молчит дольше stale_minutes с момента, когда стадию уже можно было решать (after — сек ожидания)."""
+    return now - cycle["ts_stage"] - after > stale_minutes * 60
 
 
 def check_buy_stage(cycle, snap, pay_minutes, now=None, stale_minutes=30.0):
@@ -210,31 +211,43 @@ def check_buy_stage(cycle, snap, pay_minutes, now=None, stale_minutes=30.0):
     now = now if now is not None else time.time()
     if now - cycle["ts_stage"] < pay_minutes * 60:
         return "wait", ""
-    if _venue_down(snap, cycle["buy_ex"], "buy", cycle["buy_asset"]):
-        if _stale(cycle, max(stale_minutes, pay_minutes), now):
+    if _venue_down(snap, cycle["buy_ex"], cycle["buy_asset"]):
+        if _stale(cycle, stale_minutes, now, after=pay_minutes * 60):
             return "fail", f"площадка {cycle['buy_ex']} недоступна"
         return "wait", ""
     nicks = set(json.loads(cycle.get("buy_nicks") or "[]") or [cycle["buy_nick"]])
-    ads = snap.groups.get((cycle["buy_ex"], "buy", cycle["buy_asset"]), [])
-    if not any(a.nick in nicks for a in ads):
+    left = [a for a in snap.groups.get((cycle["buy_ex"], "buy", cycle["buy_asset"]), []) if a.nick in nicks]
+    if not left:
         return "fail", "объявление покупки исчезло"
+    if len(nicks) > 1 and p2p._stack(left, cycle["amount"]) is None:   # составная покупка: оставшиеся — на всю сумму?
+        return "fail", "часть мерчантов покупки ушла, остальные сумму не покрывают"
     return "advance", ""
 
 
 def check_transfer_stage(cycle, cfg, transfer_minutes, now=None):
     """Проверка стадии transfer по свежему справочнику (только чтение fees.json/netstatus через
     p2p.withdraw_open, без сети и без записи в БД). Раньше PAPER_TRANSFER_MINUTES с начала стадии
-    не ждём. После — проверяем, что вывод buy_asset с buy_ex всё ещё возможен (известна комиссия,
-    сеть открыта) — иначе перевод сорвался бы в реальности.
+    не ждём. После — проверяем, что вывод buy_asset с buy_ex на sell_ex всё ещё возможен (известна комиссия,
+    сеть открыта, получатель принимает) — иначе перевод сорвался бы в реальности. Внутри одной площадки перевода
+    нет; монету от обменника (buy_ex=BestChange) шлёт сам обменник — сведений о его выводе нет, не проверяем.
 
     Возвращает (action, note) как check_buy_stage: "wait"/"advance"/"fail" (result станет
     failed_transfer)."""
     now = now if now is not None else time.time()
     if now - cycle["ts_stage"] < transfer_minutes * 60:
         return "wait", ""
-    if not p2p.withdraw_open(cfg, cycle["buy_ex"], cycle["buy_asset"]):
+    if cycle["buy_ex"] == cycle["sell_ex"] or cycle["buy_ex"] == "BestChange":
+        return "advance", ""
+    if not p2p.withdraw_open(cfg, cycle["buy_ex"], cycle["buy_asset"], receiver=cycle["sell_ex"]):
         return "fail", f"вывод {cycle['buy_asset']} с {cycle['buy_ex']} закрыт"
     return "advance", ""
+
+
+def simple_route(deal):
+    """Связку можно честно прогнать: покупка и продажа одной монеты без конвертаций на споте. Межмонетные и через
+    промежуточную монету зависят от курса спота между стадиями — этот риск сухой прогон пока не моделирует."""
+    _, b, s, route = deal
+    return b.asset == s.asset and "спот" not in (route or "") and "через" not in (route or "")
 
 
 def sell_qty(cycle):
@@ -257,7 +270,7 @@ def check_sell_stage(cycle, snap, now=None, stale_minutes=30.0):
     продажи в этом скане не ответила (дольше stale_minutes — срыв). Объём — выход маршрута в монете продажи
     (sell_qty), у обменника — только стакан той же сети (sell_net), что и в плане."""
     now = now if now is not None else time.time()
-    if _venue_down(snap, cycle["sell_ex"], "sell", cycle["sell_asset"]):
+    if _venue_down(snap, cycle["sell_ex"], cycle["sell_asset"]):
         if _stale(cycle, stale_minutes, now):
             return "fail", f"площадка {cycle['sell_ex']} недоступна", None
         return "wait", "", None

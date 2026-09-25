@@ -218,13 +218,13 @@ def _cfg():
 
 
 def test_check_transfer_stage_waits_before_transfer_minutes():
-    cycle = {"ts_stage": 1000.0, "buy_ex": "Bybit", "buy_asset": "USDT"}
+    cycle = {"ts_stage": 1000.0, "buy_ex": "Bybit", "buy_asset": "USDT", "sell_ex": "MEXC"}
     action, note = paper.check_transfer_stage(cycle, _cfg(), transfer_minutes=3, now=1100.0)   # 100с < 180с
     assert action == "wait" and note == ""
 
 
 def test_check_transfer_stage_advances_when_withdraw_open():
-    cycle = {"ts_stage": 1000.0, "buy_ex": "Bybit", "buy_asset": "USDT"}
+    cycle = {"ts_stage": 1000.0, "buy_ex": "Bybit", "buy_asset": "USDT", "sell_ex": "MEXC"}
     action, note = paper.check_transfer_stage(cycle, _cfg(), transfer_minutes=3, now=1300.0)
     assert action == "advance" and note == ""   # сведений о закрытии нет — не мешаем
 
@@ -233,7 +233,7 @@ def test_check_transfer_stage_fails_when_withdraw_closed():
     import netstatus
     netstatus._apply("Bybit", "USDT", {n: {"dep": True, "wd": False, "fee": 1.0}
                                         for n in ("TRC20", "BEP20", "ERC20", "TON")})
-    cycle = {"ts_stage": 1000.0, "buy_ex": "Bybit", "buy_asset": "USDT"}
+    cycle = {"ts_stage": 1000.0, "buy_ex": "Bybit", "buy_asset": "USDT", "sell_ex": "MEXC"}
     action, note = paper.check_transfer_stage(cycle, _cfg(), transfer_minutes=3, now=1300.0)
     assert action == "fail" and "закрыт" in note
 
