@@ -1,0 +1,34 @@
+{
+ "data": [
+  {
+   "price": 7016180.0,
+   "minTradeLimit": 30000.0,
+   "maxTradeLimit": 90000.0,
+   "availableQuantity": 0.021601,
+   "payMethod": "12",
+   "merchant": {
+    "nickName": "BuyFastRu"
+   },
+   "merchantStatistics": {
+    "doneLastMonthCount": 320,
+    "completeRate": "0.9900"
+   },
+   "tradeTerms": "Покупаю быстро, оплата по реквизитам в чате."
+  },
+  {
+   "price": 7045344.0,
+   "minTradeLimit": 20000.0,
+   "maxTradeLimit": 60000.0,
+   "availableQuantity": 0.011401,
+   "payMethod": "23",
+   "merchant": {
+    "nickName": "SBP_Kupim"
+   },
+   "merchantStatistics": {
+    "doneLastMonthCount": 75,
+    "completeRate": "0.9800"
+   },
+   "tradeTerms": "Оплата по СБП, одним платежом."
+  }
+ ]
+}

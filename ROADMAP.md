@@ -94,12 +94,15 @@
   объявлениями/мерчантами для sell, как раньше сделано у Bybit; тест `test_buy_and_sell_use_different_fixture_ads`
   в tests/test_adapters.py (параметризован по площадкам). Остаток — разные ₽-цены для не-USDT монет —
   новой строкой ниже.)
-- [ ] Разные объявления для разных сторон/монет в фикстурах, часть 3: разные ₽-цены для не-USDT монет
-  (BTC/ETH и т.п.) в offline-фикстурах площадок (сейчас `htx_ads.json`/`kucoin_ads.json`/`mexc_ads.json`/
-  `bitpapa_ads.json`/`bybit_ads*.json` отдают одни и те же числа независимо от запрошенной монеты, хотя
-  реальные цены отличаются на порядки) — нужно разобрать монету из запроса каждой площадки (HTX `coinId`,
-  KuCoin `currency`, MEXC `coinId` после маппинга через `mexc_coins.json`, BitPapa `crypto_currency_code`,
-  Bybit `tokenId` в теле POST) и завести фикстуры/выборку по ней.
+- [x] Разные объявления для разных сторон/монет в фикстурах, часть 3: разные ₽-цены для не-USDT монет
+  (BTC/ETH и т.п.) в offline-фикстурах площадок. (2026-09-25 — `tests/conftest.py` разбирает монету из
+  запроса каждой площадки (HTX числовой `coinId` через `p2p.HTX_COIN`, KuCoin `currency` напрямую, MEXC
+  `coinId`-хэш через обратный `mexc_coins.json`, BitPapa `crypto_currency_code`, Bybit `tokenId` в теле
+  POST) и подставляет фикстуру `*_ads_btc[_sell].json`/`*_ads_eth[_sell].json` с ценами нужного порядка
+  (посчитаны из `rapira.json` × спот-курса BTC/ETH к USDT, укладываются в `MAX_DEV` от `snap.refs`, как
+  настоящие); для остальных монет (USDC/TON и т.п., как и раньше) — фикстура USDT, отдельных чисел под
+  них не заводили. Тесты `test_ads_price_matches_requested_coin`/`test_ads_btc_and_eth_use_different_prices_than_usdt`
+  в tests/test_adapters.py и `test_scan_offline_btc_prices_near_reference` в tests/test_route.py.)
 - [ ] Кнопка «📋 объём» под карточкой: фактический выход монеты без запаса на курс (запас — отдельной строкой в подписи), иначе для BTC/ETH/TON предлагается продать на 0.3–0.7% меньше, чем выйдет.
 - [x] История аккаунтов: объединять депозиты, выводы и спот-сделки в одну ленту по времени, а не брать первый непустой источник (старые депозиты скрывают свежие события других типов). (2026-09-24 — `accounts._merge_hist` в accounts.py: `mexc_history`/`htx_history`/`kucoin_history` объединяют депозиты и выводы по времени вместо возврата первого непустого источника; `account_history` для MEXC/KuCoin дополнительно объединяет их со спот-сделками.)
 - [~] launcher (защищённый файл — делает владелец локально): накапливать падения бота через 60–600 с после старта для отката; список плохих коммитов — в файл; `pip install -r requirements.txt` при обновлении, если requirements изменился; замок `logs/launcher.lock` при ошибке открытия файла сейчас fail-open (работаем без замка) — сообщать в Telegram; при таймауте `pip install pytest` в smoke — отдельный текст ошибки.
@@ -369,6 +372,10 @@ _(облачный Claude добавляет сюда предложения, к
 - Площадки под санкциями или с сомнительным статусом (Garantex, Grinex, A7A5, ABCeX).
 
 ## Журнал
+- 2026-09-25 — offline-фикстуры площадок теперь различают и монету, не только сторону: `tests/conftest.py`
+  разбирает coinId/currency/tokenId/crypto_currency_code из запроса каждой площадки и подставляет
+  `*_ads_btc.json`/`*_ads_eth.json` (цены посчитаны от `rapira.json` × спот-курса, укладываются в
+  `MAX_DEV`) вместо одних и тех же ₽-чисел под любую монету.
 - 2026-09-25 — offline-фикстуры HTX/KuCoin/MEXC/BitPapa теперь тоже различают buy/sell (как раньше сделано
   у Bybit): `_htx_ads`/`_kucoin_ads`/`_mexc_ads`/`_bitpapa_ads` в tests/conftest.py выбирают `*_ads_sell.json`
   по стороне бота в URL запроса каждой площадки; разные ₽-цены для не-USDT монет в фикстурах — остаток,

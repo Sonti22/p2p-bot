@@ -1,0 +1,64 @@
+{
+ "data": [
+  {
+   "price": 7257830.0,
+   "minTradeLimit": 50000.0,
+   "maxTradeLimit": 183781.0,
+   "availableQuantity": 0.025322,
+   "payMethod": "13",
+   "merchant": {
+    "nickName": "Alhimik 🧪"
+   },
+   "merchantStatistics": {
+    "doneLastMonthCount": 10,
+    "completeRate": "1.0000"
+   },
+   "tradeTerms": "❗️Принимаю оплату от первых лиц, на личный счёт\n💳 Оплата по реквизитам\n🧾 После перевода обязательно отправляйте чек\n⚡️ Отправка сразу после подтверждения оплаты"
+  },
+  {
+   "price": 7274495.0,
+   "minTradeLimit": 40000.0,
+   "maxTradeLimit": 50970.91,
+   "availableQuantity": 0.007007,
+   "payMethod": "13,23",
+   "merchant": {
+    "nickName": "🌑onetwo"
+   },
+   "merchantStatistics": {
+    "doneLastMonthCount": 690,
+    "completeRate": "1.0000"
+   },
+   "tradeTerms": "ПРИНИМАЮ ТОЛЬКО С Т-БАНКА ОПЛАТУ С ЧЕКОМ НА ПОЧТУ!!! От третьих лиц не принимаю!!!"
+  },
+  {
+   "price": 7281995.0,
+   "minTradeLimit": 40000.0,
+   "maxTradeLimit": 200997.0,
+   "availableQuantity": 0.027602,
+   "payMethod": "13",
+   "merchant": {
+    "nickName": "Hackway"
+   },
+   "merchantStatistics": {
+    "doneLastMonthCount": 57,
+    "completeRate": "1.0000"
+   },
+   "tradeTerms": "Принимаю только с Тиньков (Т банка) по реквизитам в чате. Если перепутали получателя/банк/номер то потеряли деньги. Заходите на суммы кратные 5т. После оплаты о"
+  },
+  {
+   "price": 7299493.0,
+   "minTradeLimit": 10000.0,
+   "maxTradeLimit": 132753.33,
+   "availableQuantity": 0.018187,
+   "payMethod": "13",
+   "merchant": {
+    "nickName": "Быстро и Честно"
+   },
+   "merchantStatistics": {
+    "doneLastMonthCount": 9,
+    "completeRate": "1.0000"
+   },
+   "tradeTerms": "Если не умеете отправлять чек на почту не заходите\nЗаходить строго на 50000\n• Принимаю оплату ТОЛЬКО с Т-Банка (Тинькофф) по\nНОМЕРУ КАРТЫ (возможна комиссия!)\n﻿"
+  }
+ ]
+}

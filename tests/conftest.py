@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import re
 
 import pytest
 
@@ -21,28 +22,52 @@ def _kucoin_currency(url):
     return {"code": "200000", "data": d or {}}
 
 
+_HTX_COIN_BY_ID = {v: k for k, v in p2p.HTX_COIN.items()}
+_MEXC_COIN_BY_ID = {c["coinId"]: c["coinName"] for c in json.load(
+    open(os.path.join(FIX, "mexc_coins.json"), encoding="utf-8"))["data"]}
+
+
+def _ads_name(prefix, asset, sell):
+    """Фикстуры с ценами под конкретную монету заведены только для BTC/ETH (на порядки отличаются от USDT);
+    для остальных монет отдаём фикстуру USDT — как и раньше, до разбора монеты из запроса."""
+    suffix = "_sell" if sell else ""
+    name = f"{prefix}_ads_{asset.lower()}{suffix}.json"
+    if asset == "USDT" or not os.path.exists(os.path.join(FIX, name)):
+        name = f"{prefix}_ads{suffix}.json"
+    return name
+
+
 def _bybit_ads(body):
     """Объявления Bybit различаются по стороне запроса (`side` в теле POST): "1" — бот покупает
     (площадке отдаём объявления продавцов), "0" — бот продаёт (объявления покупателей), у них разные
-    цены и мерчанты, как в реальном стакане."""
-    return load("bybit_ads_sell.json" if (body or {}).get("side") == "0" else "bybit_ads.json")
+    цены и мерчанты, как в реальном стакане. Монета — `tokenId` в том же теле."""
+    body = body or {}
+    return load(_ads_name("bybit", body.get("tokenId", "USDT"), body.get("side") == "0"))
 
 
 def _htx_ads(url):
-    """HTX кодирует сторону бота в query `tradeType` (значение — противоположная сторона стакана)."""
-    return load("htx_ads_sell.json" if "tradeType=buy" in url else "htx_ads.json")
+    """HTX кодирует сторону бота в query `tradeType` (значение — противоположная сторона стакана),
+    монету — числовым `coinId` (см. `p2p.HTX_COIN`)."""
+    coin = _HTX_COIN_BY_ID.get(int(re.search(r"coinId=(\d+)", url).group(1)), "USDT")
+    return load(_ads_name("htx", coin, "tradeType=buy" in url))
 
 
 def _kucoin_ads(url):
-    return load("kucoin_ads_sell.json" if "side=BUY" in url else "kucoin_ads.json")
+    asset = re.search(r"currency=([^&]+)", url).group(1)
+    return load(_ads_name("kucoin", asset, "side=BUY" in url))
 
 
 def _mexc_ads(url):
-    return load("mexc_ads_sell.json" if "tradeType=BUY" in url else "mexc_ads.json")
+    """Монета в запросе MEXC — внутренний `coinId` (хэш), а не тикер; обратно сопоставляем через
+    справочник `mexc_coins.json` — тот же, что заполняет `p2p._mexc_coins`."""
+    coin_id = re.search(r"coinId=([^&]+)", url).group(1)
+    asset = _MEXC_COIN_BY_ID.get(coin_id, "USDT")
+    return load(_ads_name("mexc", asset, "tradeType=BUY" in url))
 
 
 def _bitpapa_ads(url):
-    return load("bitpapa_ads_sell.json" if "type=buy" in url else "bitpapa_ads.json")
+    asset = re.search(r"crypto_currency_code=([^&]+)", url).group(1)
+    return load(_ads_name("bitpapa", asset, "type=buy" in url))
 
 
 # подстрока URL -> файл фикстуры (урезанные живые ответы площадок) или функция от URL

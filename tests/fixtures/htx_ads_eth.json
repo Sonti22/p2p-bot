@@ -1,0 +1,114 @@
+{
+ "data": [
+  {
+   "price": "229670.56",
+   "minTradeLimit": "40000.00",
+   "maxTradeLimit": "54738.00",
+   "tradeCount": "0.238334",
+   "payMethods": [
+    {
+     "payMethodId": 28,
+     "name": "Tinkoff",
+     "color": "#DAB700",
+     "isRecommend": null
+    }
+   ],
+   "userName": "whiteduke",
+   "tradeMonthTimes": 939,
+   "orderCompleteRate": "99"
+  },
+  {
+   "price": "231545.10",
+   "minTradeLimit": "40000.00",
+   "maxTradeLimit": "93000.00",
+   "tradeCount": "0.946900",
+   "payMethods": [
+    {
+     "payMethodId": 1025,
+     "name": "PSB",
+     "color": "#2b4087",
+     "isRecommend": null
+    },
+    {
+     "payMethodId": 69,
+     "name": "SBP - Fast Bank Transfer",
+     "color": "#1487C9",
+     "isRecommend": null
+    },
+    {
+     "payMethodId": 361,
+     "name": "Sovkombank",
+     "color": "#FF4B5F",
+     "isRecommend": null
+    },
+    {
+     "payMethodId": 28,
+     "name": "Tinkoff",
+     "color": "#DAB700",
+     "isRecommend": null
+    }
+   ],
+   "userName": "Hellatrigger",
+   "tradeMonthTimes": 592,
+   "orderCompleteRate": "97"
+  },
+  {
+   "price": "231914.73",
+   "minTradeLimit": "50000.00",
+   "maxTradeLimit": "50000.00",
+   "tradeCount": "1.766130",
+   "payMethods": [
+    {
+     "payMethodId": 69,
+     "name": "SBP - Fast Bank Transfer",
+     "color": "#1487C9",
+     "isRecommend": null
+    }
+   ],
+   "userName": "OLGANOIR",
+   "tradeMonthTimes": 863,
+   "orderCompleteRate": "97"
+  },
+  {
+   "price": "232020.34",
+   "minTradeLimit": "50000.00",
+   "maxTradeLimit": "73032.00",
+   "tradeCount": "0.314766",
+   "payMethods": [
+    {
+     "payMethodId": 1027,
+     "name": "Ozon",
+     "color": "#005bff",
+     "isRecommend": null
+    },
+    {
+     "payMethodId": 69,
+     "name": "SBP - Fast Bank Transfer",
+     "color": "#1487C9",
+     "isRecommend": null
+    },
+    {
+     "payMethodId": 25,
+     "name": "Alfa-bank",
+     "color": "#EE3424",
+     "isRecommend": null
+    },
+    {
+     "payMethodId": 28,
+     "name": "Tinkoff",
+     "color": "#DAB700",
+     "isRecommend": null
+    },
+    {
+     "payMethodId": 29,
+     "name": "Sberbank",
+     "color": "#319B41",
+     "isRecommend": null
+    }
+   ],
+   "userName": "vitarigovam",
+   "tradeMonthTimes": 30,
+   "orderCompleteRate": "25"
+  }
+ ]
+}

@@ -1,0 +1,61 @@
+{
+ "data": [
+  {
+   "price": "6924519",
+   "minTradeLimit": "30000.00",
+   "maxTradeLimit": "60000.00",
+   "tradeCount": "0.013231",
+   "payMethods": [
+    {
+     "payMethodId": 69,
+     "name": "SBP - Fast Bank Transfer",
+     "color": "#1487C9",
+     "isRecommend": null
+    }
+   ],
+   "userName": "NightTrader88",
+   "tradeMonthTimes": 410,
+   "orderCompleteRate": "98"
+  },
+  {
+   "price": "6953684",
+   "minTradeLimit": "20000.00",
+   "maxTradeLimit": "70000.00",
+   "tradeCount": "0.036604",
+   "payMethods": [
+    {
+     "payMethodId": 28,
+     "name": "Tinkoff",
+     "color": "#DAB700",
+     "isRecommend": null
+    },
+    {
+     "payMethodId": 25,
+     "name": "Alfa-bank",
+     "color": "#EE3424",
+     "isRecommend": null
+    }
+   ],
+   "userName": "KurskExch",
+   "tradeMonthTimes": 205,
+   "orderCompleteRate": "96"
+  },
+  {
+   "price": "6966183",
+   "minTradeLimit": "50000.00",
+   "maxTradeLimit": "150000.00",
+   "tradeCount": "0.062404",
+   "payMethods": [
+    {
+     "payMethodId": 29,
+     "name": "Sberbank",
+     "color": "#319B41",
+     "isRecommend": null
+    }
+   ],
+   "userName": "SoyuzP2P",
+   "tradeMonthTimes": 1200,
+   "orderCompleteRate": "99"
+  }
+ ]
+}
