@@ -519,6 +519,8 @@ def _stack(ads, amount):
     for a in ads:
         if remaining <= 0:
             break
+        if a.avail <= 0:
+            continue   # нулевой доступный объём — вообще не участвует в стеке (даже если min_amt тоже 0)
         take = min(remaining, a.max_amt, a.avail * a.price)
         if take < a.min_amt:
             continue   # меньше минимума этого объявления — пропускаем, берём из следующего
@@ -541,6 +543,8 @@ def _stack_qty(ads, qty):
     for a in ads:
         if remaining <= 0:
             break
+        if a.avail <= 0:
+            continue   # нулевой доступный объём — вообще не участвует в стеке (даже если min_amt тоже 0)
         take = min(remaining, a.avail, a.max_amt / a.price)
         if take * a.price < a.min_amt:
             continue   # меньше минимума этого объявления — пропускаем, берём из следующего

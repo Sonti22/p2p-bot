@@ -221,6 +221,16 @@ def test_stack_returns_none_when_depth_insufficient():
     assert p2p._stack(ads, 50000) is None
 
 
+def test_stack_skips_ad_with_zero_avail():
+    # min_amt=0 у нулевого объявления — без явной проверки avail оно проскочило бы мимо "take < min_amt"
+    ads = [make_ad(price=85.0, min_amt=0, max_amt=0, avail=0, pays=("Zero-Bank",)),
+           make_ad(price=86.0, min_amt=1000, max_amt=500000, avail=500000 / 86.0)]
+    stacked = p2p._stack(ads, 50000)
+    assert stacked is not None
+    assert stacked.nick == "nick"   # нулевое объявление не попало в used — не "2 объявл."
+    assert "Zero-Bank" not in stacked.pays
+
+
 def test_stack_keeps_net_only_when_all_ads_share_it():
     trc = [make_ad("BestChange", "sell", 89.9, net="TRC20", max_amt=25000, avail=25000 / 89.9),
            make_ad("BestChange", "sell", 89.7, net="TRC20", max_amt=25000, avail=25000 / 89.7)]
@@ -320,6 +330,15 @@ def test_stack_qty_skips_ad_below_min():
            make_ad("MEXC", "sell", 100.0, avail=10_000)]
     stacked = p2p._stack_qty(ads, 500.0)
     assert stacked.price == pytest.approx((450 * 102.0 + 50 * 100.0) / 500)
+
+
+def test_stack_qty_skips_ad_with_zero_avail():
+    ads = [make_ad("MEXC", "sell", 102.0, min_amt=0, max_amt=0, avail=0, pays=("Zero-Bank",)),
+           make_ad("MEXC", "sell", 101.0, avail=10_000)]
+    stacked = p2p._stack_qty(ads, 500.0)
+    assert stacked is not None
+    assert stacked.nick == "nick"   # нулевое объявление не попало в used — не "2 объявл."
+    assert "Zero-Bank" not in stacked.pays
 
 
 def test_route_uses_sell_depth_for_actual_output():
