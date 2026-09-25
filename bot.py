@@ -1547,6 +1547,33 @@ class Bot:
         parts = [f"{i}) {fmt_deal(d, self.cfg)}" for i, d in enumerate(top, 1)]
         await self.send("🌅 <b>Доброе утро! Топ-3 связки за ночь</b>\n\n" + "\n\n".join(parts), topic="signals")
 
+    def paper_digest_line(self):
+        """Одна строка сводки сухого прогона за сутки для утреннего дайджеста — то же, что «За сегодня»
+        в /paper. None — сухой прогон выключен или за сутки не было ни одного завершённого круга (не слать)."""
+        if not paper.settings()["on"]:
+            return None
+        p = paper.stats()["day"]
+        if not p["total"]:
+            return None
+        line = f"🧪 Сухой прогон за сутки: {p['total']} кругов, исполнилось {p['done']}"
+        if p["failed"]:
+            reasons = ", ".join(f"{paper.FAIL_LABELS.get(r, r)} {n}" for r, n in p["failed_by_reason"].items())
+            line += f", сорвалось {p['failed']} ({reasons})"
+        if p["avg_diff"] is not None:
+            line += f", факт vs план {p['avg_diff']:+.2f} п.п."
+        balance = paper.get_balance()
+        if balance is not None:
+            change = paper.balance_change()
+            change_str = f"{change:+,.0f}".replace(",", " ")
+            line += f", баланс {_money(balance)} ₽ ({change_str} ₽)"
+        return line
+
+    async def send_paper_digest(self):
+        """Отправить строку `paper_digest_line()` в топик «Сигналы», если есть что показать."""
+        line = self.paper_digest_line()
+        if line:
+            await self.send(line, topic="signals")
+
     async def quiet_and_pause_tick(self, snap):
         """Тихие часы копят связки для утреннего дайджеста вместо отправки; обычная пауза (ручная или
         по /pause) просто не шлёт сигналы. Дайджест уходит один раз — в момент выхода из тихих часов."""
@@ -1555,6 +1582,7 @@ class Bot:
             self.collect_night_deals(snap)
         elif self._was_quiet:
             await self.send_night_digest()
+            await self.send_paper_digest()
         self._was_quiet = quiet
         paused = self.paused or (self.pause_until and time.time() < self.pause_until)
         if not quiet and not paused:
