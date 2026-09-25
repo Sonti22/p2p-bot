@@ -1,3 +1,4 @@
+import datetime
 import sqlite3
 import time
 
@@ -19,6 +20,27 @@ def test_log_and_stats_within_periods(tmp_path):
     assert st["week"]["count"] == 2 and st["week"]["amount"] == 150000
     assert st["week"]["avg_profit"] == 3.0
     assert st["month"]["count"] == 2         # запись 40-дневной давности не входит
+
+
+def test_stats_day_is_calendar_day_msk_not_rolling_24h(tmp_path):
+    db = str(tmp_path / "trades.db")
+    now = datetime.datetime(2026, 9, 25, 0, 30, tzinfo=trades.MSK).timestamp()          # чуть после полуночи МСК
+    yesterday_late = datetime.datetime(2026, 9, 24, 22, 30, tzinfo=trades.MSK).timestamp()  # 2 ч назад, но вчера
+    today_early = datetime.datetime(2026, 9, 25, 0, 10, tzinfo=trades.MSK).timestamp()      # тот же день МСК
+    trades.log_trade(deal(), 10000, path=db, ts=yesterday_late)
+    trades.log_trade(deal(), 20000, path=db, ts=today_early)
+    st = trades.stats(path=db, now=now)
+    assert st["day"]["count"] == 1 and st["day"]["amount"] == 20000    # вчерашняя не попала, хотя ей всего 2 ч
+
+
+def test_stats_month_is_calendar_month_not_rolling_30_days(tmp_path):
+    db = str(tmp_path / "trades.db")
+    now = time.time()
+    month_start = trades._month_start(now)
+    trades.log_trade(deal(), 10000, path=db, ts=month_start + 3600)   # начало текущего календарного месяца
+    trades.log_trade(deal(), 20000, path=db, ts=month_start - 3600)   # конец прошлого месяца, но < 30 дней назад
+    st = trades.stats(path=db, now=now)
+    assert st["month"]["count"] == 1 and st["month"]["amount"] == 10000
 
 
 def test_stats_empty_db_missing_file(tmp_path):
