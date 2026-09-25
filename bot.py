@@ -25,7 +25,7 @@ import presets
 import trades
 from cards import deal_card, history_card, history_compare_card, portfolio_card, top_chart
 from p2p import ALL_EXCHANGES, AMOUNT_MAX, AMOUNT_MIN, DEFAULT_ASSETS, ENV_PATH, LOG_PATH, MIN_PROFIT_MAX, \
-    MIN_PROFIT_MIN, Config, _money, _price, _route_qty, bank_liquidity, deal_amounts, deal_for_amount, fmt_ad, \
+    MIN_PROFIT_MIN, TRAP, Config, _money, _price, _route_qty, bank_liquidity, deal_amounts, deal_for_amount, fmt_ad, \
     fmt_breakeven, fmt_deal, fmt_top, load_env, maker_quote, parse_amount, parse_min_profit, profit_breakdown, \
     reliability, scan, setup_logging, spot_url, traps_log, venue_url
 
@@ -1243,6 +1243,14 @@ class Bot:
             if r["avg_duration_min"] is not None:
                 line += f", среднее время круга {r['avg_duration_min']:.0f} мин"
             lines.append(line)
+        by_label = paper.label_stats()
+        if by_label:
+            lines += ["", "По метке надёжности на старте:"]
+            for label, g in sorted(by_label.items()):
+                line = f"{label}: {g['total']} кругов, исполнилось {g['done']}, план {g['avg_planned_pct']:+.2f}%"
+                if g["avg_realized_pct"] is not None:
+                    line += f" / факт {g['avg_realized_pct']:+.2f}%"
+                lines.append(line)
         lines.append("")
         lines.append("📄 те же данные — файлом CSV ниже.")
         return "\n".join(lines)
@@ -1730,6 +1738,10 @@ class Bot:
             if key not in alive:
                 del self.live[key]
 
+    def is_confirmed(self, d):
+        """Связка держится LIVE_SCANS сканов подряд — только такие уходят владельцу сигналом (и в сухой прогон)."""
+        return self.live_scans <= 1 or self.live.get(self._deal_key(d), {}).get("streak", 0) >= self.live_scans
+
     def held_label(self, d, now=None):
         """«⏱ держится N мин», если связка видна не первый скан; иначе пусто."""
         rec = self.live.get(self._deal_key(d))
@@ -1739,32 +1751,46 @@ class Bot:
         return f"⏱ держится {minutes} мин · "
 
     async def maybe_start_paper_cycle(self, deals, snap):
-        """Сухой прогон (paper.py): при сигнале выше порога и свободном слоте виртуально «берём»
-        лучшую связку на сумму PAPER_AMOUNT (глубина — на неё, а не на AMOUNT, через deal_for_amount/
-        _stack) и пишем круг в data/paper.db со стадией buy. Карточка — только владельцу, гостям
-        про сухой прогон ничего не идёт."""
+        """Сухой прогон (paper.py): при свободном слоте виртуально «берём» первую связку из тех, о которых
+        владелец получает сигнал (выше порога и держится LIVE_SCANS сканов), если стакана хватает на сумму
+        PAPER_AMOUNT (deal_for_amount/_stack) и она не «🪤 ловушка» (PAPER_TRAPS=1 — брать и их). Пишем
+        круг с меткой надёжности в data/paper.db со стадией buy. Карточка — только владельцу, гостям про
+        сухой прогон ничего не идёт."""
         settings = paper.settings()
         if not settings["on"] or not self.chat_id or not deals:
             return
         if len(paper.open_cycles()) >= settings["max_open"]:
             return
-        d = deal_for_amount(deals[0], self.cfg, snap, settings["amount"])
-        if d is None:
-            return   # глубины стакана на сумму сухого прогона не хватает
+        for deal in deals:
+            if not self.is_confirmed(deal):
+                continue   # сигнала о ней ещё не было — выброс одного скана не берём
+            d = deal_for_amount(deal, self.cfg, snap, settings["amount"])
+            if d is None:
+                continue   # глубины стакана на сумму сухого прогона не хватает
+            label, reasons = reliability(d, self.cfg, snap)
+            if label == TRAP and not settings["traps"]:
+                continue
+            break
+        else:
+            return
         profit, b, s, route = d
         paper.init_balance(settings["amount"])
-        paper.start_cycle(settings["amount"], b, s, route, profit)
+        paper.start_cycle(settings["amount"], b, s, route, profit, label=label)
         bank = trades.sbp_bank(b.pays) or "—"
         qty = settings["amount"] / b.price
-        await self.send(f"🧪 <b>Сухой прогон</b>: купил бы {_money(qty)} {b.asset} у {html.escape(b.nick)} "
-                        f"по {_price(b.price)} ₽, оплата {bank}", topic="signals")
+        text = (f"🧪 <b>Сухой прогон</b>: купил бы {_money(qty)} {b.asset} у {html.escape(b.nick)} "
+                f"по {_price(b.price)} ₽, оплата {bank} · план {profit:.2f}% · {label}")
+        if reasons:
+            text += "\n" + "\n".join(f"• {html.escape(r)}" for r in reasons)
+        await self.send(text, topic="signals")
 
     async def process_paper_cycles(self, snap):
         """Сухой прогон: стадии открытых виртуальных кругов по свежему снимку/справочникам, без сети.
-        buy — через PAPER_PAY_MINUTES объявление покупки ещё на месте и цена не хуже плана; transfer —
-        через PAPER_TRANSFER_MINUTES вывод всё ещё возможен (fees/netstatus); sell — объявление продажи
-        на месте, глубина хватает, цена не хуже плана — круг завершается с прибылью по факту цены
-        продажи. Любая стадия не прошла — круг сорван (failed_buy/failed_transfer/failed_sell)."""
+        buy — через PAPER_PAY_MINUTES объявление покупки ещё на месте (цена ордера зафиксирована при
+        создании); transfer — через PAPER_TRANSFER_MINUTES вывод всё ещё возможен (fees/netstatus); sell —
+        продаём лучшим объявлениям стакана на весь объём, прибыль — по фактической цене (может быть ниже
+        плана и в минус). Срыв (failed_buy/failed_transfer/failed_sell): мерчант покупки ушёл, вывод
+        закрыт, покупателей на весь объём нет."""
         if not self.chat_id:
             return
         settings = paper.settings()
@@ -1797,9 +1823,10 @@ class Bot:
                                     topic="signals")
                 else:
                     rp = paper.realized_pct(cycle, price)
-                    paper.finish_cycle(cycle["id"], "done", rp)
+                    paper.finish_cycle(cycle["id"], "done", rp, note, sell_fact=price)
                     await self.send(f"🧪 Сухой прогон: круг #{cycle['id']} завершён — план "
-                                    f"{cycle['planned_pct']:.2f}%, факт {rp:.2f}%", topic="signals")
+                                    f"{cycle['planned_pct']:.2f}%, факт {rp:.2f}%"
+                                    + (f" ({note})" if note else ""), topic="signals")
 
     async def check_paper_ladder(self):
         """Лестница суммы сухого прогона (paper.ladder_suggestion): сам PAPER_AMOUNT не меняет —
@@ -1832,7 +1859,7 @@ class Bot:
         for d in deals:
             profit = d[0]
             key = self._deal_key(d)
-            if self.live_scans > 1 and self.live.get(key, {}).get("streak", 0) < self.live_scans:
+            if not self.is_confirmed(d):
                 continue                                          # появилась только что — ждём подтверждения
             prev = self.sent.get(key)
             if prev and now - prev[0] < self.cooldown and profit < prev[1] + self.repeat_step:
@@ -2207,9 +2234,7 @@ class Bot:
             await self.cmd_paper("report")
         elif data.startswith("paper_ladder:"):
             amount = float(data[len("paper_ladder:"):])
-            save_env("PAPER_AMOUNT", f"{amount:.0f}")
-            await self.call("answerCallbackQuery", callback_query_id=cq["id"],
-                            text=f"Сумма круга: {_money(amount)} ₽")
+            save_env("PAPER_AMOUNT", f"{amount:.0f}")   # на нажатие уже ответили выше — второй answerCallbackQuery не нужен
             await self.send(f"🧪 Сумма круга сухого прогона: {_money(amount)} ₽.")
         elif data == "balance":
             await self.balance()

@@ -44,7 +44,7 @@ LADDER_DOWN_MIN_FAILED = 0.4   # доля сорвавшихся за недел
 
 _COLUMNS = ("id", "ts_start", "amount", "buy_ex", "buy_asset", "buy_price", "buy_nick",
             "sell_ex", "sell_asset", "sell_price", "sell_nick", "route", "planned_pct",
-            "stage", "ts_stage", "realized_pct", "result", "note", "bank")
+            "stage", "ts_stage", "realized_pct", "result", "note", "bank", "label", "sell_fact")
 
 
 def settings():
@@ -56,6 +56,8 @@ def settings():
         "pay_minutes": float(os.getenv("PAPER_PAY_MINUTES", 5)),
         "transfer_minutes": float(os.getenv("PAPER_TRANSFER_MINUTES", 3)),
         "max_open": int(os.getenv("PAPER_MAX_OPEN", 1)),
+        # «🪤 ловушки» по умолчанию не берём — как не взял бы их автомат на этапе 2
+        "traps": os.getenv("PAPER_TRAPS", "0").strip().lower() in ("1", "true", "yes", "on"),
     }
 
 
@@ -68,10 +70,11 @@ def _connect(path):
                 "sell_ex TEXT, sell_asset TEXT, sell_price REAL, sell_nick TEXT, "
                 "route TEXT, planned_pct REAL, stage TEXT, ts_stage REAL, "
                 "realized_pct REAL DEFAULT NULL, result TEXT DEFAULT NULL, note TEXT DEFAULT '', "
-                "bank TEXT DEFAULT '')")
+                "bank TEXT DEFAULT '', label TEXT DEFAULT '', sell_fact REAL DEFAULT NULL)")
     cols = [r[1] for r in con.execute("PRAGMA table_info(cycles)")]
-    if "bank" not in cols:
-        con.execute("ALTER TABLE cycles ADD COLUMN bank TEXT DEFAULT ''")
+    for col, ddl in (("bank", "TEXT DEFAULT ''"), ("label", "TEXT DEFAULT ''"), ("sell_fact", "REAL DEFAULT NULL")):
+        if col not in cols:   # база от прошлой версии — добавляем колонку, данные не трогаем
+            con.execute(f"ALTER TABLE cycles ADD COLUMN {col} {ddl}")
     con.execute("CREATE TABLE IF NOT EXISTS balance (id INTEGER PRIMARY KEY CHECK (id = 1), "
                 "amount REAL, updated_ts REAL)")
     con.commit()
@@ -111,20 +114,21 @@ def apply_result(realized_pct, amount, path=DB_PATH, ts=None):
     con.close()
 
 
-def start_cycle(amount, buy, sell, route, planned_pct, path=DB_PATH, ts=None):
+def start_cycle(amount, buy, sell, route, planned_pct, path=DB_PATH, ts=None, label=""):
     """Завести новый виртуальный круг со стадией buy. buy/sell — объявления покупки/продажи
     (p2p.Ad) на момент старта. Банк оплаты (trades.sbp_bank по способам оплаты buy) пишется сразу —
-    в реальности рубли по СБП уходят в момент оплаты, до проверки стадии buy. Возвращает id круга."""
+    в реальности рубли по СБП уходят в момент оплаты, до проверки стадии buy. label — метка надёжности
+    связки на старте (p2p.reliability) — для разбора в отчёте. Возвращает id круга."""
     ts = ts if ts is not None else time.time()
     bank = trades.sbp_bank(buy.pays)
     con = _connect(path)
     with con:
         cur = con.execute(
             "INSERT INTO cycles (ts_start, amount, buy_ex, buy_asset, buy_price, buy_nick, "
-            "sell_ex, sell_asset, sell_price, sell_nick, route, planned_pct, stage, ts_stage, bank) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'buy', ?, ?)",
+            "sell_ex, sell_asset, sell_price, sell_nick, route, planned_pct, stage, ts_stage, bank, label) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'buy', ?, ?, ?)",
             (ts, amount, buy.ex, buy.asset, buy.price, buy.nick,
-             sell.ex, sell.asset, sell.price, sell.nick, route, planned_pct, ts, bank))
+             sell.ex, sell.asset, sell.price, sell.nick, route, planned_pct, ts, bank, label))
         cycle_id = cur.lastrowid
     con.close()
     return cycle_id
@@ -167,23 +171,20 @@ def set_stage(cycle_id, stage, path=DB_PATH, ts=None):
 def check_buy_stage(cycle, snap, pay_minutes, now=None):
     """Проверка исполнимости стадии buy по свежему снимку (только чтение snap.groups, без сети и
     без записи в БД — решение применяет вызывающий). Раньше PAPER_PAY_MINUTES с начала круга не
-    ждём. После — ищем в текущем стакане покупки то же объявление (тот же мерчант): нет — цена
-    ушла хуже плана.
+    ждём. После — ищем в текущем стакане покупки то же объявление (тот же мерчант): нет — мерчант
+    ушёл/снял объявление, круг не состоялся. Цену не сравниваем: в ордере она фиксируется при создании.
 
     Возвращает (action, note):
       "wait"    — ещё не прошло pay_minutes, ничего не решаем;
-      "advance" — объявление на месте, цена не хуже плана — можно переходить к transfer;
-      "fail"    — объявление исчезло или цена ушла хуже плана (result станет failed_buy).
+      "advance" — объявление на месте — можно переходить к transfer;
+      "fail"    — объявление исчезло (result станет failed_buy).
     """
     now = now if now is not None else time.time()
     if now - cycle["ts_stage"] < pay_minutes * 60:
         return "wait", ""
     ads = snap.groups.get((cycle["buy_ex"], "buy", cycle["buy_asset"]), [])
-    ad = next((a for a in ads if a.nick == cycle["buy_nick"]), None)
-    if ad is None:
+    if not any(a.nick == cycle["buy_nick"] for a in ads):
         return "fail", "объявление покупки исчезло"
-    if ad.price > cycle["buy_price"]:
-        return "fail", f"цена ушла: было {cycle['buy_price']:g} ₽, стало {ad.price:g} ₽"
     return "advance", ""
 
 
@@ -205,35 +206,38 @@ def check_transfer_stage(cycle, cfg, transfer_minutes, now=None):
 
 def check_sell_stage(cycle, snap):
     """Проверка стадии sell по свежему снимку (только чтение snap.groups, без сети и без записи
-    в БД). Объявление продажи (тот же мерчант) должно быть на месте, цена — не хуже плана, а
-    глубина стакана — хватать на объём круга (p2p.sell_depth_ok, как в _match при сборке связки).
+    в БД). Монета уже на площадке продажи — продаём тем, кто сейчас есть в стакане: цена — средняя по
+    лучшим объявлениям на весь объём круга (p2p.sell_fill_price, тот же стек, что в _match), даже если
+    плановый мерчант ушёл или цена стала хуже (факт тогда ниже плана, может быть и минус). Срыв — только
+    если покупателей на весь объём нет.
 
-    Возвращает (action, note, price): price — цена продажи на момент проверки (для realized_pct),
-    только при "advance"; "fail" — result станет failed_sell."""
+    Возвращает (action, note, price): price — фактическая цена продажи (для realized_pct) при
+    "advance", note — чем факт отличается от плана; "fail" — result станет failed_sell."""
     ads = snap.groups.get((cycle["sell_ex"], "sell", cycle["sell_asset"]), [])
-    ad = next((a for a in ads if a.nick == cycle["sell_nick"]), None)
-    if ad is None:
-        return "fail", "объявление продажи исчезло", None
-    if ad.price < cycle["sell_price"]:
-        return "fail", f"цена ушла: было {cycle['sell_price']:g} ₽, стало {ad.price:g} ₽", None
     qty = cycle["amount"] / cycle["buy_price"]
-    if not p2p.sell_depth_ok(ads, qty):
+    price = p2p.sell_fill_price(ads, qty)
+    if price is None:
         return "fail", "не хватает глубины стакана продажи", None
-    return "advance", "", ad.price
+    note = ""
+    if abs(price / cycle["sell_price"] - 1) >= 1e-4:
+        note = (f"продажа по {price:g} ₽ вместо {cycle['sell_price']:g} ₽ "
+                f"({(price / cycle['sell_price'] - 1) * 100:+.2f}%)")
+    return "advance", note, price
 
 
 def realized_pct(cycle, sell_price):
     """Итоговая прибыль круга по факту: план (planned_pct) масштабируется на изменение цены продажи
-    относительно плана (buy и вывод уже проверены на своих стадиях по цене/сети не хуже плана —
-    цена продажи на стадии sell единственная, что могла измениться в лучшую сторону)."""
+    относительно плана (цена покупки зафиксирована в ордере, вывод проверен на своей стадии — на
+    стадии sell меняется только цена продажи, в любую сторону)."""
     ratio = sell_price / cycle["sell_price"]
     return ((1 + cycle["planned_pct"] / 100) * ratio - 1) * 100
 
 
-def finish_cycle(cycle_id, result, realized_pct=0.0, note="", path=DB_PATH, ts=None):
+def finish_cycle(cycle_id, result, realized_pct=0.0, note="", path=DB_PATH, ts=None, sell_fact=None):
     """Завершить круг: result — 'done' (успех) или 'failed_buy'/'failed_transfer'/'failed_sell'
     (срыв на соответствующей стадии). Обновляет виртуальный баланс на realized_pct (для срыва —
-    обычно 0, круг не состоялся). Круга с таким id нет — возвращает False, баланс не трогает."""
+    обычно 0, круг не состоялся); sell_fact — фактическая цена продажи. Круга с таким id нет —
+    возвращает False, баланс не трогает."""
     ts = ts if ts is not None else time.time()
     con = _connect(path)
     row = con.execute("SELECT amount FROM cycles WHERE id = ?", (cycle_id,)).fetchone()
@@ -242,8 +246,8 @@ def finish_cycle(cycle_id, result, realized_pct=0.0, note="", path=DB_PATH, ts=N
         return False
     amount = row[0]
     with con:
-        con.execute("UPDATE cycles SET result = ?, ts_stage = ?, realized_pct = ?, note = ? "
-                    "WHERE id = ?", (result, ts, realized_pct, note, cycle_id))
+        con.execute("UPDATE cycles SET result = ?, ts_stage = ?, realized_pct = ?, note = ?, sell_fact = ? "
+                    "WHERE id = ?", (result, ts, realized_pct, note, sell_fact, cycle_id))
     con.close()
     apply_result(realized_pct, amount, path=path, ts=ts)
     return True
@@ -397,6 +401,29 @@ def report_rows(path=DB_PATH):
                                  if g["duration_done"] else None,
         })
     return out
+
+
+def label_stats(path=DB_PATH):
+    """Итоги завершённых кругов по метке надёжности на старте (✅/⚠️/🪤, p2p.reliability): сколько
+    кругов, сколько исполнилось, средний план и факт исполнившихся — видно, оправдывает ли себя метка."""
+    if not os.path.exists(path):
+        return {}
+    con = _connect(path)
+    rows = con.execute("SELECT label, result, planned_pct, realized_pct FROM cycles "
+                       "WHERE result IS NOT NULL").fetchall()
+    con.close()
+    out = {}
+    for label, result, planned, realized in rows:
+        g = out.setdefault(label or "—", {"total": 0, "done": 0, "planned": [], "realized": []})
+        g["total"] += 1
+        g["planned"].append(planned)
+        if result == "done":
+            g["done"] += 1
+            g["realized"].append(realized)
+    return {k: {"total": g["total"], "done": g["done"],
+                "avg_planned_pct": sum(g["planned"]) / len(g["planned"]),
+                "avg_realized_pct": sum(g["realized"]) / len(g["realized"]) if g["realized"] else None}
+            for k, g in out.items()}
 
 
 def write_report_csv(rows, path=REPORT_CSV_PATH):

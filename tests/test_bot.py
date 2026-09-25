@@ -194,20 +194,19 @@ def test_process_paper_cycles_fails_when_ad_gone(monkeypatch, tmp_path):
     assert len(msgs) == 1 and "исчезло" in msgs[0]
 
 
-def test_process_paper_cycles_fails_when_price_worse(monkeypatch, tmp_path):
+def test_process_paper_cycles_buy_price_change_does_not_fail(monkeypatch, tmp_path):
     monkeypatch.setenv("PAPER_PAY_MINUTES", "5")
     db = str(tmp_path / "paper.db")
     _patch_paper_db(monkeypatch, db)
     buy, sell = make_ad("Bybit", "buy", 85.0), make_ad("MEXC", "sell", 90.0)
     cid = paper.start_cycle(10000, buy, sell, "route", 2.0, path=db, ts=time.time() - 400)
     bot = Stub(p2p.Config(min_profit=2.0))
-    worse = make_ad("Bybit", "buy", 86.0)   # тот же мерчант, цена выросла — хуже плана
+    worse = make_ad("Bybit", "buy", 86.0)   # тот же мерчант, цена выросла — ордер уже по старой цене
     s = p2p.Snapshot(88.0, "test", {}, {}, [], {}, {}, {}, groups={("Bybit", "buy", "USDT"): [worse]})
     asyncio.run(bot.process_paper_cycles(s))
     c = paper.get_cycle(cid, path=db)
-    assert c["stage"] == "buy" and c["result"] == "failed_buy"
-    msgs = [t for t in texts(bot) if "сорвался" in t]
-    assert len(msgs) == 1 and "цена ушла" in msgs[0]
+    assert c["stage"] == "transfer" and c["result"] is None
+    assert not [t for t in texts(bot) if "сорвался" in t]
 
 
 def test_process_paper_cycles_noop_without_chat_id(monkeypatch, tmp_path):
@@ -289,7 +288,7 @@ def test_process_paper_cycles_sell_completes_and_updates_balance(monkeypatch, tm
     assert len(msgs) == 1 and "план 2.00%" in msgs[0]
 
 
-def test_process_paper_cycles_sell_fails_when_ad_gone(monkeypatch, tmp_path):
+def test_process_paper_cycles_sell_fails_when_nobody_buys(monkeypatch, tmp_path):
     db = str(tmp_path / "paper.db")
     _patch_paper_db(monkeypatch, db)
     buy, sell = make_ad("Bybit", "buy", 85.0), make_ad("MEXC", "sell", 90.0)
@@ -300,7 +299,7 @@ def test_process_paper_cycles_sell_fails_when_ad_gone(monkeypatch, tmp_path):
     c = paper.get_cycle(cid, path=db)
     assert c["stage"] == "sell" and c["result"] == "failed_sell" and c["realized_pct"] == 0.0
     msgs = [t for t in texts(bot) if "сорвался" in t]
-    assert len(msgs) == 1 and "продаже" in msgs[0] and "исчезло" in msgs[0]
+    assert len(msgs) == 1 and "продаже" in msgs[0] and "глубины" in msgs[0]
 
 
 def test_paper_cycle_skips_when_depth_insufficient(monkeypatch, tmp_path):
