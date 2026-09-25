@@ -107,10 +107,12 @@ def deal_card(deal, cfg, amounts=None, rel=None, breakdown=None):
     d.text((56 + f_big.getlength(big), 108), f"чистыми на {_money(cfg.amount)} ₽", font=_font(30), fill=MUTED)
     d.text((40, 180), f"{b.ex} {b.asset}  →  {s.ex} {s.asset}", font=_font(30, "semi"), fill=TEXT)
     if rel:
-        label, _reasons = rel
+        label, _reasons = rel[:2]
+        if len(rel) > 2:   # индекс надёжности 0–10 рядом с меткой
+            label = f"{label} · {rel[2]}/10"
         f_rel = _font(22, "semi")
         pw = f_rel.getlength(label) + 24
-        _pill(d, W - 40 - pw, 176, label, REL_COLORS.get(label, AMBER), f_rel)
+        _pill(d, W - 40 - pw, 176, label, REL_COLORS.get(rel[0], AMBER), f_rel)
 
     f_extra, ey = _font(18), 210
     for line in filter(None, [_breakdown_line(breakdown) if breakdown else "", _amounts_line(amounts) if amounts else ""]):

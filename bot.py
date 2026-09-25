@@ -27,7 +27,7 @@ from cards import deal_card, history_card, history_compare_card, portfolio_card,
 from p2p import ALL_EXCHANGES, AMOUNT_MAX, AMOUNT_MIN, DEFAULT_ASSETS, ENV_PATH, LOG_PATH, MIN_PROFIT_MAX, \
     MIN_PROFIT_MIN, TRAP, Config, _money, _price, _route_qty, bank_liquidity, deal_amounts, deal_for_amount, fmt_ad, \
     fmt_breakeven, fmt_deal, fmt_top, load_env, maker_quote, parse_amount, parse_min_profit, profit_breakdown, \
-    reliability, scan, setup_logging, spot_url, traps_log, venue_url
+    reliability, reliability_index, scan, setup_logging, spot_url, traps_log, venue_url
 
 logger = logging.getLogger(__name__)
 
@@ -1041,7 +1041,7 @@ class Bot:
         guest = self.is_guest(self.chat_for(chat_id))
         deal_id = None if guest else self.remember_deal(d, cfg, snap)   # у гостя нет «✅ Сделал»/«📋 Шаги»/«🚫»
         amounts = deal_amounts(d, cfg, snap) if snap else None
-        rel = reliability(d, cfg, snap) if snap else None
+        rel = (*reliability(d, cfg, snap), reliability_index(d, cfg, snap)) if snap else None
         breakdown = profit_breakdown(d[1], d[2], cfg, snap.spot, snap.over_banks) if snap else None
         caption = prefix + fmt_deal(d, cfg, snap)
         r, is_photo = await self.photo_or_text(lambda: deal_card(d, cfg, amounts, rel, breakdown), caption,
