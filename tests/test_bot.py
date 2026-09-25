@@ -186,7 +186,8 @@ def test_process_paper_cycles_fails_when_ad_gone(monkeypatch, tmp_path):
     buy, sell = make_ad("Bybit", "buy", 85.0), make_ad("MEXC", "sell", 90.0)
     cid = paper.start_cycle(10000, buy, sell, "route", 2.0, path=db, ts=time.time() - 400)
     bot = Stub(p2p.Config(min_profit=2.0))
-    s = p2p.Snapshot(88.0, "test", {}, {}, [], {}, {}, {}, groups={})   # объявление исчезло из стакана
+    s = p2p.Snapshot(88.0, "test", {}, {}, [], {}, {}, {},
+                     groups={("Bybit", "buy", "USDT"): []})   # площадка ответила, объявления нет
     asyncio.run(bot.process_paper_cycles(s))
     c = paper.get_cycle(cid, path=db)
     assert c["stage"] == "buy" and c["result"] == "failed_buy" and c["realized_pct"] == 0.0

@@ -94,7 +94,7 @@ def test_paper_card_says_how_owner_pays(monkeypatch, tmp_path):
         for c in paper.open_cycles():
             paper.finish_cycle(c["id"], "done", 0.0)
         b = p2p.Ad("HTX", "buy", 87.5, 1000, 500000, 10000, list(pays), "m", 1000, 100.0, "", "USDT", "", "")
-        s = p2p.Ad("KuCoin", "sell", 90.0, 1000, 500000, 10000, ["SBP"], "k", 1000, 100.0, "", "USDT", "", "")
+        s = p2p.Ad("KuCoin", "sell", 91.0, 1000, 500000, 10000, ["SBP"], "k", 1000, 100.0, "", "USDT", "", "")
         snap = p2p.Snapshot(88.0, "t", {"USDT": 88.0}, {}, [(2.8, b, s, "r")], {}, {}, {},
                             groups={("HTX", "buy", "USDT"): [b], ("KuCoin", "sell", "USDT"): [s]})
         bot = Stub(p2p.Config(min_profit=2.0))
