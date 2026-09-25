@@ -130,6 +130,7 @@ AMOUNT_PRESETS = (25000, 50000, 100000, 200000)
 VENUE_DOWN_AFTER = 900      # сек: площадка отдаёт ошибку дольше — алерт, даже если сканы не подряд
 VENUE_FAIL_STREAK = 3       # или столько сканов подряд с ошибкой
 VENUE_ALERT_COOLDOWN = 3600  # не чаще раза в час на площадку
+LADDER_ALERT_COOLDOWN = 86400  # предложение лестницы суммы сухого прогона — не чаще раза в сутки
 EXCHANGE_NAMES = {"bybit": "Bybit", "mexc": "MEXC", "htx": "HTX", "kucoin": "KuCoin", "bitpapa": "BitPapa"}
 ASSET_LIST = tuple(DEFAULT_ASSETS.split(","))       # монеты для кнопок «🎛 Фильтры»
 EXCHANGE_LIST = tuple(ALL_EXCHANGES.split(","))      # площадки для кнопок «🎛 Фильтры»
@@ -819,6 +820,7 @@ class Bot:
         self.last_scan_duration = 0.0   # сколько секунд занял последний скан
         self.market_msg_id = None       # id закреплённого сообщения «Статус рынка»
         self.market_status_ts = 0.0     # unix-время последнего обновления статуса рынка
+        self.paper_ladder_alerted_ts = 0.0   # unix-время последнего предложения лестницы суммы сухого прогона
 
     async def call(self, method, **params):
         async with self.s.post(f"https://api.telegram.org/bot{self.token}/{method}", json=params,
@@ -1464,6 +1466,7 @@ class Bot:
                     await self.check_alerts(self.last)
                     await self.check_networks()
                     await self.process_paper_cycles(self.last)
+                    await self.check_paper_ladder()
                     await self.quiet_and_pause_tick(self.last)
                     await self.update_market_status(self.last)
             except Exception as e:
@@ -1725,6 +1728,29 @@ class Bot:
                     paper.finish_cycle(cycle["id"], "done", rp)
                     await self.send(f"🧪 Сухой прогон: круг #{cycle['id']} завершён — план "
                                     f"{cycle['planned_pct']:.2f}%, факт {rp:.2f}%", topic="signals")
+
+    async def check_paper_ladder(self):
+        """Лестница суммы сухого прогона (paper.ladder_suggestion): сам PAPER_AMOUNT не меняет —
+        шлёт владельцу сообщение с кнопкой подтверждения, не чаще раза в LADDER_ALERT_COOLDOWN."""
+        if not self.chat_id or not paper.settings()["on"]:
+            return
+        suggestion = paper.ladder_suggestion()
+        if not suggestion:
+            return
+        now = time.time()
+        if now - self.paper_ladder_alerted_ts < LADDER_ALERT_COOLDOWN:
+            return
+        self.paper_ladder_alerted_ts = now
+        amount = suggestion["amount"]
+        if suggestion["action"] == "up":
+            text = ("🧪 Сухой прогон стабилен (≥20 кругов, срывов мало, факт не хуже плана) — "
+                    f"можно попробовать сумму круга {_money(amount)} ₽.")
+        else:
+            text = (f"🧪 Сухой прогон: за неделю много срывов — может, вернуться на "
+                    f"{_money(amount)} ₽ за круг?")
+        kb = {"inline_keyboard": [[{"text": f"Перейти на {_money(amount)} ₽",
+                                    "callback_data": f"paper_ladder:{amount:.0f}"}]]}
+        await self.send(text, markup=kb, topic="signals")
 
     async def notify(self, snap):
         now = time.time()
@@ -2097,6 +2123,12 @@ class Bot:
             await self.send(self.status_view())
         elif data == "paper":
             await self.send(self.paper_view())
+        elif data.startswith("paper_ladder:"):
+            amount = float(data[len("paper_ladder:"):])
+            save_env("PAPER_AMOUNT", f"{amount:.0f}")
+            await self.call("answerCallbackQuery", callback_query_id=cq["id"],
+                            text=f"Сумма круга: {_money(amount)} ₽")
+            await self.send(f"🧪 Сумма круга сухого прогона: {_money(amount)} ₽.")
         elif data == "balance":
             await self.balance()
         elif data.startswith("did:"):

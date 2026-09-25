@@ -26,6 +26,15 @@ MSK = datetime.timezone(datetime.timedelta(hours=3))
 STATS_WEEK = 7 * 86400
 FAIL_LABELS = {"failed_buy": "покупка", "failed_transfer": "перевод", "failed_sell": "продажа"}
 
+# Лестница суммы круга: две ступени, 10 000 ₽ и 20 000 ₽ (решение всегда подтверждает владелец кнопкой,
+# сам PAPER_AMOUNT ladder_suggestion не меняет).
+LADDER_LOW = 10000.0
+LADDER_HIGH = 20000.0
+LADDER_UP_MIN_CYCLES = 20      # минимум завершённых кругов за всё время для предложения повысить
+LADDER_UP_MAX_FAILED = 0.2     # доля сорвавшихся не выше 20%
+LADDER_UP_MIN_MEDIAN = -0.3    # медиана (факт − план) по исполнившимся, п.п.
+LADDER_DOWN_MIN_FAILED = 0.4   # доля сорвавшихся за неделю выше 40% — предложить вернуться
+
 _COLUMNS = ("id", "ts_start", "amount", "buy_ex", "buy_asset", "buy_price", "buy_nick",
             "sell_ex", "sell_asset", "sell_price", "sell_nick", "route", "planned_pct",
             "stage", "ts_stage", "realized_pct", "result", "note")
@@ -259,6 +268,46 @@ def stats(path=DB_PATH, now=None):
                        "avg_diff": sum(done_diffs) / len(done_diffs) if done_diffs else None}
     con.close()
     return out
+
+
+def _median(values):
+    """Медиана списка чисел; пустой список — None."""
+    if not values:
+        return None
+    s = sorted(values)
+    n = len(s)
+    mid = n // 2
+    return s[mid] if n % 2 else (s[mid - 1] + s[mid]) / 2
+
+
+def ladder_suggestion(path=DB_PATH, now=None):
+    """Лестница суммы круга — предложение, не смена настройки (её пишет вызывающий по кнопке).
+    Повышение (LADDER_LOW → LADDER_HIGH): за всё время набралось ≥ LADDER_UP_MIN_CYCLES завершённых
+    кругов, доля сорвавшихся ≤ LADDER_UP_MAX_FAILED и медиана (факт − план) по исполнившимся ≥
+    LADDER_UP_MIN_MEDIAN п.п. Понижение (обратно на LADDER_LOW): сумма сейчас LADDER_HIGH и за
+    последнюю неделю доля сорвавшихся > LADDER_DOWN_MIN_FAILED.
+    Возвращает {"action": "up"/"down", "amount": ...} или None — предлагать нечего."""
+    amount = settings()["amount"]
+    if not os.path.exists(path):
+        return None
+    now = time.time() if now is None else now
+    con = _connect(path)
+    all_rows = con.execute("SELECT result, planned_pct, realized_pct FROM cycles "
+                           "WHERE result IS NOT NULL").fetchall()
+    week_rows = con.execute("SELECT result FROM cycles WHERE result IS NOT NULL AND ts_start >= ?",
+                            (now - STATS_WEEK,)).fetchall()
+    con.close()
+    if amount < LADDER_HIGH and len(all_rows) >= LADDER_UP_MIN_CYCLES:
+        failed = sum(1 for res, _, _ in all_rows if res != "done")
+        median_diff = _median([realized - planned for res, planned, realized in all_rows if res == "done"])
+        if (failed / len(all_rows) <= LADDER_UP_MAX_FAILED
+                and median_diff is not None and median_diff >= LADDER_UP_MIN_MEDIAN):
+            return {"action": "up", "amount": LADDER_HIGH}
+    if amount >= LADDER_HIGH and week_rows:
+        failed = sum(1 for (res,) in week_rows if res != "done")
+        if failed / len(week_rows) > LADDER_DOWN_MIN_FAILED:
+            return {"action": "down", "amount": LADDER_LOW}
+    return None
 
 
 def balance_change(path=DB_PATH):

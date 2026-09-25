@@ -281,3 +281,70 @@ def test_balance_change_sums_finished_cycles(tmp_path):
     paper.finish_cycle(cid2, "failed_buy", realized_pct=0.0, path=db)  # +0
     assert paper.balance_change(path=db) == pytest.approx(200.0)
     assert paper.get_balance(path=db) == pytest.approx(10200.0)
+
+
+def _fill_cycles(db, done=18, failed=2, diff=0.0, ts=None):
+    """Завести done+failed завершённых кругов: done — план 2.0%, факт 2.0+diff% (для медианы),
+    failed — failed_sell. Все с сегодняшним ts (или заданным) по умолчанию."""
+    buy, sell = make_ad("Bybit", "buy", 85.0), make_ad("MEXC", "sell", 90.0)
+    for _ in range(done):
+        cid = paper.start_cycle(10000, buy, sell, "route", 2.0, path=db, ts=ts)
+        paper.finish_cycle(cid, "done", realized_pct=2.0 + diff, path=db, ts=ts)
+    for _ in range(failed):
+        cid = paper.start_cycle(10000, buy, sell, "route", 2.0, path=db, ts=ts)
+        paper.finish_cycle(cid, "failed_sell", realized_pct=0.0, note="цена ушла", path=db, ts=ts)
+
+
+def test_ladder_suggestion_none_without_db():
+    assert paper.ladder_suggestion(path="/nonexistent/paper.db") is None
+
+
+def test_ladder_suggestion_none_below_min_cycles(monkeypatch, tmp_path):
+    monkeypatch.setenv("PAPER_AMOUNT", "10000")
+    db = str(tmp_path / "paper.db")
+    _fill_cycles(db, done=15, failed=2)   # 17 < 20
+    assert paper.ladder_suggestion(path=db) is None
+
+
+def test_ladder_suggestion_up_when_criteria_met(monkeypatch, tmp_path):
+    monkeypatch.setenv("PAPER_AMOUNT", "10000")
+    db = str(tmp_path / "paper.db")
+    _fill_cycles(db, done=18, failed=2)   # 20 всего, срывов 10%, факт == план (diff 0)
+    assert paper.ladder_suggestion(path=db) == {"action": "up", "amount": 20000.0}
+
+
+def test_ladder_suggestion_none_when_too_many_failed(monkeypatch, tmp_path):
+    monkeypatch.setenv("PAPER_AMOUNT", "10000")
+    db = str(tmp_path / "paper.db")
+    _fill_cycles(db, done=15, failed=5)   # 20 всего, срывов 25% > 20%
+    assert paper.ladder_suggestion(path=db) is None
+
+
+def test_ladder_suggestion_none_when_median_too_low(monkeypatch, tmp_path):
+    monkeypatch.setenv("PAPER_AMOUNT", "10000")
+    db = str(tmp_path / "paper.db")
+    _fill_cycles(db, done=18, failed=2, diff=-0.5)   # медиана факт-план -0.5 п.п. < -0.3
+    assert paper.ladder_suggestion(path=db) is None
+
+
+def test_ladder_suggestion_none_when_already_at_high(monkeypatch, tmp_path):
+    monkeypatch.setenv("PAPER_AMOUNT", "20000")
+    db = str(tmp_path / "paper.db")
+    _fill_cycles(db, done=18, failed=2)   # критерии повышения выполнены, но уже на 20000
+    assert paper.ladder_suggestion(path=db) is None
+
+
+def test_ladder_suggestion_down_when_week_failure_high(monkeypatch, tmp_path):
+    monkeypatch.setenv("PAPER_AMOUNT", "20000")
+    db = str(tmp_path / "paper.db")
+    now = time.time()
+    _fill_cycles(db, done=2, failed=3, ts=now)   # 5 за неделю, срывов 60% > 40%
+    assert paper.ladder_suggestion(path=db, now=now) == {"action": "down", "amount": 10000.0}
+
+
+def test_ladder_suggestion_none_when_week_failure_ok(monkeypatch, tmp_path):
+    monkeypatch.setenv("PAPER_AMOUNT", "20000")
+    db = str(tmp_path / "paper.db")
+    now = time.time()
+    _fill_cycles(db, done=4, failed=1, ts=now)   # 5 за неделю, срывов 20% <= 40%
+    assert paper.ladder_suggestion(path=db, now=now) is None
