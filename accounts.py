@@ -4,7 +4,9 @@
 (`BYBIT_API_KEY`/`BYBIT_API_SECRET`, `MEXC_API_KEY`/`MEXC_API_SECRET`). Нет ключей для биржи —
 `keys()` вернёт None, функции аккаунтов для неё выключены. Удалённый в боте ключ помечается в
 `data/keys.json` как `disabled` — пометка выключает его, даже если он остался в `.env`. Никаких
-торговых/выводных запросов — только подписанные GET к read-only эндпоинтам.
+торговых/выводных запросов — только подписанные GET к read-only эндпоинтам. key/secret/passphrase в
+`data/keys.json` хранятся зашифрованными Windows DPAPI (`protect`/`unprotect`) — файл бесполезен вне этой
+учётной записи Windows; открытые значения от прошлой версии шифруются при старте бота (`encrypt_saved_keys`).
 """
 import asyncio
 import base64
@@ -12,6 +14,7 @@ import hashlib
 import hmac
 import json
 import os
+import sys
 import time
 from datetime import datetime, timezone
 from urllib.parse import urlencode
@@ -28,6 +31,73 @@ KUCOIN_BASE = "https://api.kucoin.com"
 CONNECTABLE = ("bybit", "mexc", "htx", "kucoin")   # биржи, для которых уже есть подпись запросов
 PASSPHRASE_REQUIRED = ("kucoin",)      # ключ биржи — 3 шага (key/secret/passphrase)
 ONBOARDABLE = tuple(dict.fromkeys(CONNECTABLE + PASSPHRASE_REQUIRED))   # биржи, для которых бот предлагает подключить ключ кнопками
+
+
+SECRET_FIELDS = ("key", "secret", "passphrase")
+DPAPI_PREFIX = "dpapi:"
+
+
+def _dpapi(data, encrypt):
+    """Windows DPAPI (CryptProtectData/CryptUnprotectData через ctypes): шифр привязан к учётной записи Windows
+    владельца — файл ключей бесполезен на другом ПК или под другим пользователем. Вне Windows — None."""
+    if sys.platform != "win32":
+        return None
+    import ctypes
+    from ctypes import wintypes
+
+    class Blob(ctypes.Structure):
+        _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_char))]
+
+    crypt32, kernel32 = ctypes.windll.crypt32, ctypes.windll.kernel32
+    fn = crypt32.CryptProtectData if encrypt else crypt32.CryptUnprotectData
+    fn.argtypes = [ctypes.POINTER(Blob), ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                   wintypes.DWORD, ctypes.POINTER(Blob)]
+    fn.restype = wintypes.BOOL
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    buf = ctypes.create_string_buffer(data, len(data))
+    src, out = Blob(len(data), ctypes.cast(buf, ctypes.POINTER(ctypes.c_char))), Blob()
+    if not fn(ctypes.byref(src), None, None, None, None, 0x1, ctypes.byref(out)):   # 0x1 — без окон и запросов
+        raise OSError(ctypes.GetLastError(), "DPAPI")
+    try:
+        return ctypes.string_at(out.pbData, out.cbData)
+    finally:
+        kernel32.LocalFree(ctypes.cast(out.pbData, ctypes.c_void_p))
+
+
+def protect(value):
+    """Секрет → "dpapi:<base64>" для data/keys.json (Windows); уже зашифрованный или вне Windows — как есть."""
+    if not value or value.startswith(DPAPI_PREFIX):
+        return value
+    enc = _dpapi(value.encode("utf-8"), True)
+    return value if enc is None else DPAPI_PREFIX + base64.b64encode(enc).decode("ascii")
+
+
+def unprotect(value):
+    """"dpapi:<base64>" → секрет; открытое значение (файл старой версии) — как есть; не расшифровывается
+    (другой ПК/учётка Windows, файл испорчен) — None: ключ считается неподключённым."""
+    if not value or not value.startswith(DPAPI_PREFIX):
+        return value
+    try:
+        dec = _dpapi(base64.b64decode(value[len(DPAPI_PREFIX):], validate=True), False)
+        return None if dec is None else dec.decode("utf-8")
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None
+
+
+def encrypt_saved_keys():
+    """Зашифровать открытые key/secret/passphrase в data/keys.json (файл от прошлой версии) — при старте бота.
+    Возвращает, сколько полей зашифровано; вне Windows — 0."""
+    data, changed = _keys_file(), 0
+    for entry in data.values():
+        for field in SECRET_FIELDS:
+            value = entry.get(field) if isinstance(entry, dict) else None
+            if value and not value.startswith(DPAPI_PREFIX):
+                enc = protect(value)
+                if enc != value:
+                    entry[field], changed = enc, changed + 1
+    if changed:
+        _write_keys_file(data)
+    return changed
 
 
 def _keys_file():
@@ -51,19 +121,20 @@ def keys(exchange):
     saved = _keys_file().get(ex, {})
     if saved.get("disabled"):   # ключ удалён в боте — не подхватываем его и из .env
         return None
-    key = saved.get("key") or os.getenv(f"{exchange.upper()}_API_KEY")
-    secret = saved.get("secret") or os.getenv(f"{exchange.upper()}_API_SECRET")
+    key = unprotect(saved.get("key")) or os.getenv(f"{exchange.upper()}_API_KEY")
+    secret = unprotect(saved.get("secret")) or os.getenv(f"{exchange.upper()}_API_SECRET")
     return (key, secret) if key and secret else None
 
 
 def save_key(exchange, key, secret, passphrase=None):
     """Сохранить ключ биржи в data/keys.json (создаёт папку/файл при необходимости).
 
-    `passphrase` — только для бирж из PASSPHRASE_REQUIRED (сейчас KuCoin)."""
+    `passphrase` — только для бирж из PASSPHRASE_REQUIRED (сейчас KuCoin). Секреты пишутся зашифрованными
+    (protect: Windows DPAPI)."""
     data = _keys_file()
-    entry = {"key": key, "secret": secret}
+    entry = {"key": protect(key), "secret": protect(secret)}
     if passphrase:
-        entry["passphrase"] = passphrase
+        entry["passphrase"] = protect(passphrase)
     data[exchange.lower()] = entry   # новая запись целиком — снимает и пометку disabled
     _write_keys_file(data)
 
@@ -74,7 +145,7 @@ def passphrase(exchange):
     saved = _keys_file().get(ex, {})
     if saved.get("disabled"):
         return None
-    return saved.get("passphrase") or os.getenv(f"{exchange.upper()}_API_PASSPHRASE")
+    return unprotect(saved.get("passphrase")) or os.getenv(f"{exchange.upper()}_API_PASSPHRASE")
 
 
 def delete_key(exchange):

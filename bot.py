@@ -2532,6 +2532,11 @@ async def main():
     if not token:
         raise SystemExit("TG_TOKEN не задан: создай бота у @BotFather и пропиши токен в .env")
     cfg = Config.from_env()
+    try:   # ключи от прошлой версии лежат открыто — шифруем (DPAPI); сбой не мешает запуску
+        if accounts.encrypt_saved_keys():
+            logger.info("ключи бирж в data/keys.json зашифрованы (Windows DPAPI)")
+    except Exception as e:
+        logger.warning("шифрование ключей: %s", type(e).__name__)
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as s:
         bot = Bot(s, token, os.getenv("TG_CHAT_ID", "").strip(), cfg)
         await bot.setup()
