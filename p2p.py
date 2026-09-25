@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import re
+import socket
 import statistics
 import sys
 import time
@@ -333,8 +334,12 @@ async def bitpapa(s, cfg, side, asset):
     return out
 
 
-_bc = {"t": 0.0, "ads": []}
+_bc = {"t": 0.0, "ads": [], "local": None}   # local — локальный адрес, с которого выгрузка дошла в обход VPN
 _bc_lock = asyncio.Lock()
+BC_URL = "http://api.bestchange.ru/info.zip"
+# без ответа за 10 с — путь закрыт (VPN-выход бывает в бане у BestChange: пакет уходит, ответа нет вообще)
+BC_TIMEOUT = aiohttp.ClientTimeout(total=60, sock_connect=6, sock_read=10)
+BC_MAX_TRIES = 5
 
 
 def _bc_parse(data):
@@ -375,16 +380,60 @@ def _bc_parse(data):
     return ads
 
 
+def _local_addrs():
+    """Локальные IPv4 этого ПК без loopback/link-local — кандидаты для выхода в обход VPN. Сначала 192.168.*
+    (обычная домашняя сеть), потом 10.*, в конце 172.* (виртуальные адаптеры Hyper-V/WSL)."""
+    try:
+        ips = socket.gethostbyname_ex(socket.gethostname())[2]
+    except OSError:
+        return []
+    ips = [ip for ip in dict.fromkeys(ips) if not ip.startswith(("127.", "169.254."))]
+    return sorted(ips, key=lambda ip: (0 if ip.startswith("192.168.") else 1 if ip.startswith("10.") else 2))
+
+
+async def _bc_download(s, local=None):
+    """info.zip: local=None — обычным путём (сессия s), иначе с привязкой к локальному адресу `local`
+    (обходит полный VPN-туннель: маршрут выбирается по адресу отправителя)."""
+    own = local is not None
+    sess = aiohttp.ClientSession(connector=aiohttp.TCPConnector(local_addr=(local, 0))) if own else s
+    try:
+        async with sess.get(BC_URL, headers=HEADERS, timeout=BC_TIMEOUT) as r:
+            r.raise_for_status()
+            return await r.read()
+    finally:
+        if own:
+            await sess.close()
+
+
+async def _bc_fetch(s):
+    """Скачать выгрузку BestChange. Порядок: BC_LOCAL_ADDR из .env или запомненный рабочий адрес → обычный путь →
+    остальные локальные адреса ПК. Рабочий вариант запоминается: следующие скачивания идут сразу им."""
+    first = os.getenv("BC_LOCAL_ADDR", "").strip() or _bc.get("local")
+    order = [first] if first else []
+    order += [None] + [ip for ip in _local_addrs() if ip != first]
+    last = None
+    for ip in order[:BC_MAX_TRIES]:
+        try:
+            data = await _bc_download(s, ip)
+        except Exception as e:
+            last = e
+            continue
+        if ip != _bc.get("local"):
+            logger.info("BestChange: выгрузка идёт %s", f"с локального адреса {ip} (в обход VPN)" if ip else "обычным путём")
+        _bc["local"] = ip
+        return data
+    if _bc.get("local"):
+        _bc["local"] = None   # запомненный адрес устарел (сменилась сеть) — на следующем круге начнём с обычного пути
+    raise last
+
+
 async def bestchange(s, cfg, side, asset):
     async with _bc_lock:   # все стороны и монеты скана делят одну выгрузку
         now = time.time()
         # после сбоя не повторяем минуту: иначе каждая пара монета×сторона ждёт свой таймаут
         if now - _bc["t"] > cfg.bc_refresh and now - _bc.get("tried", 0) > 60:
             _bc["tried"] = now
-            async with s.get("http://api.bestchange.ru/info.zip", headers=HEADERS,
-                             timeout=aiohttp.ClientTimeout(total=30)) as r:
-                r.raise_for_status()
-                data = await r.read()
+            data = await _bc_fetch(s)
             _bc["ads"] = await asyncio.to_thread(_bc_parse, data)
             _bc["t"] = time.time()
     return [a for a in _bc["ads"] if a.side == side and a.asset == asset]
