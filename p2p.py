@@ -611,6 +611,13 @@ def sell_depth_ok(ads, qty):
     return _stack_qty(ads, qty) is not None
 
 
+def sell_fill_price(ads, qty):
+    """Средняя цена продажи qty монеты по лучшим объявлениям стакана (тот же стек, что в _match), None —
+    если глубины не хватает; для факта стадии sell сухого прогона (paper.py)."""
+    st = _stack_qty(ads, qty)
+    return st.price if st else None
+
+
 def _combined(used, price, total, qty):
     """Синтетическое Ad из использованных объявлений стакана: total — объём в фиате, qty — в монете;
     сеть сохраняем, если она у всех объявлений одна, условия мерчантов объединяем."""

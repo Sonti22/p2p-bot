@@ -3,6 +3,7 @@ import time
 
 import pytest
 
+import p2p
 import paper
 from helpers import make_ad
 
@@ -11,7 +12,8 @@ def test_settings_defaults(monkeypatch):
     for k in ("PAPER", "PAPER_AMOUNT", "PAPER_PAY_MINUTES", "PAPER_TRANSFER_MINUTES", "PAPER_MAX_OPEN"):
         monkeypatch.delenv(k, raising=False)
     s = paper.settings()
-    assert s == {"on": False, "amount": 10000.0, "pay_minutes": 5.0, "transfer_minutes": 3.0, "max_open": 1}
+    assert s == {"on": False, "amount": 10000.0, "pay_minutes": 5.0, "transfer_minutes": 3.0, "max_open": 1,
+                 "traps": False}
 
 
 def test_settings_reads_env_each_call(monkeypatch):
@@ -191,11 +193,12 @@ def test_check_buy_stage_fails_when_ad_gone():
     assert action == "fail" and "исчезло" in note
 
 
-def test_check_buy_stage_fails_when_price_worse():
+def test_check_buy_stage_ignores_price_change_of_same_merchant():
+    """Цена в ордере фиксируется при создании: рост цены объявления потом круг не срывает."""
     cycle = {"ts_stage": 1000.0, "buy_ex": "Bybit", "buy_asset": "USDT", "buy_nick": "nick", "buy_price": 85.0}
-    ad = make_ad("Bybit", "buy", 86.0)   # тот же мерчант, но цена выросла — хуже плана покупки
+    ad = make_ad("Bybit", "buy", 86.0)
     action, note = paper.check_buy_stage(cycle, _cycle_snap(ads=[ad]), pay_minutes=5, now=1400.0)
-    assert action == "fail" and "цена ушла" in note
+    assert action == "advance" and note == ""
 
 
 def test_check_buy_stage_ignores_different_merchant():
@@ -249,20 +252,38 @@ def test_check_sell_stage_advances_when_ad_still_there_at_same_or_better_price()
     cycle = _sell_cycle()
     ad = make_ad("MEXC", "sell", 91.0, avail=10000)   # цена даже лучше плана, глубины хватает
     action, note, price = paper.check_sell_stage(cycle, _sell_snap(ads=[ad]))
-    assert action == "advance" and note == "" and price == 91.0
+    assert action == "advance" and price == 91.0 and "+1.11%" in note
 
 
-def test_check_sell_stage_fails_when_ad_gone():
+def test_check_sell_stage_fails_only_when_nobody_buys_the_volume():
     cycle = _sell_cycle()
     action, note, price = paper.check_sell_stage(cycle, _sell_snap())
-    assert action == "fail" and "исчезло" in note and price is None
+    assert action == "fail" and "глубины" in note and price is None
+    small = make_ad("MEXC", "sell", 90.0, avail=10, max_amt=900)   # берёт 10 монет из ~117
+    assert paper.check_sell_stage(cycle, _sell_snap(ads=[small]))[0] == "fail"
 
 
-def test_check_sell_stage_fails_when_price_worse():
+def test_check_sell_stage_sells_at_worse_price_and_realizes_less():
+    """Круг #1 25.09: курс 91,88 → 91,31 — не срыв, а продажа по 91,31 с фактом ниже плана."""
     cycle = _sell_cycle()
-    ad = make_ad("MEXC", "sell", 89.0)   # тот же мерчант, цена упала — хуже плана продажи
+    ad = make_ad("MEXC", "sell", 89.0)
     action, note, price = paper.check_sell_stage(cycle, _sell_snap(ads=[ad]))
-    assert action == "fail" and "цена ушла" in note and price is None
+    assert action == "advance" and price == 89.0 and "-1.11%" in note
+    assert 0 < paper.realized_pct(cycle, price) < cycle["planned_pct"]
+    crash = make_ad("MEXC", "sell", 85.0)   # ниже безубытка — факт уходит в минус, это тоже итог круга
+    assert paper.realized_pct(cycle, paper.check_sell_stage(cycle, _sell_snap(ads=[crash]))[2]) < 0
+
+
+def test_check_sell_stage_uses_other_merchants_and_averages_depth():
+    """Плановый мерчант ушёл — продаём тем, кто есть; объём не влезает в одно объявление — средняя цена."""
+    cycle = _sell_cycle()   # 10 000 ₽ / 85 ≈ 117,6 монеты
+    a = p2p.Ad("MEXC", "sell", 91.0, 100, 5000, 50, ["T-Bank"], "other1", 200, 100.0, "", "USDT", "", "")
+    b = p2p.Ad("MEXC", "sell", 89.0, 100, 500000, 1000, ["T-Bank"], "other2", 200, 100.0, "", "USDT", "", "")
+    action, note, price = paper.check_sell_stage(cycle, _sell_snap(ads=[a, b]))
+    qty = 10000.0 / 85.0
+    take_a = min(qty, 50, 5000 / 91.0)
+    expected = (take_a * 91.0 + (qty - take_a) * 89.0) / qty
+    assert action == "advance" and abs(price - expected) < 1e-9
 
 
 def test_check_sell_stage_fails_when_depth_insufficient():
