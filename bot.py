@@ -78,7 +78,7 @@ COMMANDS = [{"command": "best", "description": "Лучшая связка сей
             {"command": "backtest", "description": "Бэктест маршрута по истории спредов (7/30 дней)"},
             {"command": "calc", "description": "Разовый расчёт под сумму, напр. /calc 20000"},
             {"command": "stats", "description": "Журнал сделок: день/неделя/месяц, расчёт vs факт"},
-            {"command": "paper", "description": "Сухой прогон: круги, статистика, /paper on|off|amount"},
+            {"command": "paper", "description": "Сухой прогон: круги, статистика, /paper on|off|amount|report"},
             {"command": "alert", "description": "Алерт на курс, напр. /alert USDT sell 92 7d"},
             {"command": "alerts", "description": "Список алертов на курс"},
             {"command": "blacklist", "description": "Скрытые мерчанты и обменники"},
@@ -915,6 +915,22 @@ class Bot:
                                timeout=aiohttp.ClientTimeout(total=40)) as r:
             return await r.json()
 
+    async def send_document(self, path, caption="", topic=None, chat_id=None):
+        """Отправить файл с диска (например CSV-отчёт) документом; caption — обычный текст, без HTML-разметки."""
+        chat_id = self.chat_for(chat_id)
+        thread = self.thread_for(topic, chat_id)
+        form = aiohttp.FormData()
+        form.add_field("chat_id", str(chat_id))
+        if caption:
+            form.add_field("caption", caption)
+        if thread:
+            form.add_field("message_thread_id", str(thread))
+        with open(path, "rb") as f:
+            form.add_field("document", f.read(), filename=os.path.basename(path), content_type="text/csv")
+        async with self.s.post(f"https://api.telegram.org/bot{self.token}/sendDocument", data=form,
+                               timeout=aiohttp.ClientTimeout(total=40)) as r:
+            return await r.json()
+
     async def photo_or_text(self, render, caption, markup, topic=None, chat_id=None):
         """Картинка с подписью; если не вышло — тем же текстом. Возвращает (ответ Telegram, картинка ли)."""
         if len(caption) <= 1024:
@@ -1186,12 +1202,40 @@ class Bot:
                 mark = "⚠️ " if total >= trades.BANK_LIMIT else ""
                 lines.append(f"{mark}{bank}: {_money(total)} ₽ / {_money(trades.BANK_LIMIT)} ₽")
         lines.append("")
-        lines.append("/paper on|off — включить/выключить · /paper amount 20000 — сумма круга")
+        lines.append("/paper on|off — включить/выключить · /paper amount 20000 — сумма круга · "
+                    "/paper report — отчёт по площадкам и парам + CSV")
+        return "\n".join(lines)
+
+    def paper_report_view(self, rows):
+        """Текст «/paper report»: по каждой связке площадка/монета покупки → площадка/монета продажи —
+        план/факт, срывы по причинам, нехватка глубины стакана, среднее время круга."""
+        if not rows:
+            return "🧪 Отчёт сухого прогона: завершённых кругов ещё нет."
+        lines = ["🧪 <b>Отчёт сухого прогона</b> — по площадкам и парам:", ""]
+        for r in rows:
+            line = (f"{r['buy_ex']}→{r['sell_ex']} ({r['buy_asset']}→{r['sell_asset']}): "
+                    f"{r['total']} кругов, исполнилось {r['done']}")
+            if r["avg_planned_pct"] is not None:
+                line += f", план {r['avg_planned_pct']:+.2f}%"
+            if r["avg_realized_pct"] is not None:
+                line += f" / факт {r['avg_realized_pct']:+.2f}%"
+            if r["failed"]:
+                reasons = ", ".join(f"{paper.FAIL_LABELS.get(k, k)} {v}"
+                                    for k, v in r["failed_by_reason"].items())
+                line += f", сорвалось {r['failed']} ({reasons})"
+            if r["depth_shortfall"]:
+                line += f", не хватило глубины {r['depth_shortfall']}×"
+            if r["avg_duration_min"] is not None:
+                line += f", среднее время круга {r['avg_duration_min']:.0f} мин"
+            lines.append(line)
+        lines.append("")
+        lines.append("📄 те же данные — файлом CSV ниже.")
         return "\n".join(lines)
 
     async def cmd_paper(self, arg):
         """/paper — сводка сухого прогона; /paper on|off — включить/выключить; /paper amount 20000 —
-        сумма виртуального круга (баланс не сбрасывает, действует для новых кругов)."""
+        сумма виртуального круга (баланс не сбрасывает, действует для новых кругов); /paper report —
+        отчёт по площадкам и парам + CSV-файл (data/paper_report.csv)."""
         sub, _, rest = arg.strip().partition(" ")
         sub = sub.lower()
         if sub == "on":
@@ -1208,6 +1252,12 @@ class Bot:
                 return
             save_env("PAPER_AMOUNT", f"{amount:.0f}")
             await self.send(f"🧪 Сумма круга сухого прогона: {_money(amount)} ₽.")
+        elif sub == "report":
+            rows = paper.report_rows()
+            await self.send(self.paper_report_view(rows))
+            if rows:
+                path = paper.write_report_csv(rows)
+                await self.send_document(path, "Отчёт сухого прогона (CSV)")
         else:
             await self.send(self.paper_view())
 

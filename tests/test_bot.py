@@ -35,6 +35,10 @@ class Stub(B.Bot):
         self.out.append(("sendPhoto", {"caption": caption, "markup": markup}))
         return {"ok": True}
 
+    async def send_document(self, path, caption="", topic=None, chat_id=None):
+        self.out.append(("sendDocument", {"path": path, "caption": caption}))
+        return {"ok": True}
+
 
 def deal(profit=3.0, s_ex="MEXC", s_asset="USDT", route="перевод −0.2 USDT (BEP20) на MEXC"):
     return profit, make_ad("Bybit", "buy", 85.0), make_ad(s_ex, "sell", 90.0, asset=s_asset), route
@@ -93,6 +97,7 @@ def _patch_paper_db(monkeypatch, db):
     monkeypatch.setattr(B.paper, "stats", functools.partial(B.paper.stats, path=db))
     monkeypatch.setattr(B.paper, "ladder_suggestion", functools.partial(B.paper.ladder_suggestion, path=db))
     monkeypatch.setattr(B.paper, "banks_this_month", functools.partial(B.paper.banks_this_month, path=db))
+    monkeypatch.setattr(B.paper, "report_rows", functools.partial(B.paper.report_rows, path=db))
 
 
 def test_paper_cycle_starts_on_signal_when_enabled(monkeypatch, tmp_path):
@@ -2036,6 +2041,31 @@ def test_dispatch_paper_routes_to_cmd_paper(monkeypatch, tmp_path):
     bot = Stub(p2p.Config())
     asyncio.run(bot.dispatch("/paper", ""))
     assert "🧪 <b>Сухой прогон</b>" in texts(bot)[-1]
+
+
+def test_cmd_paper_report_no_cycles_sends_text_only(monkeypatch, tmp_path):
+    _patch_paper_db(monkeypatch, str(tmp_path / "paper.db"))
+    bot = Stub(p2p.Config())
+    asyncio.run(bot.cmd_paper("report"))
+    assert "завершённых кругов ещё нет" in texts(bot)[-1]
+    assert not [m for m in bot.out if m[0] == "sendDocument"]
+
+
+def test_cmd_paper_report_sends_summary_and_csv(monkeypatch, tmp_path):
+    db = str(tmp_path / "paper.db")
+    _patch_paper_db(monkeypatch, db)
+    csv_path = str(tmp_path / "paper_report.csv")
+    monkeypatch.setattr(B.paper, "write_report_csv", functools.partial(B.paper.write_report_csv, path=csv_path))
+    buy, sell = make_ad("Bybit", "buy", 85.0), make_ad("MEXC", "sell", 90.0)
+    cid = paper.start_cycle(10000, buy, sell, "route", 2.0, path=db)
+    paper.finish_cycle(cid, "done", realized_pct=2.5, path=db)
+    bot = Stub(p2p.Config())
+    asyncio.run(bot.cmd_paper("report"))
+    text = texts(bot)[-1]
+    assert "Bybit→MEXC (USDT→USDT)" in text and "план +2.00%" in text and "факт +2.50%" in text
+    docs = [m for m in bot.out if m[0] == "sendDocument"]
+    assert len(docs) == 1 and docs[0][1]["path"] == csv_path
+    assert os.path.exists(csv_path)
 
 
 def test_traps_view_lists_reasons():
