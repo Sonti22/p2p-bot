@@ -26,9 +26,10 @@ import presets
 import trades
 from cards import deal_card, history_card, history_compare_card, portfolio_card, top_chart
 from p2p import ALL_EXCHANGES, AMOUNT_MAX, AMOUNT_MIN, DEFAULT_ASSETS, ENV_PATH, LOG_PATH, MIN_PROFIT_MAX, \
-    MIN_PROFIT_MIN, TRAP, Config, _money, _price, _route_qty, bank_liquidity, deal_amounts, deal_for_amount, fmt_ad, \
-    fmt_breakeven, fmt_deal, fmt_top, load_env, maker_quote, parse_amount, parse_min_profit, profit_breakdown, \
-    reliability, reliability_index, scan, setup_logging, spot_url, traps_log, venue_url
+    MIN_PROFIT_MIN, TRAP, Config, _money, _price, _route_qty, bank_liquidity, book_spread, deal_amounts, \
+    deal_for_amount, fmt_ad, fmt_breakeven, fmt_deal, fmt_top, load_env, maker_neighbors, maker_place, maker_quote, \
+    maker_round_fee, parse_amount, parse_min_profit, profit_breakdown, reliability, reliability_index, scan, \
+    setup_logging, spot_url, traps_log, venue_url
 
 logger = logging.getLogger(__name__)
 
@@ -566,16 +567,17 @@ def traps_view():
     return "\n".join(lines)
 
 
-MAKER_HELP = ("Формат: /maker USDT — цена, чтобы встать первым объявлением в очереди на покупку и на продажу "
-              "на каждой подключённой площадке, и во сколько это обходится против цены сделки прямо сейчас.")
+MAKER_HELP = ("Формат: /maker USDT — цена, чтобы встать первым в очереди на покупку и на продажу, и сколько это "
+              "стоит против сделки сразу.")
 
 
 def maker_view(snap, cfg, asset):
     """Текст «/maker <монета>»: на каждой подключённой площадке (`cfg.exchanges`) — цена мейкера
     (`p2p.maker_quote`) на покупку и на продажу и спред против цены немедленной сделки. Площадка без
-    обеих сторон стакана по этой монете пропускается."""
+    обеих сторон стакана по этой монете пропускается. В конце — стакан для самого выгодного варианта
+    (наименьший спред из всех): `maker_book_lines`."""
     lines = [f"📝 <b>Мейкер {asset}</b>", "", MAKER_HELP, ""]
-    found = False
+    quotes = []   # (спред %, площадка, тип объявления, цена) — из них выбираем вариант для блока стакана
     for ex in cfg.exchanges:
         name = EXCHANGE_NAMES.get(ex)
         if not name:
@@ -584,21 +586,70 @@ def maker_view(snap, cfg, asset):
         buy = maker_quote(snap.groups, name, asset, "buy_ad")
         if buy:
             price, now_price, spread = buy
-            rows.append(f"купить: выставить {_price(price)} ₽ (сейчас купить сразу можно по {_price(now_price)} ₽, "
+            rows.append(f"купить: выставить {_price(price)} ₽ (сразу по {_price(now_price)} ₽, "
                         f"переплата {spread:.2f}%)")
+            quotes.append((spread, name, "buy_ad", price))
         sell = maker_quote(snap.groups, name, asset, "sell_ad")
         if sell:
             price, now_price, spread = sell
-            rows.append(f"продать: выставить {_price(price)} ₽ (сейчас продать сразу можно по {_price(now_price)} ₽, "
+            rows.append(f"продать: выставить {_price(price)} ₽ (сразу по {_price(now_price)} ₽, "
                         f"недополучим {spread:.2f}%)")
+            quotes.append((spread, name, "sell_ad", price))
         if rows:
-            found = True
             lines.append(f"<b>{name}</b>")
             lines += rows
             lines.append("")
-    if not found:
+    if not quotes:
         lines.append("Нет обеих сторон стакана ни на одной подключённой площадке — попробуй другую монету.")
+    else:
+        _, name, post_side, price = min(quotes, key=lambda q: q[0])
+        lines += maker_book_lines(snap, cfg, name, asset, post_side, price)
     return "\n".join(lines).rstrip()
+
+
+MAKER_ROWS = 5   # сколько объявлений-конкурентов показать вокруг своей цены
+
+
+def _rival_line(place, a, cfg):
+    """Строка конкурента в /maker: место, цена, лимиты, остаток, сделки/%, способы оплаты (коротко);
+    ⚠️ — его лимиты не включают сумму круга, за ту же сделку он не конкурирует."""
+    pays = a.all_pays if a.all_pays is not None else a.pays   # как на площадке, до своего фильтра оплаты
+    short = ", ".join(pays[:2]) + (f" +{len(pays) - 2}" if len(pays) > 2 else "")
+    vol = _money(a.avail) if a.avail >= 100 else f"{a.avail:.4g}"
+    warn = "" if a.min_amt <= cfg.amount <= a.max_amt else " ⚠️ лимиты не пересекаются"
+    return (f"{place}. {_price(a.price)} ₽ · {_money(a.min_amt)}–{_money(a.max_amt)} ₽ · {vol} {a.asset} · "
+            f"{a.orders} сд/{a.rate:.0f}% · {html.escape(short)}{warn}")
+
+
+def maker_book_lines(snap, cfg, ex, asset, post_side, price):
+    """Блок /maker для одного варианта (площадка, тип объявления, цена мейкера): место своего объявления
+    в очереди (`p2p.maker_place` по `snap.book` — вся выдача площадки, включая мерчантов, отсеянных своими
+    фильтрами; без неё — `snap.groups`), до MAKER_ROWS конкурентов вокруг этой цены и спред стакана с остатком
+    после комиссии мейкера. Только публичные данные стакана и сумма круга — можно показывать и гостям."""
+    side = "sell" if post_side == "buy_ad" else "buy"   # в какой очереди стоит моё объявление (см. maker_quote)
+    queue = snap.book.get((ex, side, asset)) or snap.groups.get((ex, side, asset), [])
+    place, total, gap = maker_place(queue, price, post_side)
+    action = "купить" if post_side == "buy_ad" else "продать"
+    lines = [f"📍 <b>Стакан {ex}: {action} по {_price(price)} ₽</b> (лучший вариант)"]
+    if place > 1:
+        lines.append(f"Место в стакане: {place}-е из {total}, до 1-го {_price(gap)} ₽ ({gap / price * 100:.2f}%)")
+    elif queue:
+        lines.append(f"Место в стакане: 1-е из {total}, отрыв от 2-го {_price(abs(queue[0].price - price))} ₽")
+    else:
+        lines.append("Место в стакане: 1-е, других объявлений нет")
+    rows = [(n, _rival_line(n, a, cfg)) for n, a in maker_neighbors(queue, place, MAKER_ROWS)]
+    if rows:
+        rows.append((place, f"▶ {place}. {_price(price)} ₽ — ты"))
+        lines.append(f"Конкуренты рядом (сумма {_money(cfg.amount)} ₽):")
+        lines += [text for _, text in sorted(rows)]
+    spread = book_spread(snap.groups, ex, asset)
+    if spread:
+        ask, bid, pct = spread
+        fee = maker_round_fee(ex)
+        rest = (f"комиссия мейкера {ex} неизвестна — остаток не считаю" if fee is None else
+                f"после комиссии мейкера за круг ({fee:.2f}%) остаётся {pct - fee:.2f}%")
+        lines.append(f"Спред {ex}: купить {_price(ask)} / продать {_price(bid)} ₽ → {pct:.2f}%; {rest}")
+    return lines
 
 
 BANKS_HELP = ("Формат: /banks USDT — сколько объявлений и какой объём (₽) по каждому банку/способу оплаты "

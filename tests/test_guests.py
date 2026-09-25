@@ -178,3 +178,16 @@ def test_guest_cannot_note_blacklist_and_gets_no_owner_risk_info():
     assert not any("Контрагенты" in p["text"] or "ОД-2506" in p["text"] for p in sent(bot) if p["chat_id"] == "42")
     asyncio.run(bot.handle("/stats"))                                      # владельцу — блок есть
     assert sent(bot)[-1]["chat_id"] == "1" and "Контрагенты по картам" in sent(bot)[-1]["text"]
+
+
+def test_guest_can_use_maker_with_book_block():
+    """/maker — рыночная команда: гостю тоже место в стакане, конкуренты и спред (только публичный стакан)."""
+    g = {("MEXC", "buy", "USDT"): [make_ad("MEXC", "buy", 92.0), make_ad("MEXC", "buy", 92.3)],
+         ("MEXC", "sell", "USDT"): [make_ad("MEXC", "sell", 90.0)]}
+    bot = Stub(p2p.Config(exchanges=["mexc"]), guests=["42"])
+    bot.last = p2p.Snapshot(88.0, "t", {}, {}, [], {}, {}, {}, groups=g)
+    asyncio.run(bot.on_update(msg(42, "/maker usdt")))
+    text = sent(bot)[-1]["text"]
+    assert sent(bot)[-1]["chat_id"] == "42" and text != B.GUEST_DENIED
+    assert "Место в стакане: 1-е из 3" in text and "Конкуренты рядом" in text and "Спред MEXC" in text
+    assert not [p for p in sent(bot) if p["chat_id"] == "1"]   # владельцу ничего не ушло
