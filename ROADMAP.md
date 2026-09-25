@@ -47,7 +47,11 @@
 - [x] Правило «справочник сетей есть, нужной сети в нём нет → маршрута нет» применять и когда у отправителя есть статическая таблица (`fees.json`): сейчас MEXC/Bybit → BitPapa идёт по табличной TRC20 даже при закрытой сети. (2026-09-25 — `_withdraw` в p2p.py: если живой справочник (`netstatus.known_nets`) знает про отправителя, табличные записи `WITHDRAW` (fees.json) по сетям, которых в справочнике нет, отбрасываются как устаревшие — и для автовыбора сети, и для явно заданной сети (обменник); нет живого справочника — табличная комиссия работает как раньше; тест `test_static_table_net_ignored_when_live_directory_lacks_it` в tests/test_netstatus.py.)
 - [x] Статус ключа в «🔑 Мои биржи»: различать «подтверждён только чтение», «ошибка проверки» и «неизвестно»; при ошибке — предупреждение, а не «ок». (2026-09-25 — `accounts.set_verified`/`verify_status` в accounts.py хранят результат последней проверки ключа (`ok`/`error`/`unknown`) в `data/keys.json` рядом с ключом; `bot.verify_state(ok, safe)` сводит результат `verify()` и `key_permissions()` в один статус — «ok» только когда права подтверждены как только чтение, иначе «unknown»/«error»; список «🔑 Мои биржи» (`accounts_view`) и карточка биржи (`account_view`) показывают ✅/⚠️/❓/➖ вместо прежнего «есть ключ → ✅»; переподключение ключа сбрасывает статус на «неизвестно».)
 - [x] `/stats`: «за сегодня» — календарный день по МСК (сейчас последние 24 ч); месяц — календарный, как у счётчика СБП. (2026-09-25 — `trades._day_start` (календарные сутки по МСК) и `trades._month_start` (уже был у счётчика лимита СБП) вместо `now - 86400`/`now - 30*86400` в `trades.stats`; «неделя» осталась скользящей — 7 суток; тесты `test_stats_day_is_calendar_day_msk_not_rolling_24h`/`test_stats_month_is_calendar_month_not_rolling_30_days` в tests/test_trades.py.)
-- [ ] `ACCOUNT_POLL_INTERVAL` читать после `load_env()` (сейчас — при импорте bot.py, до загрузки .env).
+- [x] `ACCOUNT_POLL_INTERVAL` читать после `load_env()` (сейчас — при импорте bot.py, до загрузки .env).
+  (2026-09-25 — вместо константы `ACCOUNT_POLL_INTERVAL`, читаемой `os.getenv` при импорте bot.py (до
+  вызова `load_env()` в `main()`), новая функция `bot.account_poll_interval()` читает переменную окружения
+  при каждом обращении в `accounts_loop`; тест `test_account_poll_interval_reads_dotenv_after_load` в
+  tests/test_bot.py проверяет, что значение из `.env`, загруженного `p2p.load_env()`, подхватывается.)
 - [ ] README и `.env.example`: описать все команды (/top /best /calc /maker /banks /balance /stats /history /backtest /alert /alerts /blacklist /traps /fees /status /logs /dev /pause), настройки и топики; убрать устаревшие статусы из ROADMAP.
 - [ ] Автосопоставление истории биржи (P2P-ордера, депозиты) со сделками журнала — поле `fact` уже есть.
 - [ ] Сквозные тесты: `scan → _stack → reliability → notify` на фикстурах; ответы Telegram `ok:false` в notify/alerts; ENV-fallback ключей после удаления; разные объявления для разных сторон/монет в фикстурах.
@@ -484,3 +488,6 @@ _(облачный Claude добавляет сюда предложения, к
 - 2026-09-25 — `/stats`: «за сегодня» теперь считается по календарным суткам МСК (`trades._day_start`), а
   «за месяц» — по календарному месяцу (`trades._month_start`, та же функция, что и у лимита СБП), вместо
   скользящих последних 24 ч / 30 дней; «за неделю» осталась скользящей — 7 суток.
+- 2026-09-25 — `ACCOUNT_POLL_INTERVAL` в bot.py читался `os.getenv` при импорте модуля — до вызова
+  `load_env()` в `main()`, — поэтому значение из `.env` игнорировалось. Заменил на функцию
+  `bot.account_poll_interval()`, читающую переменную окружения при каждом обращении из `accounts_loop`.

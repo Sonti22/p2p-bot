@@ -132,11 +132,17 @@ EXCHANGE_NAMES = {"bybit": "Bybit", "mexc": "MEXC", "htx": "HTX", "kucoin": "KuC
 ASSET_LIST = tuple(DEFAULT_ASSETS.split(","))       # монеты для кнопок «🎛 Фильтры»
 EXCHANGE_LIST = tuple(ALL_EXCHANGES.split(","))      # площадки для кнопок «🎛 Фильтры»
 VENUE_NAMES = dict(EXCHANGE_NAMES, bestchange="BestChange")  # + обменник, которого нет в EXCHANGE_NAMES
-ACCOUNT_POLL_INTERVAL = int(os.getenv("ACCOUNT_POLL_INTERVAL", 60))  # опрос истории аккаунтов, сек
+ACCOUNT_POLL_INTERVAL_DEFAULT = 60  # опрос истории аккаунтов, сек — если не задано в .env
 LIVE_EDIT_INTERVAL = 30     # сек: не чаще обновляем карточку последнего сигнала вместо повторной отправки
 MARKET_STATUS_INTERVAL = 60  # сек: не чаще обновляем закреплённое сообщение «Статус рынка»
 MSK = timezone(timedelta(hours=3))                    # тихие часы и /pause считаем по МСК, не по времени ПК
 PAUSE_PRESETS = {"30m": 1800, "1h": 3600, "3h": 3 * 3600}  # аргументы /pause -> секунды
+
+
+def account_poll_interval():
+    """Читаем ACCOUNT_POLL_INTERVAL при каждом обращении, а не при импорте модуля — иначе значение
+    из .env не подхватывается: load_env() вызывается в main() уже после импорта bot.py."""
+    return int(os.getenv("ACCOUNT_POLL_INTERVAL", ACCOUNT_POLL_INTERVAL_DEFAULT))
 
 
 def parse_quiet_hours(spec):
@@ -1650,7 +1656,7 @@ class Bot:
                     await self.check_accounts()
                 except Exception as e:
                     logger.error("accounts_loop error: %s", e)
-            await asyncio.sleep(ACCOUNT_POLL_INTERVAL)
+            await asyncio.sleep(account_poll_interval())
 
     async def command_loop(self):
         offset = 0
