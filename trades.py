@@ -10,6 +10,7 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(HERE, "data", "trades.db")
 PERIODS = {"day": 86400, "week": 7 * 86400, "month": 30 * 86400}
+MSK = datetime.timezone(datetime.timedelta(hours=3))
 # Банки, через которые обычно идёт оплата P2P-мерчанту по СБП (определяем по способу оплаты объявления).
 # Свободный лимит СБП физлицу — 100 тыс. ₽ в календарный месяц НА КАЖДЫЙ банк, дальше — комиссия до 0.5%.
 SBP_BANKS = ("Sberbank", "T-Bank", "Alfa-bank", "VTB", "SBP")
@@ -72,6 +73,12 @@ def _month_start(ts):
     return datetime.datetime(dt.year, dt.month, 1).timestamp()
 
 
+def _day_start(ts):
+    """Начало календарных суток по МСК, в которые попадает `ts`."""
+    dt = datetime.datetime.fromtimestamp(ts, MSK)
+    return dt.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+
+
 def bank_month_total(bank, path=DB_PATH, now=None):
     """Сумма отправленного через банк по СБП с начала текущего календарного месяца."""
     if not bank or not os.path.exists(path):
@@ -131,21 +138,23 @@ def set_fact(trade_id, fact_percent, path=DB_PATH):
 
 def stats(path=DB_PATH, now=None):
     """{"day"/"week"/"month": {"count", "amount", "avg_profit", "fact_count", "avg_fact", "avg_diff"}} —
-    для /stats. `fact_count`/`avg_fact`/`avg_diff` — только по сделкам, где введён факт (avg_diff = среднее
-    факт-расчёт, п.п.); при отсутствии таких сделок avg_fact/avg_diff — None."""
+    для /stats. «day» — календарные сутки по МСК, «month» — календарный месяц (как счётчик лимита СБП),
+    «week» — последние 7 суток. `fact_count`/`avg_fact`/`avg_diff` — только по сделкам, где введён факт
+    (avg_diff = среднее факт-расчёт, п.п.); при отсутствии таких сделок avg_fact/avg_diff — None."""
     now = time.time() if now is None else now
+    starts = {"day": _day_start(now), "week": now - PERIODS["week"], "month": _month_start(now)}
     out = {p: {"count": 0, "amount": 0.0, "avg_profit": 0.0, "fact_count": 0, "avg_fact": None, "avg_diff": None}
            for p in PERIODS}
     if not os.path.exists(path):
         return out
     con = _connect(path)
-    for period, span in PERIODS.items():
+    for period, start in starts.items():
         count, amount, avg_profit = con.execute(
             "SELECT COUNT(*), COALESCE(SUM(amount), 0), COALESCE(AVG(profit), 0) FROM trades WHERE ts >= ?",
-            (now - span,)).fetchone()
+            (start,)).fetchone()
         fact_count, avg_fact, avg_diff = con.execute(
             "SELECT COUNT(*), AVG(fact), AVG(fact - profit) FROM trades WHERE ts >= ? AND fact IS NOT NULL",
-            (now - span,)).fetchone()
+            (start,)).fetchone()
         out[period] = {"count": count, "amount": amount, "avg_profit": avg_profit,
                        "fact_count": fact_count, "avg_fact": avg_fact, "avg_diff": avg_diff}
     con.close()
