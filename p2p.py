@@ -534,6 +534,8 @@ TERMS_WARN = (
     (r"только\s+(с\s+)?(т[\s-]?банк|тиньк|сбер|альф|втб|райф)", "принимает только с одного банка"),
     (r"сч[её]т\s+ип|на\s+ип\b|юр\.?\s?лиц|расч[её]тн\w*\s+сч", "оплата на счёт ИП/юрлица"),
     (r"верифиц|kyc", "требует верификацию"),
+    (r"селфи|фото\s+(с\s+)?паспорт|фото\s+документ", "просит селфи/фото документов"),
+    (r"скрин", "нужен скриншот оплаты"),
     (r"\+7\s?\(?\d{3}|\b8\s?9\d{2}", "в условиях указан телефон"),
 )
 TERMS_RISKY = ("реквизиты в чате", "оплата на счёт ИП/юрлица", "в условиях указан телефон")
@@ -1382,11 +1384,22 @@ def fmt_ad(a):
     return f"{a.ex} {a.asset} {_price(a.price)} ({html.escape(pays)}) · {html.escape(a.nick)} · {stats}{link}{cond}"
 
 
+def premium_line(b, s, snap):
+    """«К ориентиру (Rapira USDT/RUB): покупка −3.9%, продажа +3.9%» — насколько цены объявлений отличаются от
+    биржевого курса; пусто, если ориентира по монете нет."""
+    parts = [f"{name} {(ad.price / snap.refs[ad.asset] - 1) * 100:+.1f}%"
+             for ad, name in ((b, "покупка"), (s, "продажа")) if snap.refs.get(ad.asset)]
+    return f"К ориентиру ({snap.ref_src}): " + ", ".join(parts) if parts else ""
+
+
 def fmt_deal(d, cfg, snap=None):
     profit, b, s, route = d
     text = (f"<b>{profit:+.2f}%</b> на {_money(cfg.amount)} {cfg.fiat} ({route})\n")
     if snap is not None:
         text += html.escape(fmt_reliability(*reliability(d, cfg, snap), reliability_index(d, cfg, snap))) + "\n"
+        prem = premium_line(b, s, snap)
+        if prem:
+            text += html.escape(prem) + "\n"
     return text + f"Купить: {fmt_ad(b)}\nПродать: {fmt_ad(s)}"
 
 
