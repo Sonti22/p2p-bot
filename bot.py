@@ -1826,10 +1826,16 @@ class Bot:
             return
         if len(paper.open_cycles()) >= settings["max_open"]:
             return
+        # лимит СБП исчерпан по-настоящему (trades) или по виртуальному обороту прогона — комиссия 0.5% в плане
+        own = trades.own_banks()[0]
+        over = frozenset(snap.over_banks) | {b for b in own if paper.bank_month_total(b) >= trades.free_limit(b)}
+        psnap = dataclasses.replace(snap, over_banks=over)
         for deal in deals:
             if not self.is_confirmed(deal):
                 continue   # сигнала о ней ещё не было — выброс одного скана не берём
-            d = deal_for_amount(deal, self.cfg, snap, settings["amount"])
+            if not paper.simple_route(deal):
+                continue   # через спот/промежуточную монету: риск курса на споте прогон пока не моделирует
+            d = deal_for_amount(deal, self.cfg, psnap, settings["amount"])
             if d is None or d[0] < self.cfg.min_profit:
                 continue   # на сумму сухого прогона глубины не хватает или прибыль ниже порога
             label, reasons = reliability(d, self.cfg, snap)
@@ -1840,9 +1846,12 @@ class Bot:
             return
         profit, b, s, route = d
         paper.init_balance(settings["amount"])
-        # s — стек продажи из _match: его объём (avail) = выход маршрута в монете продажи
+        # выход маршрута в монете продажи по итоговому стеку s (его parts: переводов на каждый обменник) — без
+        # запаса на курс и с комиссией СБП, если лимит исчерпан
+        qty = _route_qty(b, s, dataclasses.replace(self.cfg, amount=settings["amount"]), psnap.spot, over,
+                         disable=frozenset({"risk"}))
         cycle = paper.get_cycle(paper.start_cycle(settings["amount"], b, s, route, profit, label=label,
-                                                  sell_qty=s.avail)) or {}
+                                                  sell_qty=qty or s.avail)) or {}
         pay = trades.pay_label(cycle.get("pay_kind", ""), cycle.get("bank", ""), b.pays)
         qty = settings["amount"] / b.price
         text = (f"🧪 <b>Сухой прогон</b>: купил бы {_money(qty)} {b.asset} у {html.escape(b.nick)} "
