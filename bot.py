@@ -355,18 +355,31 @@ def env_key_hint(ex):
             "не использует, но сотри его оттуда.")
 
 
-def readonly_note(safe):
+def allow_unsafe_keys():
+    """ALLOW_UNSAFE_KEYS=1 в .env — владелец сознательно оставляет ключ с правами сверх чтения (торговля/вывод).
+    По умолчанию такой ключ удаляется. Бот и в этом режиме делает только запросы на чтение."""
+    return os.getenv("ALLOW_UNSAFE_KEYS", "0").strip() == "1"
+
+
+def readonly_note(safe, detail=""):
     """Хвост к «✅ Подключено»/«✅ Ключ рабочий»: «только чтение» — лишь когда биржа сама подтвердила права ключа."""
     if safe:
         return " (только чтение)"
+    if safe is False:
+        return (f". ⚠️ Ключ даёт больше, чем чтение ({html.escape(detail)}) — оставлен по твоему решению "
+                f"(ALLOW_UNSAFE_KEYS=1). Бот делает только запросы на чтение, но при утечке ключа им можно торговать"
+                f" или выводить. Отключить: ALLOW_UNSAFE_KEYS=0 в .env.")
     return ", но права ключа проверить не удалось — убедись, что у него нет прав на торговлю и вывод."
 
 
 def verify_state(ok, safe):
     """Итог проверки ключа для accounts.set_verified: "error" — verify() не прошёл, "ok" — прошёл и
-    биржа подтвердила права только на чтение, "unknown" — прошёл, но права подтвердить не удалось."""
+    биржа подтвердила права только на чтение, "unknown" — прошёл, но права подтвердить не удалось,
+    "unsafe" — прошёл, ключ даёт больше, чем чтение (оставлен владельцем через ALLOW_UNSAFE_KEYS=1)."""
     if not ok:
         return "error"
+    if safe is False:
+        return "unsafe"
     return "ok" if safe is True else "unknown"
 
 
@@ -381,6 +394,7 @@ def account_view(ex):
             "unknown": "❓ Права ключа не подтверждены (не проверялся или биржа не вернула права).",
             "ok": "✅ Подтверждён только чтение.",
             "error": f"⚠️ Ошибка последней проверки: {html.escape(err)}" if err else "⚠️ Ошибка последней проверки.",
+            "unsafe": f"⚠️ Ключ даёт больше, чем чтение ({html.escape(err)}) — оставлен по твоему решению (ALLOW_UNSAFE_KEYS=1).",
         }[state]
         text = (f"🔑 <b>{name}</b>\n\nКлюч подключён: <code>{accounts.mask(pair[0])}</code>\n{status_line}\n"
                 f"Нужен ключ только для чтения: права проверяю при подключении, по «🔄 Проверить» и при старте бота.")
@@ -1326,12 +1340,12 @@ class Bot:
         accounts.save_key(ex, state["key"], state["secret"], state.get("passphrase"))
         # сначала права: ключ с торговлей/выводом удаляем сразу, «только чтение» — лишь когда биржа это подтвердила
         safe, detail = await accounts.key_permissions(self.s, ex)
-        if safe is False:
+        if safe is False and not allow_unsafe_keys():
             await self.drop_unsafe_key(ex, detail)
         else:
             ok, msg = await accounts.verify(self.s, ex)
-            accounts.set_verified(ex, verify_state(ok, safe), msg)
-            await self.send(f"✅ Подключено{readonly_note(safe)}" if ok
+            accounts.set_verified(ex, verify_state(ok, safe), detail if ok and safe is False else msg)
+            await self.send(f"✅ Подключено{readonly_note(safe, detail)}" if ok
                             else f"⚠️ Ключ сохранён, но проверка не прошла: {html.escape(msg)}")
         t, kb = account_view(ex)
         await self.send(t, markup=kb)
@@ -1975,14 +1989,14 @@ class Bot:
         elif data.startswith("acc_check:"):
             ex = data[10:]
             safe, detail = await accounts.key_permissions(self.s, ex)
-            if safe is False:
+            if safe is False and not allow_unsafe_keys():
                 await self.drop_unsafe_key(ex, detail)
                 t, kb = account_view(ex)
                 await self.send(t, markup=kb)
             else:
                 ok, msg = await accounts.verify(self.s, ex)
-                accounts.set_verified(ex, verify_state(ok, safe), msg)
-                await self.send(f"✅ Ключ рабочий{readonly_note(safe)}" if ok else f"⚠️ {html.escape(msg)}")
+                accounts.set_verified(ex, verify_state(ok, safe), detail if ok and safe is False else msg)
+                await self.send(f"✅ Ключ рабочий{readonly_note(safe, detail)}" if ok else f"⚠️ {html.escape(msg)}")
         elif data.startswith("acc_del:"):
             ex = data[8:]
             if accounts.delete_key(ex):
@@ -2109,7 +2123,10 @@ class Bot:
             if accounts.keys(ex) is None:
                 continue
             safe, detail = await accounts.api_permissions(self.s, ex)
-            if not safe:
+            if not safe and allow_unsafe_keys():   # владелец оставил ключ сознательно — без удаления и без спама
+                accounts.set_verified(ex, "unsafe", detail)
+                logger.warning("%s: ключ даёт больше, чем чтение (%s) — оставлен, ALLOW_UNSAFE_KEYS=1", ex, detail)
+            elif not safe:
                 await self.drop_unsafe_key(ex, detail)
 
     async def setup(self):

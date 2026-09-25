@@ -93,15 +93,16 @@ def delete_key(exchange):
 
 def set_verified(exchange, state, msg=""):
     """Запомнить результат последней проверки ключа для статуса в «🔑 Мои биржи»: `state` —
-    "ok" (запрос прошёл и права подтверждены как только чтение), "error" (запрос не прошёл) или
-    "unknown" (запрос прошёл, но права подтвердить не удалось — как раньше, не утверждаем «только чтение»).
+    "ok" (запрос прошёл и права подтверждены как только чтение), "error" (запрос не прошёл),
+    "unknown" (запрос прошёл, но права подтвердить не удалось — как раньше, не утверждаем «только чтение») или
+    "unsafe" (ключ даёт больше, чем чтение, и оставлен по решению владельца, ALLOW_UNSAFE_KEYS=1; msg — какие права).
     Ключ не подключён (запись уже удалена/помечена disabled) — писать некуда, тихо выходим."""
     ex = exchange.lower()
     data = _keys_file()
     if ex not in data or data[ex].get("disabled"):
         return
     data[ex]["verified"] = state
-    data[ex]["verified_msg"] = msg if state == "error" else ""
+    data[ex]["verified_msg"] = msg if state in ("error", "unsafe") else ""
     _write_keys_file(data)
 
 
@@ -109,13 +110,13 @@ def verify_status(exchange):
     """Статус последней проверки ключа биржи для «🔑 Мои биржи»: ("none", "") — ключ не подключён,
     ("unknown", "") — подключён, но права не подтверждены (ещё не проверялся или сама биржа не
     вернула права ключа), ("ok", "") — подтверждён только чтение, ("error", msg) — последняя проверка
-    не прошла (неверный ключ, сеть и т.п.)."""
+    не прошла (неверный ключ, сеть и т.п.), ("unsafe", права) — ключ даёт больше, чем чтение, оставлен владельцем."""
     ex = exchange.lower()
     if keys(ex) is None:
         return "none", ""
     saved = _keys_file().get(ex, {})
     state = saved.get("verified", "unknown")
-    return state, saved.get("verified_msg", "") if state == "error" else ""
+    return state, saved.get("verified_msg", "") if state in ("error", "unsafe") else ""
 
 
 def mask(key):
