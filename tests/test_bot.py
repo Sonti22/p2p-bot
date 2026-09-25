@@ -880,13 +880,26 @@ def test_awaiting_amount_reset_by_other_command():
 
 
 def test_accounts_view_lists_exchanges_with_status(tmp_path, monkeypatch):
+    """Ключ подключён, но ещё не проверялся → «❓» (не «✅»): «✅» только после подтверждённой
+    проверки только чтение (accounts.set_verified)."""
     monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
     accounts.save_key("bybit", "abcd1234", "secret")
     cfg = p2p.Config(exchanges=["bybit", "mexc", "htx"])
     text, kb = B.accounts_view(cfg)
-    assert "✅ Bybit" in text and "➖ MEXC" in text and "➖ HTX" in text
+    assert "❓ Bybit" in text and "➖ MEXC" in text and "➖ HTX" in text
     callbacks = [b["callback_data"] for row in kb["inline_keyboard"] for b in row if "callback_data" in b]
     assert "acc:bybit" in callbacks and "acc:mexc" in callbacks
+
+
+def test_accounts_view_shows_confirmed_readonly_and_error_status(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    accounts.save_key("bybit", "abcd1234", "secret")
+    accounts.set_verified("bybit", "ok")
+    accounts.save_key("mexc", "k", "s")
+    accounts.set_verified("mexc", "error", "Invalid api_key")
+    cfg = p2p.Config(exchanges=["bybit", "mexc"])
+    text, kb = B.accounts_view(cfg)
+    assert "✅ Bybit" in text and "⚠️ MEXC" in text
 
 
 def test_account_view_connected_shows_masked_key(tmp_path, monkeypatch):
@@ -1219,6 +1232,12 @@ def _verify_ok(calls=None):
     return fake
 
 
+def _verify_fail(msg="Invalid api_key"):
+    async def fake(s, ex):
+        return False, msg
+    return fake
+
+
 def test_handle_key_input_drops_trade_key_and_never_says_readonly(tmp_path, monkeypatch):
     monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
     calls = []
@@ -1260,6 +1279,53 @@ def test_handle_key_input_unverified_permissions_not_called_readonly(tmp_path, m
     connected = [t for t in texts(bot) if t.startswith("✅ Подключено")]
     assert connected and "проверить не удалось" in connected[0]
     assert not any("только чтение" in t for t in texts(bot))
+
+
+def test_handle_key_input_remembers_confirmed_readonly_status(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    monkeypatch.setattr(B.accounts, "key_permissions", _perms((True, "")))
+    monkeypatch.setattr(B.accounts, "verify", _verify_ok())
+    bot = Stub(p2p.Config())
+    bot.awaiting_key = {"ex": "bybit", "step": "secret", "key": "APIKEY123"}
+    asyncio.run(bot.handle_key_input("SECRET456", 56))
+    assert accounts.verify_status("bybit") == ("ok", "")
+
+
+def test_handle_key_input_unverified_permissions_status_is_unknown_not_error(tmp_path, monkeypatch):
+    """safe=None (права не удалось узнать), но сам verify() прошёл — статус «неизвестно», не «ошибка»."""
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    monkeypatch.setattr(B.accounts, "key_permissions", _perms((None, "")))
+    monkeypatch.setattr(B.accounts, "verify", _verify_ok())
+    bot = Stub(p2p.Config())
+    bot.awaiting_key = {"ex": "bybit", "step": "secret", "key": "APIKEY123"}
+    asyncio.run(bot.handle_key_input("SECRET456", 56))
+    assert accounts.verify_status("bybit") == ("unknown", "")
+
+
+def test_handle_key_input_verify_failure_remembers_error_status(tmp_path, monkeypatch):
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    monkeypatch.setattr(B.accounts, "key_permissions", _perms((True, "")))
+    monkeypatch.setattr(B.accounts, "verify", _verify_fail("Invalid api_key"))
+    bot = Stub(p2p.Config())
+    bot.awaiting_key = {"ex": "bybit", "step": "secret", "key": "APIKEY123"}
+    asyncio.run(bot.handle_key_input("SECRET456", 56))
+    assert accounts.verify_status("bybit") == ("error", "Invalid api_key")
+    text, kb = B.account_view("bybit")
+    assert "⚠️ Ошибка последней проверки: Invalid api_key" in text
+
+
+def test_acc_check_updates_status_from_ok_to_error(tmp_path, monkeypatch):
+    """Повторная «🔄 Проверить» с новым результатом перезаписывает прошлый статус."""
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    accounts.save_key("bybit", "k", "s")
+    monkeypatch.setattr(B.accounts, "key_permissions", _perms((True, "")))
+    monkeypatch.setattr(B.accounts, "verify", _verify_ok())
+    bot = Stub(p2p.Config())
+    asyncio.run(bot.on_callback({"id": "1", "data": "acc_check:bybit", "message": {"message_id": 1}}))
+    assert accounts.verify_status("bybit") == ("ok", "")
+    monkeypatch.setattr(B.accounts, "verify", _verify_fail("network down"))
+    asyncio.run(bot.on_callback({"id": "2", "data": "acc_check:bybit", "message": {"message_id": 1}}))
+    assert accounts.verify_status("bybit") == ("error", "network down")
 
 
 def test_acc_check_drops_trade_key(tmp_path, monkeypatch):

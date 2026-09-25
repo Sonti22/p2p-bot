@@ -315,8 +315,14 @@ def hist_text(ex, it):
     return f"💰 {name}: {label} — {it['amount']:g} {it['asset']}"
 
 
+ACCOUNT_STATUS_ICON = {"none": "➖", "unknown": "❓", "ok": "✅", "error": "⚠️"}
+ACCOUNT_STATUS_NOTE = {"none": "", "unknown": " (права не подтверждены)", "ok": " (только чтение)",
+                       "error": " (ошибка проверки)"}
+
+
 def accounts_view(cfg):
-    """Текст и кнопки раздела «🔑 Мои биржи»: список бирж со статусом подключения."""
+    """Текст и кнопки раздела «🔑 Мои биржи»: список бирж со статусом последней проверки ключа —
+    подтверждён только чтение / ошибка проверки / ещё не проверялся (не путать с «не подключён»)."""
     lines = ["🔑 <b>Мои биржи</b>", "",
              "Только чтение: балансы, история. Торговых ордеров, выводов и P2P-действий бот не делает.", ""]
     rows = []
@@ -324,9 +330,10 @@ def accounts_view(cfg):
         name = EXCHANGE_NAMES.get(ex)
         if not name:
             continue
-        connected = accounts.keys(ex) is not None
-        lines.append(f"{'✅' if connected else '➖'} {name}")
-        rows.append([{"text": f"{'✅' if connected else '➖'} {name}", "callback_data": f"acc:{ex}"}])
+        state, _ = accounts.verify_status(ex)
+        icon = ACCOUNT_STATUS_ICON[state]
+        lines.append(f"{icon} {name}{ACCOUNT_STATUS_NOTE[state]}")
+        rows.append([{"text": f"{icon} {name}", "callback_data": f"acc:{ex}"}])
     rows.append([{"text": "⚙️ Настройки", "callback_data": "settings"}])
     return "\n".join(lines), {"inline_keyboard": rows}
 
@@ -346,14 +353,27 @@ def readonly_note(safe):
     return ", но права ключа проверить не удалось — убедись, что у него нет прав на торговлю и вывод."
 
 
+def verify_state(ok, safe):
+    """Итог проверки ключа для accounts.set_verified: "error" — verify() не прошёл, "ok" — прошёл и
+    биржа подтвердила права только на чтение, "unknown" — прошёл, но права подтвердить не удалось."""
+    if not ok:
+        return "error"
+    return "ok" if safe is True else "unknown"
+
+
 def account_view(ex):
     """Текст и кнопки карточки одной биржи: статус, «Проверить»/«Удалить» или «Подключить»."""
     name = EXCHANGE_NAMES.get(ex, ex)
     pair = accounts.keys(ex)
     back = {"text": "⬅️ Мои биржи", "callback_data": "accounts"}
     if pair:
-        # права здесь не известны — не утверждаем их, только напоминаем, когда бот их проверяет
-        text = (f"🔑 <b>{name}</b>\n\nКлюч подключён: <code>{accounts.mask(pair[0])}</code>\n"
+        state, err = accounts.verify_status(ex)
+        status_line = {
+            "unknown": "❓ Права ключа не подтверждены (не проверялся или биржа не вернула права).",
+            "ok": "✅ Подтверждён только чтение.",
+            "error": f"⚠️ Ошибка последней проверки: {html.escape(err)}" if err else "⚠️ Ошибка последней проверки.",
+        }[state]
+        text = (f"🔑 <b>{name}</b>\n\nКлюч подключён: <code>{accounts.mask(pair[0])}</code>\n{status_line}\n"
                 f"Нужен ключ только для чтения: права проверяю при подключении, по «🔄 Проверить» и при старте бота.")
         kb = [[{"text": "🔄 Проверить", "callback_data": f"acc_check:{ex}"}],
               [{"text": "🗑 Удалить ключ", "callback_data": f"acc_del:{ex}"}], [back]]
@@ -1301,6 +1321,7 @@ class Bot:
             await self.drop_unsafe_key(ex, detail)
         else:
             ok, msg = await accounts.verify(self.s, ex)
+            accounts.set_verified(ex, verify_state(ok, safe), msg)
             await self.send(f"✅ Подключено{readonly_note(safe)}" if ok
                             else f"⚠️ Ключ сохранён, но проверка не прошла: {html.escape(msg)}")
         t, kb = account_view(ex)
@@ -1934,6 +1955,7 @@ class Bot:
                 await self.send(t, markup=kb)
             else:
                 ok, msg = await accounts.verify(self.s, ex)
+                accounts.set_verified(ex, verify_state(ok, safe), msg)
                 await self.send(f"✅ Ключ рабочий{readonly_note(safe)}" if ok else f"⚠️ {html.escape(msg)}")
         elif data.startswith("acc_del:"):
             ex = data[8:]
