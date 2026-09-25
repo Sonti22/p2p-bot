@@ -1,6 +1,7 @@
 import asyncio
 import functools
 import logging
+import os
 import time
 from datetime import datetime
 
@@ -165,6 +166,20 @@ def test_apply_callback_rejects_forged_values(tmp_path, monkeypatch):
         assert ("answerCallbackQuery", {"callback_query_id": "1", "text": "Некорректное значение"}) in bot.out, data
     assert bot.cfg.amount == 50000 and bot.cfg.min_profit == 2.0
     assert env.read_text(encoding="utf-8") == "TG_CHAT_ID=1\n"
+
+
+def test_account_poll_interval_reads_dotenv_after_load(tmp_path, monkeypatch):
+    """ACCOUNT_POLL_INTERVAL раньше читался в момент импорта bot.py — до load_env() в main() — и .env
+    игнорировался. account_poll_interval() должен подхватывать значение уже после load_env()."""
+    monkeypatch.delenv("ACCOUNT_POLL_INTERVAL", raising=False)
+    assert B.account_poll_interval() == B.ACCOUNT_POLL_INTERVAL_DEFAULT
+    env = tmp_path / ".env"
+    env.write_text("ACCOUNT_POLL_INTERVAL=45\n", encoding="utf-8")
+    try:
+        p2p.load_env(str(env))   # os.environ.setdefault — не отслеживается monkeypatch, снимаем сами
+        assert B.account_poll_interval() == 45
+    finally:
+        os.environ.pop("ACCOUNT_POLL_INTERVAL", None)
 
 
 def test_send_deal_passes_amount_breakdown_from_snap(monkeypatch):
