@@ -199,6 +199,12 @@ def month_banks(path=DB_PATH, now=None):
     return [r[0] for r in rows]
 
 
+def _counterparty(ex, nick):
+    """Контрагент по нику: у обменника BestChange ник несёт сеть («Obmennik [TRC20]») — это один обменник."""
+    nick = nick.strip()
+    return re.sub(r"\s*\[[^\]]*\]$", "", nick) if ex == "BestChange" else nick
+
+
 def counterparties(bank, path=DB_PATH, now=None):
     """(за сегодня, за месяц): сколько разных контрагентов — мерчантов покупки и продажи (buy_nick/sell_nick,
     у собранной из стакана стороны — каждый ник) — в сделках с оплатой со своего банка `bank`. Сутки — по МСК
@@ -213,7 +219,7 @@ def counterparties(bank, path=DB_PATH, now=None):
     con.close()
     today, month = set(), set()
     for ts, buy_ex, buy_nick, sell_ex, sell_nick in rows:
-        who = {(ex, n.strip()) for ex, nicks in ((buy_ex, buy_nick), (sell_ex, sell_nick))
+        who = {(ex, _counterparty(ex, n)) for ex, nicks in ((buy_ex, buy_nick), (sell_ex, sell_nick))
                for n in (nicks or "").split(", ") if n.strip()}
         month |= who
         if ts >= day:
@@ -379,19 +385,37 @@ def facts_by_pair(since=0.0, path=DB_PATH):
 
 def period_start(period, now=None):
     """Начало периода /export по МСК: «month» — 1-е число текущего месяца, «year» — 1 января (год до сегодня)."""
+    return period_range(period, now)[0]
+
+
+def period_range(period, now=None):
+    """(начало, конец) периода /export по МСК; конец None — до сегодня. «month»/«year» — текущие, «prev» — прошлый
+    месяц, «prevyear» — прошлый год, «2026» — календарный год (для 3-НДФЛ за прошлый год)."""
     now = time.time() if now is None else now
     dt = datetime.datetime.fromtimestamp(now, MSK).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    return (dt.replace(month=1) if period == "year" else dt).timestamp()
+    if period == "year":
+        return dt.replace(month=1).timestamp(), None
+    if period == "prev":
+        prev = (dt - datetime.timedelta(days=1)).replace(day=1)
+        return prev.timestamp(), dt.timestamp()
+    if period == "prevyear":
+        year = dt.replace(month=1)
+        return year.replace(year=year.year - 1).timestamp(), year.timestamp()
+    if str(period).isdigit():
+        start = dt.replace(year=int(period), month=1)
+        return start.timestamp(), start.replace(year=int(period) + 1).timestamp()
+    return dt.timestamp(), None
 
 
-def export_rows(since, path=DB_PATH):
-    """Сделки журнала с `since` по времени — словари со всеми колонками таблицы, какие есть в базе
-    (buy_nick/sell_nick могут быть, а могут и не быть — читаем через SELECT *)."""
+def export_rows(since, path=DB_PATH, until=None):
+    """Сделки журнала с `since` (и до `until`, если задан) по времени — словари со всеми колонками таблицы, какие
+    есть в базе (buy_nick/sell_nick могут быть, а могут и не быть — читаем через SELECT *)."""
     if not os.path.exists(path):
         return []
     con = _connect(path)
     con.row_factory = sqlite3.Row
-    rows = con.execute("SELECT * FROM trades WHERE ts >= ? ORDER BY ts", (since,)).fetchall()
+    rows = con.execute("SELECT * FROM trades WHERE ts >= ? AND ts < ? ORDER BY ts",
+                       (since, until if until is not None else float("inf"))).fetchall()
     con.close()
     return [dict(r) for r in rows]
 
@@ -415,6 +439,11 @@ def _csv_text(value):
     return "'" + text if text[:1] in ("=", "+", "-", "@", "\t", "\r") else text
 
 
+def _num(x):
+    """Число для CSV «под русский Excel»: десятичная запятая, иначе Excel с ru-RU читает его как текст."""
+    return f"{x:.2f}".replace(".", ",")
+
+
 def write_export_csv(rows, path=EXPORT_CSV_PATH):
     """Выгрузка сделок (export_rows) в CSV для банка (запрос документов по 115-ФЗ) и для 3-НДФЛ: «;» и UTF-8 с BOM —
     так файл сразу открывается по колонкам в русском Excel."""
@@ -427,8 +456,8 @@ def write_export_csv(rows, path=EXPORT_CSV_PATH):
             fact, rub = r.get("fact"), fact_rub(r)
             bank, kind = r.get("bank") or "", r.get("kind") or ""
             line = [datetime.datetime.fromtimestamp(r["ts"], MSK).strftime("%Y-%m-%d %H:%M"),
-                    r["buy_ex"], r["buy_asset"], r["sell_ex"], r["sell_asset"], f"{r['amount']:.2f}",
-                    f"{r['profit']:.2f}", "" if fact is None else f"{fact:.2f}", "" if rub is None else f"{rub:.2f}",
+                    r["buy_ex"], r["buy_asset"], r["sell_ex"], r["sell_asset"], _num(r["amount"]),
+                    _num(r["profit"]), "" if fact is None else _num(fact), "" if rub is None else _num(rub),
                     BANK_NAMES.get(bank, bank), KIND_NAMES.get(kind, kind)]
             if nicks:
                 line += [_csv_text(r.get("buy_nick")), _csv_text(r.get("sell_nick"))]
