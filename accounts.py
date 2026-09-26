@@ -12,7 +12,8 @@ BingX и Cryptomus — только аккаунты (P2P-площадками �
 а не правами ключа: `bingx_get` — только GET и только пути из BINGX_READ_PATHS (спот- и Fund-баланс, права ключа,
 история депозитов и выводов), POST-запросов к BingX в коде нет; `cryptomus_call` — только пары (метод, путь) из
 CRYPTOMUS_READ_CALLS (баланс личного кабинета GET /v2/user-api/balance, баланс бизнес-кабинета POST /v1/balance,
-история личного кабинета POST /v2/user-api/transaction/list). Любой другой путь — ValueError до подписи и отправки.
+история личного кабинета POST /v2/user-api/transaction/list). Любой другой путь — ValueError до подписи и отправки;
+за редиректами оба не идут (3xx — ошибка), так что путь и хост не может подменить и сервер.
 Ключей «только чтение» у Cryptomus нет вовсе: любой его ключ даёт двигать деньги (см. CRYPTOMUS_KEY_RIGHTS).
 """
 import asyncio
@@ -235,6 +236,16 @@ async def _get_json(s, url, headers):
         return await r.json(content_type=None)
 
 
+async def _json_no_redirect(req):
+    """JSON ответа на запрос, отправленный с allow_redirects=False (BingX, Cryptomus). 3xx — ошибка: за редиректом
+    не идём, иначе путь и хост выбрал бы сервер, а не список чтения, и туда же ушли бы заголовки с ключом и подписью."""
+    async with req as r:
+        if 300 <= r.status < 400:
+            raise aiohttp.ClientResponseError(r.request_info, r.history, status=r.status, message="редирект запрещён")
+        r.raise_for_status()
+        return await r.json(content_type=None)
+
+
 def api_error_text(e):
     """Текст ошибки запроса к бирже для пользователя и лога — без URL и параметров запроса: str() ошибки
     aiohttp содержит полный URL, а в query HTX лежат AccessKeyId и Signature, у MEXC — signature."""
@@ -359,11 +370,12 @@ def bingx_signed_query(api_secret, params=None, timestamp=None, recv_window="500
 
 
 async def bingx_get(s, api_key, api_secret, path, params=None):
-    """Подписанный GET к приватному BingX. Путь не из BINGX_READ_PATHS — ValueError до подписи и отправки."""
+    """Подписанный GET к приватному BingX. Путь не из BINGX_READ_PATHS — ValueError до подписи и отправки;
+    за редиректом не идём (3xx — ошибка), чтобы сервер не увёл запрос на другой путь или хост."""
     if path not in BINGX_READ_PATHS:
         raise ValueError(f"BingX: путь {path} не входит в список чтения")
     url = f"{BINGX_BASE}{path}?{bingx_signed_query(api_secret, params)}"
-    return await _get_json(s, url, {"X-BX-APIKEY": api_key})
+    return await _json_no_redirect(s.get(url, headers={"X-BX-APIKEY": api_key}, allow_redirects=False))
 
 
 def _scrub(text, *secrets, limit=160):
@@ -391,24 +403,44 @@ def bingx_error_text(j, *secrets):
 BINGX_READ_CODE = 2   # apiPermissions (docs-v3): 2 — чтение, остальные коды — права сверх чтения
 BINGX_PERM_CODES = {1: "торговля спот", 3: "фьючерсы", 4: "переводы между своими счетами",
                     5: "вывод и переводы другим пользователям BingX", 7: "переводы между субаккаунтами"}
-BINGX_PERM_FLAGS = (   # apiPermissions (api-ai-skills): флаги enable* -> что даёт ключ
-    ("enableSpotAndMarginTrading", "торговля спот"), ("enableFutures", "фьючерсы"), ("enableVanillaOptions", "опционы"),
-    ("permitsUniversalTransfer", "переводы между своими счетами"),
-    ("enableWithdrawals", "вывод и переводы другим пользователям BingX"),
-    ("enableInternalTransfer", "переводы между субаккаунтами"))
+BINGX_PERM_FLAGS = {   # apiPermissions (api-ai-skills): флаг enable*/permits* -> что даёт ключ сверх чтения
+    "enableSpotAndMarginTrading": "торговля спот", "enableFutures": "фьючерсы", "enableVanillaOptions": "опционы",
+    "permitsUniversalTransfer": "переводы между своими счетами",
+    "enableWithdrawals": "вывод и переводы другим пользователям BingX",
+    "enableInternalTransfer": "переводы между субаккаунтами"}
+# без любого из этих флагов «только чтение» не подтвердить: у api-ai-skills есть и урезанная форма ответа (без
+# enableWithdrawals); enableVanillaOptions есть не во всех формах — его отсутствие не мешает, «истина» — право сверх чтения
+BINGX_FLAGS_REQUIRED = ("enableReading", "enableSpotAndMarginTrading", "enableFutures", "permitsUniversalTransfer",
+                        "enableWithdrawals", "enableInternalTransfer")
+
+
+def _bingx_flag(value):
+    """Флаг из ответа BingX: True/False (bool, 1/0, "true"/"false"/"1"/"0" в любом регистре), иначе None — не распознан."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str) and value.strip().lower() in ("true", "1", "false", "0"):
+        return value.strip().lower() in ("true", "1")
+    return None
 
 
 def bingx_key_safety(data):
-    """Права ключа BingX по `data` ответа /openApi/v1/account/apiPermissions: (safe, detail), как key_permissions.
+    """Права ключа BingX по ответу /openApi/v1/account/apiPermissions (уже без обёртки {code, data}): (safe, detail),
+    как key_permissions.
 
     Официальные источники расходятся — принимаем обе формы: docs-v3 {permissions: [коды], ipAddresses: [...]}
     (2 — чтение, 1 спот, 3 фьючерсы, 4 переводы между своими счетами, 5 вывод и переводы другим пользователям,
     7 переводы между субаккаунтами; незнакомый код — тоже сверх чтения) и api-ai-skills {enableReading,
-    enableSpotAndMarginTrading, enableWithdrawals, ..., ipRestrict}. Непонятная форма — (None, "")."""
+    enableSpotAndMarginTrading, enableWithdrawals, ..., ipRestrict}. safe=True — только когда чтение подтверждено
+    (код 2 и других нет; enableReading и все флаги из BINGX_FLAGS_REQUIRED распознаны, сверх чтения — ни одного).
+    Любое право сверх чтения — False, даже если остальное не распознано. Иначе (непонятная форма, неполный набор
+    флагов, пустой список прав) — (None, "")."""
     if isinstance(data, list) and len(data) == 1:
         data = data[0]
     if not isinstance(data, dict):
         return None, ""
+    missing = []
     if "permissions" in data:
         raw = data["permissions"]
         raw = raw.split(",") if isinstance(raw, str) else raw
@@ -419,15 +451,24 @@ def bingx_key_safety(data):
         except ValueError:
             return None, ""
         bad = [BINGX_PERM_CODES.get(c, f"право {c}") for c in sorted(codes - {BINGX_READ_CODE})]
+        confirmed = codes == {BINGX_READ_CODE}
         no_ip = "ipAddresses" in data and not data["ipAddresses"]
-    elif "enableReading" in data or any(flag in data for flag, _ in BINGX_PERM_FLAGS):
-        bad = [label for flag, label in BINGX_PERM_FLAGS if data.get(flag) in (True, "true")]
-        no_ip = data.get("ipRestrict") in (False, "false")
+    elif any(str(k).lower().startswith(("enable", "permit")) for k in data):
+        rights = {k: _bingx_flag(v) for k, v in data.items() if str(k).lower().startswith(("enable", "permit"))}
+        # известные флаги в порядке BINGX_PERM_FLAGS, затем незнакомые enable*/permits* — тоже права сверх чтения
+        order = [*BINGX_PERM_FLAGS, *sorted(k for k in rights if k not in BINGX_PERM_FLAGS and k != "enableReading")]
+        bad = [BINGX_PERM_FLAGS.get(k, f"право {k}") for k in order if rights.get(k)]
+        missing = [BINGX_PERM_FLAGS[k] for k in BINGX_FLAGS_REQUIRED
+                   if k in BINGX_PERM_FLAGS and rights.get(k) is None]
+        confirmed = (rights.get("enableReading") is True and None not in rights.values()
+                     and all(k in rights for k in BINGX_FLAGS_REQUIRED))
+        no_ip = _bingx_flag(data.get("ipRestrict")) is False
     else:
         return None, ""
-    if not bad:
-        return True, ""
-    return False, ", ".join(dict.fromkeys(bad)) + ("; без привязки к IP" if no_ip else "")
+    if bad:
+        return False, (", ".join(dict.fromkeys(bad)) + ("; без привязки к IP" if no_ip else "")
+                       + (f"; не проверено: {', '.join(missing)}" if missing else ""))
+    return (True, "") if confirmed else (None, "")
 
 
 # Cryptomus: у любого ключа есть права двигать деньги — поэтому только эти пары (метод, путь)
@@ -443,6 +484,9 @@ CRYPTOMUS_KEY_RIGHTS = {   # что даёт ключ Cryptomus сверх чт�
             "на бирже Cryptomus, отмену ордеров, покупку AML-пакетов",
     "merchant": "у Cryptomus нет ключей только для чтения: ключ бизнес-кабинета даёт возвраты платежей "
                 "на любой адрес, выплаты и переводы между кошельками",
+    None: "у Cryptomus нет ключей только для чтения: ключ личного кабинета даёт конвертации и ордера на бирже "
+          "Cryptomus, отмену ордеров, покупку AML-пакетов; ключ бизнес-кабинета — возвраты платежей на любой адрес, "
+          "выплаты и переводы между кошельками",   # кабинет ещё не определён
 }
 CRYPTOMUS_CODES = {"GRAM": "TON"}   # Toncoin у Cryptomus — код GRAM
 _CRYPTOMUS_MODE = {}   # {ID: "user"/"merchant"} — какой кабинет принял этот ID (в памяти процесса)
@@ -457,7 +501,9 @@ def cryptomus_sign(body, api_key):
 async def cryptomus_call(s, uid, api_key, method, path, body=None, mode="user"):
     """Подписанный запрос к Cryptomus. Пара (метод, путь) не из CRYPTOMUS_READ_CALLS — ValueError до подписи
     и отправки. mode="user" — заголовок userId (личный кабинет), "merchant" — merchant (бизнес). Тело — компактный
-    JSON, подписывается ровно отправляемая строка. Заголовки, подпись и тело не логируются."""
+    JSON, подписывается ровно отправляемая строка. За редиректом не идём (3xx — ошибка): подпись Cryptomus не привязана
+    к пути, и переадресованный запрос ушёл бы с валидной подписью туда, куда укажет сервер. Заголовки, подпись и тело
+    не логируются."""
     method = str(method).upper()
     if (method, path) not in CRYPTOMUS_READ_CALLS:
         raise ValueError(f"Cryptomus: {method} {path} не входит в список чтения")
@@ -467,10 +513,9 @@ async def cryptomus_call(s, uid, api_key, method, path, body=None, mode="user"):
     headers = {"userId" if mode == "user" else "merchant": uid, "sign": cryptomus_sign(payload, api_key),
                "Content-Type": "application/json"}
     url = f"{CRYPTOMUS_BASE}{path}"
-    req = s.get(url, headers=headers) if method == "GET" else s.post(url, headers=headers, data=payload)
-    async with req as r:
-        r.raise_for_status()
-        return await r.json(content_type=None)
+    req = (s.get(url, headers=headers, allow_redirects=False) if method == "GET"
+           else s.post(url, headers=headers, data=payload, allow_redirects=False))
+    return await _json_no_redirect(req)
 
 
 def _cryptomus_ok(j):
@@ -520,7 +565,9 @@ async def key_permissions(s, exchange):
     """Права сохранённого ключа биржи по данным самого API: (safe, detail).
 
     safe=True — биржа подтвердила: только чтение; safe=False — ключ даёт торговать или выводить,
-    detail — что именно нашли; safe=None — права проверить не удалось (нет ключа, ошибка сети/API/формата)."""
+    detail — что именно нашли; safe=None — права проверить не удалось (нет ключа, ошибка сети/API/формата).
+    Биржи из NO_READONLY_KEYS (Cryptomus) — всегда False без запроса: read-only ключей у них нет вовсе, и сбой сети
+    не должен превращаться в «проверить не удалось», которое при старте считается безопасным."""
     ex = exchange.lower()
     pair = keys(ex)
     if not pair:
@@ -568,13 +615,15 @@ async def key_permissions(s, exchange):
             return not bad, ", ".join(bad)
         elif ex == "bingx":
             j = await bingx_get(s, api_key, api_secret, "/openApi/v1/account/apiPermissions")
-            if not isinstance(j, dict) or j.get("code") != 0:
-                return None, ""
-            return bingx_key_safety(j.get("data"))
+            if isinstance(j, dict) and "code" in j:   # обёртка {code, msg, data} (api-ai-skills); ошибка — code != 0
+                if j["code"] not in (0, "0"):
+                    return None, ""
+                j = j.get("data")
+            return bingx_key_safety(j)   # без обёртки — {apiKey, permissions, ipAddresses, note}, как в docs-v3
         elif ex == "cryptomus":
-            # прав ключа Cryptomus не отдаёт, read-only ключей нет: ключ принят — значит, даёт больше, чем чтение
-            mode, _ = await cryptomus_detect(s, api_key, api_secret)   # key = ID кабинета, secret = API key
-            return (False, CRYPTOMUS_KEY_RIGHTS[mode]) if mode else (None, "")
+            # прав ключа Cryptomus не отдаёт, read-only ключей нет вовсе — ответ известен без запроса; кабинет (что
+            # именно даёт ключ) знаем, если verify/баланс его уже определили. key = ID кабинета.
+            return False, CRYPTOMUS_KEY_RIGHTS[_CRYPTOMUS_MODE.get(api_key)]
     except Exception:
         return None, ""
     return None, ""
@@ -583,7 +632,7 @@ async def key_permissions(s, exchange):
 async def api_permissions(s, exchange):
     """Проверка прав при старте бота: (safe, detail), как key_permissions, но «не удалось проверить» = safe.
 
-    safe=False — ключ даёт торговать или выводить (не read-only), detail — что именно нашли.
+    safe=False — ключ даёт торговать или выводить (не read-only), detail — что именно нашли; у Cryptomus — всегда.
     safe=True — либо ключ read-only, либо права проверить не удалось (не блокируем по недоступности API)."""
     safe, detail = await key_permissions(s, exchange)
     return safe is not False, detail
@@ -852,7 +901,8 @@ def _bingx_coin(coin, network=""):
 
 async def bingx_history(s, api_key, api_secret, limit=20):
     """История BingX одной лентой по времени: завершённые депозиты (status 1 или 6; 0 — ещё в пути) и выводы
-    (status 6). Вывод с transferType 2 — перевод другому пользователю BingX, а не на внешний адрес: kind "transfer".
+    (status 6). Вывод с transferType 2 — перевод другому пользователю BingX (innerTransfer, право Withdraw), а не на
+    внешний адрес и не между своими счетами: kind "transfer_out" — деньги ушли третьему лицу.
     Ответы — голые массивы; время депозита — insertTime (мс), вывода — applyTime (ISO-8601 со смещением)."""
     sources = []
     for kind, path in (("deposit", "/openApi/api/v3/capital/deposit/hisrec"),
@@ -875,7 +925,7 @@ async def bingx_history(s, api_key, api_secret, limit=20):
                 items.append(_hist_item("deposit", _bingx_coin(it.get("coin"), it.get("network")), it.get("amount"),
                                         it.get("insertTime")))
             elif kind == "withdraw" and status == "6":
-                k = "transfer" if str(it.get("transferType")) == "2" else "withdraw"
+                k = "transfer_out" if str(it.get("transferType")) == "2" else "withdraw"
                 items.append(_hist_item(k, _bingx_coin(it.get("coin"), it.get("network")), it.get("amount"),
                                         it.get("applyTime")))
         sources.append([it for it in items if it])

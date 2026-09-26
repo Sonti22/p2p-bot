@@ -6,10 +6,12 @@ import asyncio
 import hashlib
 import hmac
 import inspect
+import socket
 from datetime import datetime, timedelta, timezone
 
 import aiohttp
 import pytest
+from aiohttp import web
 from multidict import CIMultiDict, CIMultiDictProxy
 from yarl import URL
 
@@ -54,9 +56,18 @@ def _http_error(status=401, message="Unauthorized"):
                                        status=status, message=message)
 
 
+class Redirect:
+    """Ответ 3xx (как его отдаёт aiohttp при allow_redirects=False)."""
+    def __init__(self, status=307):
+        self.status = status
+
+
 class _Resp:
     def __init__(self, body):
         self.body = body
+        self.status = body.status if isinstance(body, Redirect) else 200
+        u = URL(accounts.CRYPTOMUS_BASE)
+        self.request_info, self.history = aiohttp.RequestInfo(u, "GET", CIMultiDictProxy(CIMultiDict()), u), ()
 
     async def __aenter__(self):
         return self
@@ -73,22 +84,23 @@ class _Resp:
 
 
 class Session:
-    """Ответ по (метод, путь); каждый запрос записывается: (метод, URL, заголовки, тело)."""
+    """Ответ по (метод, путь); каждый запрос записывается: (метод, URL, заголовки, тело), allow_redirects — в redirects."""
     def __init__(self, routes):
-        self.routes, self.calls = routes, []
+        self.routes, self.calls, self.redirects = routes, [], []
 
-    def _answer(self, method, url, headers, data=None):
+    def _answer(self, method, url, headers, data=None, allow_redirects=True):
         self.calls.append((method, url, headers, data))
+        self.redirects.append(allow_redirects)
         body = self.routes.get((method, URL(url).path))
         if body is None:
             raise AssertionError(f"unexpected request: {method} {URL(url).path}")
         return _Resp(body)
 
-    def get(self, url, headers=None):
-        return self._answer("GET", url, headers)
+    def get(self, url, headers=None, allow_redirects=True):
+        return self._answer("GET", url, headers, allow_redirects=allow_redirects)
 
-    def post(self, url, headers=None, data=None):
-        return self._answer("POST", url, headers, data)
+    def post(self, url, headers=None, data=None, allow_redirects=True):
+        return self._answer("POST", url, headers, data, allow_redirects=allow_redirects)
 
     def paths(self):
         return [(m, URL(u).path) for m, u, _, _ in self.calls]
@@ -167,6 +179,7 @@ def test_every_bingx_feature_sends_only_allowlisted_gets():
     run(accounts.account_history(s, "bingx"))
     assert s.calls and all(m == "GET" and p in accounts.BINGX_READ_PATHS for m, p in s.paths())
     assert all(URL(u).host == URL(accounts.BINGX_BASE).host for _, u, _, _ in s.calls)
+    assert s.redirects and not any(s.redirects)   # ни один запрос не идёт за редиректом
 
 
 # --- Cryptomus: подпись и allowlist ---
@@ -221,6 +234,64 @@ def test_every_cryptomus_feature_sends_only_allowlisted_calls():
     run(accounts.account_history(s, "cryptomus"))
     assert s.calls and all(pair in accounts.CRYPTOMUS_READ_CALLS for pair in s.paths())
     assert all(URL(u).host == URL(accounts.CRYPTOMUS_BASE).host for _, u, _, _ in s.calls)
+    assert s.redirects and not any(s.redirects)
+
+
+# --- редиректы: путь и хост не может подменить и сервер ---
+
+def test_redirect_answer_is_an_error_and_not_followed():
+    accounts.save_key("bingx", BX_KEY, BX_SECRET)
+    s = Session({("GET", SPOT): Redirect(302)})
+    assert run(accounts.verify(s, "bingx")) == (False, "HTTP 302: редирект запрещён")
+    assert s.redirects == [False]
+    s = Session({("GET", CM_USER): Redirect(307), ("POST", CM_MERCHANT): Redirect(308)})
+    assert run(accounts.cryptomus_detect(s, CM_ID, CM_KEY)) == (None, "HTTP 308: редирект запрещён")
+    assert s.paths() == [("GET", CM_USER), ("POST", CM_MERCHANT)] and s.redirects == [False, False]
+
+
+async def _loopback_site(handler):
+    """Локальный aiohttp-сервер на 127.0.0.1 (порт выбирает ОС) — наружу запросы не уходят. (runner, base URL)."""
+    app = web.Application()
+    app.router.add_route("*", "/{tail:.*}", handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    await web.SockSite(runner, sock).start()
+    return runner, str(URL.build(scheme="http", host="127.0.0.1", port=sock.getsockname()[1]))
+
+
+def test_real_aiohttp_does_not_follow_redirect_off_the_allowlist(monkeypatch):
+    """Настоящий aiohttp: 307 с POST /v1/balance на /v1/payout и 302 с баланса BingX на торговый путь другого хоста.
+    Без allow_redirects=False aiohttp повторил бы POST с телом и sign на /v1/payout, а X-BX-APIKEY отдал бы чужому хосту."""
+    seen = []
+
+    async def scenario():
+        async def handler(request):
+            seen.append((request.method, request.path, request.headers.get("merchant"), request.headers.get("X-BX-APIKEY")))
+            if request.path == CM_MERCHANT:
+                raise web.HTTPTemporaryRedirect("/v1/payout")
+            if request.path == SPOT:
+                raise web.HTTPFound(str(URL(other).with_path("/openApi/spot/v1/trade/order")))
+            return web.json_response({"code": 0, "state": 0, "result": {}, "data": {}})
+
+        runner, base = await _loopback_site(handler)
+        runner2, other = await _loopback_site(handler)
+        monkeypatch.setattr(accounts, "CRYPTOMUS_BASE", base)
+        monkeypatch.setattr(accounts, "BINGX_BASE", base)
+        try:
+            async with aiohttp.ClientSession() as s:
+                with pytest.raises(aiohttp.ClientResponseError) as cm:
+                    await accounts.cryptomus_call(s, CM_ID, CM_KEY, "POST", CM_MERCHANT, {}, mode="merchant")
+                with pytest.raises(aiohttp.ClientResponseError) as bx:
+                    await accounts.bingx_get(s, BX_KEY, BX_SECRET, SPOT)
+        finally:
+            await runner.cleanup()
+            await runner2.cleanup()
+        return cm.value.status, bx.value.status
+
+    assert run(scenario()) == (307, 302)
+    assert seen == [("POST", CM_MERCHANT, CM_ID, None), ("GET", SPOT, None, BX_KEY)]   # второго запроса нет
 
 
 # --- Cryptomus: определение кабинета ---
@@ -273,9 +344,50 @@ def test_bingx_key_safety_enable_flags_shape():
     assert safe is False and "вывод и переводы другим пользователям BingX" in detail and "без привязки" not in detail
 
 
-@pytest.mark.parametrize("data", [None, {}, {"foo": 1}, "text", {"permissions": {"a": 1}}, {"permissions": ["x"]}])
-def test_bingx_key_safety_unknown_shape_is_unknown(data):
+RO_FLAGS = {"enableReading": True, "enableSpotAndMarginTrading": False, "enableWithdrawals": False,
+            "enableInternalTransfer": False, "enableFutures": False, "permitsUniversalTransfer": False}
+
+
+@pytest.mark.parametrize("data", [
+    None, {}, {"foo": 1}, "text", {"permissions": {"a": 1}}, {"permissions": ["x"]},
+    {"permissions": []},                                            # пустой список прав — чтение не подтверждено
+    {"enableReading": True},                                        # флагов прав сверх чтения нет вовсе
+    {"ipRestrict": True, "createTime": 1, "permitsUniversalTransfer": False, "enableReading": True,
+     "enableFutures": False, "enableSpotAndMarginTrading": False},  # урезанная форма api-ai-skills: без enableWithdrawals
+    dict(RO_FLAGS, enableWithdrawals="yes"),                        # значение не распознано
+    dict(RO_FLAGS, enableWithdrawals=None),
+    dict(RO_FLAGS, enableReading=False),                            # чтение не подтверждено
+    dict(RO_FLAGS, enableVanillaOptions="maybe")])
+def test_bingx_key_safety_unknown_or_incomplete_is_unknown(data):
     assert accounts.bingx_key_safety(data) == (None, "")
+
+
+@pytest.mark.parametrize("value", [True, "true", "True", "TRUE", " true ", "1", 1])
+def test_bingx_key_safety_any_spelling_of_true_is_a_right(value):
+    assert accounts.bingx_key_safety(dict(RO_FLAGS, enableWithdrawals=value)) == (
+        False, "вывод и переводы другим пользователям BingX")
+
+
+@pytest.mark.parametrize("value", [False, "false", "False", "FALSE", "0", 0])
+def test_bingx_key_safety_any_spelling_of_false_is_not_a_right(value):
+    assert accounts.bingx_key_safety(dict(RO_FLAGS, enableWithdrawals=value, enableVanillaOptions=value)) == (True, "")
+
+
+def test_bingx_key_safety_unknown_flag_and_partial_answer():
+    # незнакомый флаг enable*/permits* со значением «истина» — право сверх чтения
+    assert accounts.bingx_key_safety(dict(RO_FLAGS, enableMargin=True, permitsSubAccounts="true")) == (
+        False, "право enableMargin, право permitsSubAccounts")
+    # право сверх чтения видно, а остальных флагов нет — False, и честно: что не проверено
+    safe, detail = accounts.bingx_key_safety({"enableReading": True, "enableSpotAndMarginTrading": True,
+                                              "ipRestrict": False})
+    assert safe is False and detail.startswith("торговля спот; без привязки к IP; не проверено: ")
+    for word in ("фьючерсы", "переводы между своими счетами", "вывод и переводы другим пользователям BingX",
+                 "переводы между субаккаунтами"):
+        assert word in detail, word
+    assert accounts.bingx_key_safety({"permissions": [1]}) == (False, "торговля спот")   # без Read, но с торговлей
+
+
+BX_DOCS_V3_PERMS = {"apiKey": "", "permissions": [1, 2], "ipAddresses": [], "note": "demo"}   # пример из docs-v3
 
 
 def test_key_permissions_bingx_reads_api_permissions():
@@ -283,6 +395,26 @@ def test_key_permissions_bingx_reads_api_permissions():
     s = Session({("GET", PERMS): {"code": 0, "msg": "", "data": {"permissions": [1, 2], "ipAddresses": []}}})
     assert run(accounts.key_permissions(s, "bingx")) == (False, "торговля спот; без привязки к IP")
     assert s.paths() == [("GET", PERMS)]
+
+
+@pytest.mark.parametrize("body,expected", [
+    (BX_DOCS_V3_PERMS, (False, "торговля спот; без привязки к IP")),
+    ({"apiKey": "", "permissions": [2], "ipAddresses": ["1.2.3.4"], "note": "bot"}, (True, "")),
+    ({"code": "0", "data": {"permissions": [2], "ipAddresses": ["1.2.3.4"]}}, (True, "")),
+    (dict(RO_FLAGS, ipRestrict=True), (True, "")),                  # флаги тоже бывают без обёртки
+    ({"msg": "something went wrong"}, (None, "")), ({"code": 0}, (None, ""))])
+def test_key_permissions_bingx_accepts_answer_with_and_without_envelope(body, expected):
+    """docs-v3 показывает ответ apiPermissions без обёртки {code, data} — его тоже разбираем, а не считаем ошибкой."""
+    accounts.save_key("bingx", BX_KEY, BX_SECRET)
+    assert run(accounts.key_permissions(Session({("GET", PERMS): body}), "bingx")) == expected
+
+
+def test_startup_without_flag_deletes_bingx_trading_key_from_docs_v3_answer():
+    accounts.save_key("bingx", BX_KEY, BX_SECRET)
+    bot = Stub(Session({("GET", PERMS): BX_DOCS_V3_PERMS}))
+    run(bot.check_key_safety())
+    assert accounts.keys("bingx") is None
+    assert [t for t in texts(bot) if t.startswith("⚠️ BingX: ключ даёт больше, чем чтение (торговля спот")]
 
 
 @pytest.mark.parametrize("body", [{"code": 100413, "msg": "Null apiKey"}, {"code": 100004, "msg": "no permission"},
@@ -294,22 +426,30 @@ def test_key_permissions_bingx_errors_are_unknown_and_fail_open(body):
     assert run(accounts.api_permissions(s, "bingx")) == (True, "")
 
 
-def test_key_permissions_cryptomus_is_never_readonly():
+def test_key_permissions_cryptomus_is_never_readonly_and_sends_nothing():
+    """Read-only ключей у Cryptomus нет — ответ известен заранее: False без единого запроса."""
     accounts.save_key("cryptomus", CM_ID, CM_KEY)
-    safe, detail = run(accounts.key_permissions(Session({("GET", CM_USER): CM_USER_OK}), "cryptomus"))
+    s = Session({})
+    safe, detail = run(accounts.key_permissions(s, "cryptomus"))   # кабинет ещё не определён — перечисляем оба
+    assert safe is False and "нет ключей только для чтения" in detail and s.calls == []
+    for word in ("конвертации", "отмену ордеров", "AML", "возвраты", "выплаты"):
+        assert word in detail, word
+    run(accounts.cryptomus_detect(Session({("GET", CM_USER): CM_USER_OK}), CM_ID, CM_KEY))
+    assert run(accounts.key_permissions(s, "cryptomus")) == (False, accounts.CRYPTOMUS_KEY_RIGHTS["user"])
+    accounts._CRYPTOMUS_MODE[CM_ID] = "merchant"
+    assert run(accounts.key_permissions(s, "cryptomus")) == (False, accounts.CRYPTOMUS_KEY_RIGHTS["merchant"])
+    assert s.calls == []
+
+
+@pytest.mark.parametrize("routes", [{}, {("GET", CM_USER): CM_FAIL, ("POST", CM_MERCHANT): CM_FAIL},
+                                    {("GET", CM_USER): _http_error(502, "Bad Gateway"),
+                                     ("POST", CM_MERCHANT): _http_error(502, "Bad Gateway")}])
+def test_key_permissions_cryptomus_false_even_when_cryptomus_unreachable(routes):
+    """Сбой сети/ключ не принят — не «проверить не удалось» (при старте это считалось бы безопасным), а всё так же False."""
+    accounts.save_key("cryptomus", CM_ID, CM_KEY)
+    safe, detail = run(accounts.key_permissions(Session(routes), "cryptomus"))
     assert safe is False and "нет ключей только для чтения" in detail
-    assert "конвертации" in detail and "отмену ордеров" in detail and "AML" in detail
-    accounts._CRYPTOMUS_MODE.clear()
-    s = Session({("GET", CM_USER): CM_FAIL, ("POST", CM_MERCHANT): CM_MERCHANT_OK})
-    safe, detail = run(accounts.key_permissions(s, "cryptomus"))
-    assert safe is False and "возвраты" in detail and "выплаты" in detail
-
-
-def test_key_permissions_cryptomus_unknown_when_key_not_accepted():
-    accounts.save_key("cryptomus", CM_ID, CM_KEY)
-    s = Session({("GET", CM_USER): CM_FAIL, ("POST", CM_MERCHANT): CM_FAIL})
-    assert run(accounts.key_permissions(s, "cryptomus")) == (None, "")
-    assert run(accounts.api_permissions(s, "cryptomus")) == (True, "")
+    assert run(accounts.api_permissions(Session(routes), "cryptomus")) == (False, detail)
 
 
 # --- verify: подсказки по ошибкам без ключа ---
@@ -421,17 +561,31 @@ BX_WITHDRAWS = [
     {"id": "3", "coin": "USDT", "amount": "9", "status": 5, "applyTime": "2023-12-14T06:00:00.000+08:00"}]
 
 
-def test_bingx_history_completed_only_with_internal_transfer():
+def test_bingx_history_completed_only_with_transfer_to_another_user():
     s = Session({("GET", DEPOSITS): BX_DEPOSITS, ("GET", WITHDRAWS): BX_WITHDRAWS})
     hist = run(accounts.bingx_history(s, BX_KEY, BX_SECRET))
     assert hist == [
-        {"kind": "transfer", "asset": "USDT", "amount": 5.0,
+        {"kind": "transfer_out", "asset": "USDT", "amount": 5.0,
          "ts": datetime(2023, 12, 13, 21, 0, tzinfo=timezone.utc).timestamp()},
         {"kind": "withdraw", "asset": "USDT", "amount": 20.0,
          "ts": datetime(2023, 12, 13, 20, 5, 2, tzinfo=timezone.utc).timestamp()},
         {"kind": "deposit", "asset": "USDT", "amount": 50.0, "ts": 1700000100.0},
         {"kind": "deposit", "asset": "USDT", "amount": 100.0, "ts": 1700000000.0}]
     assert all("limit=20" in u for _, u, _, _ in s.calls)
+
+
+def test_bingx_transfer_to_another_user_is_announced_as_money_leaving():
+    """transferType 2 у BingX — перевод другому пользователю (право Withdraw): уведомление не должно звучать как
+    безобидное перемещение между своими счетами — это единственная сигнализация владельцу об уходе денег."""
+    accounts.save_key("bingx", BX_KEY, BX_SECRET)
+    s = Session({("GET", DEPOSITS): [], ("GET", WITHDRAWS): []})
+    bot = Stub(s)
+    run(bot.check_accounts())   # первый опрос — база без сообщений
+    s.routes[("GET", WITHDRAWS)] = [{"id": "9", "coin": "USDT", "amount": "500", "status": 6, "transferType": 2,
+                                     "applyTime": "2026-09-26T10:00:00.000+08:00"}]
+    run(bot.check_accounts())
+    assert texts(bot) == ["💰 BingX: списан перевод другому пользователю — 500 USDT"]
+    assert "внутренний" not in texts(bot)[0]
 
 
 def test_bingx_history_empty_and_failure():
@@ -599,18 +753,54 @@ def test_startup_without_flag_deletes_both_keys():
     assert not any(BX_KEY in t or BX_SECRET in t or CM_KEY in t for t in texts(bot))
 
 
-def test_startup_keeps_keys_when_permissions_cannot_be_checked():
+def test_startup_when_exchanges_unreachable_keeps_bingx_but_still_drops_cryptomus():
+    """BingX не ответил — права не проверить, ключ остаётся (не блокируем по недоступности API). Cryptomus без
+    ALLOW_UNSAFE_KEYS=1 удаляется всегда: ключей только для чтения у него нет, и сеть тут ни при чём."""
     accounts.save_key("bingx", BX_KEY, BX_SECRET)
     accounts.save_key("cryptomus", CM_ID, CM_KEY)
-    bot = Stub(Session({("GET", CM_USER): CM_FAIL, ("POST", CM_MERCHANT): _http_error(502, "Bad Gateway"),
-                        ("GET", PERMS): _http_error(502, "Bad Gateway")}))
+    s = Session({("GET", CM_USER): _http_error(502, "Bad Gateway"), ("POST", CM_MERCHANT): _http_error(502, "Bad Gateway"),
+                 ("GET", PERMS): _http_error(502, "Bad Gateway")})
+    bot = Stub(s)
     run(bot.check_key_safety())
-    assert accounts.keys("bingx") is not None and accounts.keys("cryptomus") is not None and texts(bot) == []
+    assert accounts.keys("bingx") == (BX_KEY, BX_SECRET) and accounts.keys("cryptomus") is None
+    assert len(texts(bot)) == 1 and texts(bot)[0].startswith("⚠️ Cryptomus: ключ даёт больше, чем чтение")
+    assert ("GET", CM_USER) not in s.paths() and ("POST", CM_MERCHANT) not in s.paths()   # ключом Cryptomus не ходили
+    run(accounts.portfolio(s))   # удалённый ключ больше не используется
+    assert ("GET", CM_USER) not in s.paths() and ("POST", CM_MERCHANT) not in s.paths()
+
+
+@pytest.mark.parametrize("data", ["acc_check:cryptomus", None])
+def test_cryptomus_key_dropped_without_flag_even_if_cryptomus_is_down(data):
+    """Подключение и «🔄 Проверить» при недоступном Cryptomus: без ALLOW_UNSAFE_KEYS=1 ключ не остаётся «unknown»."""
+    s = Session({("GET", CM_USER): _http_error(504, "Gateway Timeout"),
+                 ("POST", CM_MERCHANT): _http_error(504, "Gateway Timeout")})
+    bot = Stub(s)
+    if data:
+        accounts.save_key("cryptomus", CM_ID, CM_KEY)
+        run(bot.on_callback({"id": "1", "data": data, "message": {"message_id": 1}}))
+    else:
+        bot.awaiting_key = {"ex": "cryptomus", "step": "secret", "key": CM_ID}
+        run(bot.handle_key_input(CM_KEY, None))
+    assert accounts.keys("cryptomus") is None and s.calls == []
+    assert any("удалил его из бота" in t for t in texts(bot))
+    assert not any("проверить не удалось" in t for t in texts(bot))
+
+
+def test_cryptomus_with_flag_and_cryptomus_down_is_unsafe_and_error_not_unknown(monkeypatch):
+    monkeypatch.setenv("ALLOW_UNSAFE_KEYS", "1")
+    accounts.save_key("cryptomus", CM_ID, CM_KEY)
+    bot = Stub(Session({("GET", CM_USER): _http_error(504, "Gateway Timeout"),
+                        ("POST", CM_MERCHANT): _http_error(504, "Gateway Timeout")}))
+    run(bot.check_key_safety())
+    assert texts(bot) == [] and accounts.verify_status("cryptomus")[0] == "unsafe"
+    run(bot.on_callback({"id": "1", "data": "acc_check:cryptomus", "message": {"message_id": 1}}))
+    assert accounts.keys("cryptomus") == (CM_ID, CM_KEY) and accounts.verify_status("cryptomus")[0] == "error"
+    assert not any("проверить не удалось" in t for t in texts(bot))
 
 
 def test_hist_text_and_portfolio_use_account_names():
     it = {"kind": "transfer", "asset": "USDT", "amount": 5.0, "ts": 1.0}
-    assert B.hist_text("bingx", it) == "💰 BingX: внутренний перевод — 5 USDT"
+    assert B.hist_text("cryptomus", it) == "💰 Cryptomus: внутренний перевод — 5 USDT"   # между своими кошельками
     rows, _ = B.portfolio_rows({"bingx": {"USDT": 1.0}, "cryptomus": {"TON": 2.0}}, None)
     assert [name for name, _ in rows] == ["BingX", "Cryptomus"]
     empty = B.portfolio_view({}, None)

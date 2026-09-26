@@ -386,7 +386,8 @@ def hist_key(it):
 
 
 def hist_text(ex, it):
-    """Текст уведомления о новом движении по счёту: депозит/вывод/внутренний перевод, спот-сделка или P2P-ордер Bybit."""
+    """Текст уведомления о новом движении по счёту: депозит/вывод, перевод между своими кошельками (Cryptomus) или
+    другому пользователю биржи (BingX — деньги ушли третьему лицу, не «внутренний»), спот-сделка или P2P-ордер Bybit."""
     name = ACCOUNT_NAMES.get(ex, ex)
     if "fiat" in it:   # P2P-ордер Bybit: {id, side, asset, fiat, amount, price, ts}
         arrow = "купил" if it["side"] == "buy" else "продал"
@@ -394,8 +395,8 @@ def hist_text(ex, it):
     if it.get("kind") == "trade":
         arrow = "купил" if it["side"] == "buy" else "продал"
         return f"💱 {name}: {arrow} {it['amount']:g} {it['asset']} по {it['price']:g}"
-    label = {"deposit": "пришёл депозит", "withdraw": "исполнен вывод",
-             "transfer": "внутренний перевод"}.get(it.get("kind"), it.get("kind"))
+    label = {"deposit": "пришёл депозит", "withdraw": "исполнен вывод", "transfer": "внутренний перевод",
+             "transfer_out": "списан перевод другому пользователю"}.get(it.get("kind"), it.get("kind"))
     return f"💰 {name}: {label} — {it['amount']:g} {it['asset']}"
 
 

@@ -542,7 +542,11 @@ _(облачный Claude добавляет сюда предложения, к
   параметрам (тест на официальный пример), права — обе документированные формы apiPermissions (коды 1–7 и флаги enable*).
   Cryptomus: sign = md5(base64(тело) + ключ), кабинет определяется сам (userId, иначе merchant), GRAM → TON; ключей «только
   чтение» у Cryptomus нет — ключ всегда «сверх чтения» и остаётся только при ALLOW_UNSAFE_KEYS=1. «🔑 Мои биржи» больше не
-  падает на ключе со статусом «unsafe». Для guard нужны домены bingx.com и cryptomus.com.
+  падает на ключе со статусом «unsafe». Для guard нужны домены bingx.com и cryptomus.com. После ревью: apiPermissions
+  разбирается и без обёртки {code, data} (как в docs-v3), «только чтение» BingX — лишь при подтверждённом Read и полном
+  наборе флагов (любое «true»/«1» — право); права Cryptomus — «сверх чтения» без запроса, так что сбой сети не оставляет
+  ключ; BingX и Cryptomus не идут за редиректами (3xx — ошибка); вывод BingX с transferType 2 — «списан перевод другому
+  пользователю», а не «внутренний перевод».
 - 2026-09-26 — новая площадка LBank (`p2p.lbank`, только USDT/USDC): публичная выдача без ключа
   `GET www.lbank.com/lbk-api/otc-trade-center/fiat/p2p/adv/advertisementList` (tradeType=buy/sell = сторона бота).
   Стакан RUB на покупку — в основном объявления MEXC, которые LBank показывает у себя (source=MEXC): счётчика сделок
