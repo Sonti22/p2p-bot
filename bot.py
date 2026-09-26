@@ -1012,7 +1012,13 @@ class Bot:
         self.topics = {}
         if not self.chat_id:
             return
-        me = await self.call("getMe")
+        try:
+            me = await self.call("getMe")
+        except Exception as e:   # нет сети при старте (ПК проснулся, VPN ещё не поднялся) — не падаем: топики из
+            logger.warning("getMe: %s — топики из сохранённых, режим проверю при следующем запуске",   # файла
+                           accounts.api_error_text(e))
+            self.topics = load_topics()
+            return
         if me.get("ok"):
             self.username = me["result"].get("username") or ""
         if not me.get("ok") or not me["result"].get("has_topics_enabled"):
@@ -1021,7 +1027,10 @@ class Bot:
         for key, name in TOPICS:
             if key in saved:
                 continue
-            r = await self.call("createForumTopic", chat_id=self.chat_id, name=name)
+            try:
+                r = await self.call("createForumTopic", chat_id=self.chat_id, name=name)
+            except Exception as e:
+                r = {"ok": False, "description": accounts.api_error_text(e)}
             if not r.get("ok"):
                 logger.warning("createForumTopic: %s", r.get("description"))
                 return
