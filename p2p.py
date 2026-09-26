@@ -1454,6 +1454,89 @@ def fmt_deal(d, cfg, snap=None):
     return text + f"Купить: {fmt_ad(b)}\nПродать: {fmt_ad(s)}"
 
 
+COST_STEPS = ("комиссия банка", "запас на курс")   # издержки маршрута, уже учтённые в прибыли, — не действия
+NO_TRANSFER = "внутри биржи"
+KEYCAPS = ("1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣")
+
+
+def route_actions(route):
+    """(действия, издержки) из строки маршрута: действия — перевод, спот, «обменник шлёт» (их владелец делает
+    руками между покупкой и продажей), издержки — комиссия банка, запас на курс (уже учтены в прибыли).
+    «внутри биржи» — ни то ни другое: переводить ничего не нужно."""
+    steps = [st for st in (route or "").split(" → ") if st and st != NO_TRANSFER]
+    costs = [st for st in steps if st.startswith(COST_STEPS)]
+    return [st for st in steps if st not in costs], costs
+
+
+def _pays_short(a, n=3):
+    return ", ".join(a.pays[:n]) + (f" +{len(a.pays) - n}" if len(a.pays) > n else "")
+
+
+def _signal_ad(a, who, pays_title, terms=True):
+    """Строки шага «купить/продать»: кто, сколько сделок, как платить/получить, условия мерчанта.
+    Ссылки на объявление нет — она на кнопке «1. Купить …»/«N. Продать …» под карточкой."""
+    stats = (f"{a.orders} отзывов · {a.rate:.0f}% хороших" if a.ex == "BestChange"
+             else f"{a.orders} сделок · {a.rate:.0f}% успешных")
+    lines = [f"• {who}: {html.escape(a.nick)} · {stats}", f"• {pays_title}: {html.escape(_pays_short(a))}"]
+    notes = terms_flags(a.terms)[1] if terms else []
+    if notes:
+        lines.append(f"• ⚠️ Условия: {html.escape('; '.join(notes[:2]))}")
+    return lines
+
+
+SIGNAL_MAX = 900   # подпись к фото — до 1024 символов; запас под «🔔 держится N мин» и «⌛ связка устарела»
+
+
+def fmt_signal(d, cfg, snap=None, limit=SIGNAL_MAX):
+    """Подпись карточки сигнала — пошаговая инструкция: 1️⃣ купить → 2️⃣ перевести/поменять → 3️⃣ продать,
+    у каждого шага — кто, по какой цене, как платить; внизу — надёжность, цены к рынку и что уже учтено в прибыли.
+    Не влезает в limit — по очереди убираем хвост, причины надёжности, условия мерчантов."""
+    profit, b, s, route = d
+    acts, costs = route_actions(route)
+    cur = "₽" if cfg.fiat == "RUB" else cfg.fiat
+    label, reasons = reliability(d, cfg, snap) if snap is not None else (None, [])
+
+    def build(tail=True, why=True, terms=True):
+        lines = [f"<b>{profit:+.2f}% чистыми</b> на {_money(cfg.amount)} {cur}: {b.ex} → {s.ex}"]
+        if label:
+            lines.append(f"{label} · надёжность {reliability_index(d, cfg, snap)}/10")
+            lines += [f"  – {html.escape(r)}" for r in reasons[:2]] if why else []
+        lines += ["", f"<b>{KEYCAPS[0]} Купить {b.asset} на {b.ex}</b> по {_price(b.price)} ₽"]
+        lines += _signal_ad(b, "Продавец", "Оплатить через", terms)
+        for i, st in enumerate(acts, 1):
+            lines += ["", f"<b>{KEYCAPS[min(i, 5)]}</b> {html.escape(st[0].upper() + st[1:])}"]
+        who = "Обменник" if s.ex == "BestChange" else "Покупатель"
+        lines += ["", f"<b>{KEYCAPS[sell_step_number(route) - 1]} Продать {s.asset} на {s.ex}</b> по {_price(s.price)} ₽"]
+        lines += _signal_ad(s, who, "Деньги придут на", terms)
+        extra = []
+        if tail and snap is not None:
+            prem = premium_line(b, s, snap)
+            if prem:
+                extra.append("📈 " + html.escape(prem.replace("К ориентиру", "Цены к рынку")))
+        if tail and costs:
+            extra.append("🧮 Уже учтено в прибыли: " + html.escape(", ".join(costs)))
+        return "\n".join(lines + ([""] + extra if extra else []))
+
+    text = build()
+    for kw in ({"tail": False}, {"tail": False, "why": False}, {"tail": False, "why": False, "terms": False}):
+        if len(text) <= limit:
+            break
+        text = build(**kw)
+    if len(text) > limit:   # крайний случай (очень длинные ники) — целыми строками: теги в каждой строке закрыты
+        kept = []
+        for ln in text.split("\n"):
+            if sum(len(x) + 1 for x in kept) + len(ln) + 1 > limit:
+                break
+            kept.append(ln)
+        text = "\n".join(kept + ["…"])
+    return text
+
+
+def sell_step_number(route):
+    """Номер шага «продать» в подписи и на кнопке: 1 — купить, дальше действия маршрута, потом продажа."""
+    return min(len(route_actions(route)[0]) + 2, len(KEYCAPS))
+
+
 def fmt_top(snap, cfg, n=5):
     refs = " · ".join(f"{a} {_price(p)}" for a, p in snap.refs.items() if a != "USDT")
     lines = [f"Ориентир USDT {snap.ref:.2f} ({snap.ref_src})" + (f" · {refs}" if refs else ""),

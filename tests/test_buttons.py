@@ -37,8 +37,8 @@ def test_deal_markup_colors_and_copy():
     cfg = p2p.Config(amount=50000)
     kb = B.deal_markup(deal(), deal_id=1, cfg=cfg, snap=snap([deal()]))
     by_text = {b["text"]: b for b in buttons(kb)}
-    assert by_text["🟢 Купить · Bybit"]["style"] == "success"
-    assert by_text["🔴 Продать · MEXC"]["style"] == "danger"
+    assert by_text["🟢 1. Купить на Bybit"]["style"] == "success"
+    assert by_text["🔴 3. Продать на MEXC"]["style"] == "danger"
     copies = [b for b in buttons(kb) if "copy_text" in b]
     assert copies[0]["copy_text"] == {"text": "50000"} and "50 000" in copies[0]["text"]
     qty = float(copies[1]["copy_text"]["text"])            # 50000/85 минус перевод 0.2 USDT
@@ -63,7 +63,7 @@ def test_deal_markup_without_cfg_has_no_copy_buttons():
     kb = B.deal_markup(deal(), deal_id=1)
     assert not any("copy_text" in b for b in buttons(kb))
     assert B.deal_markup(deal(), cfg=p2p.Config(), snap=None)["inline_keyboard"][1] == [
-        {"text": "📋 50 000 RUB", "copy_text": {"text": "50000"}}]
+        {"text": "📋 Сумма: 50 000 ₽", "copy_text": {"text": "50000"}}]
 
 
 def test_plain_markup_strips_style_and_copy():
