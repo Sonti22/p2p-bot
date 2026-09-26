@@ -357,11 +357,17 @@ async def lbank(s, cfg, side, asset):
     for i in (j.get("data") or {}).get("resultList") or []:
         if i.get("topTag") or i.get("templateCode") or i.get("enable") is False:
             continue
-        out.append(Ad("LBank", side, float(i["price"]), float(i["minAmount"]), float(i["maxAmount"]),
-                      float(i["realQuantity"]), [LBANK_PAY_FIX.get(p["name"], p["name"]) for p in i.get("payMethods") or []],
-                      i.get("nickName") or "?", int(i.get("dealOrderTotal") or 0),
-                      float((i.get("turnoverRateTotal") or "0").rstrip("%") or 0), asset=asset,
-                      terms=(i.get("adRemark") or "").strip()))
+        if i.get("source") not in (None, "LBANK"):
+            continue   # копия объявления MEXC: оно уже есть в стакане MEXC, а блэклист MEXC его под ником LBank не узнал бы
+        try:   # одно кривое объявление не должно ронять всю сторону LBank в этом скане
+            out.append(Ad("LBank", side, float(i["price"]), float(i["minAmount"]), float(i["maxAmount"]),
+                          float(i["realQuantity"]),
+                          [LBANK_PAY_FIX.get(p["name"], p["name"]) for p in i.get("payMethods") or []],
+                          i.get("nickName") or "?", int(i.get("dealOrderTotal") or 0),
+                          float(str(i.get("turnoverRateTotal") or "0").rstrip("%") or 0), asset=asset,
+                          terms=(i.get("adRemark") or "").strip()))
+        except (KeyError, TypeError, ValueError):
+            continue
     return out
 
 
@@ -733,6 +739,10 @@ def _withdraw(cfg, sender, asset, net="", receiver="", qty=None):
         return None   # справочник есть, и во всех его сетях вывод (или ввод у получателя) закрыт
     if listed and not known and need and set(need) <= set(netstatus.KNOWN_NETS):
         return None   # справочник есть, а сети, которую принимает получатель (BitPapa — TRC20), в нём нет
+    if receiver:   # про сети отправителя (BitPapa, LBank) не знаем — но у получателя ввод закрыт во всех сетях
+        rnets = [n for n in netstatus.known_nets(receiver, asset) if accepts(n)]
+        if rnets and all(netstatus.deposit_ok(receiver, asset, n) is False for n in rnets):
+            return None
     return cfg.transfer_fees.get(asset, 0), ""
 
 

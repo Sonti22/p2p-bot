@@ -1,212 +1,243 @@
 {
- "data": {
-  "resultList": [
-   {
-    "uuid": "13fa0d62-282d-43c8-a761-c81e78c3e541",
-    "tradeType": "sell",
-    "currencyCode": "RUB",
-    "assetCode": "USDT",
-    "advType": 0,
-    "price": "10.00000000000000000000",
-    "quantity": "200.00000000000000000000",
-    "realQuantity": "200.00000000000000000000",
-    "minAmount": "10.00000000000000000000",
-    "maxAmount": "10.00000000000000000000",
-    "advSource": 1,
-    "source": "LBANK",
-    "adRemark": "",
-    "payMethods": [
-     {
-      "code": "Sberbank",
-      "name": "Sberbank",
-      "channelId": 516
-     },
-     {
-      "code": "AIfa-bank",
-      "name": "AIfa-bank",
-      "channelId": 536
-     },
-     {
-      "code": "SBP - Fast Bank Transfer",
-      "name": "SBP - Fast Bank Transfer",
-      "channelId": 1079
-     }
+  "data": {
+    "resultList": [
+      {
+        "uuid": "13fa0d62-282d-43c8-a761-c81e78c3e541",
+        "tradeType": "sell",
+        "currencyCode": "RUB",
+        "assetCode": "USDT",
+        "advType": 0,
+        "price": "10.00000000000000000000",
+        "quantity": "200.00000000000000000000",
+        "realQuantity": "200.00000000000000000000",
+        "minAmount": "10.00000000000000000000",
+        "maxAmount": "10.00000000000000000000",
+        "advSource": 1,
+        "source": "LBANK",
+        "adRemark": "",
+        "payMethods": [
+          {
+            "code": "Sberbank",
+            "name": "Sberbank",
+            "channelId": 516
+          },
+          {
+            "code": "AIfa-bank",
+            "name": "AIfa-bank",
+            "channelId": 536
+          },
+          {
+            "code": "SBP - Fast Bank Transfer",
+            "name": "SBP - Fast Bank Transfer",
+            "channelId": 1079
+          }
+        ],
+        "nickName": "ANTRADER",
+        "online": true,
+        "orderCnt": "20",
+        "successOrderCnt": "14",
+        "proportion": "70.00",
+        "lastDaysTurnoverRate": "45.00%",
+        "turnoverRateTotal": "45.00%",
+        "dealOrderTotal": "22",
+        "enable": true,
+        "topTag": "New User Flash Sale",
+        "templateCode": "ONE_BUY",
+        "originalPrice": "86.00",
+        "eligibilityType": 0,
+        "currencySymbol": "₽"
+      },
+      {
+        "uuid": "FP_c26750d0-8f0b-42e0-9bc4-7ca71df2cafa",
+        "tradeType": "sell",
+        "currencyCode": "RUB",
+        "assetCode": "USDT",
+        "advType": 0,
+        "price": "86.80000000000000000000",
+        "quantity": "3346.35020000000000000000",
+        "realQuantity": "3346.35020000000000000000",
+        "minAmount": "92400.00000000000000000000",
+        "maxAmount": "92401.00000000000000000000",
+        "advSource": 3,
+        "source": "MEXC",
+        "externalAdvNo": "a1813794161174269953",
+        "adRemark": " ВАЖНО! ПЕРЕД СДЕЛКОЙ ОЗНАКОМЬТЕСЬ С УСЛОВИЯМИ Сумма сделки: строго  Принимаю перевод с любого банка. После открытия ордера сразу пишите:• ФИО отправителя• Банк отправителя По отправителю:• Только 1-е",
+        "payMethods": [
+          {
+            "code": "SBP - Fast Bank Transfer",
+            "name": "SBP - Fast Bank Transfer",
+            "channelId": 1079
+          }
+        ],
+        "nickName": "1-Переводом",
+        "online": false,
+        "proportion": "0",
+        "lastDaysTurnoverRate": "1.0",
+        "turnoverRateTotal": "0.00%",
+        "dealOrderTotal": "0",
+        "enable": true,
+        "currencySymbol": "₽"
+      },
+      {
+        "uuid": "FP_5b3e4a0c-b719-46b7-9ea1-30f46f789d3b",
+        "tradeType": "sell",
+        "currencyCode": "RUB",
+        "assetCode": "USDT",
+        "advType": 0,
+        "price": "87.67000000000000000000",
+        "quantity": "2000.00000000000000000000",
+        "realQuantity": "2000.00000000000000000000",
+        "minAmount": "30000.00000000000000000000",
+        "maxAmount": "150000.00000000000000000000",
+        "advSource": 3,
+        "source": "MEXC",
+        "externalAdvNo": "a1776892214483296258",
+        "adRemark": "заходить строго 5к 10к 20к 30к 40к 50к 60к 70к 75к 80к 90к 100к 110к 120к 130к 140к СБП или карта . Перевод строго с ТИНЬКОФФ на разные банки.  После оплаты чек на почту от имени банка, с веб версий н",
+        "payMethods": [
+          {
+            "code": "SBP - Fast Bank Transfer",
+            "name": "SBP - Fast Bank Transfer",
+            "channelId": 1079
+          }
+        ],
+        "nickName": "БЕЗОПАСНОСТЬ",
+        "online": false,
+        "proportion": "0",
+        "lastDaysTurnoverRate": "1.0",
+        "turnoverRateTotal": "0.00%",
+        "dealOrderTotal": "0",
+        "enable": true,
+        "currencySymbol": "₽"
+      },
+      {
+        "uuid": "FP_5c0aefcd-f9c4-4fa3-ae73-0491ae7df635",
+        "tradeType": "sell",
+        "currencyCode": "RUB",
+        "assetCode": "USDT",
+        "advType": 0,
+        "price": "89.90000000000000000000",
+        "quantity": "6869.46620000000000000000",
+        "realQuantity": "6869.46620000000000000000",
+        "minAmount": "30000.00000000000000000000",
+        "maxAmount": "617565.01000000000000000000",
+        "advSource": 3,
+        "source": "MEXC",
+        "externalAdvNo": "a1606785602316816386",
+        "adRemark": "Принимаю переводы по СБП (по номеру телефона) с любых банков. Переводы на российские банки!                             От 3-х лиц приму только однофамильцы, личный кабинет у вас в руках или докажите ",
+        "payMethods": [
+          {
+            "code": "SBP - Fast Bank Transfer",
+            "name": "SBP - Fast Bank Transfer",
+            "channelId": 1079
+          }
+        ],
+        "nickName": "Kleopatra_usdt",
+        "online": false,
+        "proportion": "0",
+        "lastDaysTurnoverRate": "1.0",
+        "turnoverRateTotal": "0.00%",
+        "dealOrderTotal": "0",
+        "enable": true,
+        "currencySymbol": "₽"
+      },
+      {
+        "uuid": "FP_ef4dcb6b-1b92-4af3-9e25-f11f278c5300",
+        "tradeType": "sell",
+        "currencyCode": "RUB",
+        "assetCode": "USDT",
+        "advType": 0,
+        "price": "89.95000000000000000000",
+        "quantity": "1377.70070000000000000000",
+        "realQuantity": "1377.70070000000000000000",
+        "minAmount": "50000.00000000000000000000",
+        "maxAmount": "100000.00000000000000000000",
+        "advSource": 3,
+        "source": "MEXC",
+        "externalAdvNo": "a1789502882709597185",
+        "adRemark": "Принимаю на личную карту, строго без 3 лиц, новореги с одними покупками просьба не заходить . ",
+        "payMethods": [
+          {
+            "code": "SBP - Fast Bank Transfer",
+            "name": "SBP - Fast Bank Transfer",
+            "channelId": 1079
+          }
+        ],
+        "nickName": "Shlyapnik",
+        "online": false,
+        "proportion": "0",
+        "lastDaysTurnoverRate": "1.0",
+        "turnoverRateTotal": "0.00%",
+        "dealOrderTotal": "0",
+        "enable": true,
+        "currencySymbol": "₽"
+      },
+      {
+        "uuid": "FP_4fad88b0-724e-41f7-8418-a252f8843ae9",
+        "tradeType": "sell",
+        "currencyCode": "RUB",
+        "assetCode": "USDT",
+        "advType": 0,
+        "price": "90.35000000000000000000",
+        "quantity": "14999.60000000000000000000",
+        "realQuantity": "14999.60000000000000000000",
+        "minAmount": "20000.00000000000000000000",
+        "maxAmount": "1355213.86000000000000000000",
+        "advSource": 3,
+        "source": "MEXC",
+        "externalAdvNo": "a1680896749068850178",
+        "adRemark": "Привет! — ПЛАТЕЖ НЕ ДЕЛИМ (только в редких случаях).— Строго от первого лица /однофамильцы.— Любой банк РФ.— Скрин чека в чат.— Реквизиты дам в чате.— Отпускаю крипту максимально быстро.Обнял!",
+        "payMethods": [
+          {
+            "code": "SBP - Fast Bank Transfer",
+            "name": "SBP - Fast Bank Transfer",
+            "channelId": 1079
+          }
+        ],
+        "nickName": "Dr.Crypto202",
+        "online": false,
+        "proportion": "0",
+        "lastDaysTurnoverRate": "1.0",
+        "turnoverRateTotal": "0.00%",
+        "dealOrderTotal": "0",
+        "enable": true,
+        "currencySymbol": "₽"
+      },
+      {
+        "uuid": "FP_4fad88b0-724e-41f7-8418-a252f8843ae9",
+        "tradeType": "sell",
+        "currencyCode": "RUB",
+        "assetCode": "USDT",
+        "advType": 0,
+        "price": "88.10000000000000000000",
+        "quantity": "14999.60000000000000000000",
+        "realQuantity": "14999.60000000000000000000",
+        "minAmount": "20000.00000000000000000000",
+        "maxAmount": "1355213.86000000000000000000",
+        "advSource": 3,
+        "source": "LBANK",
+        "externalAdvNo": "a1680896749068850178",
+        "adRemark": "Привет! — ПЛАТЕЖ НЕ ДЕЛИМ (только в редких случаях).— Строго от первого лица /однофамильцы.— Любой банк РФ.— Скрин чека в чат.— Реквизиты дам в чате.— Отпускаю крипту максимально быстро.Обнял!",
+        "payMethods": [
+          {
+            "code": "SBP - Fast Bank Transfer",
+            "name": "SBP - Fast Bank Transfer",
+            "channelId": 1079
+          }
+        ],
+        "nickName": "own_lbank_seller",
+        "online": false,
+        "proportion": "0",
+        "lastDaysTurnoverRate": "1.0",
+        "turnoverRateTotal": "0.00%",
+        "dealOrderTotal": "0",
+        "enable": true,
+        "currencySymbol": "₽"
+      }
     ],
-    "nickName": "ANTRADER",
-    "online": true,
-    "orderCnt": "20",
-    "successOrderCnt": "14",
-    "proportion": "70.00",
-    "lastDaysTurnoverRate": "45.00%",
-    "turnoverRateTotal": "45.00%",
-    "dealOrderTotal": "22",
-    "enable": true,
-    "topTag": "New User Flash Sale",
-    "templateCode": "ONE_BUY",
-    "originalPrice": "86.00",
-    "eligibilityType": 0,
-    "currencySymbol": "₽"
-   },
-   {
-    "uuid": "FP_c26750d0-8f0b-42e0-9bc4-7ca71df2cafa",
-    "tradeType": "sell",
-    "currencyCode": "RUB",
-    "assetCode": "USDT",
-    "advType": 0,
-    "price": "86.80000000000000000000",
-    "quantity": "3346.35020000000000000000",
-    "realQuantity": "3346.35020000000000000000",
-    "minAmount": "92400.00000000000000000000",
-    "maxAmount": "92401.00000000000000000000",
-    "advSource": 3,
-    "source": "MEXC",
-    "externalAdvNo": "a1813794161174269953",
-    "adRemark": " ВАЖНО! ПЕРЕД СДЕЛКОЙ ОЗНАКОМЬТЕСЬ С УСЛОВИЯМИ Сумма сделки: строго  Принимаю перевод с любого банка. После открытия ордера сразу пишите:• ФИО отправителя• Банк отправителя По отправителю:• Только 1-е",
-    "payMethods": [
-     {
-      "code": "SBP - Fast Bank Transfer",
-      "name": "SBP - Fast Bank Transfer",
-      "channelId": 1079
-     }
-    ],
-    "nickName": "1-Переводом",
-    "online": false,
-    "proportion": "0",
-    "lastDaysTurnoverRate": "1.0",
-    "turnoverRateTotal": "0.00%",
-    "dealOrderTotal": "0",
-    "enable": true,
-    "currencySymbol": "₽"
-   },
-   {
-    "uuid": "FP_5b3e4a0c-b719-46b7-9ea1-30f46f789d3b",
-    "tradeType": "sell",
-    "currencyCode": "RUB",
-    "assetCode": "USDT",
-    "advType": 0,
-    "price": "87.67000000000000000000",
-    "quantity": "2000.00000000000000000000",
-    "realQuantity": "2000.00000000000000000000",
-    "minAmount": "30000.00000000000000000000",
-    "maxAmount": "150000.00000000000000000000",
-    "advSource": 3,
-    "source": "MEXC",
-    "externalAdvNo": "a1776892214483296258",
-    "adRemark": "заходить строго 5к 10к 20к 30к 40к 50к 60к 70к 75к 80к 90к 100к 110к 120к 130к 140к СБП или карта . Перевод строго с ТИНЬКОФФ на разные банки.  После оплаты чек на почту от имени банка, с веб версий н",
-    "payMethods": [
-     {
-      "code": "SBP - Fast Bank Transfer",
-      "name": "SBP - Fast Bank Transfer",
-      "channelId": 1079
-     }
-    ],
-    "nickName": "БЕЗОПАСНОСТЬ",
-    "online": false,
-    "proportion": "0",
-    "lastDaysTurnoverRate": "1.0",
-    "turnoverRateTotal": "0.00%",
-    "dealOrderTotal": "0",
-    "enable": true,
-    "currencySymbol": "₽"
-   },
-   {
-    "uuid": "FP_5c0aefcd-f9c4-4fa3-ae73-0491ae7df635",
-    "tradeType": "sell",
-    "currencyCode": "RUB",
-    "assetCode": "USDT",
-    "advType": 0,
-    "price": "89.90000000000000000000",
-    "quantity": "6869.46620000000000000000",
-    "realQuantity": "6869.46620000000000000000",
-    "minAmount": "30000.00000000000000000000",
-    "maxAmount": "617565.01000000000000000000",
-    "advSource": 3,
-    "source": "MEXC",
-    "externalAdvNo": "a1606785602316816386",
-    "adRemark": "Принимаю переводы по СБП (по номеру телефона) с любых банков. Переводы на российские банки!                             От 3-х лиц приму только однофамильцы, личный кабинет у вас в руках или докажите ",
-    "payMethods": [
-     {
-      "code": "SBP - Fast Bank Transfer",
-      "name": "SBP - Fast Bank Transfer",
-      "channelId": 1079
-     }
-    ],
-    "nickName": "Kleopatra_usdt",
-    "online": false,
-    "proportion": "0",
-    "lastDaysTurnoverRate": "1.0",
-    "turnoverRateTotal": "0.00%",
-    "dealOrderTotal": "0",
-    "enable": true,
-    "currencySymbol": "₽"
-   },
-   {
-    "uuid": "FP_ef4dcb6b-1b92-4af3-9e25-f11f278c5300",
-    "tradeType": "sell",
-    "currencyCode": "RUB",
-    "assetCode": "USDT",
-    "advType": 0,
-    "price": "89.95000000000000000000",
-    "quantity": "1377.70070000000000000000",
-    "realQuantity": "1377.70070000000000000000",
-    "minAmount": "50000.00000000000000000000",
-    "maxAmount": "100000.00000000000000000000",
-    "advSource": 3,
-    "source": "MEXC",
-    "externalAdvNo": "a1789502882709597185",
-    "adRemark": "Принимаю на личную карту, строго без 3 лиц, новореги с одними покупками просьба не заходить . ",
-    "payMethods": [
-     {
-      "code": "SBP - Fast Bank Transfer",
-      "name": "SBP - Fast Bank Transfer",
-      "channelId": 1079
-     }
-    ],
-    "nickName": "Shlyapnik",
-    "online": false,
-    "proportion": "0",
-    "lastDaysTurnoverRate": "1.0",
-    "turnoverRateTotal": "0.00%",
-    "dealOrderTotal": "0",
-    "enable": true,
-    "currencySymbol": "₽"
-   },
-   {
-    "uuid": "FP_4fad88b0-724e-41f7-8418-a252f8843ae9",
-    "tradeType": "sell",
-    "currencyCode": "RUB",
-    "assetCode": "USDT",
-    "advType": 0,
-    "price": "90.35000000000000000000",
-    "quantity": "14999.60000000000000000000",
-    "realQuantity": "14999.60000000000000000000",
-    "minAmount": "20000.00000000000000000000",
-    "maxAmount": "1355213.86000000000000000000",
-    "advSource": 3,
-    "source": "MEXC",
-    "externalAdvNo": "a1680896749068850178",
-    "adRemark": "Привет! — ПЛАТЕЖ НЕ ДЕЛИМ (только в редких случаях).— Строго от первого лица /однофамильцы.— Любой банк РФ.— Скрин чека в чат.— Реквизиты дам в чате.— Отпускаю крипту максимально быстро.Обнял!",
-    "payMethods": [
-     {
-      "code": "SBP - Fast Bank Transfer",
-      "name": "SBP - Fast Bank Transfer",
-      "channelId": 1079
-     }
-    ],
-    "nickName": "Dr.Crypto202",
-    "online": false,
-    "proportion": "0",
-    "lastDaysTurnoverRate": "1.0",
-    "turnoverRateTotal": "0.00%",
-    "dealOrderTotal": "0",
-    "enable": true,
-    "currencySymbol": "₽"
-   }
-  ],
-  "hasNext": false,
-  "totalCount": 6,
-  "totalPage": 1
- },
- "code": 200,
- "message": "Success!"
+    "hasNext": false,
+    "totalCount": 6,
+    "totalPage": 1
+  },
+  "code": 200,
+  "message": "Success!"
 }

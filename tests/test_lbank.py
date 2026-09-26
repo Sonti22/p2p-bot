@@ -18,17 +18,43 @@ def _run(side, asset="USDT"):
     return asyncio.run(p2p.lbank(None, p2p.Config(), side, asset))
 
 
-def test_lbank_buy_fields_and_mirrored_mexc_ads(offline):
-    """Бот покупает: объявления продавцов. Большая часть стакана RUB — объявления MEXC, которые LBank показывает
-    у себя (source=MEXC): счётчика сделок у них нет — orders=0, % завершения 0, как и в строке мерчанта на LBank."""
+def test_lbank_buy_skips_mirrored_mexc_ads(offline):
+    """Стакан RUB на покупку у LBank сейчас — объявления MEXC, которые LBank показывает у себя (source=MEXC). Они уже
+    есть в стакане MEXC (дубли связок), а блэклист MEXC их под площадкой LBank не узнал бы — не берём. В фикстуре
+    одно своё объявление LBank (own_lbank_seller, добавлено для тестов) — только оно и остаётся."""
+    assert [a.nick for a in _run("buy")] == ["own_lbank_seller"]
+
+
+def test_lbank_own_ad_fields_and_broken_item(monkeypatch):
+    with open(os.path.join(FIX, "lbank_ads.json"), encoding="utf-8") as f:
+        item = next(i for i in json.load(f)["data"]["resultList"] if i["nickName"] == "1-Переводом")
+    item = dict(item, source="LBANK")
+    broken = dict(item, price=None, nickName="broken")   # одно кривое объявление не роняет всю сторону
+
+    async def fake(s, method, url, body=None):
+        return {"code": 200, "data": {"resultList": [broken, item]}}
+
+    monkeypatch.setattr(p2p, "_json", fake)
     ads = _run("buy")
+    assert len(ads) == 1
     first = ads[0]
     assert (first.ex, first.side, first.asset, first.nick) == ("LBank", "buy", "USDT", "1-Переводом")
     assert (first.price, first.min_amt, first.max_amt, first.avail) == (86.8, 92400.0, 92401.0, 3346.3502)
     assert first.pays == ["SBP - Fast Bank Transfer"] and trades.is_sbp(first.pays[0])
     assert (first.orders, first.rate) == (0, 0.0)
     assert first.terms.startswith("ВАЖНО!")                     # adRemark без ведущих пробелов
-    assert [a.price for a in ads] == sorted(a.price for a in ads)   # лучшая цена покупки — первой
+
+
+def test_transfer_from_venue_without_directory_respects_closed_deposit(monkeypatch):
+    """У LBank/BitPapa нет справочника сетей — но если у получателя ввод закрыт во всех сетях, маршрута нет
+    (раньше бралась запасная комиссия, и связка «LBank → HTX» проходила при закрытом вводе HTX)."""
+    cfg = p2p.Config()
+    closed = {"TRC20": {"wd": True, "dep": False}, "BEP20": {"wd": True, "dep": False}}
+    monkeypatch.setitem(p2p.netstatus.STATUS, ("HTX", "USDT"), closed)
+    assert p2p._withdraw(cfg, "LBank", "USDT", receiver="HTX") is None
+    assert p2p._withdraw(cfg, "BitPapa", "USDT", receiver="HTX") is None
+    monkeypatch.setitem(p2p.netstatus.STATUS, ("HTX", "USDT"), dict(closed, BEP20={"wd": True, "dep": True}))
+    assert p2p._withdraw(cfg, "LBank", "USDT", receiver="HTX") == (cfg.transfer_fees["USDT"], "")
 
 
 def test_lbank_skips_new_user_flash_sale(offline):
@@ -37,7 +63,7 @@ def test_lbank_skips_new_user_flash_sale(offline):
         raw = [i["nickName"] for i in json.load(f)["data"]["resultList"]]
     assert "ANTRADER" in raw
     assert "ANTRADER" not in {a.nick for a in _run("buy")}
-    assert min(a.price for a in _run("buy")) > 80
+    assert all(a.price > 80 for a in _run("buy"))
 
 
 def test_lbank_sell_reads_merchant_stats_and_fixes_alfa(offline):
