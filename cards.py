@@ -9,7 +9,7 @@ import time
 
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
-from p2p import _money, _price, terms_flags
+from p2p import _money, _price, route_actions, sell_step_number, terms_flags
 
 FONT_DIR = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts")
 BG, PANEL, BORDER = "#0F1419", "#18212C", "#2A3441"
@@ -61,91 +61,128 @@ def _pill(d, x, y, text, color, font, pad=12):
     return x + w
 
 
-def _side_box(d, x, y, w, h, title, color, ad):
-    d.rounded_rectangle((x, y, x + w, y + h), radius=22, fill=PANEL, outline=BORDER, width=2)
-    f_small, f_mid = _font(20, "semi"), _font(24)
-    nx = _pill(d, x + 20, y + 18, title, color, f_small)
-    _pill(d, nx + 10, y + 18, ad.ex, VENUE_COLORS.get(ad.ex, BLUE), f_small)
-    d.text((x + 20, y + 66), f"{ad.asset} {_price(ad.price)} ₽", font=_font(40, "bold"), fill=TEXT)
-    d.text((x + 20, y + 122), _fit(ad.nick, f_mid, w - 40), font=f_mid, fill=TEXT)
-    stats = f"{ad.orders} отзывов · {ad.rate:.0f}% хор." if ad.ex == "BestChange" else f"{ad.orders} сделок · {ad.rate:.0f}%"
-    d.text((x + 20, y + 156), stats, font=_font(22), fill=MUTED)
-    d.text((x + 20, y + 190), _fit(", ".join(ad.pays), _font(22), w - 40), font=_font(22), fill=MUTED)
+def _plain(text):
+    """Текст без эмодзи и служебных символов: в шрифте карточки (Segoe UI) их нет, Pillow рисует квадраты."""
+    out = "".join(ch for ch in str(text) if not (ord(ch) >= 0x1F000 or 0x2600 <= ord(ch) <= 0x27BF
+                                                 or ord(ch) in (0xFE0F, 0x200D, 0x20E3)))
+    return " ".join(out.split())
+
+
+def _step_box(d, x, y, w, h, num, title, color, ad, pays_title):
+    """Шаг «купить»/«продать»: номер и действие, площадка, цена, кто, как платить, условия мерчанта."""
+    d.rounded_rectangle((x, y, x + w, y + h), radius=22, fill=PANEL, outline=color, width=3)
+    f_pill, f_mid, f_small = _font(22, "bold"), _font(24, "semi"), _font(21)
+    nx = _pill(d, x + 18, y + 18, f"{num}  {title}", color, f_pill)
+    _pill(d, nx + 10, y + 18, ad.ex, VENUE_COLORS.get(ad.ex, BLUE), f_pill)
+    price, per = f"{_price(ad.price)} ₽", f"за 1 {ad.asset}"
+    size = 44   # цена BTC в рублях длинная — уменьшаем шрифт, пока цена с «за 1 BTC» не влезет в рамку
+    while size > 28 and _font(size, "bold").getlength(price) + 8 + f_small.getlength(per) > w - 40:
+        size -= 2
+    f_price = _font(size, "bold")
+    d.text((x + 20, y + 70 + (44 - size) // 2), price, font=f_price, fill=TEXT)
+    d.text((x + 28 + f_price.getlength(price), y + 90), per, font=f_small, fill=MUTED)
+    who = "Обменник" if ad.ex == "BestChange" else ("Продавец" if title == "КУПИТЬ" else "Покупатель")
+    d.text((x + 20, y + 132), _fit(f"{who}: {_plain(ad.nick)}", f_mid, w - 40), font=f_mid, fill=TEXT)
+    stats = f"{ad.orders} отзывов · {ad.rate:.0f}% хороших" if ad.ex == "BestChange" else f"{ad.orders} сделок · {ad.rate:.0f}% успешных"
+    d.text((x + 20, y + 166), stats, font=f_small, fill=MUTED)
+    d.text((x + 20, y + 198), _fit(f"{pays_title}: {_plain(', '.join(ad.pays))}", f_small, w - 40), font=f_small, fill=TEXT)
     notes = terms_flags(ad.terms)[1]
-    if notes:   # ключевые условия мерчанта — одной строкой
-        d.text((x + 20, y + 216), _fit("⚠ " + " · ".join(notes), _font(19), w - 40), font=_font(19), fill=AMBER)
-
-
-def _amounts_line(amounts):
-    parts = []
-    for amt, val in amounts.items():
-        label = f"{amt // 1000}к"
-        parts.append(f"{label} {val:+.2f}%" if val is not None else f"{label} —")
-    return "На другую сумму: " + " · ".join(parts)
+    if notes:   # условия мерчанта словами, до двух строк
+        ty = y + 232
+        for ln in _wrap("Условия: " + _plain("; ".join(notes)), _font(20), w - 40)[:2]:
+            d.text((x + 20, ty), ln, font=_font(20), fill=AMBER)
+            ty += 25
 
 
 REL_COLORS = {"✅ надёжно": GREEN, "⚠️ риск": AMBER, "🪤 ловушка": RED}
 
 
-def _breakdown_line(breakdown):
-    return " → ".join(f"{label} {p:+.2f}%" for label, p in breakdown)
+def _amounts_chips(d, x, y, amounts, W):
+    """«Другая сумма круга»: плашки «10 000 ₽ +3.95%», серые — если на эту сумму не хватает глубины."""
+    f_lbl, f_chip = _font(22), _font(22, "semi")
+    d.text((x, y + 6), "На другую сумму:", font=f_lbl, fill=MUTED)
+    cx = x + f_lbl.getlength("На другую сумму:") + 16
+    for amt, val in amounts.items():
+        text = f"{_money(amt)} ₽  {val:+.2f}%" if val is not None else f"{_money(amt)} ₽  нет объёма"
+        w = f_chip.getlength(text) + 28
+        if cx + w > W - 40:
+            break
+        d.rounded_rectangle((cx, y, cx + w, y + 38), radius=19, fill=PANEL, outline=BORDER, width=2)
+        d.text((cx + 14, y + 6), text, font=f_chip, fill=(_profit_color(val) if val is not None else MUTED))
+        cx += w + 10
 
 
-def deal_card(deal, cfg, amounts=None, rel=None, breakdown=None):
+def deal_card(deal, cfg, amounts=None, rel=None):
+    """Карточка сигнала — те же шаги, что в подписи и на кнопках: 1 купить → 2… перевод/спот → N продать.
+    Без эмодзи (в шрифте их нет) и без мелкого текста: всё читается с телефона. Прибыль по стадиям —
+    в «📝 Инструкция» (steps_view), на картинке только итог."""
     profit, b, s, route = deal
-    W, H = 1080, 640
+    acts, _costs = route_actions(route)
+    W, H = 1080, 720 if amounts else 660
     img = Image.new("RGB", (W, H), BG)
     d = ImageDraw.Draw(img)
-    d.text((40, 30), "P2P-СВЯЗКА", font=_font(24, "semi"), fill=MUTED)
+    d.text((40, 28), "СИГНАЛ · P2P-СВЯЗКА", font=_font(24, "semi"), fill=MUTED)
     stamp = time.strftime("%d.%m %H:%M")
-    d.text((W - 40 - _font(24).getlength(stamp), 30), stamp, font=_font(24), fill=MUTED)
+    d.text((W - 40 - _font(24).getlength(stamp), 28), stamp, font=_font(24), fill=MUTED)
 
     color = AMBER if profit >= 5 else GREEN if profit > 0 else RED
     big = f"{profit:+.2f}%"
     f_big = _font(96, "bold")
-    d.text((36, 58), big, font=f_big, fill=color)
-    d.text((56 + f_big.getlength(big), 108), f"чистыми на {_money(cfg.amount)} ₽", font=_font(30), fill=MUTED)
-    d.text((40, 180), f"{b.ex} {b.asset}  →  {s.ex} {s.asset}", font=_font(30, "semi"), fill=TEXT)
+    d.text((36, 56), big, font=f_big, fill=color)
+    d.text((56 + f_big.getlength(big), 106), f"чистыми на {_money(cfg.amount)} ₽", font=_font(32), fill=TEXT)
+    d.text((40, 176), f"{b.ex} {b.asset}  →  {s.ex} {s.asset}", font=_font(30, "semi"), fill=TEXT)
     if rel:
-        label, _reasons = rel[:2]
+        label = _plain(rel[0]).upper()
         if len(rel) > 2:   # индекс надёжности 0–10 рядом с меткой
             label = f"{label} · {rel[2]}/10"
-        f_rel = _font(22, "semi")
+        f_rel = _font(24, "bold")
         pw = f_rel.getlength(label) + 24
-        _pill(d, W - 40 - pw, 176, label, REL_COLORS.get(rel[0], AMBER), f_rel)
+        _pill(d, W - 40 - pw, 172, label, REL_COLORS.get(rel[0], AMBER), f_rel)
 
-    f_extra, ey = _font(18), 210
-    for line in filter(None, [_breakdown_line(breakdown) if breakdown else "", _amounts_line(amounts) if amounts else ""]):
-        d.text((40, ey), _fit(line, f_extra, W - 80), font=f_extra, fill=MUTED)
-        ey += 22
-
-    y, h = (240, 240) if ey == 210 else (ey + 8, 240)
-    _side_box(d, 40, y, 360, h, "КУПИТЬ", GREEN, b)
-    _side_box(d, 680, y, 360, h, "ПРОДАТЬ", RED, s)
-    # шаги маршрута столбиком (каждый шаг целиком, с номером) и стрелка под ними
-    f_step, mid, colw = _font(19), 540, 250
+    y, h, bw = 236, 290, 350
+    sell_n = sell_step_number(route)
+    _step_box(d, 40, y, bw, h, 1, "КУПИТЬ", GREEN, b, "Оплата")
+    _step_box(d, W - 40 - bw, y, bw, h, sell_n, "ПРОДАТЬ", RED, s, "Получить на")
+    # середина: шаги между покупкой и продажей (перевод, спот) с номерами, как в подписи
+    mx0, mx1 = 40 + bw + 20, W - 40 - bw - 20
+    mid, colw = (mx0 + mx1) / 2, mx1 - mx0
+    f_step, f_num = _font(20), _font(22, "bold")
     lines = []
-    for i, step in enumerate(route.split(" → "), 1):
-        wrapped = _wrap(step, f_step, colw - 30)
-        lines += [(f"{i}. {wrapped[0]}" if len(route.split(" → ")) > 1 else wrapped[0], TEXT)] + [(w, TEXT) for w in wrapped[1:]]
-    block = len(lines) * 25 + 34
-    ty = y + (h - block) // 2
-    for ln, color in lines[:7]:
-        d.text((mid - f_step.getlength(ln) / 2, ty), ln, font=f_step, fill=color)
-        ty += 25
-    ay = ty + 16
-    d.line((mid - 100, ay, mid + 90, ay), fill=MUTED, width=4)
-    d.polygon([(mid + 104, ay), (mid + 86, ay - 12), (mid + 86, ay + 12)], fill=MUTED)
+    for i, st in enumerate(acts[:5], 2):
+        st = _plain(st)
+        wrapped = _wrap(st[:1].upper() + st[1:], f_step, colw - 10)[:3]
+        lines.append((f"{i}", wrapped))
+    if not lines:
+        lines.append(("", ["без перевода:", "всё на одной площадке"]))
+    rows = sum(1 + len(w) for _, w in lines)
+    ty = y + max(10, (h - rows * 26 - 40) / 2)
+    for num, wrapped in lines:
+        if num:
+            r = 16
+            d.ellipse((mid - r, ty, mid + r, ty + 2 * r), fill=BLUE)
+            d.text((mid - f_num.getlength(num) / 2, ty + 2), num, font=f_num, fill="#0B0F14")
+            ty += 2 * r + 4
+        for ln in wrapped:
+            d.text((mid - f_step.getlength(ln) / 2, ty), ln, font=f_step, fill=TEXT if num else MUTED)
+            ty += 25
+        ty += 6
+    ay = min(ty + 14, y + h - 14)
+    d.line((mid - 90, ay, mid + 80, ay), fill=MUTED, width=4)
+    d.polygon([(mid + 94, ay), (mid + 76, ay - 12), (mid + 76, ay + 12)], fill=MUTED)
 
-    d.rounded_rectangle((40, 520, W - 40, 600), radius=18, fill="#2A2112", outline="#5C4513", width=2)
-    d.ellipse((62, 545, 92, 575), fill=AMBER)
-    d.text((72, 544), "!", font=_font(24, "bold"), fill="#0B0F14")
+    fy = y + h + 22
+    if amounts:
+        _amounts_chips(d, 40, fy, amounts, W)
+        fy += 60
+    d.rounded_rectangle((40, fy, W - 40, fy + 76), radius=18, fill="#2A2112", outline="#5C4513", width=2)
+    d.ellipse((62, fy + 23, 92, fy + 53), fill=AMBER)
+    d.text((72, fy + 22), "!", font=_font(24, "bold"), fill="#0B0F14")
     note = "Проверь ФИО отправителя и условия мерчанта. Первая сделка — малой суммой."
     if profit >= 5:
-        note = "Спред ≥5% часто плата за риск: проверь мерчанта и ФИО, начни с малой суммы."
+        note = "Спред от 5% часто плата за риск: проверь мерчанта и ФИО, начни с малой суммы."
     if rel and rel[1]:
-        note = rel[1][0][0].upper() + rel[1][0][1:] + ". Проверь мерчанта, начни с малой суммы."
-    d.text((108, 545), _fit(note, _font(22), W - 170), font=_font(22), fill="#F5D9A8")
+        note = _plain(rel[1][0][0].upper() + rel[1][0][1:]) + ". Проверь мерчанта, начни с малой суммы."
+    d.text((108, fy + 22), _fit(note, _font(23), W - 170), font=_font(23), fill="#F5D9A8")
     return _png(img)
 
 

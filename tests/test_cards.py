@@ -17,25 +17,9 @@ def test_deal_card_renders_with_amount_breakdown():
     assert cards.deal_card(d, p2p.Config(), amounts)[:8] == PNG
 
 
-def test_deal_card_renders_with_profit_breakdown():
-    d = (6.5, make_ad("Bybit", "buy", 85.0), make_ad("MEXC", "sell", 91.0), "внутри биржи")
-    breakdown = [("Валовый спред", 7.06), ("− вывод", 6.9), ("− запас на курс", 6.5), ("Чистыми", 6.5)]
-    assert cards.deal_card(d, p2p.Config(), breakdown=breakdown)[:8] == PNG
-
-
-def test_breakdown_line_formats_stages():
-    line = cards._breakdown_line([("Валовый спред", 7.06), ("Чистыми", 6.5)])
-    assert line == "Валовый спред +7.06% → Чистыми +6.50%"
-
-
 def test_deal_card_renders_with_reliability_pill():
     d = (6.5, make_ad("Bybit", "buy", 85.0), make_ad("MEXC", "sell", 91.0, asset="USDC"), "внутри биржи")
     assert cards.deal_card(d, p2p.Config(), rel=("🪤 ловушка", ["спред 6.5% ≥5% — часто плата за риск"]))[:8] == PNG
-
-
-def test_amounts_line_formats_missing_depth_as_dash():
-    line = cards._amounts_line({50_000: 1.23, 300_000: None})
-    assert "50к +1.23%" in line and "300к —" in line
 
 
 def test_portfolio_card_renders():

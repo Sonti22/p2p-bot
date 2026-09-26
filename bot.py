@@ -26,7 +26,7 @@ import presets
 import trades
 from cards import deal_card, history_card, history_compare_card, portfolio_card, top_chart
 from p2p import ALL_EXCHANGES, AMOUNT_MAX, AMOUNT_MIN, DEFAULT_ASSETS, ENV_PATH, LOG_PATH, MIN_PROFIT_MAX, \
-    MIN_PROFIT_MIN, TRAP, Config, _money, _price, _route_qty, bank_liquidity, book_spread, deal_amounts, \
+    MIN_PROFIT_MIN, TRAP, Config, fmt_signal, sell_step_number, _money, _price, _route_qty, bank_liquidity, book_spread, deal_amounts, \
     deal_for_amount, fmt_ad, fmt_breakeven, fmt_deal, fmt_top, load_env, maker_neighbors, maker_place, maker_quote, \
     maker_round_fee, parse_amount, parse_min_profit, profit_breakdown, reliability, reliability_index, scan, \
     setup_logging, spot_url, traps_log, venue_url
@@ -109,11 +109,16 @@ DEV_STATUS = os.path.join(HERE, ".dev_status.json")   # пишет launcher.py �
 DESCRIPTION = ("Сканирую P2P Bybit, MEXC, HTX, KuCoin, BitPapa и обменники BestChange. "
                "Присылаю связки USDT, USDC, BTC, ETH, TON за рубли: чистая прибыль, карточка, ссылки на площадки.")
 SHORT_DESCRIPTION = "Сигналы P2P-связок за рубли"
-GUIDE_BODY = ("<b>Как работать с сигналом</b>\n\n"
-              "1. «🟢 Купить» — откроется площадка. Найди мерчанта из карточки.\n"
-              "2. Если в маршруте есть спот — поменяй монету (кнопка «🔁 Спот»).\n"
-              "3. Переведи монету на площадку продажи: сеть и комиссия — в карточке.\n"
-              "4. «🔴 Продать» — продай мерчанту или обменнику из карточки.\n\n"
+GUIDE_BODY = ("<b>Как работать с сигналом</b>\n"
+              "Шаги пронумерованы одинаково на картинке, в тексте под ней и на кнопках.\n\n"
+              "1. «🟢 1. Купить на …» — откроется площадка. Найди продавца из шага 1, оплати способом из карточки. "
+              "Сумму скопирует «📋 Сумма».\n"
+              "2. Средние шаги — перевод монеты на площадку продажи (сеть и комиссия в тексте) и спот, если он есть "
+              "(кнопка «🔁 Спот»).\n"
+              "3. «🔴 N. Продать на …» — продай покупателю или обменнику из последнего шага. Объём скопирует "
+              "«📋 Продать».\n"
+              "Пошаговый чек-лист с ценами — «📝 Инструкция». Сделал — «✅ Сделал», сделка попадёт в журнал. "
+              "Мерчант не понравился — «🚫 Скрыть мерчанта».\n\n"
               "<b>Безопасность</b>\n"
               "• Оплата только от человека с ФИО как на бирже. Третьи лица — отказ.\n"
               "• Крипту отпускай, только когда деньги видны в банке. Чек и скриншот — не подтверждение.\n"
@@ -124,9 +129,11 @@ GUIDE_BODY = ("<b>Как работать с сигналом</b>\n\n"
               "• Комиссия вывода по бирже и сети: бот берёт самую дешёвую сеть, у обменника — его сеть.\n"
               "• Спот 0,1% на бирже, где уже лежит монета.\n"
               "• Запас на курс ETH 0,5%, TON 0,7%, BTC 0,3% — пока идут сделки и переводы.\n"
-              "• Комиссия банка — если задана PAY_FEE.\n\n"
+              "• Комиссия банка — если задана PAY_FEE.\n"
+              "• Комиссия СБП 0,5% — если у мерчанта нет твоего банка и бесплатный лимит СБП за месяц исчерпан "
+              "(считается по журналу сделок, банки и лимиты — /mybanks).\n\n"
               "<b>Что НЕ учтено</b>\n"
-              "• СБП другим людям сверх 100 тыс. ₽/мес в банке — до 0,5%. Перевод по номеру карты в чужой банк — 1,5–2%.\n"
+              "• Перевод по номеру карты в чужой банк — 1,5–2%.\n"
               "• НДФЛ с дохода от продажи крипты.\n"
               "• Проверки обменников (AML) и время: сделка может зависнуть.\n")
 GUIDE = GUIDE_BODY + "\nПлощадки:"
@@ -279,10 +286,10 @@ def copy_buttons(d, cfg, snap):
     выход монеты — продавать придётся всё, что реально пришло; запас виден отдельной строкой в
     маршруте карточки)."""
     _, b, s, _ = d
-    row = [{"text": f"📋 {_money(cfg.amount)} {cfg.fiat}", "copy_text": {"text": f"{cfg.amount:g}"}}]
+    row = [{"text": f"📋 Сумма: {_money(cfg.amount)} ₽", "copy_text": {"text": f"{cfg.amount:g}"}}]
     qty = _route_qty(b, s, cfg, snap.spot, snap.over_banks, disable=frozenset({"risk"})) if snap else None
     if qty:
-        row.append({"text": f"📋 {_qty(qty)} {s.asset}", "copy_text": {"text": _qty(qty)}})
+        row.append({"text": f"📋 Продать: {_qty(qty)} {s.asset}", "copy_text": {"text": _qty(qty)}})
     return row
 
 
@@ -307,12 +314,14 @@ def is_fancy(markup):
     return any("style" in b or "copy_text" in b for row in (markup or {}).get("inline_keyboard", []) for b in row)
 
 
-def deal_markup(d, deal_id=None, cfg=None, snap=None):
+def deal_markup(d, deal_id=None, cfg=None, snap=None, nav=True):
     """Кнопки под карточкой: купить (зелёная) / продать (красная) — `style` из Bot API 9.4, спот, «📋» копировать
     сумму и объём (если передан cfg), шаги/сделал/скрыть (если сигнал запомнен), топ/обновить."""
     _, b, s, route = d
-    row = [{"text": f"{label} · {ad.ex}", "url": venue_url(ad), "style": style}
-           for ad, label, style in ((b, "🟢 Купить", "success"), (s, "🔴 Продать", "danger")) if venue_url(ad)]
+    sell_n = sell_step_number(route)   # номера шагов — как в подписи: 1 купить … N продать
+    row = [{"text": f"{label} на {ad.ex}", "url": venue_url(ad), "style": style}
+           for ad, label, style in ((b, "🟢 1. Купить", "success"), (s, f"🔴 {sell_n}. Продать", "danger"))
+           if venue_url(ad)]
     rows = [row] if row else []
     m = re.search(r"спот (\w+)→(\w+) на (\w+)", route)
     if m and spot_url(route):
@@ -320,17 +329,18 @@ def deal_markup(d, deal_id=None, cfg=None, snap=None):
     if cfg is not None:
         rows.append(copy_buttons(d, cfg, snap))
     if deal_id is not None:
-        rows.append([{"text": "📋 Шаги", "callback_data": f"steps:{deal_id}"},
+        rows.append([{"text": "📝 Инструкция", "callback_data": f"steps:{deal_id}"},
                      {"text": "✅ Сделал", "callback_data": f"did:{deal_id}"}])
         fav = favorites.is_fav((b.ex, b.asset, s.ex, s.asset))
         rows.append([{"text": "★ Убрать из избранного" if fav else "⭐ В избранное", "callback_data": f"fav:{deal_id}"},
-                     {"text": "🚫 Не показывать", "callback_data": f"bl:{deal_id}"}])
-    rows.append([{"text": "📊 Все связки", "callback_data": "top"}, {"text": "🔄 Обновить", "callback_data": "best"}])
+                     {"text": "🚫 Скрыть мерчанта", "callback_data": f"bl:{deal_id}"}])
+    if nav:   # в сигналах не показываем: общие кнопки сливали соседние карточки в одну ленту
+        rows.append([{"text": "📊 Топ связок", "callback_data": "top"}, {"text": "🔄 Лучшая сейчас", "callback_data": "best"}])
     return {"inline_keyboard": rows}
 
 
 def steps_view(d, cfg, snap):
-    """Текст «📋 Шаги»: пошаговый чек-лист маршрута с ценами объявлений (на момент сигнала) и
+    """Текст «📝 Инструкция»: пошаговый чек-лист маршрута с ценами объявлений (на момент сигнала) и
     разложением прибыли по стадиям; напоминание перепроверить цены перед сделкой."""
     profit, b, s, route = d
     lines = [f"📋 <b>Шаги связки</b> — {_money(cfg.amount)} {cfg.fiat}", "",
@@ -529,7 +539,7 @@ def blacklist_view(now=None):
     с удалением. Сами записи не снимаются: решает владелец."""
     rows = blacklist.list_all()
     if not rows:
-        return ("🚫 <b>Блэклист пуст</b>\n\nКнопка «🚫 Не показывать» под сигналом добавляет сюда мерчанта "
+        return ("🚫 <b>Блэклист пуст</b>\n\nКнопка «🚫 Скрыть мерчанта» под сигналом добавляет сюда мерчанта "
                 "или обменника — скан больше не покажет связки с ним.", {"inline_keyboard": []})
     now = time.time() if now is None else now
     lines = ["🚫 <b>Блэклист</b>", "", "Скан больше не показывает связки с этими мерчантами и обменниками. "
@@ -989,7 +999,7 @@ class Bot:
         self.live = {}                                            # (ex,asset,ex,asset) -> {"first": ts, "streak": n}
         self.live_scans = int(os.getenv("LIVE_SCANS", 2))        # сигнал, только если связка держится ≥ N сканов
         self.venue = {}   # ex -> {"streak": сканов подряд с ошибкой, "down_since": ts, "alerted_at": ts}
-        self.deals_by_id = {}   # id -> (d, снимок cfg, snap на момент сигнала) для кнопок «✅ Сделал»/«📋 Шаги»; не переживает рестарт
+        self.deals_by_id = {}   # id -> (d, снимок cfg, snap на момент сигнала) для кнопок «✅ Сделал»/«📝 Инструкция»; не переживает рестарт
         self.acc_seen = {}   # ex -> set известных ключей истории; None пока не было первого опроса
         self.start_ts = time.time()     # для аптайма в /status
         # id сигналов от времени старта в мс: после рестарта старая кнопка did:N не попадёт на новую связку
@@ -1148,7 +1158,7 @@ class Bot:
         return True
 
     def remember_deal(self, d, cfg=None, snap=None):
-        """Запомнить связку под кнопками «✅ Сделал»/«📋 Шаги»; хранится ограниченное число последних."""
+        """Запомнить связку под кнопками «✅ Сделал»/«📝 Инструкция»; хранится ограниченное число последних."""
         cfg = copy.deepcopy(cfg or self.cfg)   # снимок настроек (и списков): старая карточка не увидит новые сумму/порог
         snap = snap if snap is not None else self.last
         snap = _lean(snap)
@@ -1158,18 +1168,18 @@ class Bot:
             del self.deals_by_id[min(self.deals_by_id)]
         return deal_id
 
-    async def send_deal(self, d, prefix="", cfg=None, snap=None, topic=None, chat_id=None):
+    async def send_deal(self, d, prefix="", cfg=None, snap=None, topic=None, chat_id=None, nav=True):
         """Карточка связки (картинка или текст); возвращает ответ Telegram — ok ли доставка."""
         cfg = cfg or self.cfg
         snap = snap if snap is not None else self.last
         guest = self.is_guest(self.chat_for(chat_id))
-        deal_id = None if guest else self.remember_deal(d, cfg, snap)   # у гостя нет «✅ Сделал»/«📋 Шаги»/«🚫»
+        deal_id = None if guest else self.remember_deal(d, cfg, snap)   # у гостя нет «✅ Сделал»/«📝 Инструкция»/«🚫»
         amounts = deal_amounts(d, cfg, snap) if snap else None
         rel = (*reliability(d, cfg, snap), reliability_index(d, cfg, snap)) if snap else None
-        breakdown = profit_breakdown(d[1], d[2], cfg, snap.spot, snap.over_banks) if snap else None
-        caption = prefix + fmt_deal(d, cfg, snap)
-        r, is_photo = await self.photo_or_text(lambda: deal_card(d, cfg, amounts, rel, breakdown), caption,
-                                               deal_markup(d, deal_id, cfg, snap), topic, chat_id)
+        caption = prefix + fmt_signal(d, cfg, snap)
+        r, is_photo = await self.photo_or_text(lambda: deal_card(d, cfg, amounts, rel), caption,
+                                               deal_markup(d, deal_id, cfg, snap, nav), topic,
+                                               chat_id)
         message_id = (r.get("result") or {}).get("message_id") if r.get("ok") else None
         if topic == "signals" and message_id is not None and not guest:
             key = self._deal_key(d)
@@ -1178,7 +1188,7 @@ class Bot:
         return r
 
     async def show_steps(self, cq, deal_id):
-        """Кнопка «📋 Шаги»: отдельным сообщением пошаговый чек-лист маршрута."""
+        """Кнопка «📝 Инструкция»: отдельным сообщением пошаговый чек-лист маршрута."""
         entry = self.deals_by_id.get(deal_id)
         if not entry:
             await self.call("answerCallbackQuery", callback_query_id=cq["id"], text="Сигнал устарел")
@@ -1199,7 +1209,7 @@ class Bot:
         await self.call("answerCallbackQuery", callback_query_id=cq["id"], text="Записано в журнал ✅")
         await self.send(f"Расчёт был {d[0]:+.2f}%. Какой вышел факт?", markup=fact_markup(trade_id), topic="journal")
         await self.call("editMessageReplyMarkup", chat_id=self.chat_id, message_id=cq["message"]["message_id"],
-                        reply_markup=self.markup(deal_markup(d, cfg=cfg, snap=snap)))
+                        reply_markup=self.markup(deal_markup(d, cfg=cfg, snap=snap, nav=False)))
         if crossed:
             await self.send(f"⚠️ С {trades.BANK_NAMES.get(bank, bank)} по СБП в этом месяце отправлено "
                             f"{_money(total)} ₽ — выше бесплатного лимита {_limit_text(trades.free_limit(bank))}, "
@@ -1244,7 +1254,7 @@ class Bot:
         await self.save_fact(None, trade_id, row, fact)
 
     async def hide_deal(self, cq, deal_id):
-        """Кнопка «🚫 Не показывать»: занести обе стороны связки в блэклист (у стакана — всех его мерчантов),
+        """Кнопка «🚫 Скрыть мерчанта»: занести обе стороны связки в блэклист (у стакана — всех его мерчантов),
         скан их больше не покажет."""
         entry = self.deals_by_id.pop(deal_id, None)
         if not entry:
@@ -1258,7 +1268,7 @@ class Bot:
         hidden = ", ".join(f"{EXCHANGE_NAMES.get(ex, ex)}: {html.escape(nick)} (id {i})" for ex, nick, i in added)
         await self.send(f"🚫 В блэклисте: {hidden}.\n{BLACKLIST_NOTE_HELP}")
         await self.call("editMessageReplyMarkup", chat_id=self.chat_id, message_id=cq["message"]["message_id"],
-                        reply_markup=self.markup(deal_markup(d, cfg=cfg, snap=snap)))
+                        reply_markup=self.markup(deal_markup(d, cfg=cfg, snap=snap, nav=False)))
 
     async def blacklist_note(self, arg):
         """«/blacklist note <id> <текст>» (только владелец): записать причину, почему мерчант в блэклисте."""
@@ -2153,7 +2163,7 @@ class Bot:
                 continue
             # антидубль расходуем только после доставки: сбой Telegram — повторим в следующем скане
             try:
-                r = await self.send_deal(d, "🔔 " + self.held_label(d, now), snap=snap, topic="signals")
+                r = await self.send_deal(d, "🔔 " + self.held_label(d, now), snap=snap, topic="signals", nav=False)
             except Exception as e:   # сеть/таймаут: остальные связки этого скана тоже не дойдут
                 logger.warning("signal send error: %s", accounts.api_error_text(e))   # без URL с токеном бота
                 break
@@ -2166,7 +2176,7 @@ class Bot:
             # владельцу, иначе повтор на следующем скане продублировал бы её гостям
             for g in sorted(self.guests):
                 try:
-                    await self.send_deal(d, "🔔 " + self.held_label(d, now), snap=snap, chat_id=g)
+                    await self.send_deal(d, "🔔 " + self.held_label(d, now), snap=snap, chat_id=g, nav=False)
                 except Exception as e:
                     logger.warning("сигнал гостю %s: %s", g, e)
         await self.notify_favorites(snap, active, now)
@@ -2188,7 +2198,7 @@ class Bot:
                 await self.update_live_card(key, d, snap, now)
                 continue
             try:
-                r = await self.send_deal(d, "⭐ " + self.held_label(d, now), snap=snap, topic="signals")
+                r = await self.send_deal(d, "⭐ " + self.held_label(d, now), snap=snap, topic="signals", nav=False)
             except Exception as e:
                 logger.warning("signal send error: %s", accounts.api_error_text(e))
                 break
@@ -2226,7 +2236,7 @@ class Bot:
         live = self.live_msg.get(key)
         if not live or live["stale"] or now - live["last_edit"] < LIVE_EDIT_INTERVAL:
             return
-        caption = "🔔 " + self.held_label(d, now) + fmt_deal(d, self.cfg, snap)
+        caption = "🔔 " + self.held_label(d, now) + fmt_signal(d, self.cfg, snap)
         live["last_edit"], live["caption"] = now, caption
         try:
             if live["photo"]:
@@ -2238,7 +2248,7 @@ class Bot:
         except Exception as e:
             logger.warning("live card edit error: %s", e)
             return
-        # подпись теперь по новой связке и текущим настройкам — кнопки «✅ Сделал»/«📋 Шаги»/«🚫» этого
+        # подпись теперь по новой связке и текущим настройкам — кнопки «✅ Сделал»/«📝 Инструкция»/«🚫» этого
         # сообщения тоже, иначе в журнал уйдёт сумма, которой на карточке уже нет
         if r.get("ok") and live.get("deal_id") in self.deals_by_id:
             self.deals_by_id[live["deal_id"]] = (d, copy.deepcopy(self.cfg), _lean(snap))

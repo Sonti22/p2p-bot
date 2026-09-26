@@ -628,7 +628,7 @@ def test_amount_change_via_settings_keeps_old_card_amount(tmp_path, monkeypatch)
 
 def test_live_card_edit_moves_buttons_to_edited_amount(tmp_path, monkeypatch):
     """Сигнал на 50 000 → «amt:200000» → живая карточка переписана «на 200 000»: кнопки того же сообщения
-    («📋 Шаги», «✅ Сделал») — по той же сумме и связке, что теперь в подписи."""
+    («📝 Инструкция», «✅ Сделал») — по той же сумме и связке, что теперь в подписи."""
     monkeypatch.setattr(B, "deal_card", lambda d, c, a=None, r=None, breakdown=None: b"png")
     monkeypatch.setattr(B, "save_env", lambda *a, **k: None)
     db = str(tmp_path / "trades.db")
