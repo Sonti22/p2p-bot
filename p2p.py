@@ -752,39 +752,48 @@ def withdraw_open(cfg, sender, asset, receiver=""):
     return _withdraw(cfg, sender, asset, receiver=receiver) is not None
 
 
+def _hop_detail(cfg, frm, frm_net, to, to_net, asset, qty=None, parts=1):
+    """То же самое, что _hop (см. её докстринг), но третьим значением возвращает ещё и выбранную сеть
+    (net) — нужна отдельно от подписи шага для сухого прогона (paper.py: route_hops сохраняет сеть
+    каждого хопа при старте круга, ROADMAP «межмонетные, часть 2»). _hop — обёртка над этой функцией,
+    отбрасывающая net, чтобы не трогать её многочисленные вызовы в _route_qty/_route."""
+    if frm == to and frm != "BestChange":
+        return 0.0, "", ""
+    if frm == "BestChange" and to == "BestChange":   # обменник → твой кошелёк на бирже → другой обменник
+        if netstatus.deposit_ok("Bybit", asset, frm_net) is False:
+            return None, "", ""                       # на Bybit закрыт ввод в сети первого обменника
+        w = _withdraw(cfg, "Bybit", asset, to_net, qty=qty)
+        if w is None:
+            return None, "", ""
+        fee, net = w
+        fee *= parts
+        mult = f" ×{parts}" if parts > 1 else ""
+        return fee, f"через Bybit: перевод −{fee:g} {asset} ({net}){mult}", net
+    if frm == "BestChange":                          # обменник сам шлёт монету, комиссия в его курсе
+        need = _receive_nets(to, asset)
+        if need and frm_net not in need:
+            return None, "", ""                       # получатель не принимает сеть обменника (BitPapa: USDT/USDC — только TRC20)
+        if netstatus.deposit_ok(to, asset, frm_net) is False:
+            return None, "", ""                       # у биржи закрыт ввод в сети обменника
+        return 0.0, f"обменник шлёт {asset} ({frm_net}) на {to}", frm_net
+    w = _withdraw(cfg, frm, asset, to_net if to == "BestChange" else "", to, qty=qty)
+    if w is None:
+        return None, "", ""
+    fee, net = w
+    fee *= parts
+    mult = f" ×{parts}" if parts > 1 else ""
+    cost = f"−{fee:g} {asset}" if fee else f"{asset} без комиссии"
+    return fee, f"перевод {cost}" + (f" ({net})" if net else "") + mult + f" на {to}", net
+
+
 def _hop(cfg, frm, frm_net, to, to_net, asset, qty=None, parts=1):
     """Перевод монеты между площадками: (комиссия в монете, подпись шага); та же биржа — (0, '');
     (None, '') — перевод невозможен: вывод или ввод в нужной сети закрыт (или сумма qty меньше
     минимума вывода биржи в единственной подходящей сети). parts — из скольких объявлений собран
     получатель (стакан обменников одной сети, см. Ad.parts): каждому нужен свой перевод, комиссия
     вывода умножается на их число."""
-    if frm == to and frm != "BestChange":
-        return 0.0, ""
-    if frm == "BestChange" and to == "BestChange":   # обменник → твой кошелёк на бирже → другой обменник
-        if netstatus.deposit_ok("Bybit", asset, frm_net) is False:
-            return None, ""                          # на Bybit закрыт ввод в сети первого обменника
-        w = _withdraw(cfg, "Bybit", asset, to_net, qty=qty)
-        if w is None:
-            return None, ""
-        fee, net = w
-        fee *= parts
-        mult = f" ×{parts}" if parts > 1 else ""
-        return fee, f"через Bybit: перевод −{fee:g} {asset} ({net}){mult}"
-    if frm == "BestChange":                          # обменник сам шлёт монету, комиссия в его курсе
-        need = _receive_nets(to, asset)
-        if need and frm_net not in need:
-            return None, ""                          # получатель не принимает сеть обменника (BitPapa: USDT/USDC — только TRC20)
-        if netstatus.deposit_ok(to, asset, frm_net) is False:
-            return None, ""                          # у биржи закрыт ввод в сети обменника
-        return 0.0, f"обменник шлёт {asset} ({frm_net}) на {to}"
-    w = _withdraw(cfg, frm, asset, to_net if to == "BestChange" else "", to, qty=qty)
-    if w is None:
-        return None, ""
-    fee, net = w
-    fee *= parts
-    mult = f" ×{parts}" if parts > 1 else ""
-    cost = f"−{fee:g} {asset}" if fee else f"{asset} без комиссии"
-    return fee, f"перевод {cost}" + (f" ({net})" if net else "") + mult + f" на {to}"
+    fee, label, _ = _hop_detail(cfg, frm, frm_net, to, to_net, asset, qty=qty, parts=parts)
+    return fee, label
 
 
 def _route_qty(b, s, cfg, spot, over_banks=frozenset(), disable=frozenset()):
@@ -980,6 +989,88 @@ def _route(b, s, cfg, spot, over_banks=frozenset()):
     if out_qty is None:
         return None
     return (out_qty * s.price / cfg.amount - 1) * 100, " → ".join(steps)
+
+
+def route_hops(b, s, cfg, spot, over_banks=frozenset()):
+    """Площадки конвертации и сеть+комиссия каждого хопа маршрута — для сухого прогона (paper.start_cycle
+    сохраняет в круге при старте, ROADМАP «межмонетные, часть 2»: стадии transfer/sell смогут проверять
+    реальные хопы вместо повторного подбора площадки/сети). То же ветвление и тот же qty на каждом шаге,
+    что в _route_qty (без disable — реальный расчёт при старте круга), чтобы _hop_detail выбрал ту же сеть.
+    None — маршрут невозможен. Возвращает {"venues": [...], "hops": [{"frm", "frm_net", "to", "to_net",
+    "asset", "fee", "parts"}, ...]}: venues — 0, 1 или 2 площадки конвертации на споте (пусто — одна монета,
+    конвертации нет)."""
+    kind, bank = trades.pay_plan(b.pays, over_banks)
+    pay_fee = cfg.pay_fee
+    if kind == "sbp" and bank in over_banks and pay_fee < trades.SBP_OVER_FEE:
+        pay_fee = trades.SBP_OVER_FEE
+    qty = cfg.amount * (1 - pay_fee / 100) / b.price
+    s_parts = s.parts if s.ex == "BestChange" else 1
+    hops = []
+
+    def hop(frm, frm_net, to, to_net, asset, q, parts=1):
+        fee, _, net = _hop_detail(cfg, frm, frm_net, to, to_net, asset, qty=q, parts=parts)
+        if fee is None:
+            return None
+        hops.append({"frm": frm, "frm_net": frm_net, "to": to, "to_net": net, "asset": asset,
+                     "fee": fee, "parts": parts})
+        return fee
+
+    if b.asset == s.asset:
+        if hop(b.ex, b.net, s.ex, s.net, b.asset, qty, s_parts) is None:
+            return None
+        return {"venues": [], "hops": hops}
+    if "USDT" in (b.asset, s.asset):
+        alt = s.asset if b.asset == "USDT" else b.asset
+        venue = next((v for v in (b.ex, s.ex) + SPOT_VENUES if v in SPOT_VENUES and alt in spot.get(v, {})), None)
+        if not venue:
+            return None
+        fee = hop(b.ex, b.net, venue, "", b.asset, qty)
+        if fee is None:
+            return None
+        qty -= fee
+        bid, ask = spot[venue][alt]
+        sf = _spot_fee(cfg, venue)
+        qty = (qty / ask if b.asset == "USDT" else qty * bid) * (1 - sf / 100)
+        if hop(venue, "", s.ex, s.net, s.asset, qty, s_parts) is None:
+            return None
+        return {"venues": [venue], "hops": hops}
+    venue = next((v for v in (b.ex, s.ex) + SPOT_VENUES
+                  if v in SPOT_VENUES and b.asset in spot.get(v, {}) and s.asset in spot.get(v, {})), None)
+    if venue:
+        bid1, _ = spot[venue][b.asset]
+        _, ask2 = spot[venue][s.asset]
+        fee = hop(b.ex, b.net, venue, "", b.asset, qty)
+        if fee is None:
+            return None
+        qty -= fee
+        sf = _spot_fee(cfg, venue)
+        qty = qty * bid1 * (1 - sf / 100)
+        qty = (qty / ask2) * (1 - sf / 100)
+        if hop(venue, "", s.ex, s.net, s.asset, qty, s_parts) is None:
+            return None
+        return {"venues": [venue], "hops": hops}
+    # ни одна площадка не держит обе пары: конвертация на каждой своей + перевод USDT между ними
+    venue1 = next((v for v in (b.ex,) + SPOT_VENUES if v in SPOT_VENUES and b.asset in spot.get(v, {})), None)
+    venue2 = next((v for v in (s.ex,) + SPOT_VENUES if v in SPOT_VENUES and s.asset in spot.get(v, {})), None)
+    if not venue1 or not venue2 or venue1 == venue2:
+        return None
+    bid1, _ = spot[venue1][b.asset]
+    _, ask2 = spot[venue2][s.asset]
+    fee = hop(b.ex, b.net, venue1, "", b.asset, qty)
+    if fee is None:
+        return None
+    qty -= fee
+    sf1 = _spot_fee(cfg, venue1)
+    qty = qty * bid1 * (1 - sf1 / 100)
+    fee = hop(venue1, "", venue2, "", "USDT", qty)
+    if fee is None:
+        return None
+    qty -= fee
+    sf2 = _spot_fee(cfg, venue2)
+    qty = (qty / ask2) * (1 - sf2 / 100)
+    if hop(venue2, "", s.ex, s.net, s.asset, qty, s_parts) is None:
+        return None
+    return {"venues": [venue1, venue2], "hops": hops}
 
 
 def _match(b, sell_ads, cfg, spot, over_banks=frozenset()):
