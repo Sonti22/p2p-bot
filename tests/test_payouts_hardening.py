@@ -132,8 +132,16 @@ def test_guard_sees_renamed_payout_code_and_pytest_config(tmp_path, monkeypatch)
     ("evil.pth", True), ("site/Evil.PTH", True), ("requirements.txt", True), ("tools/requirements.txt", True),
     ("tests/Conftest.py", True), ("run.bat", True), ("tests/test_launcher_money_gate.py", True),
     ("tests/payout_stubs.py", True), ("tests/test_payout_pins.py", True),
+    # регистр не важен: на Windows LAUNCHER.PY из коммита записался бы поверх launcher.py
+    ("LAUNCHER.PY", True), (".GitHub/workflows/ci.yml", True), ("Scripts/Guard.py", True), ("claude.md", True),
+    ("RUN.BAT", True), (".GITIGNORE", True),
+    # как в launcher: торговый код, локальное состояние, которое merge перезаписал бы, .gitattributes
+    (".gitattributes", True), ("trading/venues.py", True), ("tests/trading/test_risk.py", True),
+    ("paper_Trading.py", True), ("data/keys.json", True), ("logs/approved_shas", True), (".env", True),
+    (".last_good", True), (".dev_status.json", True),
     ("bot.py", False), ("tests/test_bot.py", False), ("tests/helpers.py", False), ("requirements-dev.md", False),
-    ("docs/conftest.md", False), ("pthelper.py", False)])
+    ("docs/conftest.md", False), ("pthelper.py", False), (".env.example", False), ("docs/data/x.md", False),
+    ("trades.py", False)])
 def test_guard_protects_pytest_config_and_python_startup_files_at_any_depth(monkeypatch, path, protected):
     """conftest.py/pytest.ini во вложенной папке, sitecustomize/usercustomize и *.pth (Python выполняет их сам при
     старте), requirements.txt — на любой глубине только вручную: через них тесты выплат выпадали бы или подменялись."""
@@ -142,6 +150,43 @@ def test_guard_protects_pytest_config_and_python_startup_files_at_any_depth(monk
     monkeypatch.setattr(guard, "git", lambda *args: path + "\n" if "--name-only" in args else "")
     assert bool(guard.check("origin/main")) is protected
     assert guard.protected(path) is protected
+
+
+def _answers(bot):
+    return [p.get("text", "") for m, p in bot.out if m == "answerCallbackQuery"]
+
+
+def test_payout_handlers_refuse_non_owner_even_past_routing():
+    """«Только владелец» проверяют сами запиненные обработчики выплат, а не только маршрутизация (on_update,
+    dispatch, handle_guest — не запинены): гость, дошедший до них в обход, получает отказ, ничего не уходит,
+    одноразовая кнопка владельца остаётся рабочей."""
+    bot = owner()
+    token = to_preview(bot)
+    posts = len(bot.s.posts())
+    for data in ("pay_to:w1", f"pay_ok:{token}", "pay_no:" + token, "pay_stop", "pay_hist"):   # мимо on_update
+        run(bot.on_callback({"id": "g", "data": data, "message": {"message_id": 3, "chat": {"id": 42}}}))
+    run(bot.payout_callback({"id": "g", "data": "pay_ok:" + token}, "pay_ok:" + token))   # без message — чей, неясно
+    assert _answers(bot)[-6:] == ["Только для владельца бота"] * 6
+    assert payouts.enabled() and bot.payout_preview["token"] == token and len(bot.s.posts()) == posts
+    guest = B.REPLY_CHAT.set("42")                                  # команда гостя, дошедшая до обработчиков
+    try:
+        out = len(bot.out)
+        run(bot.cmd_payout(""))
+        run(bot.cmd_payout("history"))
+        run(bot.payout_amount("w1", "25"))
+        run(bot.payout_callback({"id": "g", "data": "pay_hist", "message": {"message_id": 3, "chat": {"id": 1}}},
+                                "pay_hist"))
+    finally:
+        B.REPLY_CHAT.reset(guest)
+    new = bot.out[out:]
+    assert [p["text"] for m, p in new if m == "sendMessage"] == [B.GUEST_DENIED] * 2
+    assert [p.get("text") for m, p in new if m == "answerCallbackQuery"] == ["Только для владельца бота"]
+    assert bot.payout_preview["token"] == token and len(bot.s.posts()) == posts
+    async def owner_press():
+        await bot.on_callback({"id": "o", "data": f"pay_ok:{token}", "message": {"message_id": 5, "chat": {"id": 1}}})
+        await bot.payout_task
+    run(owner_press())
+    assert len(bot.s.posts()) == posts + 1                         # владелец отправляет как обычно
 
 
 def test_forged_onboarding_bank_callback_is_ignored():

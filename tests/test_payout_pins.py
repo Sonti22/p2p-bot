@@ -1,7 +1,8 @@
 """Пины зависимостей выплат (защищённый файл, правится только вручную владельцем).
 
 payouts.py и тесты выплат защищены guard и launcher, но выплаты опираются и на код в незащищённых файлах: подпись и
-ключи в accounts.py, чтение JSON в jsonstore.py, запись .env, проверку «владелец или гость» и экраны выплат в bot.py.
+ключи в accounts.py, чтение JSON в jsonstore.py, чтение .env при старте в p2p.py, запись .env, проверку «владелец или
+гость» и экраны выплат в bot.py.
 Здесь — sha256 исходника каждой такой функции и константы (ast.get_source_segment вместе с декораторами, переводы
 строк нормализованы). Любая правка любой из них — красный тест, а значит и смоук launcher: обновление не встанет, пока
 владелец не проверит изменение и не обновит пин. Плюс — кто в accounts.py и payouts.py вообще может слать POST.
@@ -16,6 +17,7 @@ import pytest
 import accounts
 import bot as B
 import jsonstore
+import p2p
 import payouts
 
 HOW_TO_UPDATE = (
@@ -46,13 +48,18 @@ PINS = {
     "jsonstore": {
         "read_dict": "5a8483b471a9d1a2a28086bfb5be90a1f2ffabd41f069b256d8712fa6c2db609",
     },
+    "p2p": {   # чтение .env при старте бота: от него зависит, что PAYOUTS=0 от launcher дойдёт до процесса
+        "ENV_PATH": "b798b14e84cc4dc7fb9a2a071f5738cb7ad4e90e60e2c599be38012c46f27391",
+        "HERE": "23b6448daffea6947fa94a8eeb3549908f2d11dfd93427a81564c4f1c6f23726",
+        "load_env": "fd47832c89bca7a4b7076c3c7aa28e5b08ed6a92e4820ecd4230b3a3afbcf600",
+    },
     "bot": {
         "Bot._owner_gate": "791b619f4d5e5c423537f02c7d737b3b1015cf7a593c2918c59698bc68b8d307",
-        "Bot.cmd_payout": "902905b64fb7b57caf4a63b0ef948201698346855e343d5e6003d835aa3dab1b",
+        "Bot.cmd_payout": "2ae4aa84ef8550ce13d865bfbca73263f1e3367186ea874cb029687389490403",
         "Bot.is_guest": "6ec5bae4210f98d830738dd39b2a4af415903dc282cec6b7491d6afc5236ddff",
         "Bot.on_guest_callback": "b07a402c731d1cd1caece87305842e5dd9a77760512a5ace172923d5bf47330d",
-        "Bot.payout_amount": "3dc797220f1f7fb10a9d8bfbfd4dafc106db61ae4294caa757356c7d5e8c346c",
-        "Bot.payout_callback": "e5a6dab9d6091c90debbad53324ab41f91e957278470e49378518a4ed6af5b60",
+        "Bot.payout_amount": "21359a591d61369ae8c9c1705eb2e31165418d816ec296360da0d06d59efca0d",
+        "Bot.payout_callback": "44e229587f144ff556f5ff6bf0107d36531a3060e94e4925fc513b2fc54ddbe9",
         "Bot.payout_confirm": "26995ae3ff79a4633d1133e2302c4141734f31c4e4b6c17bd2cfc1fa2bbedd2a",
         "Bot.payout_pick": "3951617dc74926cd7e9f6140e8612f408ebce2e347c88b14ba46b4e6735749ce",
         "Bot.payout_send": "373d2f464362e2f005ce26e7719fdbe1705599ed8d43a203089edd6d22524fb9",
@@ -78,7 +85,7 @@ PINS = {
         "save_env": "6cc5a56e2078e62bb5489c04208d803690bee7209b0d156059911b3f217f9527",
     },
 }
-MODULES = {"accounts": accounts, "jsonstore": jsonstore, "bot": B}
+MODULES = {"accounts": accounts, "jsonstore": jsonstore, "p2p": p2p, "bot": B}
 
 
 def _source(mod):
@@ -212,12 +219,16 @@ def test_pinned_names_bound_once_and_live(mod_name):
             assert live == expected, f"{mod_name}.{name}: значение в памяти не совпадает с исходником"
 
 
+def _fake_module(tmp_path, text):
+    path = tmp_path / "fake.py"
+    path.write_bytes(text.encode("utf-8"))
+    return type("M", (), {"__file__": str(path)})
+
+
 def test_pin_checks_see_rebinding_decorators_and_new_names(tmp_path):
     """Сама проверка пинов: вторая привязка имени, новый декоратор, CRLF и новая функция payout_* в bot.py."""
     def fake(text):
-        path = tmp_path / "fake.py"
-        path.write_bytes(text.encode("utf-8"))
-        return type("M", (), {"__file__": str(path)})
+        return _fake_module(tmp_path, text)
 
     base = "def save_env(k, v):\n    return 1\n"
     src = _source(fake(base))
@@ -237,17 +248,35 @@ def test_pin_checks_see_rebinding_decorators_and_new_names(tmp_path):
     assert "payouts" not in _pinned_names("bot", names4)
 
 
+SEND_METHODS = ("post", "put", "delete", "patch", "request", "_request")
+# поиск метода по имени-строке: getattr(s, "post"), s.__getattribute__("post"), operator.methodcaller("post")…
+DYNAMIC_LOOKUP = ("getattr", "__getattribute__", "attrgetter", "methodcaller")
+
+
 def _senders(mod):
-    """Имена функций модуля (или <module>/<lambda>), в которых есть вызов .post/.put/.delete/.patch/.request."""
+    """Имена функций модуля (или <module>/<lambda>), которые могут отправить POST/PUT/DELETE/PATCH: любое обращение
+    к атрибуту .post/.put/.delete/.patch/.request/._request (вызов, псевдоним op = s.post, functools.partial(s.post))
+    и поиск метода по имени — getattr/__getattribute__/attrgetter/methodcaller с таким именем строкой или с именем,
+    которое вычисляется (не строка). Нарочно запутанный код (exec, vars(...)["po" + "st"]) этим не поймать — это
+    остаточный риск из ROADMAP; здесь — всё, что пишется без умысла спрятать."""
     found = set()
+
+    def dynamic(call):
+        func = call.func
+        name = func.attr if isinstance(func, ast.Attribute) else func.id if isinstance(func, ast.Name) else ""
+        if name not in DYNAMIC_LOOKUP:
+            return False
+        args = call.args[1:2] if name in ("getattr",) else call.args[:1]
+        return any(not (isinstance(a, ast.Constant) and isinstance(a.value, str))
+                   or a.value.lower() in SEND_METHODS for a in args) or not args
 
     def visit(node, where):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             where = node.name
         elif isinstance(node, ast.Lambda):
             where = "<lambda>"
-        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-                and node.func.attr in ("post", "put", "delete", "patch", "request", "_request")):
+        if (isinstance(node, ast.Attribute) and node.attr in SEND_METHODS
+                or isinstance(node, ast.Call) and dynamic(node)):
             found.add(where)
         for child in ast.iter_child_nodes(node):
             visit(child, where)
@@ -262,3 +291,41 @@ def test_only_known_senders_of_state_changing_requests():
     assert _senders(accounts) == {"bybit_post", "cryptomus_call"}
     assert _senders(payouts) == {"payout_call"}
     assert accounts.BYBIT_POST_PATHS == frozenset({"/v5/p2p/order/simplifyList"})
+
+
+@pytest.mark.parametrize("body", [
+    "def f(s):\n    return s.post('u')\n",
+    "def f(s):\n    op = s.post\n    return op('u')\n",                       # псевдоним метода
+    "import functools\ndef f(s):\n    return functools.partial(s.request, 'POST')('u')\n",
+    "def f(s):\n    return getattr(s, 'post')('u')\n",                       # имя метода строкой
+    "def f(s):\n    return getattr(s, 'POST'.lower())('u')\n",               # имя метода вычисляется
+    "def f(s, m):\n    return getattr(s, m)('u')\n",
+    "def f(s):\n    return s.__getattribute__('post')('u')\n",
+    "import operator\ndef f(s):\n    return operator.methodcaller('post', 'u')(s)\n",
+    "import operator\ndef f(s):\n    return operator.attrgetter('put')(s)('u')\n",
+])
+def test_senders_see_aliases_and_dynamic_lookup(tmp_path, body):
+    """Отправитель виден и без прямого вызова s.post(...): псевдоним, partial, getattr/__getattribute__,
+    operator.methodcaller/attrgetter — иначе новая незапиненная функция в accounts.py слала бы POST незаметно."""
+    assert _senders(_fake_module(tmp_path, body)) == {"f"}
+
+
+def test_senders_ignore_plain_reads(tmp_path):
+    body = ("def f(s, d):\n    x = getattr(d, 'name', None)\n    return s.get('u'), d.get('post'), x\n"
+            "def g(s):\n    return s.request_info\n")
+    assert _senders(_fake_module(tmp_path, body)) == set()
+
+
+def test_bot_main_takes_payouts_switch_from_env_file():
+    """bot.main: сначала load_env(), затем payouts.switch_from_file(ENV_PATH) — оба верхним уровнем тела main (не под
+    if/try), и именно main запускается из __main__. Без этого PAYOUTS=1 из окружения Windows пережил бы PAYOUTS=0,
+    записанный launcher в .env после обновления (launcher такое окружение боту и не передаёт — это второй рубеж)."""
+    tree = ast.parse(_source(B))
+    mains = [n for n in tree.body if isinstance(n, ast.AsyncFunctionDef) and n.name == "main"]
+    assert len(mains) == 1 and len(_names_of(B)[1]["main"]) == 1
+    calls = [ast.unparse(s.value) for s in mains[0].body if isinstance(s, ast.Expr) and isinstance(s.value, ast.Call)]
+    assert "load_env()" in calls and "payouts.switch_from_file(ENV_PATH)" in calls
+    assert calls.index("load_env()") < calls.index("payouts.switch_from_file(ENV_PATH)")
+    entry = [n for n in tree.body if isinstance(n, ast.If) and "__main__" in ast.unparse(n.test)]
+    assert len(entry) == 1 and [ast.unparse(s) for s in entry[0].body] == ["asyncio.run(main())"]
+    assert B.load_env is p2p.load_env and B.ENV_PATH == p2p.ENV_PATH

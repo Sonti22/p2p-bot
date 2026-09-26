@@ -3117,7 +3117,11 @@ class Bot:
             await self.send(GUIDE if REPLY_CHAT.get() is not None else OWNER_GUIDE, markup=LINKS)
 
     async def cmd_payout(self, arg):
-        """/payout — выплата Cryptomus на адрес из белого списка; /payout history — последние 10 выплат."""
+        """/payout — выплата Cryptomus на адрес из белого списка; /payout history — последние 10 выплат.
+        Только владелец: команда гостя (REPLY_CHAT задан) — отказ здесь же, а не только в dispatch."""
+        if REPLY_CHAT.get() is not None:
+            await self.send(GUEST_DENIED)
+            return
         if arg.strip().lower() in ("history", "история"):
             await self.send(payout_history_view(payouts.history(10), payouts.used_today(), payouts.limits()[1]))
             return
@@ -3149,7 +3153,12 @@ class Bot:
 
     async def payout_callback(self, cq, data):
         """Кнопки выплат: pay_to:<id> — получатель из белого списка, pay_ok/pay_no:<токен> — кнопки предпросмотра,
-        pay_hist — история, pay_stop — выключить выплаты."""
+        pay_hist — история, pay_stop — выключить выплаты. Только чат владельца (_owner_gate) и не в контексте гостя —
+        проверка здесь же, а не только в маршрутизации on_update."""
+        chat = str((cq.get("message") or {}).get("chat", {}).get("id", ""))
+        if REPLY_CHAT.get() is not None or self._owner_gate(chat) != "owner":
+            await self.call("answerCallbackQuery", callback_query_id=cq["id"], text="Только для владельца бота")
+            return
         kind, _, arg = data.partition(":")
         if kind == "pay_stop":
             err = self.payout_stop()
@@ -3181,7 +3190,10 @@ class Bot:
                         f"Получатель получит ровно эту сумму, комиссия Cryptomus спишется с баланса сверху.")
 
     async def payout_amount(self, eid, text):
-        """Сумма выплаты текстом -> живая комиссия и лимиты (payouts.quote) -> экран проверки с одноразовой кнопкой."""
+        """Сумма выплаты текстом -> живая комиссия и лимиты (payouts.quote) -> экран проверки с одноразовой кнопкой.
+        Только владелец: в контексте гостя (REPLY_CHAT) — ничего."""
+        if REPLY_CHAT.get() is not None:
+            return
         amount, why = payouts.parse_amount(text)
         if why:
             self.awaiting_payout = eid   # ждём сумму дальше; любая команда или кнопка — отмена

@@ -30,8 +30,13 @@ python cards.py    # перерисовать аватарки
    бот на ПК подтянет обновление через launcher.
 6. Очередь пуста — добавить 3 обоснованные идеи в «Идеи» и запушить только `ROADMAP.md`.
 
-Защищённые файлы (не менять — guard блокирует автомерж): `.github/`, `scripts/guard.py`, `launcher.py`, `CLAUDE.md`, `.gitignore`,
-`payouts.py`, `scripts/payout_whitelist.py`, `tests/test_payouts.py`. Guard блокирует и любую добавленную/удалённую
+Защищённые пути (не создавать, не менять и не удалять — guard блокирует автомерж, launcher на ПК без подтверждения
+владельца не ставит; регистр букв не важен): `.github/`, `scripts/guard.py`, `launcher.py`, `run.bat`, `CLAUDE.md`,
+`.gitignore`, `.gitattributes`, `payouts.py`, `scripts/payout_whitelist.py`, `tests/trading/`,
+`tests/test_launcher_money_gate.py`, `data/`, `logs/`, `.env`, `.last_good`, `.dev_status.json`; любой путь со словом
+`payout` или `trading` (tests/test_payouts.py, tests/payout_stubs.py, paper_trading.py…); на любой глубине —
+`conftest.py`, `pytest.ini`, `pyproject.toml`, `setup.cfg`, `tox.ini`, `sitecustomize.py`, `usercustomize.py`,
+`requirements.txt`, `*.pth`. Новые файлы называть без этих слов. Guard блокирует и любую добавленную/удалённую
 строку с `payout`/`PAYOUT`/`pay_to|ok|no|hist|stop` в других файлах (bot.py, accounts.py, .env.example…).
 Guard также блокирует: новые домены в коде, `subprocess`/`os.system`/`eval`/`exec`, браузерную и UI-автоматизацию, секреты.
 
@@ -55,3 +60,5 @@ Guard также блокирует: новые домены в коде, `subpr
 каждой выплаты кнопкой. Автовыплат, переводов между кошельками, конвертаций и торговли нет и не будет.
 Launcher на ПК после каждого обновления кода переписывает PAYOUTS и TRADING в .env в 0 (включает снова только владелец), а
 обновление с защищёнными путями (список зашит в launcher.py) ставит только после `python launcher.py --approve <sha>` на ПК.
+Обработчики выплат в bot.py сами проверяют, что это владелец; после подтверждённого обновления launcher.py launcher
+перезапускается сам.

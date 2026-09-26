@@ -17,8 +17,13 @@
 - обновление, меняющее защищённые пути (список PROTECTED_* зашит здесь, из репозитория не читается), не ставится,
   пока владелец не подтвердит ровно этот коммит на ПК: python launcher.py --approve <sha> (sha → logs/approved_shas);
   до того работает прежняя версия, уведомление — один раз на sha;
-- после каждого обновления кода (не только .md) PAYOUTS и TRADING в .env переписываются в 0 — деньги включает снова
-  только владелец на ПК; .env не записать — обновление не ставится (прежняя версия работает дальше).
+- при каждом обновлении кода (не только .md) PAYOUTS и TRADING в .env переписываются в 0 — деньги включает снова
+  только владелец на ПК: до merge (launcher, убитый посреди обновления, не оставит новый код с включёнными деньгами)
+  и ещё раз после остановки старого бота (его save_env мог дописать .env поверх); .env не записать — обновление не
+  ставится (прежняя версия работает дальше). Из окружения launcher бот получает PAYOUTS/TRADING только «0»:
+  включить деньги может только .env;
+- подтверждённое обновление launcher.py: launcher останавливает бота и выходит, run.bat через 15 с поднимает новый —
+  иначе новые правила барьера работали бы только после ручного перезапуска.
 """
 import json
 import os
@@ -55,7 +60,8 @@ _lock_fd = None   # дескриптор замка держим открыты�
 # LAUNCHER.PY из коммита записался бы поверх launcher.py). Список — только здесь, а не в репозитории: иначе обновление
 # могло бы само себя «разрешить». Кроме CI, guard, выплат и торгового кода — run.bat (cmd выполняет его, перечитывая
 # на ходу) и локальное состояние: git merge молча перезаписывает игнорируемые файлы, если коммит добавит их в git
-# (.env, data/ с ключами и белым списком, logs/ с approved_shas, .last_good).
+# (.env, data/ с ключами и белым списком, logs/ с approved_shas, .last_good). scripts/guard.py держит тот же список
+# (tests/test_launcher_money_gate.py сверяет оба направления), чтобы CI не вливал то, что launcher потом не поставит.
 PROTECTED_PREFIXES = (".github/", "launcher.py", "run.bat", "scripts/guard.py", "claude.md", ".gitignore",
                       ".gitattributes", "payouts.py", "scripts/payout_whitelist.py", "tests/trading/",
                       "tests/test_launcher_money_gate.py", "data/", "logs/")
@@ -67,6 +73,8 @@ APPROVED_PATH = os.path.join(HERE, "logs", "approved_shas")   # sha, подтв�
 MONEY_KEYS = ("PAYOUTS", "TRADING")
 MONEY_OFF_NOTE = ("💸 Выплаты/торговля выключены после обновления {sha}: проверь изменения и включи на ПК "
                   "(PAYOUTS=1 / TRADING=1 в .env)")
+USAGE = ("Запуск: python launcher.py                 — бот с автообновлением (обычно через run.bat)\n"
+         "        python launcher.py --approve <sha>  — подтвердить обновление с защищёнными файлами")
 
 
 def _mask(text):
@@ -228,7 +236,18 @@ def approve(arg):
         print(f"Не смог записать {APPROVED_PATH}: {e}")
         return 2
     log(f"владелец подтвердил обновление {sha}")
-    print(f"Подтверждено: {sha}. Launcher поставит это обновление при следующей проверке (раз в UPDATE_EVERY сек).")
+    try:   # вершина main по последнему fetch работающего launcher — без сети
+        tip = git("rev-parse", "--verify", "--quiet", "origin/main^{commit}", check=False).lower()
+    except RuntimeError:
+        tip = ""
+    if re.fullmatch(r"[0-9a-f]{40}", tip) and tip != sha:
+        # launcher ставит только вершину main, а подтверждение действует ровно на свой коммит
+        print(f"Записал подтверждение {sha}, но main на GitHub уже на {tip} (по последней проверке launcher), а "
+              f"launcher ставит только вершину main — этот коммит отдельно он не поставит. Проверь изменения до "
+              f"вершины и подтверди её: python launcher.py --approve {tip}")
+    else:
+        print(f"Подтверждено: {sha}. Launcher поставит это обновление при следующей проверке (по умолчанию — "
+              f"в течение 5 минут).")
     return 0
 
 
@@ -304,9 +323,17 @@ def smoke():
     return r.returncode == 0, out[-500:], r.returncode != 0 and any(m in out for m in TRANSIENT)
 
 
+def bot_env():
+    """Окружение бота: всё окружение launcher, но PAYOUTS/TRADING (имя без учёта регистра) — только со значением «0».
+    Включить деньги может только .env (его launcher выключает при каждом обновлении кода), а не переменная Windows
+    или родительского процесса: иначе PAYOUTS=1 из окружения пережил бы PAYOUTS=0 в .env (load_env — setdefault),
+    стоит обновлению убрать из bot.main вызов payouts.switch_from_file."""
+    return {k: v for k, v in os.environ.items() if k.upper() not in MONEY_KEYS or v.strip() == "0"}
+
+
 def start_bot():
     """Процесс бота; в тестах подменяется."""
-    return subprocess.Popen([sys.executable, "bot.py"], cwd=HERE)
+    return subprocess.Popen([sys.executable, "bot.py"], cwd=HERE, env=bot_env())
 
 
 def stop(proc):
@@ -430,6 +457,8 @@ class Launcher:
         self.minutes_warned = ("", 0)   # (год-месяц, старший порог %, о котором уже предупредили)
         self.asked_approval = set()     # sha с защищёнными файлами, о которых владельцу уже написали
         self.money_failed = set()       # sha, не поставленные из-за незаписанного .env, — о них уже написали
+        self.money_noted = set()        # sha, о выключении денег при которых уже написали
+        self.pending = None             # (прежний HEAD, новый sha, файлы): поставлено, новый бот ещё не запущен
 
     def check_prs(self):
         """Открытые PR = автомерж не прошёл (тесты/guard) — сообщить один раз со ссылкой."""
@@ -515,13 +544,19 @@ class Launcher:
                        f"работает прежняя версия {head[:7]}:\n{shown}\n\nПроверь изменения (git diff {head[:7]} "
                        f"{remote[:7]}) и подтверди на ПК:\npython launcher.py --approve {remote}")
             return False
+        docs_only = bool(files) and all(f.endswith(".md") for f in files)
+        # деньги — до merge: launcher, убитый между merge и концом смоука, при следующем старте запустил бы новый код
+        # (HEAD уже равен origin/main — обновлять «нечего») с включёнными деньгами. Не прошёл смоук — деньги всё равно
+        # выключены, это безопасная сторона. .env не записать — не ставим вовсе
+        if not docs_only and not self.money_off_for(head, remote):
+            return False
         try:   # ровно на проверенный sha: pull сходил бы в origin заново и мог принести ещё не проверенный коммит
             git("merge", "--ff-only", "--quiet", remote)
         except RuntimeError as e:
             notify(f"⚠️ Не смог обновиться (ветки разошлись): {e}")
             self.bad.add(remote)
             return False
-        if files and all(f.endswith(".md") for f in files):   # код не менялся: ни смоука, ни перезапуска бота
+        if docs_only:   # код не менялся: ни смоука, ни перезапуска бота
             log(f"только документация ({remote[:7]}): {', '.join(files)[:200]}")
             try:   # бот работает дальше: рабочая версия — новая, иначе откат при падениях «вернул» бы тот же код
                    # со старыми .md и забраковал бы этот коммит
@@ -542,10 +577,26 @@ class Launcher:
             self.bad.add(remote)
             notify(f"⚠️ Обновление {remote[:7]} не прошло проверку — оставил {head[:7]}.\n{err}")
             return False
-        try:   # новый код стартует только с выключенными деньгами; .env не записать — не стартует вовсе
-            money = money_off(os.path.join(HERE, ".env"))
+        done, total, nxt = roadmap_progress()
+        notify(f"🔄 Бот обновился до {remote[:7]}\n\nЧто нового:\n" + "\n".join(changes)
+               + (f"\n\n📋 ROADMAP: сделано {done} из {total}" if total else "")
+               + (f"\n➡️ Дальше: {nxt}" if nxt else "")
+               + f"\n\n{repo_url()}/commits/main"
+               + ("\n\n⚠️ Изменён run.bat — закрой окно launcher и запусти run.bat заново вручную: cmd читает его с "
+                  "диска по ходу выполнения, сам launcher его безопасно не перезапустит."
+                  if any(f.lower() == "run.bat" for f in files) else ""))
+        self.pending = (head, remote, files)   # остальное — в after_update, когда старый бот уже остановлен
+        return True
+
+    def money_off_for(self, head, remote):
+        """PAYOUTS/TRADING → 0 перед новым кодом remote. True — выключены (или уже были выключены); False — .env не
+        записать: новый код не ставить. Сообщение владельцу — одно на sha и то и другое."""
+        try:
+            if money_off(os.path.join(HERE, ".env")) and remote not in self.money_noted:
+                self.money_noted.add(remote)
+                notify(MONEY_OFF_NOTE.format(sha=remote[:7]))
+            return True
         except OSError as e:
-            git("reset", "--hard", head)   # в bad не кладём: починят .env — поставим при следующей проверке
             if remote not in self.money_failed:
                 self.money_failed.add(remote)
                 notify(f"🚨 Не смог выключить выплаты/торговлю в .env ({type(e).__name__}: {e}) — обновление "
@@ -554,14 +605,25 @@ class Launcher:
             else:
                 log(f"{remote[:7]}: .env по-прежнему не записать ({type(e).__name__}) — обновление не ставлю")
             return False
-        done, total, nxt = roadmap_progress()
-        notify(f"🔄 Бот обновился до {remote[:7]}\n\nЧто нового:\n" + "\n".join(changes)
-               + (f"\n\n📋 ROADMAP: сделано {done} из {total}" if total else "")
-               + (f"\n➡️ Дальше: {nxt}" if nxt else "")
-               + f"\n\n{repo_url()}/commits/main")
-        if money:
-            notify(MONEY_OFF_NOTE.format(sha=remote[:7]))
-        return True
+
+    def after_update(self):
+        """Обновление поставлено, старый бот уже остановлен, новый ещё не запущен. Деньги — ещё раз в 0: пока шёл
+        смоук, старый бот мог дописать .env своим save_env (прочитал файл до money_off) и вернуть PAYOUTS=1. .env не
+        записать — откат на прежний коммит: новый код с включёнными деньгами не стартует (в bad не кладём — починят
+        .env, поставим при следующей проверке). → True — обновился launcher.py: выйти из run(), run.bat поднимет
+        новый launcher, иначе новые правила барьера работали бы только после ручного перезапуска."""
+        if not self.pending:
+            return False
+        head, remote, files = self.pending
+        self.pending = None
+        if not self.money_off_for(head, remote):
+            git("reset", "--hard", head)
+            return False
+        if any(f.lower() == "launcher.py" for f in files):
+            notify(f"🔁 launcher.py обновлён ({remote[:7]}) — перезапускаю launcher: run.bat поднимет новый через 15 с "
+                   "(если launcher запущен не через run.bat — запусти python launcher.py вручную).")
+            return True
+        return False
 
     def rollback(self):
         head = git("rev-parse", "HEAD")
@@ -577,11 +639,21 @@ class Launcher:
         every = int(env_value("UPDATE_EVERY", "300"))
         kill_orphan()
         try:
-            self.try_update()
+            updated = self.try_update()
         except Exception as e:
             log(f"ошибка первой проверки: {type(e).__name__}: {e}")
+            updated = False
         crashes, last_check = 0, time.time()
         while True:
+            if updated:   # старый бот остановлен (или ещё не запускался): деньги ещё раз в 0, обновился ли launcher
+                updated = False
+                try:
+                    if self.after_update():
+                        log("launcher.py обновлён — выхожу, run.bat запустит новый launcher")
+                        return
+                except Exception as e:   # откат не удался — не запускать бота на непроверенном состоянии .env
+                    log(f"ошибка после обновления: {type(e).__name__}: {e}")
+                    raise
             started = time.time()
             write_dev_status()
             try:   # версию — до запуска: таймаут git после Popen оставил бы бота без присмотра
@@ -635,8 +707,12 @@ class Launcher:
 
 
 def main(argv):
-    if argv[:1] == ["--approve"]:   # подтверждение владельца: записать sha и выйти, цикл не запускается
-        return approve(argv[1] if len(argv) > 1 else "")
+    if argv:   # только --approve <sha> или --approve=<sha>; опечатка не должна молча запускать второй цикл и бота
+        flag, eq, value = argv[0].partition("=")
+        if flag == "--approve" and len(argv) <= (1 if eq else 2):   # записать sha и выйти, цикл не запускается
+            return approve(value if eq else (argv[1] if len(argv) > 1 else ""))
+        print(USAGE)
+        return 2
     if not acquire_lock():   # замок — до kill_orphan в run(): второй launcher не должен трогать бота первого
         log("launcher уже запущен в другом окне — выхожу")
         return 3

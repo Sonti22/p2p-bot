@@ -6,14 +6,24 @@ python launcher.py --approve <sha> на ПК. CI на GitHub запускает 
 Настоящие git, pytest и Telegram не трогаем: подменяются git, smoke, notify; все пути — во временной папке."""
 import importlib.util
 import os
+import time
 from types import SimpleNamespace
 
 import pytest
 
 import launcher
+import p2p
 import payouts
 
 HEAD, R1, R2 = "a" * 40, "b" * 40, "c" * 40
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _load_guard():
+    spec = importlib.util.spec_from_file_location("guard_script", os.path.join(ROOT, "scripts", "guard.py"))
+    guard = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(guard)
+    return guard
 
 
 @pytest.fixture
@@ -155,7 +165,8 @@ def test_code_update_switches_money_off_once(gate, files):
     lau = launcher.Launcher()
     assert lau.try_update() is True and gate.head == R1 and gate.smoked == 1
     assert gate.env.read_bytes() == b"TG_CHAT_ID=42\nPAYOUTS=0\r\nTRADING=0\n"
-    assert gate.notes[0].startswith("🔄") and gate.money_notes() == [money_note(R1)]
+    assert gate.money_notes() == [money_note(R1)] and gate.notes[-1].startswith("🔄")
+    assert gate.git.index(f"merge --ff-only --quiet {R1}") > 0 and gate.notes[0] == money_note(R1)   # выключены до merge
     gate.github = R2                                                # следующее обновление: деньги уже выключены
     assert lau.try_update() is True and gate.head == R2
     assert gate.money_notes() == [money_note(R1)]                   # сообщение — одно, только когда выключили
@@ -169,8 +180,9 @@ def test_code_update_without_money_lines_no_money_note(gate):
 
 @pytest.mark.parametrize("blocker", ["tmp", "env"])
 def test_unwritable_env_update_not_applied(gate, blocker):
-    """.env не записать (или не прочитать) — новый код не стартует: откат на прежний коммит, громкое сообщение
-    один раз; коммит не бракуется — починят .env, и следующая проверка его поставит."""
+    """.env не записать (или не прочитать) — обновление не ставится вовсе: деньги выключаются до merge, так что
+    новый код не оказывается на диске при включённых деньгах; громкое сообщение один раз; коммит не бракуется —
+    починят .env, и следующая проверка его поставит."""
     if blocker == "tmp":
         gate.env.write_bytes(b"PAYOUTS=1\n")
         (gate.env.parent / ".env.money-off.tmp").mkdir()
@@ -178,15 +190,42 @@ def test_unwritable_env_update_not_applied(gate, blocker):
         gate.env.mkdir()                                            # .env — папка: open() падает с OSError
     lau = launcher.Launcher()
     assert lau.try_update() is False
-    assert gate.head == HEAD and f"reset --hard {HEAD}" in gate.git and R1 not in lau.bad
+    assert not gate.merged() and gate.smoked == 0 and gate.head == HEAD and R1 not in lau.bad
     assert len(gate.notes) == 1 and gate.notes[0].startswith("🚨") and "НЕ ставлю" in gate.notes[0]
     assert R1[:7] in gate.notes[0] and HEAD[:7] in gate.notes[0] and not gate.money_notes()
-    assert lau.try_update() is False and gate.smoked == 2 and gate.head == HEAD
+    assert lau.try_update() is False and not gate.merged() and gate.head == HEAD
     assert len(gate.notes) == 1                                     # без спама на каждой проверке
     if blocker == "tmp":
         (gate.env.parent / ".env.money-off.tmp").rmdir()
-        assert lau.try_update() is True and gate.head == R1
+        assert lau.try_update() is True and gate.head == R1 and gate.smoked == 1
         assert gate.env.read_bytes() == b"PAYOUTS=0\n" and gate.money_notes() == [money_note(R1)]
+
+
+def test_money_off_before_merge_even_if_smoke_fails(gate):
+    """Деньги выключаются до merge, поэтому и при проваленном смоуке они уже выключены (прежняя версия работает,
+    включит снова владелец) — и владелец об этом знает."""
+    gate.env.write_bytes(b"PAYOUTS=1\n")
+    gate.smokes = [(False, "FAILED tests/test_x.py::test_a", False)]
+    lau = launcher.Launcher()
+    assert lau.try_update() is False and gate.head == HEAD and R1 in lau.bad
+    assert gate.env.read_bytes() == b"PAYOUTS=0\n" and gate.money_notes() == [money_note(R1)]
+    assert gate.notes[-1].startswith("⚠️ Обновление")
+
+
+def test_crash_between_merge_and_smoke_leaves_money_off(gate, monkeypatch):
+    """Launcher убит после merge, пока шёл смоук (закрыли окно, перезагрузка): новый launcher видит HEAD == origin/main,
+    обновлять нечего — и бот стартует на новом коде. К этому моменту деньги уже должны быть выключены."""
+    gate.env.write_bytes(b"PAYOUTS=1\nTRADING=1\n")
+
+    def killed():
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(launcher, "smoke", killed)
+    with pytest.raises(KeyboardInterrupt):
+        launcher.Launcher().try_update()
+    assert gate.head == R1
+    assert launcher.Launcher().try_update() is False              # после перезапуска: обновлять нечего
+    assert gate.env.read_bytes() == b"PAYOUTS=0\nTRADING=0\n"
 
 
 def test_docs_only_update_unchanged(gate):
@@ -197,6 +236,151 @@ def test_docs_only_update_unchanged(gate):
     assert gate.head == R1 and gate.smoked == 0 and gate.merged()
     assert gate.env.read_bytes() == b"PAYOUTS=1\nTRADING=1\n"
     assert gate.notes == [f"📝 Обновлена документация ({R1[:7]}), бот не перезапускал"]
+
+
+# --- run(): между остановкой старого бота и запуском нового ---
+
+class Stop(Exception):
+    """Выход из бесконечного цикла run() в тесте."""
+
+
+class Proc:
+    pid = 4242
+
+    def __init__(self, st):
+        self.st, self.returncode = st, None
+
+    def poll(self):
+        return self.returncode
+
+    def terminate(self):
+        self.st.events.append("stop")
+        if self.st.on_stop:                     # то, что успел сделать старый бот, пока его останавливали
+            self.st.on_stop()
+            self.st.on_stop = None
+        self.returncode = 15
+
+    def wait(self, timeout=None):
+        return self.returncode
+
+    def kill(self):
+        self.returncode = 9
+
+
+@pytest.fixture
+def loop(gate, monkeypatch, tmp_path):
+    """run() на модели gate: запуск бота пишет в gate.events версию и .env на этот момент, остановка — "stop".
+    Первая проверка при старте launcher ничего не находит, R1 появляется на GitHub на первом sleep; sleep номер
+    gate.stop_at бросает Stop."""
+    gate.github, gate.events, gate.sleeps, gate.stop_at, gate.on_stop = HEAD, [], 0, 2, None
+
+    def start():
+        gate.events.append(("start", gate.head, gate.env.read_bytes() if gate.env.is_file() else None))
+        return Proc(gate)
+
+    def sleep(sec):
+        gate.sleeps += 1
+        if gate.sleeps == 1:
+            gate.github = R1
+        if gate.sleeps >= gate.stop_at:
+            raise Stop
+
+    monkeypatch.setattr(launcher, "start_bot", start)
+    monkeypatch.setattr(launcher, "time", SimpleNamespace(time=time.time, strftime=time.strftime, sleep=sleep))
+    monkeypatch.setattr(launcher, "kill_orphan", lambda: None)
+    monkeypatch.setattr(launcher, "write_pid", lambda pid: None)
+    monkeypatch.setattr(launcher, "PID_FILE", str(tmp_path / "bot.pid"))
+    monkeypatch.setattr(launcher, "env_value", lambda key, default="": "-1" if key == "UPDATE_EVERY" else default)
+    monkeypatch.setattr(launcher.Launcher, "check_prs", lambda self: None)
+    monkeypatch.setattr(launcher.Launcher, "check_minutes", lambda self: None)
+    gate.runs = lambda: [e if e == "stop" else e[:2] for e in gate.events]
+    return gate
+
+
+def test_money_rechecked_after_old_bot_stopped(loop):
+    """Старый бот работает, пока идёт смоук; его save_env (прочитал .env до money_off) может дописаться позже и
+    вернуть PAYOUTS=1. Перед запуском нового кода, уже после остановки старого бота, деньги выключаются ещё раз."""
+    loop.env.write_bytes(b"PAYOUTS=1\nTRADING=1\n")
+    loop.on_stop = lambda: loop.env.write_bytes(b"PAYOUTS=1\nTRADING=1\nTG_CHAT_ID=42\n")
+    with pytest.raises(Stop):
+        launcher.Launcher().run()
+    assert loop.runs() == [("start", HEAD), "stop", ("start", R1), "stop"]
+    assert loop.events[2][2] == b"PAYOUTS=0\nTRADING=0\nTG_CHAT_ID=42\n"
+    assert loop.money_notes() == [money_note(R1)]                   # одно сообщение на обновление
+
+
+def test_env_unwritable_right_before_new_bot_keeps_old_version(loop):
+    """Перед запуском нового кода .env не записать, а в нём снова PAYOUTS=1 — новый код не стартует: откат на
+    прежний коммит, работает прежняя версия; коммит не бракуется, сообщение одно."""
+    loop.env.write_bytes(b"PAYOUTS=1\n")
+
+    def old_bot_write():
+        loop.env.write_bytes(b"PAYOUTS=1\n")
+        (loop.env.parent / ".env.money-off.tmp").mkdir()
+
+    loop.on_stop = old_bot_write
+    lau = launcher.Launcher()
+    with pytest.raises(Stop):
+        lau.run()
+    assert loop.runs() == [("start", HEAD), "stop", ("start", HEAD), "stop"]
+    assert f"reset --hard {HEAD}" in loop.git and R1 not in lau.bad and R1 in lau.money_failed
+    alarms = [n for n in loop.notes if n.startswith("🚨")]
+    assert len(alarms) == 1 and "НЕ ставлю" in alarms[0] and R1[:7] in alarms[0] and HEAD[:7] in alarms[0]
+
+
+@pytest.mark.parametrize("name", ["launcher.py", "LAUNCHER.PY"])
+def test_launcher_update_restarts_launcher_itself(loop, name):
+    """Барьер живёт в самом launcher.py: подтверждённое обновление launcher.py не должно остаться без действия до
+    ручного перезапуска. Старый launcher останавливает бота, выключает деньги и выходит — run.bat поднимет новый."""
+    loop.files = ["bot.py", name]
+    loop.env.write_bytes(b"PAYOUTS=1\n")
+    loop.approved.parent.mkdir()
+    loop.approved.write_text(R1 + "\n", encoding="utf-8")
+    assert launcher.Launcher().run() is None                        # вышел сам, без Stop
+    assert loop.runs() == [("start", HEAD), "stop"] and loop.head == R1
+    assert loop.env.read_bytes() == b"PAYOUTS=0\n"
+    assert any("launcher.py обновлён" in n for n in loop.notes)
+
+
+def test_run_bat_update_asks_for_manual_restart(loop):
+    """run.bat cmd читает с диска по ходу выполнения — перезапускать его из launcher нельзя; владельцу — просьба
+    перезапустить окно вручную, бот при этом обновляется как обычно."""
+    loop.files = ["run.bat"]
+    loop.approved.parent.mkdir()
+    loop.approved.write_text(R1 + "\n", encoding="utf-8")
+    with pytest.raises(Stop):
+        launcher.Launcher().run()
+    assert loop.runs() == [("start", HEAD), "stop", ("start", R1), "stop"]
+    assert any("run.bat" in n and "вручную" in n for n in loop.notes if n.startswith("🔄"))
+
+
+def test_bot_gets_money_switches_only_from_env_file(monkeypatch, tmp_path):
+    """PAYOUTS/TRADING из окружения Windows или родителя бот не наследует (кроме «0»): включить деньги может только
+    .env, а его launcher выключает после каждого обновления. Так выключение держится, даже если обновление убрало
+    из bot.main вызов payouts.switch_from_file (он и защищал от PAYOUTS=1 в окружении)."""
+    monkeypatch.setenv("PAYOUTS", "1")
+    monkeypatch.setenv("TRADING", " 1 ")
+    monkeypatch.setenv("P2P_TEST_KEEP", "да")
+    env = launcher.bot_env()
+    assert not {k.upper() for k in env} & {"PAYOUTS", "TRADING"} and env["P2P_TEST_KEEP"] == "да"
+    monkeypatch.setenv("TRADING", "0")
+    assert launcher.bot_env()["TRADING"] == "0"                     # окружением выключить можно, включить — нет
+    popen = []
+    monkeypatch.setattr(launcher.subprocess, "Popen", lambda args, **kw: popen.append((args, kw)))
+    launcher.start_bot()
+    assert popen[0][1]["env"] == launcher.bot_env() and popen[0][1]["cwd"] == launcher.HERE
+    # бот без switch_from_file: load_env (setdefault) поверх окружения launcher и .env после money_off
+    dotenv = tmp_path / ".env"
+    dotenv.write_bytes(b"PAYOUTS=1\nTRADING=1\n")
+    launcher.money_off(str(dotenv))
+    monkeypatch.setenv("PAYOUTS", "1")
+    child = launcher.bot_env()
+    for key in ("PAYOUTS", "TRADING"):
+        monkeypatch.delenv(key, raising=False)
+        if key in child:
+            monkeypatch.setenv(key, child[key])
+    p2p.load_env(str(dotenv))
+    assert not payouts.enabled() and os.environ["TRADING"] == "0"
 
 
 # --- защищённые пути: только после --approve ---
@@ -268,15 +452,19 @@ def test_diff_failure_not_applied(gate):
 
 # --- python launcher.py --approve <sha> ---
 
+TIP = "rev-parse --verify --quiet origin/main^{commit}"
+
+
 @pytest.fixture
 def cli(monkeypatch, tmp_path):
-    st = SimpleNamespace(git=[], rev="", approved=tmp_path / "logs" / "approved_shas", ran=[])
+    """st.rev — ответ git rev-parse на начало sha, st.tip — на origin/main (локальная ссылка, без fetch)."""
+    st = SimpleNamespace(git=[], rev="", tip="", approved=tmp_path / "logs" / "approved_shas", ran=[])
     monkeypatch.setattr(launcher, "APPROVED_PATH", str(st.approved))
     monkeypatch.setattr(launcher, "LOG_PATH", str(tmp_path / "launcher.log"))
 
     def git(*args, check=True):
         st.git.append(" ".join(args))
-        return st.rev
+        return st.tip if " ".join(args) == TIP else st.rev
 
     monkeypatch.setattr(launcher, "git", git)
     monkeypatch.setattr(launcher, "acquire_lock", lambda: st.ran.append("lock") or True)
@@ -287,17 +475,47 @@ def cli(monkeypatch, tmp_path):
 def test_approve_full_sha(cli):
     assert launcher.main(["--approve", " " + R1.upper() + " "]) == 0
     assert cli.approved.read_text(encoding="utf-8") == R1 + "\n"
-    assert cli.ran == [] and cli.git == []                          # цикл не запускается, git не нужен
+    assert cli.ran == [] and cli.git == [TIP]                       # цикл не запускается; git — только вершина main
     assert launcher.main(["--approve", R2]) == 0
     assert cli.approved.read_text(encoding="utf-8") == f"{R1}\n{R2}\n"
     assert launcher.approved(R1) and launcher.approved(R2.upper()) and not launcher.approved(HEAD)
 
 
+def test_approve_equals_form(cli):
+    assert launcher.main(["--approve=" + R1]) == 0
+    assert cli.approved.read_text(encoding="utf-8") == R1 + "\n" and cli.ran == []
+
+
 def test_approve_resolves_unique_prefix(cli):
     cli.rev = "1a2b" + "0" * 36
     assert launcher.main(["--approve", "1A2B"]) == 0
-    assert cli.git == ["rev-parse --verify --quiet 1a2b^{commit}"]
+    assert cli.git == ["rev-parse --verify --quiet 1a2b^{commit}", TIP]
     assert cli.approved.read_text(encoding="utf-8") == cli.rev + "\n" and cli.ran == []
+
+
+def test_approve_tells_when_main_moved_on(cli, capsys):
+    """Launcher ставит только вершину main: подтверждение более старого коммита ничего не даст, и владелец должен
+    узнать это сразу, а не по второму 🔐."""
+    cli.tip = R1
+    assert launcher.main(["--approve", R1]) == 0
+    out = capsys.readouterr().out
+    assert "Подтверждено" in out and R2 not in out
+    cli.tip = R2
+    assert launcher.main(["--approve", R1]) == 0
+    out = capsys.readouterr().out
+    assert "Подтверждено" not in out and f"python launcher.py --approve {R2}" in out and R1 in out
+    assert launcher.approved(R1)                                    # записано всё равно
+    cli.tip = ""                                                    # origin/main не прочитать — обычный текст
+    assert launcher.main(["--approve", R2]) == 0 and "Подтверждено" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("argv", [["--aprove", R1], ["-approve", R1], ["approve", R1], ["--approve", R1, R2],
+                                  ["--approve=" + R1, R2], ["--help"], ["x"], [R1]])
+def test_unknown_arguments_do_not_start_loop(cli, argv, capsys):
+    """Опечатка в --approve не должна молча запускать второй цикл обновлений и бота в этом окне."""
+    assert launcher.main(argv) == 2
+    assert cli.ran == [] and not cli.approved.exists()
+    assert "--approve <sha>" in capsys.readouterr().out
 
 
 @pytest.mark.parametrize("rev", ["", "fatal: ambiguous", "ffff" + "0" * 36, "1a2b"])
@@ -321,15 +539,38 @@ def test_main_without_approve_runs_loop(cli, monkeypatch):
     assert launcher.main([]) == 3
 
 
-# --- список launcher покрывает guard ---
+# --- списки launcher и guard совпадают ---
+
+def _samples(prefixes, basenames, exact, names):
+    """Пути, которые список обязан защищать: сами префиксы, файлы внутри папок, имена на глубине, точные пути,
+    слова в пути, *.pth — и всё то же ЗАГЛАВНЫМИ (Windows запишет LAUNCHER.PY поверх launcher.py)."""
+    out = (list(prefixes) + [p + "x.py" for p in prefixes if p.endswith("/")] + [f"deep/dir/{b}" for b in basenames]
+           + list(exact) + [f"x/my_{n}_notes.txt" for n in names] + ["a/b/x.pth"])
+    return out + [s.upper() for s in out]
+
 
 def test_launcher_list_covers_guard():
     """Всё, что guard (CI) считает защищённым, launcher тоже не поставит без подтверждения."""
-    spec = importlib.util.spec_from_file_location(
-        "guard_script", os.path.join(os.path.dirname(os.path.dirname(__file__)), "scripts", "guard.py"))
-    guard = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(guard)
+    guard = _load_guard()
     assert "tests/test_launcher_money_gate.py" in guard.PROTECTED
-    names = list(guard.PROTECTED) + [f"deep/dir/{b}" for b in guard.PROTECTED_BASENAMES] + ["a/b/x.pth"]
-    assert launcher.protected_paths(names) == names
-    assert launcher.protected_paths([f"x/{guard.PROTECTED_NAME}_notes.txt"])
+    names = _samples(guard.PROTECTED, guard.PROTECTED_BASENAMES, guard.PROTECTED_EXACT, guard.PROTECTED_NAMES)
+    assert [n for n in names if not launcher.protected_paths([n])] == []
+
+
+def test_guard_covers_launcher_list():
+    """И наоборот: что launcher без подтверждения не поставит, guard не пустит в автомерж. Иначе CI вливал бы такой
+    коммит, а launcher потом стоял бы на нём (и на всём, что придёт следом) до ручного --approve."""
+    guard = _load_guard()
+    names = _samples(launcher.PROTECTED_PREFIXES, launcher.PROTECTED_BASENAMES, launcher.PROTECTED_EXACT,
+                     launcher.PROTECTED_NAMES)
+    assert [n for n in names if not guard.protected(n)] == []
+    assert [n for n in NOT_PROTECTED if guard.protected(n)] == []
+
+
+def test_claude_md_names_every_protected_path():
+    """О защищённых путях облачная рутина узнаёт только из CLAUDE.md: там назван каждый путь из списка launcher."""
+    with open(os.path.join(ROOT, "CLAUDE.md"), encoding="utf-8") as f:
+        text = f.read().lower()
+    listed = (launcher.PROTECTED_PREFIXES + launcher.PROTECTED_BASENAMES + launcher.PROTECTED_EXACT
+              + launcher.PROTECTED_NAMES + ("*.pth",))
+    assert [p for p in listed if f"`{p}`" not in text] == []

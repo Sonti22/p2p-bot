@@ -7,13 +7,20 @@ import re
 import subprocess
 import sys
 
-PROTECTED = (".github/", "scripts/guard.py", "launcher.py", "CLAUDE.md", ".gitignore",
+# Сравнение путей — без учёта регистра: на Windows LAUNCHER.PY из коммита записался бы поверх launcher.py.
+# Список совпадает со списком launcher.py (PROTECTED_* там): что launcher без --approve не поставит, то и сюда —
+# иначе CI вливал бы коммит, а launcher стоял бы на нём до ручного подтверждения.
+PROTECTED = (".github/", "scripts/guard.py", "launcher.py", "CLAUDE.md", ".gitignore", ".gitattributes",
              "payouts.py", "scripts/payout_whitelist.py", "tests/test_payouts.py",   # выплаты — только вручную
+             "tests/trading/",                      # торговля (этап 3 плана) — тоже только вручную
              # настройки pytest: через addopts/--ignore тесты выплат молча выпадали бы из CI
              "pytest.ini", "pyproject.toml", "setup.cfg", "tox.ini", "conftest.py", "tests/conftest.py",
              "tests/test_launcher_money_gate.py",   # тесты барьера launcher: деньги выкл. после обновления, --approve
-             "run.bat")                             # его выполняет cmd на ПК владельца, перечитывая файл на ходу
-PROTECTED_NAME = "payout"   # любой путь со словом payout (payouts/__init__.py, tests/test_payouts_x…) — тоже защищён
+             "run.bat",                             # его выполняет cmd на ПК владельца, перечитывая файл на ходу
+             # локальное состояние: git merge молча перезапишет игнорируемый файл, если коммит добавит его в git
+             "data/", "logs/")
+PROTECTED_EXACT = (".env", ".last_good", ".dev_status.json")   # ровно эти пути (.env.example — нет)
+PROTECTED_NAMES = ("payout", "trading")   # любой путь с этим словом (payouts/__init__.py, paper_trading.py…) — защищён
 # по имени файла на любой глубине (tests/sub/conftest.py, pkg/pyproject.toml…): настройки pytest и файлы, которые Python
 # выполняет сам при старте (sitecustomize/usercustomize, *.pth), зависимости — тоже только вручную
 PROTECTED_BASENAMES = ("conftest.py", "pytest.ini", "pyproject.toml", "setup.cfg", "tox.ini", "sitecustomize.py",
@@ -34,8 +41,10 @@ def git(*args):
 
 
 def protected(path):
-    base = path.rsplit("/", 1)[-1].lower()
-    return (path.startswith(PROTECTED) or PROTECTED_NAME in path.lower() or base in PROTECTED_BASENAMES
+    low = path.lower()
+    base = low.rsplit("/", 1)[-1]
+    return (low.startswith(tuple(p.lower() for p in PROTECTED)) or low in PROTECTED_EXACT
+            or any(n in low for n in PROTECTED_NAMES) or base in PROTECTED_BASENAMES
             or base.endswith(PROTECTED_SUFFIXES))
 
 
