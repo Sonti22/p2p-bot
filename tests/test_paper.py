@@ -70,6 +70,22 @@ def test_start_cycle_bank_empty_when_pay_method_unknown(tmp_path):
     assert paper.get_cycle(cid, path=db)["bank"] == ""
 
 
+def test_start_cycle_stores_route_hops(tmp_path):
+    db = str(tmp_path / "paper.db")
+    buy, sell = make_ad("Bybit", "buy", 85.0), make_ad("MEXC", "sell", 90.0)
+    hops = p2p.route_hops(buy, sell, p2p.Config(pay_fee=0.0), {"Bybit": {"USDT": (1.0, 1.0)},
+                                                                "MEXC": {"USDT": (1.0, 1.0)}})
+    cid = paper.start_cycle(10000, buy, sell, "route", 2.0, path=db, ts=1000.0, hops=hops)
+    assert paper.cycle_hops(paper.get_cycle(cid, path=db)) == hops
+
+
+def test_start_cycle_without_hops_defaults_to_empty(tmp_path):
+    db = str(tmp_path / "paper.db")
+    buy, sell = make_ad("Bybit", "buy", 85.0), make_ad("MEXC", "sell", 90.0)
+    cid = paper.start_cycle(10000, buy, sell, "route", 2.0, path=db, ts=1000.0)
+    assert paper.cycle_hops(paper.get_cycle(cid, path=db)) == {"venues": [], "hops": []}
+
+
 def test_bank_month_total_sums_cycles_of_that_bank_this_month(tmp_path):
     db = str(tmp_path / "paper.db")
     now = time.time()

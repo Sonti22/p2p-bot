@@ -110,6 +110,53 @@ def test_intermediate_coin_rejected_when_asset_unavailable_anywhere():
     assert p2p._route(b, s, cfg(), spot) is None
 
 
+def test_route_hops_same_venue_has_one_noop_hop():
+    hops = p2p.route_hops(make_ad("MEXC", "buy", 88.0), make_ad("MEXC", "sell", 89.76), cfg(), SPOT)
+    assert hops["venues"] == []
+    assert hops["hops"] == [{"frm": "MEXC", "frm_net": "", "to": "MEXC", "to_net": "", "asset": "USDT",
+                             "fee": 0.0, "parts": 1}]
+
+
+def test_route_hops_records_cheapest_network_and_fee():
+    hops = p2p.route_hops(make_ad("MEXC", "buy", 88.0), make_ad("Bybit", "sell", 90.0), cfg(), SPOT)
+    assert hops["venues"] == []
+    assert hops["hops"] == [{"frm": "MEXC", "frm_net": "", "to": "Bybit", "to_net": "BEP20", "asset": "USDT",
+                             "fee": pytest.approx(0.01), "parts": 1}]
+
+
+def test_route_hops_withdraw_fee_multiplied_by_exchanger_stack_parts():
+    ads = [make_ad("BestChange", "sell", 89.9 - i * 0.1, net="ERC20", min_amt=500, max_amt=25_000,
+                    avail=25_000 / (89.9 - i * 0.1)) for i in range(3)]
+    _, _, s, _ = p2p._match(make_ad("Bybit", "buy", 85.0), ads, cfg(), SPOT)
+    hops = p2p.route_hops(make_ad("Bybit", "buy", 85.0), s, cfg(), SPOT)
+    assert hops["hops"] == [{"frm": "Bybit", "frm_net": "", "to": "BestChange", "to_net": "ERC20", "asset": "USDT",
+                             "fee": pytest.approx(2.4), "parts": 3}]
+
+
+def test_route_hops_spot_conversion_records_single_venue():
+    b, s = make_ad("MEXC", "buy", 88.0), make_ad("MEXC", "sell", 245000.0, asset="ETH")
+    hops = p2p.route_hops(b, s, cfg(), SPOT)
+    assert hops["venues"] == ["MEXC"]
+    assert len(hops["hops"]) == 2
+    assert all(h["asset"] in ("USDT", "ETH") for h in hops["hops"])
+
+
+def test_route_hops_two_venues_records_both_and_usdt_transfer_hop():
+    spot = {"Bybit": {"USDT": (1.0, 1.0), "BTC": (7_000_000.0, 7_001_000.0)},
+            "MEXC": {"USDT": (1.0, 1.0), "ETH": (2499.0, 2500.0)}}
+    b, s = make_ad("Bybit", "buy", 7_000_000.0, asset="BTC"), make_ad("MEXC", "sell", 245000.0, asset="ETH")
+    hops = p2p.route_hops(b, s, cfg(), spot)
+    assert hops["venues"] == ["Bybit", "MEXC"]
+    assert hops["hops"][1] == {"frm": "Bybit", "frm_net": "", "to": "MEXC", "to_net": "BEP20", "asset": "USDT",
+                              "fee": pytest.approx(0.2), "parts": 1}
+
+
+def test_route_hops_none_when_route_impossible():
+    spot = {"Bybit": {"USDT": (1.0, 1.0)}, "MEXC": {"USDT": (1.0, 1.0), "ETH": (2499.0, 2500.0)}}
+    b, s = make_ad("Bybit", "buy", 7_000_000.0, asset="BTC"), make_ad("MEXC", "sell", 245000.0, asset="ETH")
+    assert p2p.route_hops(b, s, cfg(), spot) is None
+
+
 def test_pay_fee_applied():
     profit, route = p2p._route(make_ad("MEXC", "buy", 88.0), make_ad("MEXC", "sell", 88.0), cfg(pay_fee=0.5), SPOT)
     assert profit == pytest.approx(-0.5) and "банка" in route

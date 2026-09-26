@@ -50,7 +50,7 @@ _COLUMNS = ("id", "ts_start", "amount", "buy_ex", "buy_asset", "buy_price", "buy
             "sell_ex", "sell_asset", "sell_price", "sell_nick", "route", "planned_pct",
             "stage", "ts_stage", "realized_pct", "result", "note", "bank", "label", "sell_fact", "pay_kind",
             "sell_qty", "sell_net", "buy_nicks", "buy_net", "buy_pays", "sell_parts", "pay_fee_used",
-            "planned_raw")
+            "planned_raw", "route_hops")
 # план для сравнения с фактом: без запаса на курс; у кругов до planned_raw — план с запасом, как раньше
 _PLAN_CMP = "COALESCE(planned_raw, planned_pct)"
 
@@ -83,13 +83,14 @@ def _connect(path):
                 "bank TEXT DEFAULT '', label TEXT DEFAULT '', sell_fact REAL DEFAULT NULL, pay_kind TEXT DEFAULT '', "
                 "sell_qty REAL DEFAULT NULL, sell_net TEXT DEFAULT '', buy_nicks TEXT DEFAULT '', "
                 "buy_net TEXT DEFAULT '', buy_pays TEXT DEFAULT '[]', sell_parts INTEGER DEFAULT 1, "
-                "pay_fee_used REAL DEFAULT 0, planned_raw REAL DEFAULT NULL)")
+                "pay_fee_used REAL DEFAULT 0, planned_raw REAL DEFAULT NULL, route_hops TEXT DEFAULT '')")
     cols = [r[1] for r in con.execute("PRAGMA table_info(cycles)")]
     for col, ddl in (("bank", "TEXT DEFAULT ''"), ("label", "TEXT DEFAULT ''"), ("sell_fact", "REAL DEFAULT NULL"),
                      ("pay_kind", "TEXT DEFAULT ''"), ("sell_qty", "REAL DEFAULT NULL"), ("sell_net", "TEXT DEFAULT ''"),
                      ("buy_nicks", "TEXT DEFAULT ''"), ("buy_net", "TEXT DEFAULT ''"),
                      ("buy_pays", "TEXT DEFAULT '[]'"), ("sell_parts", "INTEGER DEFAULT 1"),
-                     ("pay_fee_used", "REAL DEFAULT 0"), ("planned_raw", "REAL DEFAULT NULL")):
+                     ("pay_fee_used", "REAL DEFAULT 0"), ("planned_raw", "REAL DEFAULT NULL"),
+                     ("route_hops", "TEXT DEFAULT ''")):
         if col not in cols:   # база от прошлой версии — добавляем колонку, данные не трогаем
             con.execute(f"ALTER TABLE cycles ADD COLUMN {col} {ddl}")
     con.execute("CREATE TABLE IF NOT EXISTS balance (id INTEGER PRIMARY KEY CHECK (id = 1), "
@@ -132,7 +133,7 @@ def apply_result(realized_pct, amount, path=DB_PATH, ts=None):
 
 
 def start_cycle(amount, buy, sell, route, planned_pct, path=DB_PATH, ts=None, label="", sell_qty=None, pay_fee=0.0,
-                over=None, planned_raw=None):
+                over=None, planned_raw=None, hops=None):
     """Завести новый виртуальный круг со стадией buy. buy/sell — объявления покупки/продажи
     (p2p.Ad) на момент старта. Как платим (trades.pay_plan: внутри банка или по СБП со своего банка, у
     которого виртуальный лимит ещё есть) пишется сразу — в реальности рубли уходят в момент оплаты, до
@@ -148,6 +149,9 @@ def start_cycle(amount, buy, sell, route, planned_pct, path=DB_PATH, ts=None, la
     лимитом СБП, с которыми бот считал план и sell_qty (реальные сделки trades + виртуальный оборот прогона):
     банк оплаты и pay_fee_used берём по ним же, иначе комиссия в круге разошлась бы с планом; не передан —
     только виртуальный оборот прогона. planned_raw — план без запаса на курс (для сравнения с фактом).
+    hops — p2p.route_hops(buy, sell, ...) (площадки конвертации и сеть/комиссия каждого хопа маршрута на
+    момент старта) — не передан, пишем пустой маршрут; для стадий transfer/sell позже (ROADMAP «межмонетные,
+    часть 2») — в этой задаче только сохраняем, не используем.
     Возвращает id круга."""
     ts = ts if ts is not None else time.time()
     if over is None:
@@ -160,13 +164,13 @@ def start_cycle(amount, buy, sell, route, planned_pct, path=DB_PATH, ts=None, la
         cur = con.execute(
             "INSERT INTO cycles (ts_start, amount, buy_ex, buy_asset, buy_price, buy_nick, sell_ex, sell_asset, "
             "sell_price, sell_nick, route, planned_pct, stage, ts_stage, bank, label, pay_kind, sell_qty, sell_net, "
-            "buy_nicks, buy_net, buy_pays, sell_parts, pay_fee_used, planned_raw) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'buy', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "buy_nicks, buy_net, buy_pays, sell_parts, pay_fee_used, planned_raw, route_hops) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'buy', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (ts, amount, buy.ex, buy.asset, buy.price, buy.nick,
              sell.ex, sell.asset, sell.price, sell.nick, route, planned_pct, ts, bank, label, kind,
              sell_qty, sell.net or "", json.dumps(list(buy.nicks or (buy.nick,)), ensure_ascii=False),
              buy.net or "", json.dumps(list(buy.pays or []), ensure_ascii=False), sell.parts or 1, pay_fee_used,
-             planned_raw))
+             planned_raw, json.dumps(hops, ensure_ascii=False) if hops else ""))
         cycle_id = cur.lastrowid
     con.close()
     return cycle_id
@@ -275,6 +279,14 @@ def simple_route(deal):
     BestChange в прогоне 25.09 завышали баланс."""
     _, b, s, route = deal
     return b.asset == s.asset and "спот" not in (route or "") and "через" not in (route or "")
+
+
+def cycle_hops(cycle):
+    """Площадки конвертации и хопы маршрута, сохранённые при старте круга (start_cycle(..., hops=...) —
+    p2p.route_hops на момент старта); круг без записи (старая версия или простая связка без hops) —
+    {"venues": [], "hops": []}."""
+    raw = cycle.get("route_hops")
+    return json.loads(raw) if raw else {"venues": [], "hops": []}
 
 
 def sell_qty(cycle):
