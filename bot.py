@@ -84,7 +84,7 @@ COMMANDS = [{"command": "best", "description": "Лучшая связка сей
             {"command": "calc", "description": "Разовый расчёт под сумму, напр. /calc 20000"},
             {"command": "stats", "description": "Журнал сделок: день/неделя/месяц, расчёт vs факт"},
             {"command": "export", "description": "Журнал сделок в CSV для банка и 3-НДФЛ: /export month|year"},
-            {"command": "paper", "description": "Сухой прогон: круги, статистика, /paper on|off|amount|report"},
+            {"command": "paper", "description": "Сухой прогон: круги, статистика, /paper on|off|amount|report|reset"},
             {"command": "mybanks", "description": "Мои банки и бесплатные лимиты СБП"},
             {"command": "fav", "description": "Избранные маршруты"},
             {"command": "alert", "description": "Алерт на курс, напр. /alert USDT sell 92 7d"},
@@ -184,6 +184,8 @@ MSK = timezone(timedelta(hours=3))                    # тихие часы и /
 PAUSE_PRESETS = {"30m": 1800, "1h": 3600, "3h": 3 * 3600}  # аргументы /pause -> секунды
 PAPER_STAGE_LABELS = {"buy": "оплата", "transfer": "перевод", "sell": "продажа"}
 PAPER_AMOUNTS = (10000, 20000)   # суммы круга сухого прогона на кнопках /paper
+PAPER_RESET_MARKUP = {"inline_keyboard": [[{"text": "🗑 Да, обнулить", "callback_data": "paper_reset:yes"},
+                                           {"text": "Отмена", "callback_data": "paper_reset:no"}]]}
 
 
 def account_poll_interval():
@@ -1009,6 +1011,7 @@ class Bot:
         self.market_msg_id = None       # id закреплённого сообщения «Статус рынка»
         self.market_status_ts = 0.0     # unix-время последнего обновления статуса рынка
         self.paper_ladder_alerted_ts = 0.0   # unix-время последнего предложения лестницы суммы сухого прогона
+        self.paper_reset_ask = self.paper_reset_done = None   # id сообщения-вопроса /paper reset и уже отвеченного
 
     async def call(self, method, **params):
         async with self.s.post(f"https://api.telegram.org/bot{self.token}/{method}", json=params,
@@ -1427,7 +1430,8 @@ class Bot:
                 mark = "⚠️ " if total >= limit else ""
                 lines.append(f"{mark}{trades.BANK_NAMES.get(bank, bank)}: {_money(total)} ₽ / {_limit_text(limit)}")
         lines.append("")
-        lines.append("Кнопки ниже; то же командами: /paper on, /paper off, /paper amount 20000, /paper report")
+        lines.append("Кнопки ниже; то же командами: /paper on, /paper off, /paper amount 20000, /paper report. "
+                     "/paper reset — начать статистику с нуля (старая база — в архив)")
         return "\n".join(lines)
 
     def paper_markup(self):
@@ -1444,10 +1448,11 @@ class Bot:
 
     def paper_report_view(self, rows):
         """Текст «/paper report»: по каждой связке площадка/монета покупки → площадка/монета продажи —
-        план/факт, срывы по причинам, нехватка глубины стакана, среднее время круга."""
+        план/факт, срывы по причинам, нехватка глубины стакана, среднее время круга. План здесь — без запаса
+        на курс (paper._PLAN_CMP): в факте запаса нет, иначе факт выглядел бы лучше плана на размер запаса."""
         if not rows:
             return "🧪 Отчёт сухого прогона: завершённых кругов ещё нет."
-        lines = ["🧪 <b>Отчёт сухого прогона</b> — по площадкам и парам:", ""]
+        lines = ["🧪 <b>Отчёт сухого прогона</b> — по площадкам и парам (план — без запаса на курс, как и факт):", ""]
         for r in rows:
             line = (f"{r['buy_ex']}→{r['sell_ex']} ({r['buy_asset']}→{r['sell_asset']}): "
                     f"{r['total']} кругов, исполнилось {r['done']}")
@@ -1508,7 +1513,8 @@ class Bot:
     async def cmd_paper(self, arg):
         """/paper — сводка сухого прогона; /paper on|off — включить/выключить; /paper amount 20000 —
         сумма виртуального круга (баланс не сбрасывает, действует для новых кругов); /paper report —
-        отчёт по площадкам и парам + CSV-файл (data/paper_report.csv)."""
+        отчёт по площадкам и парам + CSV-файл (data/paper_report.csv); /paper reset — спросить кнопками и
+        обнулить (paper_reset:yes → paper.reset, база в архив)."""
         sub, _, rest = arg.strip().partition(" ")
         sub = sub.lower()
         if sub == "on":
@@ -1531,8 +1537,28 @@ class Bot:
             if rows:
                 path = paper.write_report_csv(rows)
                 await self.send_document(path, "Отчёт сухого прогона (CSV)")
+        elif sub == "reset":
+            r = await self.send("🧪 Обнулить сухой прогон? Все круги (и открытые) уйдут в архив "
+                            "data/paper-archive-…db — он не удаляется; статистика, баланс и лестница начнутся с нуля. "
+                            "Вкл/выкл и сумма круга не меняются.", markup=PAPER_RESET_MARKUP)
+            # «Да» принимается только с этого сообщения и один раз: двойное нажатие до того, как кнопки пропали,
+            # иначе затирало итог обнуления текстом «обнулять нечего»
+            self.paper_reset_ask = (r.get("result") or {}).get("message_id")
         else:
             await self.send(self.paper_view(), markup=self.paper_markup())
+
+    def paper_reset(self):
+        """Кнопка «🗑 Да, обнулить»: paper.reset и текст ответа — что ушло в архив."""
+        try:
+            res = paper.reset()
+        except OSError as e:   # файл базы занят/нет прав — база на месте, говорим как есть
+            return f"⚠️ Не получилось обнулить сухой прогон: {html.escape(str(e))}"
+        if res is None:
+            return "🧪 Обнулять нечего — кругов сухого прогона ещё не было."
+        change = f"{res['change']:+,.0f}".replace(",", " ")
+        return (f"🗑 Сухой прогон обнулён. В архиве data/{html.escape(os.path.basename(res['archive']))}: "
+                f"кругов {res['cycles']}, итог завершённых {change} ₽. Статистика, баланс и лестница — с нуля; "
+                f"вкл/выкл и сумма круга прежние.")
 
     async def cmd_export(self, arg):
         """/export [month|year] — журнал сделок за календарный месяц (по умолчанию) или год до сегодня по МСК:
@@ -2048,6 +2074,8 @@ class Bot:
         for deal in deals:
             if not self.is_confirmed(deal):
                 continue   # сигнала о ней ещё не было — выброс одного скана не берём
+            if not paper.simple_route(deal):
+                continue   # через спот/межмонетные — пока нет, условия возврата в ROADMAP (межмонетные, часть 2)
             d = deal_for_amount(deal, self.cfg, psnap, settings["amount"])
             if d is None or d[0] < self.cfg.min_profit:
                 continue   # на сумму сухого прогона глубины не хватает или прибыль ниже порога
@@ -2060,11 +2088,14 @@ class Bot:
         profit, b, s, route = d
         paper.init_balance(settings["amount"])
         # выход маршрута в монете продажи по итоговому стеку s (его parts: переводов на каждый обменник) — без
-        # запаса на курс и с комиссией СБП, если лимит исчерпан
+        # запаса на курс и с комиссией СБП, если лимит исчерпан; по нему же план без запаса — с ним сравнивается факт
         qty = _route_qty(b, s, dataclasses.replace(self.cfg, amount=settings["amount"]), psnap.spot, over,
                          disable=frozenset({"risk"}))
+        raw = (qty * s.price / settings["amount"] - 1) * 100 if qty else profit
+        # over — тот же, что в плане и qty: банк оплаты и комиссия СБП в круге совпадут с планом
         cycle = paper.get_cycle(paper.start_cycle(settings["amount"], b, s, route, profit, label=label,
-                                                  sell_qty=qty or s.avail, pay_fee=self.cfg.pay_fee)) or {}
+                                                  sell_qty=qty or s.avail, pay_fee=self.cfg.pay_fee, over=over,
+                                                  planned_raw=raw)) or {}
         pay = trades.pay_label(cycle.get("pay_kind", ""), cycle.get("bank", ""), b.pays)
         qty = settings["amount"] / b.price
         text = (f"🧪 <b>Сухой прогон</b>: купил бы {_money(qty)} {b.asset} у {html.escape(b.nick)} "
@@ -2090,7 +2121,8 @@ class Bot:
                 if action == "wait":
                     continue
                 if action == "fail":
-                    paper.finish_cycle(cycle["id"], "failed_buy", 0.0, note)
+                    if not paper.finish_cycle(cycle["id"], "failed_buy", 0.0, note):
+                        continue   # круга уже нет (/paper reset посреди обработки)
                     await self.send(f"🧪 Сухой прогон: круг #{cycle['id']} сорвался на покупке — {note}",
                                     topic="signals")
                 else:
@@ -2100,7 +2132,8 @@ class Bot:
                 if action == "wait":
                     continue
                 if action == "fail":
-                    paper.finish_cycle(cycle["id"], "failed_transfer", 0.0, note)
+                    if not paper.finish_cycle(cycle["id"], "failed_transfer", 0.0, note):
+                        continue
                     await self.send(f"🧪 Сухой прогон: круг #{cycle['id']} сорвался на переводе — {note}",
                                     topic="signals")
                 else:
@@ -2111,7 +2144,8 @@ class Bot:
                 if action == "wait":
                     continue
                 if action == "fail":
-                    paper.finish_cycle(cycle["id"], "failed_sell", 0.0, note)
+                    if not paper.finish_cycle(cycle["id"], "failed_sell", 0.0, note):
+                        continue
                     await self.send(f"🧪 Сухой прогон: круг #{cycle['id']} сорвался на продаже — {note}",
                                     topic="signals")
                 else:
@@ -2119,9 +2153,13 @@ class Bot:
                     # связки видят движение курса между стартом круга и продажей, а не число со старта
                     qty = paper.recompute_sell_qty(cycle, self.cfg, snap.spot)
                     rp = paper.realized_pct(cycle, price, qty)
-                    paper.finish_cycle(cycle["id"], "done", rp, note, sell_fact=price)
+                    if not paper.finish_cycle(cycle["id"], "done", rp, note, sell_fact=price):
+                        continue
+                    # план без запаса на курс — с ним сравнивает и /paper (у старых кругов его нет — план с запасом)
+                    plan = cycle.get("planned_raw")
+                    plan = cycle["planned_pct"] if plan is None else plan
                     await self.send(f"🧪 Сухой прогон: круг #{cycle['id']} завершён — план "
-                                    f"{cycle['planned_pct']:.2f}%, факт {rp:.2f}%"
+                                    f"{plan:.2f}%, факт {rp:.2f}%"
                                     + (f" ({note})" if note else ""), topic="signals")
 
     async def check_paper_ladder(self):
@@ -2580,6 +2618,20 @@ class Bot:
                             text=self.paper_view(), parse_mode="HTML", reply_markup=self.paper_markup())
         elif data == "paper_report":
             await self.cmd_paper("report")
+        elif data.startswith("paper_reset:"):
+            # сообщение с вопросом заменяем ответом — кнопки пропадают; ответ только на последний вопрос и один раз
+            mid = cq["message"]["message_id"]
+            if mid == self.paper_reset_done:
+                return   # повторное нажатие уже отвеченного вопроса — итог на месте, ничего не делаем
+            if mid != self.paper_reset_ask:   # старый вопрос или бот перезапускался — не сбрасываем вслепую
+                await self.call("editMessageText", chat_id=self.chat_id, message_id=mid, parse_mode="HTML",
+                                text="🧪 Кнопка устарела — повтори /paper reset.")
+                return
+            self.paper_reset_ask, self.paper_reset_done = None, mid
+            text = (self.paper_reset() if data == "paper_reset:yes"
+                    else "🧪 Обнуление отменено — сухой прогон не тронут.")
+            await self.call("editMessageText", chat_id=self.chat_id, message_id=cq["message"]["message_id"],
+                            text=text, parse_mode="HTML")
         elif data.startswith("paper_ladder:"):
             amount = float(data[len("paper_ladder:"):])
             save_env("PAPER_AMOUNT", f"{amount:.0f}")   # на нажатие уже ответили выше — второй answerCallbackQuery не нужен
