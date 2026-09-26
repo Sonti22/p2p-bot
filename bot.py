@@ -27,6 +27,7 @@ import paper
 import payouts
 import presets
 import simmaker
+import snapshots
 import trades
 from cards import deal_card, history_card, history_compare_card, portfolio_card, top_chart
 from p2p import ALL_EXCHANGES, AMOUNT_MAX, AMOUNT_MIN, DEFAULT_ASSETS, ENV_PATH, LOG_PATH, MIN_PROFIT_MAX, \
@@ -1100,9 +1101,11 @@ def apply_mybanks(data):
 
 
 def _lean(snap):
-    """Снимок без полного стакана (Snapshot.book): он нужен только /maker по свежему снимку — запомненные сделки
-    (до 200) и живые карточки его не держат."""
-    return dataclasses.replace(snap, book={}) if snap is not None and snap.book else snap
+    """Снимок без полного стакана (Snapshot.book) и всех объявлений скана (Snapshot.ads): они нужны только /maker
+    и записи снимка (snapshots.py) по свежему скану — запомненные сделки (до 200) и живые карточки их не держат."""
+    if snap is not None and (snap.book or snap.ads or snap.jobs):
+        return dataclasses.replace(snap, book={}, ads=[], jobs=[])
+    return snap
 
 
 def fact_markup(trade_id):
@@ -2053,9 +2056,10 @@ class Bot:
 
     async def scan_loop(self):
         while True:
+            snap = None
             try:
                 t0 = time.time()
-                self.last = await scan(self.s, self.cfg)
+                snap = self.last = await scan(self.s, self.cfg)
                 self.last_scan_ts, self.last_scan_duration = time.time(), time.time() - t0
                 self.track_liveness(self.last)
                 if history.record(self.last, self.cfg.amount):   # не чаще раза в 5 минут, независимо от чата
@@ -2077,7 +2081,19 @@ class Bot:
                     await self.update_market_status(self.last)
             except Exception as e:
                 logger.error("scan error: %s", e)
+            if snap is not None:   # после сигналов: снимок для разбора не задерживает их
+                await self.save_snapshot(snap)
             await asyncio.sleep(self.cfg.interval)
+
+    async def save_snapshot(self, snap):
+        """Снимок скана в data/snapshots.db (snapshots.py): данные собираем здесь, пишем в отдельном потоке —
+        цикл событий не ждёт диск. Ошибка записи скан не ломает — строка в логе. Возвращает id снимка или None."""
+        try:
+            data = snapshots.collect(snap, self.cfg, self.live)
+            return await asyncio.to_thread(snapshots.write, data)
+        except Exception as e:
+            logger.warning("snapshot: %s", e)
+            return None
 
     def status_view(self, status_path=DEV_STATUS):
         """Текст «/status»: версия, аптайм, время/длительность последнего скана, ошибки площадок,
