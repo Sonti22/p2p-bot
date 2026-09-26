@@ -178,6 +178,9 @@ EXCHANGE_NAMES = {"bybit": "Bybit", "mexc": "MEXC", "htx": "HTX", "kucoin": "KuC
 ASSET_LIST = tuple(DEFAULT_ASSETS.split(","))       # монеты для кнопок «🎛 Фильтры»
 EXCHANGE_LIST = tuple(ALL_EXCHANGES.split(","))      # площадки для кнопок «🎛 Фильтры»
 VENUE_NAMES = dict(EXCHANGE_NAMES, bestchange="BestChange")  # + обменник, которого нет в EXCHANGE_NAMES
+# экраны аккаунтов (ключи, /balance, история): + биржи, которые не P2P-площадки бота и в скан/фильтры не попадают
+ACCOUNT_NAMES = dict(EXCHANGE_NAMES, bingx="BingX", cryptomus="Cryptomus")
+ACCOUNT_ONLY = tuple(ex for ex in ACCOUNT_NAMES if ex not in VENUE_NAMES)   # ("bingx", "cryptomus")
 ACCOUNT_POLL_INTERVAL_DEFAULT = 60  # опрос истории аккаунтов, сек — если не задано в .env
 LIVE_EDIT_INTERVAL = 30     # сек: не чаще обновляем карточку последнего сигнала вместо повторной отправки
 MARKET_STATUS_INTERVAL = 60  # сек: не чаще обновляем закреплённое сообщение «Статус рынка»
@@ -253,7 +256,20 @@ KEY_HINT = {
     "kucoin": ("Создай ключ на KuCoin: Профиль → API Management → Create API. "
                "Права — только «General» (сними «Trade» и «Transfer»), в IP restriction впиши IP своего ПК. "
                "KuCoin попросит придумать <b>passphrase</b> — запомни её, бот спросит третьим шагом."),
+    "bingx": ("Создай ключ на BingX: Профиль → API Management → Create API. "
+              "Права — только «Read» (сними «Spot Trading», «Perpetual Futures Trading», «Universal Transfer» и "
+              "«Withdraw»), в IP whitelist впиши IP своего ПК."),
+    "cryptomus": ("⚠️ У Cryptomus <b>нет ключей только для чтения</b>: любой ключ даёт двигать деньги. Бот делает "
+                  "только запросы на чтение (баланс, история), но оставит такой ключ, только если в .env стоит "
+                  "ALLOW_UNSAFE_KEYS=1 — иначе удалит сразу после проверки.\n"
+                  "Нужны два значения. Первое — <b>ID</b> (UUID): User ID личного кабинета (значок профиля) или "
+                  "Merchant ID бизнес-кабинета. Второе — <b>API key</b> того же кабинета: лучше User API key личного "
+                  "кабинета (Settings → User API key: конвертации и ордера, вывода наружу в его API не описано), для "
+                  "бизнес-кабинета — Payment API key. Ключ выплат (<b>Payout key</b>) боту не давай никогда. Если "
+                  "Cryptomus позволяет — ограничь ключ по IP своего ПК."),
 }
+KEY_STEPS = {"cryptomus": ("ID", "ID (User ID или Merchant ID, UUID)", "API key")}   # ввод ключа: что получили, 1-й и 2-й шаг
+KEY_STEPS_DEFAULT = ("Ключ", "API key", "secret")
 
 
 def key_hint(ex, name):
@@ -370,31 +386,34 @@ def hist_key(it):
 
 
 def hist_text(ex, it):
-    """Текст уведомления о новом движении по счёту: депозит/вывод, спот-сделка или P2P-ордер Bybit."""
-    name = EXCHANGE_NAMES.get(ex, ex)
+    """Текст уведомления о новом движении по счёту: депозит/вывод, перевод между своими кошельками (Cryptomus) или
+    другому пользователю биржи (BingX — деньги ушли третьему лицу, не «внутренний»), спот-сделка или P2P-ордер Bybit."""
+    name = ACCOUNT_NAMES.get(ex, ex)
     if "fiat" in it:   # P2P-ордер Bybit: {id, side, asset, fiat, amount, price, ts}
         arrow = "купил" if it["side"] == "buy" else "продал"
         return f"💱 {name} P2P: {arrow} {it['amount']:g} {it['asset']} за {it['fiat']}"
     if it.get("kind") == "trade":
         arrow = "купил" if it["side"] == "buy" else "продал"
         return f"💱 {name}: {arrow} {it['amount']:g} {it['asset']} по {it['price']:g}"
-    label = {"deposit": "пришёл депозит", "withdraw": "исполнен вывод"}.get(it.get("kind"), it.get("kind"))
+    label = {"deposit": "пришёл депозит", "withdraw": "исполнен вывод", "transfer": "внутренний перевод",
+             "transfer_out": "списан перевод другому пользователю"}.get(it.get("kind"), it.get("kind"))
     return f"💰 {name}: {label} — {it['amount']:g} {it['asset']}"
 
 
-ACCOUNT_STATUS_ICON = {"none": "➖", "unknown": "❓", "ok": "✅", "error": "⚠️"}
+ACCOUNT_STATUS_ICON = {"none": "➖", "unknown": "❓", "ok": "✅", "error": "⚠️", "unsafe": "⚠️"}
 ACCOUNT_STATUS_NOTE = {"none": "", "unknown": " (права не подтверждены)", "ok": " (только чтение)",
-                       "error": " (ошибка проверки)"}
+                       "error": " (ошибка проверки)", "unsafe": " (права сверх чтения, оставлен тобой)"}
 
 
 def accounts_view(cfg):
     """Текст и кнопки раздела «🔑 Мои биржи»: список бирж со статусом последней проверки ключа —
-    подтверждён только чтение / ошибка проверки / ещё не проверялся (не путать с «не подключён»)."""
+    подтверждён только чтение / ошибка проверки / ещё не проверялся (не путать с «не подключён»).
+    P2P-площадки из фильтров, затем биржи только для аккаунтов (ACCOUNT_ONLY: BingX, Cryptomus)."""
     lines = ["🔑 <b>Мои биржи</b>", "",
              "Только чтение: балансы, история. Торговых ордеров, выводов и P2P-действий бот не делает.", ""]
     rows = []
-    for ex in cfg.exchanges:
-        name = EXCHANGE_NAMES.get(ex)
+    for ex in dict.fromkeys([*cfg.exchanges, *ACCOUNT_ONLY]):
+        name = ACCOUNT_NAMES.get(ex)
         if not name:
             continue
         state, _ = accounts.verify_status(ex)
@@ -443,7 +462,7 @@ def verify_state(ok, safe):
 
 def account_view(ex):
     """Текст и кнопки карточки одной биржи: статус, «Проверить»/«Удалить» или «Подключить»."""
-    name = EXCHANGE_NAMES.get(ex, ex)
+    name = ACCOUNT_NAMES.get(ex, ex)
     pair = accounts.keys(ex)
     back = {"text": "⬅️ Мои биржи", "callback_data": "accounts"}
     if pair:
@@ -454,8 +473,10 @@ def account_view(ex):
             "error": f"⚠️ Ошибка последней проверки: {html.escape(err)}" if err else "⚠️ Ошибка последней проверки.",
             "unsafe": f"⚠️ Ключ даёт больше, чем чтение ({html.escape(err)}) — оставлен по твоему решению (ALLOW_UNSAFE_KEYS=1).",
         }[state]
+        need = (f"Ключей только для чтения у {name} нет — бот сам делает только запросы на чтение"
+                if ex in accounts.NO_READONLY_KEYS else "Нужен ключ только для чтения")
         text = (f"🔑 <b>{name}</b>\n\nКлюч подключён: <code>{accounts.mask(pair[0])}</code>\n{status_line}\n"
-                f"Нужен ключ только для чтения: права проверяю при подключении, по «🔄 Проверить» и при старте бота.")
+                f"{need}: права проверяю при подключении, по «🔄 Проверить» и при старте бота.")
         kb = [[{"text": "🔄 Проверить", "callback_data": f"acc_check:{ex}"}],
               [{"text": "🗑 Удалить ключ", "callback_data": f"acc_del:{ex}"}], [back]]
     elif ex in accounts.ONBOARDABLE:
@@ -736,7 +757,7 @@ def portfolio_rows(port, snap):
             if rub:
                 total += rub
             coins.append((coin, amt, rub))
-        rows.append((EXCHANGE_NAMES.get(ex, ex), coins))
+        rows.append((ACCOUNT_NAMES.get(ex, ex), coins))
     return rows, total
 
 
@@ -744,7 +765,7 @@ def portfolio_view(port, snap):
     """Текст «💰 Баланс»: монеты по подключённым биржам и итог в ₽ по ориентиру текущего снимка.
     Снимка ещё нет (первый скан не прошёл) — только количества и пометка, что курс ещё не получен."""
     if not port:
-        connectable = ", ".join(EXCHANGE_NAMES.get(ex, ex) for ex in accounts.BALANCE_FETCHERS)
+        connectable = ", ".join(ACCOUNT_NAMES.get(ex, ex) for ex in accounts.BALANCE_FETCHERS)
         return (f"💰 <b>Баланс</b>\n\nНи одна биржа не подключена ({connectable}) или баланс пуст. "
                 f"Подключи ключ: ⚙️ Настройки → 🔑 Мои биржи.")
     rows, total = portfolio_rows(port, snap)
@@ -1671,7 +1692,8 @@ class Bot:
         await self.send(banks_view(self.last, self.cfg, asset))
 
     async def balance(self):
-        """`/balance`: балансы по подключённым биржам (Bybit — Unified + Funding, MEXC — спот) и итог в ₽.
+        """`/balance`: балансы по подключённым биржам (Bybit — Unified + Funding, MEXC — спот, BingX — спот + Fund,
+        Cryptomus — кошельки кабинета) и итог в ₽.
 
         Картинка-карточка портфеля; не вышло отрисовать — тот же текст, как у остальных карточек."""
         port = await accounts.portfolio(self.s)
@@ -1774,12 +1796,13 @@ class Bot:
         if deleted is False:
             await self.send("⚠️ Не смог удалить сообщение с ключом из чата — удали его вручную.")
         done = ", сообщение удалено" if deleted else ""
-        name = EXCHANGE_NAMES.get(state["ex"], state["ex"])
+        name = ACCOUNT_NAMES.get(state["ex"], state["ex"])
+        got, _, second = KEY_STEPS.get(state["ex"], KEY_STEPS_DEFAULT)   # у Cryptomus: ID, затем API key
         text = text.strip()
         if state["step"] == "key":
             state["key"] = text
             state["step"] = "secret"
-            await self.send(f"Ключ получен{done}. Теперь пришли <b>secret</b> для {name}.")
+            await self.send(f"{got} получен{done}. Теперь пришли <b>{second}</b> для {name}.")
             return
         if state["step"] == "secret":
             state["secret"] = text
@@ -2700,10 +2723,11 @@ class Bot:
             await self.send(t, markup=kb)
         elif data.startswith("acc_add:"):
             ex = data[8:]
-            name = EXCHANGE_NAMES.get(ex, ex)
+            name = ACCOUNT_NAMES.get(ex, ex)
+            first = KEY_STEPS.get(ex, KEY_STEPS_DEFAULT)[1]
             self.awaiting_key = {"ex": ex, "step": "key"}
             await self.send(f"{key_hint(ex, name)}\n"
-                            f"Пришли <b>API key</b> — сообщение с ним сразу удалю из чата.")
+                            f"Пришли <b>{first}</b> — сообщение с ним сразу удалю из чата.")
         elif data.startswith("acc_check:"):
             ex = data[10:]
             safe, detail = await accounts.key_permissions(self.s, ex)
@@ -2843,12 +2867,16 @@ class Bot:
             await self.send(GUIDE if REPLY_CHAT.get() is not None else OWNER_GUIDE, markup=LINKS)
 
     async def drop_unsafe_key(self, ex, detail):
-        """Ключ даёт больше, чем чтение: удалить его и попросить новый read-only."""
+        """Ключ даёт больше, чем чтение: удалить его и попросить новый read-only (у бирж без read-only ключей —
+        объяснить, что подключить их можно только с ALLOW_UNSAFE_KEYS=1)."""
         accounts.delete_key(ex)
-        name = EXCHANGE_NAMES.get(ex, ex)
-        await self.send(f"⚠️ {name}: ключ даёт больше, чем чтение ({detail}) — удалил его из бота.\n"
-                        f"Создай новый ключ ТОЛЬКО для чтения и подключи заново: «⚙️ Настройки → 🔑 Мои биржи»."
-                        + env_key_hint(ex))
+        name = ACCOUNT_NAMES.get(ex, ex)
+        advice = (f"Ключей только для чтения у {name} нет: подключить его можно, только если осознанно оставить ключ "
+                  "с правами сверх чтения — ALLOW_UNSAFE_KEYS=1 в .env (бот всё равно делает только запросы на чтение)."
+                  if ex in accounts.NO_READONLY_KEYS else
+                  "Создай новый ключ ТОЛЬКО для чтения и подключи заново: «⚙️ Настройки → 🔑 Мои биржи».")
+        await self.send(f"⚠️ {name}: ключ даёт больше, чем чтение ({html.escape(detail)}) — удалил его из бота.\n"
+                        + advice + env_key_hint(ex))
 
     async def check_key_safety(self):
         """При старте: если сохранённый ключ биржи даёт торговать/выводить — удалить его и попросить read-only."""
