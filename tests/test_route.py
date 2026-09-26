@@ -139,6 +139,56 @@ def test_pay_fee_auto_skipped_when_bank_under_limit(monkeypatch):
     assert "комиссия банка" not in route
 
 
+# _route_detail — маршрут по хопам и площадка(и) конвертации (для paper.start_cycle: ROADMAP
+# «межмонетные связки, часть 2»); qty должен совпадать с _route_qty на тех же связках.
+
+def test_route_detail_same_asset_no_venue():
+    b, s = make_ad("MEXC", "buy", 88.0), make_ad("Bybit", "sell", 90.0)
+    qty, hops, venues = p2p._route_detail(b, s, cfg(), SPOT)
+    assert venues == ()
+    assert qty == p2p._route_qty(b, s, cfg(), SPOT)
+    assert len(hops) == 1
+    hop = hops[0]
+    assert hop["frm"] == "MEXC" and hop["to"] == "Bybit" and hop["asset"] == "USDT"
+    assert hop["net"] == "BEP20" and hop["fee"] == pytest.approx(0.01)
+
+
+def test_route_detail_usdt_alt_single_venue():
+    b, s = make_ad("MEXC", "buy", 88.0), make_ad("MEXC", "sell", 245000.0, asset="ETH")
+    qty, hops, venues = p2p._route_detail(b, s, cfg(risk_buffer={"ETH": 0.5}), SPOT)
+    assert venues == ("MEXC",)
+    assert qty == p2p._route_qty(b, s, cfg(risk_buffer={"ETH": 0.5}), SPOT)
+    # покупка и продажа на одной бирже — оба хопа "внутри биржи" (fee 0), но остаются в маршруте
+    assert [h["asset"] for h in hops] == ["USDT", "ETH"]
+    assert all(h["frm"] == "MEXC" and h["to"] == "MEXC" and h["fee"] == 0.0 for h in hops)
+
+
+def test_route_detail_intermediate_coin_single_venue():
+    spot = dict(SPOT, Bybit={**SPOT["Bybit"], "BTC": (7_000_000.0, 7_001_000.0)})
+    b, s = make_ad("Bybit", "buy", 7_000_000.0, asset="BTC"), make_ad("Bybit", "sell", 245000.0, asset="ETH")
+    qty, hops, venues = p2p._route_detail(b, s, cfg(), spot)
+    assert venues == ("Bybit",)
+    assert qty == p2p._route_qty(b, s, cfg(), spot)
+    assert [h["asset"] for h in hops] == ["BTC", "ETH"]
+    assert all(h["frm"] == "Bybit" and h["to"] == "Bybit" for h in hops)
+
+
+def test_route_detail_intermediate_coin_two_venues():
+    spot = {"Bybit": {"USDT": (1.0, 1.0), "BTC": (7_000_000.0, 7_001_000.0)},
+            "MEXC": {"USDT": (1.0, 1.0), "ETH": (2499.0, 2500.0)}}
+    b, s = make_ad("Bybit", "buy", 7_000_000.0, asset="BTC"), make_ad("MEXC", "sell", 245000.0, asset="ETH")
+    qty, hops, venues = p2p._route_detail(b, s, cfg(), spot)
+    assert venues == ("Bybit", "MEXC")
+    assert qty == p2p._route_qty(b, s, cfg(), spot)
+    assert [h["asset"] for h in hops] == ["BTC", "USDT", "ETH"]
+    assert hops[1]["frm"] == "Bybit" and hops[1]["to"] == "MEXC" and hops[1]["net"] == "BEP20"
+
+
+def test_route_detail_none_when_route_impossible():
+    b, s = make_ad("MEXC", "buy", 7_000_000, asset="BTC"), make_ad("MEXC", "sell", 245000, asset="ETH")
+    assert p2p._route_detail(b, s, cfg(), SPOT) is None
+
+
 def test_manual_pay_fee_not_overridden_by_auto():
     b, s = make_ad("MEXC", "buy", 88.0, pays=("T-Bank",)), make_ad("MEXC", "sell", 88.0)
     profit, route = p2p._route(b, s, cfg(pay_fee=1.0), SPOT, over_banks={"T-Bank"})

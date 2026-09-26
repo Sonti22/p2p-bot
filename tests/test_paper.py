@@ -1,3 +1,4 @@
+import json
 import os
 import time
 
@@ -52,6 +53,29 @@ def test_start_cycle_stores_ads_and_stage(tmp_path):
     assert c["sell_ex"] == "MEXC" and c["sell_price"] == 90.0
     assert c["route"] == "перевод USDT (BEP20)" and c["planned_pct"] == 2.5
     assert c["amount"] == 10000 and c["ts_start"] == 1000.0 and c["ts_stage"] == 1000.0
+
+
+def test_start_cycle_stores_route_venues_and_hops(tmp_path):
+    db = str(tmp_path / "paper.db")
+    buy = make_ad("Bybit", "buy", 7_000_000.0, asset="BTC")
+    sell = make_ad("MEXC", "sell", 245000.0, asset="ETH")
+    hops = [{"frm": "Bybit", "to": "Bybit", "asset": "BTC", "net": "", "fee": 0.0},
+            {"frm": "Bybit", "to": "MEXC", "asset": "USDT", "net": "BEP20", "fee": 0.2},
+            {"frm": "MEXC", "to": "MEXC", "asset": "ETH", "net": "", "fee": 0.0}]
+    cid = paper.start_cycle(10000, buy, sell, "спот BTC→USDT→ETH", 3.0, path=db, ts=1000.0,
+                            venues=("Bybit", "MEXC"), hops=hops)
+    c = paper.get_cycle(cid, path=db)
+    assert json.loads(c["route_venues"]) == ["Bybit", "MEXC"]
+    assert json.loads(c["route_hops"]) == hops
+
+
+def test_start_cycle_default_route_venues_and_hops_are_empty(tmp_path):
+    db = str(tmp_path / "paper.db")
+    buy, sell = make_ad("Bybit", "buy", 85.0), make_ad("MEXC", "sell", 90.0)
+    cid = paper.start_cycle(10000, buy, sell, "перевод USDT (BEP20)", 2.5, path=db, ts=1000.0)
+    c = paper.get_cycle(cid, path=db)
+    assert json.loads(c["route_venues"]) == []
+    assert json.loads(c["route_hops"]) == []
 
 
 def test_start_cycle_stores_bank_from_buy_pays(tmp_path):

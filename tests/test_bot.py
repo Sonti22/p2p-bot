@@ -1,6 +1,7 @@
 import asyncio
 import dataclasses
 import functools
+import json
 import logging
 import os
 import time
@@ -124,6 +125,23 @@ def test_paper_cycle_starts_on_signal_when_enabled(monkeypatch, tmp_path):
     # запросы sendMessage не несут явный chat_id гостя — сообщение только владельцу
     assert all(p.get("chat_id") in (None, bot.chat_id) for m, p in bot.out
               if m == "sendMessage" and "Сухой прогон" in p.get("text", ""))
+
+
+def test_paper_cycle_stores_route_hops(monkeypatch, tmp_path):
+    monkeypatch.setattr(B, "deal_card", lambda d, c, a=None, r=None, breakdown=None: b"png")
+    monkeypatch.setenv("PAPER", "1")
+    monkeypatch.setenv("PAPER_AMOUNT", "10000")
+    monkeypatch.setenv("PAPER_MAX_OPEN", "1")
+    db = str(tmp_path / "paper.db")
+    _patch_paper_db(monkeypatch, db)
+    bot = Stub(p2p.Config(min_profit=2.0))
+    bot.live_scans = 1
+    asyncio.run(bot.notify(snap_groups([deal(5)])))
+    c = paper.open_cycles(path=db)[0]
+    hops = json.loads(c["route_hops"])
+    assert json.loads(c["route_venues"]) == []   # покупка/продажа USDT — конвертации на споте нет
+    assert len(hops) == 1
+    assert hops[0]["frm"] == "Bybit" and hops[0]["to"] == "MEXC" and hops[0]["asset"] == "USDT"
 
 
 def test_paper_cycle_off_by_default(monkeypatch, tmp_path):

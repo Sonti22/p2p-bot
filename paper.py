@@ -10,6 +10,9 @@ SQLite data/paper.db, таблицы:
             intra — внутри банка, sbp — по СБП со своего банка, trades.pay_plan) и банк (bank) — для учёта
             виртуального оборота по бесплатному лимиту СБП. planned_pct — план с запасом на курс (его видит
             владелец), planned_raw — тот же план без запаса: с ним сравнивается факт (в факте запаса нет).
+            route_venues/route_hops — площадка(и) конвертации на споте и хопы маршрута (площадка/сеть/
+            комиссия каждого перевода) на момент старта, из p2p._route_detail — задел для проверки стадий
+            transfer/sell межмонетных/спот связок по факту.
   balance — один виртуальный баланс: старт = PAPER_AMOUNT, меняется на realized_pct каждого
             завершённого круга.
 """
@@ -50,7 +53,7 @@ _COLUMNS = ("id", "ts_start", "amount", "buy_ex", "buy_asset", "buy_price", "buy
             "sell_ex", "sell_asset", "sell_price", "sell_nick", "route", "planned_pct",
             "stage", "ts_stage", "realized_pct", "result", "note", "bank", "label", "sell_fact", "pay_kind",
             "sell_qty", "sell_net", "buy_nicks", "buy_net", "buy_pays", "sell_parts", "pay_fee_used",
-            "planned_raw")
+            "planned_raw", "route_venues", "route_hops")
 # план для сравнения с фактом: без запаса на курс; у кругов до planned_raw — план с запасом, как раньше
 _PLAN_CMP = "COALESCE(planned_raw, planned_pct)"
 
@@ -83,13 +86,15 @@ def _connect(path):
                 "bank TEXT DEFAULT '', label TEXT DEFAULT '', sell_fact REAL DEFAULT NULL, pay_kind TEXT DEFAULT '', "
                 "sell_qty REAL DEFAULT NULL, sell_net TEXT DEFAULT '', buy_nicks TEXT DEFAULT '', "
                 "buy_net TEXT DEFAULT '', buy_pays TEXT DEFAULT '[]', sell_parts INTEGER DEFAULT 1, "
-                "pay_fee_used REAL DEFAULT 0, planned_raw REAL DEFAULT NULL)")
+                "pay_fee_used REAL DEFAULT 0, planned_raw REAL DEFAULT NULL, route_venues TEXT DEFAULT '[]', "
+                "route_hops TEXT DEFAULT '[]')")
     cols = [r[1] for r in con.execute("PRAGMA table_info(cycles)")]
     for col, ddl in (("bank", "TEXT DEFAULT ''"), ("label", "TEXT DEFAULT ''"), ("sell_fact", "REAL DEFAULT NULL"),
                      ("pay_kind", "TEXT DEFAULT ''"), ("sell_qty", "REAL DEFAULT NULL"), ("sell_net", "TEXT DEFAULT ''"),
                      ("buy_nicks", "TEXT DEFAULT ''"), ("buy_net", "TEXT DEFAULT ''"),
                      ("buy_pays", "TEXT DEFAULT '[]'"), ("sell_parts", "INTEGER DEFAULT 1"),
-                     ("pay_fee_used", "REAL DEFAULT 0"), ("planned_raw", "REAL DEFAULT NULL")):
+                     ("pay_fee_used", "REAL DEFAULT 0"), ("planned_raw", "REAL DEFAULT NULL"),
+                     ("route_venues", "TEXT DEFAULT '[]'"), ("route_hops", "TEXT DEFAULT '[]'")):
         if col not in cols:   # база от прошлой версии — добавляем колонку, данные не трогаем
             con.execute(f"ALTER TABLE cycles ADD COLUMN {col} {ddl}")
     con.execute("CREATE TABLE IF NOT EXISTS balance (id INTEGER PRIMARY KEY CHECK (id = 1), "
@@ -132,7 +137,7 @@ def apply_result(realized_pct, amount, path=DB_PATH, ts=None):
 
 
 def start_cycle(amount, buy, sell, route, planned_pct, path=DB_PATH, ts=None, label="", sell_qty=None, pay_fee=0.0,
-                over=None, planned_raw=None):
+                over=None, planned_raw=None, venues=(), hops=()):
     """Завести новый виртуальный круг со стадией buy. buy/sell — объявления покупки/продажи
     (p2p.Ad) на момент старта. Как платим (trades.pay_plan: внутри банка или по СБП со своего банка, у
     которого виртуальный лимит ещё есть) пишется сразу — в реальности рубли уходят в момент оплаты, до
@@ -148,6 +153,9 @@ def start_cycle(amount, buy, sell, route, planned_pct, path=DB_PATH, ts=None, la
     лимитом СБП, с которыми бот считал план и sell_qty (реальные сделки trades + виртуальный оборот прогона):
     банк оплаты и pay_fee_used берём по ним же, иначе комиссия в круге разошлась бы с планом; не передан —
     только виртуальный оборот прогона. planned_raw — план без запаса на курс (для сравнения с фактом).
+    venues/hops — площадка(и) конвертации на споте и хопы маршрута (p2p._route_detail: frm/to/asset/net/fee
+    каждого перевода) на момент старта — задел для проверки стадий transfer/sell межмонетных/спот связок по
+    факту (ROADMAP «межмонетные связки, часть 2»), сами стадии их пока не используют.
     Возвращает id круга."""
     ts = ts if ts is not None else time.time()
     if over is None:
@@ -160,13 +168,14 @@ def start_cycle(amount, buy, sell, route, planned_pct, path=DB_PATH, ts=None, la
         cur = con.execute(
             "INSERT INTO cycles (ts_start, amount, buy_ex, buy_asset, buy_price, buy_nick, sell_ex, sell_asset, "
             "sell_price, sell_nick, route, planned_pct, stage, ts_stage, bank, label, pay_kind, sell_qty, sell_net, "
-            "buy_nicks, buy_net, buy_pays, sell_parts, pay_fee_used, planned_raw) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'buy', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "buy_nicks, buy_net, buy_pays, sell_parts, pay_fee_used, planned_raw, route_venues, route_hops) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'buy', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (ts, amount, buy.ex, buy.asset, buy.price, buy.nick,
              sell.ex, sell.asset, sell.price, sell.nick, route, planned_pct, ts, bank, label, kind,
              sell_qty, sell.net or "", json.dumps(list(buy.nicks or (buy.nick,)), ensure_ascii=False),
              buy.net or "", json.dumps(list(buy.pays or []), ensure_ascii=False), sell.parts or 1, pay_fee_used,
-             planned_raw))
+             planned_raw, json.dumps(list(venues or []), ensure_ascii=False),
+             json.dumps(list(hops or []), ensure_ascii=False)))
         cycle_id = cur.lastrowid
     con.close()
     return cycle_id

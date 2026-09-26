@@ -26,7 +26,8 @@ import presets
 import trades
 from cards import deal_card, history_card, history_compare_card, portfolio_card, top_chart
 from p2p import ALL_EXCHANGES, AMOUNT_MAX, AMOUNT_MIN, DEFAULT_ASSETS, ENV_PATH, LOG_PATH, MIN_PROFIT_MAX, \
-    MIN_PROFIT_MIN, TRAP, Config, fmt_signal, sell_step_number, _money, _price, _route_qty, bank_liquidity, book_spread, deal_amounts, \
+    MIN_PROFIT_MIN, TRAP, Config, fmt_signal, sell_step_number, _money, _price, _route_detail, _route_qty, \
+    bank_liquidity, book_spread, deal_amounts, \
     deal_for_amount, fmt_ad, fmt_breakeven, fmt_deal, fmt_top, load_env, maker_neighbors, maker_place, maker_quote, \
     maker_round_fee, parse_amount, parse_min_profit, profit_breakdown, reliability, reliability_index, scan, \
     setup_logging, spot_url, traps_log, venue_url
@@ -2088,14 +2089,16 @@ class Bot:
         profit, b, s, route = d
         paper.init_balance(settings["amount"])
         # выход маршрута в монете продажи по итоговому стеку s (его parts: переводов на каждый обменник) — без
-        # запаса на курс и с комиссией СБП, если лимит исчерпан; по нему же план без запаса — с ним сравнивается факт
-        qty = _route_qty(b, s, dataclasses.replace(self.cfg, amount=settings["amount"]), psnap.spot, over,
-                         disable=frozenset({"risk"}))
+        # запаса на курс и с комиссией СБП, если лимит исчерпан; по нему же план без запаса — с ним сравнивается факт;
+        # hops/venues — площадка(и) конвертации и хопы маршрута на старте, для будущей проверки стадий по факту
+        detail = _route_detail(b, s, dataclasses.replace(self.cfg, amount=settings["amount"]), psnap.spot, over,
+                               disable=frozenset({"risk"}))
+        qty, hops, venues = detail if detail else (None, [], ())
         raw = (qty * s.price / settings["amount"] - 1) * 100 if qty else profit
         # over — тот же, что в плане и qty: банк оплаты и комиссия СБП в круге совпадут с планом
         cycle = paper.get_cycle(paper.start_cycle(settings["amount"], b, s, route, profit, label=label,
                                                   sell_qty=qty or s.avail, pay_fee=self.cfg.pay_fee, over=over,
-                                                  planned_raw=raw)) or {}
+                                                  planned_raw=raw, venues=venues, hops=hops)) or {}
         pay = trades.pay_label(cycle.get("pay_kind", ""), cycle.get("bank", ""), b.pays)
         qty = settings["amount"] / b.price
         text = (f"🧪 <b>Сухой прогон</b>: купил бы {_money(qty)} {b.asset} у {html.escape(b.nick)} "
