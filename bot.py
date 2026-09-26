@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -23,6 +24,7 @@ import history
 import jsonstore
 import netstatus
 import paper
+import payouts
 import presets
 import simmaker
 import trades
@@ -96,6 +98,7 @@ COMMANDS = [{"command": "best", "description": "Лучшая связка сей
             {"command": "maker", "description": "Цена мейкера на площадках, напр. /maker USDT"},
             {"command": "banks", "description": "Объём по банкам на площадках, напр. /banks USDT"},
             {"command": "balance", "description": "Баланс по подключённым биржам"},
+            {"command": "payout", "description": "Выплата Cryptomus на адрес из белого списка, /payout history"},
             {"command": "fees", "description": "Комиссии вывода по сетям и возраст данных"},
             {"command": "settings", "description": "Порог, сумма, пауза"},
             {"command": "pause", "description": "Пауза сигналов: /pause 30m|1h|3h|до утра"},
@@ -273,7 +276,8 @@ KEY_HINT = {
                   "Нужны два значения. Первое — <b>ID</b> (UUID): User ID личного кабинета (значок профиля) или "
                   "Merchant ID бизнес-кабинета. Второе — <b>API key</b> того же кабинета: лучше User API key личного "
                   "кабинета (Settings → User API key: конвертации и ордера, вывода наружу в его API не описано), для "
-                  "бизнес-кабинета — Payment API key. Ключ выплат (<b>Payout key</b>) боту не давай никогда. Если "
+                  "бизнес-кабинета — Payment API key. Ключ выплат (<b>Payout key</b>) сюда не присылай: он нужен только "
+                  "для /payout и вписывается на ПК в .env (подробности — /payout). Если "
                   "Cryptomus позволяет — ограничь ключ по IP своего ПК."),
 }
 KEY_STEPS = {"cryptomus": ("ID", "ID (User ID или Merchant ID, UUID)", "API key")}   # ввод ключа: что получили, 1-й и 2-й шаг
@@ -793,6 +797,116 @@ def portfolio_view(port, snap):
 
 BALANCE_MARKUP = {"inline_keyboard": [[{"text": "🔄 Обновить", "callback_data": "balance"}]]}
 
+# Выплаты Cryptomus (payouts.py): только владелец, только адреса из белого списка, каждую подтверждает кнопкой.
+PAYOUT_KEY_HINT = ("💸 <b>Выплаты Cryptomus</b>: ключа выплат нет.\n\n"
+                   "Как создать: в Cryptomus открой настройки, включи 2FA, зайди в Business settings и нажми Generate "
+                   "Payout key. После генерации ключа Cryptomus на 24 часа блокирует выводы. Там же, в настройках "
+                   "мерчанта, скопируй Merchant ID.\n\n"
+                   "В Telegram ключ <b>не присылай</b>. Впиши его на ПК в .env бота: "
+                   "CRYPTOMUS_PAYOUT_API_KEY=&lt;Merchant ID&gt; и CRYPTOMUS_PAYOUT_API_SECRET=&lt;Payout key&gt;, затем "
+                   "перезапусти бота. Если Cryptomus позволяет, ограничь ключ по IP своего ПК. На бизнес-кошельке держи "
+                   "только сумму, которую собираешься выплатить.")
+PAYOUT_OFF_HINT = ("⛔ Выплаты выключены. Включить их можно только на ПК: PAYOUTS=1 в .env бота, затем перезапуск. "
+                   "Из Telegram выплаты можно только выключить кнопкой «⛔ Стоп выплаты».")
+PAYOUT_WL_HINT = ("💸 Белый список адресов пуст. Бот платит только на адреса из data/payout_whitelist.json, а сам этот "
+                  "файл не меняет. Добавь адрес на ПК: <code>python scripts/payout_whitelist.py add</code> (адрес "
+                  "вводится дважды). Посмотреть список: <code>list</code>, убрать адрес: <code>remove</code>.")
+PAYOUT_STOPPED = ("⛔ Выплаты выключены (PAYOUTS=0). Включить снова можно только на ПК: PAYOUTS=1 в .env бота, затем "
+                  "перезапуск. Статус выплат, которые уже в обработке, бот продолжает отслеживать.")
+PAYOUT_STOP_BTN = {"text": "⛔ Стоп выплаты", "callback_data": "pay_stop"}
+
+
+def payout_menu_view(entries, used, daily):
+    rows = [[{"text": f"{e['name']} · {e['currency']} {e['network']}"[:60], "callback_data": f"pay_to:{e['id']}"}]
+            for e in entries]
+    rows.append([{"text": "📜 История", "callback_data": "pay_hist"}, PAYOUT_STOP_BTN])
+    return ("💸 <b>Выплата с бизнес-кошелька Cryptomus</b>\n"
+            f"Лимит на сегодня (МСК): использовано {used:.2f} из {daily:.2f} USDT.\n"
+            "Выбери получателя из белого списка. Потом бот спросит сумму и покажет всё ещё раз перед отправкой."), \
+        {"inline_keyboard": rows}
+
+
+def payout_preview_view(entry, amount, q, token):
+    """Экран проверки перед отправкой: полный адрес, сеть, memo, комиссия, списание, лимит дня; кнопки одноразовые."""
+    cur = entry["currency"]
+    memo = f"Memo: <code>{html.escape(entry['memo'])}</code>\n" if entry["memo"] else ""
+    left = q["daily"] - q["used"] - q["usdt"]
+    warn = (f"⚠️ Есть выплаты с неясным исходом ({q['unknown']}): проверь /payout history, прежде чем платить тому же "
+            f"получателю ещё раз.\n\n" if q.get("unknown") else "")
+    text = ("💸 <b>Проверь выплату</b> (Cryptomus, бизнес-кошелёк)\n"
+            f"Получатель: {html.escape(entry['name'])}\n"
+            f"Монета и сеть: <b>{cur} · {entry['network']}</b>\n"
+            f"Адрес: <code>{html.escape(entry['address'])}</code>\n{memo}"
+            f"Получит: <b>{payouts.fmt(amount)} {cur}</b>\n"
+            f"Комиссия Cryptomus: {payouts.fmt(q['fee'])} {cur}, списывается с баланса сверху\n"
+            f"Спишется с баланса: {payouts.fmt(q['debit'])} {cur} ≈ {q['usdt']:.2f} USDT\n"
+            f"Лимит дня (МСК): использовано {q['used']:.2f} из {q['daily']:.2f} USDT, после выплаты останется "
+            f"{left:.2f}\n\n{warn}"
+            f"Кнопка действует {payouts.TOKEN_TTL // 60} мин. Отправленную выплату не отменить, поэтому сверь адрес "
+            f"и сеть.")
+    return text, {"inline_keyboard": [[{"text": "✅ Отправить", "callback_data": f"pay_ok:{token}"},
+                                       {"text": "Отмена", "callback_data": f"pay_no:{token}"}], [PAYOUT_STOP_BTN]]}
+
+
+def _payout_what(row):
+    return f"{row['amount']} {row['currency']} ({row['network']}) → {html.escape(row['wl_name'])}"
+
+
+def payout_event_text(event, row):
+    """Сообщение о выплате: итог опроса статуса (paid/failed/found/mismatch) или перезапуск посреди отправки."""
+    what, order = _payout_what(row), f"заявка <code>{row['order_id']}</code>"
+    if event == "paid":
+        txid = f", TXID <code>{html.escape(row['txid'])}</code>" if row["txid"] else ""
+        return f"✅ Выплата {what} выполнена{txid}."
+    if event == "failed":
+        return (f"❌ Выплата {what} не прошла (статус {html.escape(row['status'])}), {order}. По документации "
+                f"Cryptomus средства возвращаются на баланс — проверь баланс в кабинете. Автоповтора нет: новую "
+                f"выплату запускай через /payout.")
+    if event == "found":
+        return f"ℹ️ Выплата {what} нашлась в Cryptomus ({order}), статус {html.escape(row['status'])}. Итог пришлю сюда."
+    if event == "mismatch":
+        return (f"🚨 Выплата {what}: {html.escape(row['note'])} ({order}). Проверь её в кабинете Cryptomus. "
+                f"В дневном лимите она учтена.")
+    if event == "resumed":
+        return (f"⚠️ Бот перезапустился во время отправки выплаты {what} ({order}). Исход неясен, проверяю статус "
+                f"в Cryptomus. В дневном лимите выплата учтена.")
+    return f"Выплата {what}: {payouts.STATE_NAMES.get(row['state'], row['state'])}."
+
+
+def payout_result_text(res):
+    """Итог payouts.send для владельца."""
+    row, state, reason = res["row"], res["state"], html.escape(res.get("reason") or "")
+    if state == "refused":
+        return f"⛔ Выплата не отправлена: {reason}."
+    what, order = _payout_what(row), f"заявка <code>{row['order_id']}</code>"
+    if state == "rejected":
+        return (f"🚫 Cryptomus отклонил выплату {what}: {reason}. Деньги не ушли, в лимит не засчитано. "
+                f"Новая попытка — снова через /payout.")
+    if state == "unknown":
+        alarm = "🚨" if payouts.MISMATCH in (res.get("reason") or "") else "⚠️"
+        return (f"{alarm} Исход выплаты {what} неясен: {reason}. Заявка <code>{row['order_id']}</code> учтена в "
+                f"дневном лимите. "
+                f"Бот проверяет её статус в Cryptomus и напишет в «📒 Журнал». Не повторяй эту выплату, пока "
+                f"статус не выяснится.")
+    if state == "final_paid":
+        return payout_event_text("paid", row)
+    if state == "final_failed":
+        return payout_event_text("failed", row)
+    return (f"✅ Cryptomus принял выплату {what}, {order}, статус {html.escape(row['status'] or '?')}. "
+            f"Итог пришлю в «📒 Журнал».")
+
+
+def payout_history_view(rows, used, daily):
+    if not rows:
+        return "📜 Выплат ещё не было."
+    lines = [f"📜 <b>Выплаты</b>, последние {len(rows)}. Сегодня (МСК): {used:.2f} из {daily:.2f} USDT."]
+    for r in rows:
+        ts = datetime.fromtimestamp(r["created_ts"], MSK).strftime("%d.%m %H:%M")
+        txid = f", TXID <code>{html.escape(r['txid'][:16])}…</code>" if r["txid"] else ""
+        note = f" ({html.escape(r['note'])})" if r["state"] in ("rejected", "unknown") and r["note"] else ""
+        lines.append(f"• {ts} {_payout_what(r)}: {payouts.STATE_NAMES.get(r['state'], r['state'])}{note}{txid}")
+    return "\n".join(lines)
+
 
 def roadmap_progress(path=os.path.join(HERE, "ROADMAP.md")):
     """(сделано, всего, следующая задача) из раздела «Очередь» ROADMAP.md."""
@@ -1025,6 +1139,9 @@ class Bot:
         self.awaiting_preset_name = False  # ждём имя пресета текстом после «💾 Сохранить как пресет»
         self.awaiting_key = None      # {"ex":.., "step": "key"/"secret", "key":..} — ждём ключ биржи
         self.awaiting_fact = None     # id сделки — ждём фактический результат текстом после «✏️ ввести число»
+        self.awaiting_payout = None   # id записи белого списка — ждём сумму выплаты текстом после выбора получателя
+        self.payout_preview = None    # {"token", "entry", "amount", "quote", "ts"} — последний предпросмотр выплаты
+        self.resumed_payouts = []     # выплаты, прерванные перезапуском (payouts.resume в main), — сообщить владельцу
         self.onboarding = None   # {"step": "amount"/"banks"/"min", "banks": set()} — мастер первого /start
         self.sent = {}
         self.live_msg = {}   # (ex,asset,ex,asset) -> последнее сообщение сигнала для «живой карточки» (editMessage)
@@ -2651,6 +2768,11 @@ class Bot:
             self.awaiting_preset_name = False   # любая другая кнопка прерывает ввод имени пресета
         if not data.endswith(":manual") or not data.startswith("fact:"):
             self.awaiting_fact = None      # любая другая кнопка прерывает ввод факта числом
+        if not data.startswith("pay_to:"):
+            self.awaiting_payout = None    # любая другая кнопка прерывает ввод суммы выплаты
+        if data.startswith("pay_"):
+            await self.payout_callback(cq, data)
+            return
         toast = self.apply(data)
         await self.call("answerCallbackQuery", callback_query_id=cq["id"], text=toast)
         if data.startswith(("flt_a:", "flt_e:", "preset_apply:")):
@@ -2772,6 +2894,8 @@ class Bot:
             await self.send(t, markup=kb)
         elif data.startswith("acc_add:"):
             ex = data[8:]
+            if ex not in accounts.ONBOARDABLE:   # ключ выплат (cryptomus_payout) и прочее — только локально на ПК
+                return
             name = ACCOUNT_NAMES.get(ex, ex)
             first = KEY_STEPS.get(ex, KEY_STEPS_DEFAULT)[1]
             self.awaiting_key = {"ex": ex, "step": "key"}
@@ -2815,6 +2939,11 @@ class Bot:
             trade_id, self.awaiting_fact = self.awaiting_fact, None   # любая другая команда/кнопка сбрасывает
             if text not in BUTTONS and not text.startswith("/"):
                 await self.set_fact_from_text(trade_id, text)
+                return
+        if self.awaiting_payout is not None:
+            eid, self.awaiting_payout = self.awaiting_payout, None   # любая другая команда/кнопка — отмена
+            if text not in BUTTONS and not text.startswith("/"):
+                await self.payout_amount(eid, text)
                 return
         self.awaiting_key = None               # команда/кнопка прерывает ввод ключа биржи
         cmd, _, arg = BUTTONS.get(text, text).partition(" ")
@@ -2885,6 +3014,8 @@ class Bot:
             await self.banks(arg)
         elif cmd == "/balance":
             await self.balance()
+        elif cmd == "/payout":
+            await self.cmd_payout(arg)
         elif cmd == "/fees":
             await self.send(fees.view(live=netstatus.live_fee))
         elif cmd == "/settings":
@@ -2917,6 +3048,131 @@ class Bot:
             await self.cmd_resume()
         else:
             await self.send(GUIDE if REPLY_CHAT.get() is not None else OWNER_GUIDE, markup=LINKS)
+
+    async def cmd_payout(self, arg):
+        """/payout — выплата Cryptomus на адрес из белого списка; /payout history — последние 10 выплат."""
+        if arg.strip().lower() in ("history", "история"):
+            await self.send(payout_history_view(payouts.history(10), payouts.used_today(), payouts.limits()[1]))
+            return
+        if payouts.credentials() is None:
+            await self.send(PAYOUT_KEY_HINT)
+            return
+        if not payouts.enabled():
+            await self.send(PAYOUT_OFF_HINT)
+            return
+        entries = payouts.load_whitelist()
+        if not entries:
+            await self.send(PAYOUT_WL_HINT)
+            return
+        text, kb = payout_menu_view(entries, payouts.used_today(), payouts.limits()[1])
+        await self.send(text, markup=kb)
+
+    def payout_stop(self):
+        """«⛔ Стоп выплаты»: PAYOUTS=0 в .env и в окружении процесса. Включить обратно из Telegram нельзя."""
+        save_env("PAYOUTS", "0")
+        self.payout_preview = None
+        self.awaiting_payout = None
+
+    async def payout_callback(self, cq, data):
+        """Кнопки выплат: pay_to:<id> — получатель из белого списка, pay_ok/pay_no:<токен> — кнопки предпросмотра,
+        pay_hist — история, pay_stop — выключить выплаты."""
+        kind, _, arg = data.partition(":")
+        if kind == "pay_stop":
+            self.payout_stop()
+            await self.call("answerCallbackQuery", callback_query_id=cq["id"], text="Выплаты выключены")
+            await self.send(PAYOUT_STOPPED)
+        elif kind == "pay_hist":
+            await self.call("answerCallbackQuery", callback_query_id=cq["id"])
+            await self.cmd_payout("history")
+        elif kind == "pay_to":
+            await self.payout_pick(cq, arg)
+        elif kind in ("pay_ok", "pay_no"):
+            await self.payout_confirm(cq, kind, arg)
+        else:
+            await self.call("answerCallbackQuery", callback_query_id=cq["id"])
+
+    async def payout_pick(self, cq, eid):
+        entry = payouts.whitelist_entry(eid)
+        why = ("Нет ключа выплат" if payouts.credentials() is None else "Выплаты выключены" if not payouts.enabled()
+               else "Этого адреса нет в белом списке" if entry is None else "")
+        await self.call("answerCallbackQuery", callback_query_id=cq["id"], text=why)
+        if why:
+            return
+        self.awaiting_payout = entry["id"]
+        cur = entry["currency"]
+        memo = f"Memo: <code>{html.escape(entry['memo'])}</code>\n" if entry["memo"] else ""
+        await self.send(f"💸 {html.escape(entry['name'])}: <b>{cur} · {entry['network']}</b>\n"
+                        f"Адрес: <code>{html.escape(entry['address'])}</code>\n{memo}"
+                        f"Сколько {cur} отправить? Пришли число, до 8 знаков после точки, например 25 или 0.015. "
+                        f"Получатель получит ровно эту сумму, комиссия Cryptomus спишется с баланса сверху.")
+
+    async def payout_amount(self, eid, text):
+        """Сумма выплаты текстом -> живая комиссия и лимиты (payouts.quote) -> экран проверки с одноразовой кнопкой."""
+        amount, why = payouts.parse_amount(text)
+        if why:
+            self.awaiting_payout = eid   # ждём сумму дальше; любая команда или кнопка — отмена
+            await self.send(f"⚠️ {why}. Пришли сумму ещё раз или любую команду для отмены.")
+            return
+        entry = payouts.whitelist_entry(eid)
+        if entry is None:
+            await self.send("Этого адреса уже нет в белом списке, выплата не готовится.")
+            return
+        q, why = await payouts.quote(self.s, entry, amount)
+        if why:
+            await self.send(f"⛔ Выплата не готова: {html.escape(why)}.")
+            return
+        token = secrets.token_urlsafe(12)
+        self.payout_preview = {"token": token, "entry": entry, "amount": amount, "quote": q, "ts": time.time()}
+        text, kb = payout_preview_view(entry, amount, q, token)
+        await self.send(text, markup=kb)
+
+    async def payout_confirm(self, cq, kind, token):
+        """«✅ Отправить»/«Отмена» под предпросмотром. Кнопка одноразовая: токен снимается до любого запроса, так что
+        второе нажатие, повтор колбэка или старая кнопка ничего не отправят; через TOKEN_TTL и после «⛔ Стоп» — тоже."""
+        p = self.payout_preview
+        if not p or not token or p["token"] != token:
+            await self.call("answerCallbackQuery", callback_query_id=cq["id"],
+                            text="Кнопка устарела или уже нажата, ничего не отправлено")
+            await self.drop_buttons(cq)
+            return
+        self.payout_preview = None
+        await self.drop_buttons(cq)
+        if kind == "pay_no":
+            await self.call("answerCallbackQuery", callback_query_id=cq["id"], text="Отменено")
+            await self.send("Выплата отменена, ничего не отправлено.")
+            return
+        if time.time() - p["ts"] > payouts.TOKEN_TTL:
+            await self.call("answerCallbackQuery", callback_query_id=cq["id"], text="Подтверждение истекло")
+            await self.send(f"⌛ Подтверждение истекло ({payouts.TOKEN_TTL} с), ничего не отправлено. "
+                            f"Начни заново: /payout")
+            return
+        if not payouts.enabled():
+            await self.call("answerCallbackQuery", callback_query_id=cq["id"], text="Выплаты выключены")
+            await self.send(f"⛔ Ничего не отправлено: {payouts.OFF}.")
+            return
+        await self.call("answerCallbackQuery", callback_query_id=cq["id"], text="Отправляю…")
+        res = await payouts.send(self.s, p["entry"], p["amount"], p["quote"])
+        await self.send(payout_result_text(res))
+
+    async def drop_buttons(self, cq):
+        mid = (cq.get("message") or {}).get("message_id")
+        if mid is not None:
+            await self.call("editMessageReplyMarkup", chat_id=self.chat_id, message_id=mid,
+                            reply_markup={"inline_keyboard": []})
+
+    async def payouts_loop(self):
+        """Выплаты: сообщить о прерванных перезапуском, дальше раз в ~30 с опрос незавершённых — итог в «📒 Журнал»."""
+        while True:
+            if self.chat_id:
+                try:
+                    while self.resumed_payouts:
+                        await self.send(payout_event_text("resumed", self.resumed_payouts[0]), topic="journal")
+                        self.resumed_payouts.pop(0)
+                    for event, row in await payouts.poll(self.s):
+                        await self.send(payout_event_text(event, row), topic="journal")
+                except Exception as e:
+                    logger.error("payouts_loop error: %s", accounts.api_error_text(e))
+            await asyncio.sleep(payouts.POLL_INTERVAL)
 
     async def drop_unsafe_key(self, ex, detail):
         """Ключ даёт больше, чем чтение: удалить его и попросить новый read-only (у бирж без read-only ключей —
@@ -2968,13 +3224,14 @@ async def main():
         logger.warning("шифрование ключей: %s", type(e).__name__)
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as s:
         bot = Bot(s, token, os.getenv("TG_CHAT_ID", "").strip(), cfg)
+        bot.resumed_payouts = payouts.resume()   # до первого опроса: прерванные отправки — в «исход неясен»
         await bot.setup()
         if bot.chat_id:
             await bot.setup_topics()
             await bot.check_key_safety()
         logger.info("Бот запущен: каждые %ss, порог %g%%, биржи %s", cfg.interval, cfg.min_profit,
                     ', '.join(cfg.exchanges))
-        await asyncio.gather(bot.scan_loop(), bot.command_loop(), bot.accounts_loop())
+        await asyncio.gather(bot.scan_loop(), bot.command_loop(), bot.accounts_loop(), bot.payouts_loop())
 
 
 if __name__ == "__main__":
