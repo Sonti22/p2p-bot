@@ -4,9 +4,16 @@
 (`BYBIT_API_KEY`/`BYBIT_API_SECRET`, `MEXC_API_KEY`/`MEXC_API_SECRET`). Нет ключей для биржи —
 `keys()` вернёт None, функции аккаунтов для неё выключены. Удалённый в боте ключ помечается в
 `data/keys.json` как `disabled` — пометка выключает его, даже если он остался в `.env`. Никаких
-торговых/выводных запросов — только подписанные GET к read-only эндпоинтам. key/secret/passphrase в
+торговых/выводных запросов — только подписанные запросы к read-only эндпоинтам. key/secret/passphrase в
 `data/keys.json` хранятся зашифрованными Windows DPAPI (`protect`/`unprotect`) — файл бесполезен вне этой
 учётной записи Windows; открытые значения от прошлой версии шифруются при старте бота (`encrypt_saved_keys`).
+
+BingX и Cryptomus — только аккаунты (P2P-площадками бота они не являются). Чтение у них ограничено в самом коде,
+а не правами ключа: `bingx_get` — только GET и только пути из BINGX_READ_PATHS (спот- и Fund-баланс, права ключа,
+история депозитов и выводов), POST-запросов к BingX в коде нет; `cryptomus_call` — только пары (метод, путь) из
+CRYPTOMUS_READ_CALLS (баланс личного кабинета GET /v2/user-api/balance, баланс бизнес-кабинета POST /v1/balance,
+история личного кабинета POST /v2/user-api/transaction/list). Любой другой путь — ValueError до подписи и отправки.
+Ключей «только чтение» у Cryptomus нет вовсе: любой его ключ даёт двигать деньги (см. CRYPTOMUS_KEY_RIGHTS).
 """
 import asyncio
 import base64
@@ -16,7 +23,7 @@ import json
 import os
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urlencode
 
 import aiohttp
@@ -28,8 +35,11 @@ BYBIT_BASE = "https://api.bybit.com"
 MEXC_BASE = "https://api.mexc.com"
 HTX_BASE = "https://api.htx.com"
 KUCOIN_BASE = "https://api.kucoin.com"
-CONNECTABLE = ("bybit", "mexc", "htx", "kucoin")   # биржи, для которых уже есть подпись запросов
+BINGX_BASE = "https://open-api.bingx.com"
+CRYPTOMUS_BASE = "https://api.cryptomus.com"
+CONNECTABLE = ("bybit", "mexc", "htx", "kucoin", "bingx", "cryptomus")   # биржи, для которых уже есть подпись запросов
 PASSPHRASE_REQUIRED = ("kucoin",)      # ключ биржи — 3 шага (key/secret/passphrase)
+NO_READONLY_KEYS = ("cryptomus",)      # биржи без ключей «только чтение»: любой ключ даёт двигать деньги
 ONBOARDABLE = tuple(dict.fromkeys(CONNECTABLE + PASSPHRASE_REQUIRED))   # биржи, для которых бот предлагает подключить ключ кнопками
 
 
@@ -315,6 +325,194 @@ async def kucoin_get(s, api_key, api_secret, passphrase_value, path, params=None
     return await _get_json(s, f"{KUCOIN_BASE}{full_path}", headers)
 
 
+# BingX: ключ владельца даёт торговлю — поэтому только GET и только эти пути; POST-запросов к BingX в коде нет
+BINGX_READ_PATHS = frozenset({
+    "/openApi/spot/v1/account/balance",           # спот: data.balances[{asset, free, locked}]
+    "/openApi/fund/v1/account/balance",           # Fund-счёт (с 2025-10 отдельно от спота), та же форма
+    "/openApi/v1/account/apiPermissions",         # права ключа (две документированные формы, см. bingx_key_safety)
+    "/openApi/api/v3/capital/deposit/hisrec",     # история депозитов — голый массив
+    "/openApi/api/v3/capital/withdraw/history",   # история выводов — голый массив
+})
+BINGX_ERRORS = {   # код ошибки BingX -> подсказка владельцу (без ключа и URL)
+    100001: "неверная подпись — проверь secret",
+    100004: "у ключа нет нужного права — включи «Read»",
+    100410: "превышен лимит запросов BingX, повтори позже",
+    100412: "запрос без подписи",
+    100413: "BingX не нашёл такой API key — проверь ключ",
+    100419: "IP этого ПК не в белом списке ключа",
+    100421: "часы ПК расходятся с BingX — синхронизируй время Windows",
+    100500: "BingX занят, повтори позже",
+}
+
+
+def bingx_signed_query(api_secret, params=None, timestamp=None, recv_window="5000"):
+    """Query приватного GET BingX вместе с подписью: параметры (с timestamp в мс и recvWindow ≤ 5000) по ключу
+    в порядке ASCII, сырые значения key=value&...; signature = hex(HMAC_SHA256(secret, эта строка)) — последним
+    параметром. recv_window=None — без recvWindow (как в официальном примере подписи)."""
+    p = {k: str(v) for k, v in (params or {}).items()}
+    if recv_window is not None:
+        p.setdefault("recvWindow", str(recv_window))
+    p["timestamp"] = str(timestamp or int(time.time() * 1000))
+    query = "&".join(f"{k}={p[k]}" for k in sorted(p))
+    sign = hmac.new(api_secret.encode(), query.encode(), hashlib.sha256).hexdigest()
+    return f"{query}&signature={sign}"
+
+
+async def bingx_get(s, api_key, api_secret, path, params=None):
+    """Подписанный GET к приватному BingX. Путь не из BINGX_READ_PATHS — ValueError до подписи и отправки."""
+    if path not in BINGX_READ_PATHS:
+        raise ValueError(f"BingX: путь {path} не входит в список чтения")
+    url = f"{BINGX_BASE}{path}?{bingx_signed_query(api_secret, params)}"
+    return await _get_json(s, url, {"X-BX-APIKEY": api_key})
+
+
+def _scrub(text, *secrets, limit=160):
+    """Текст ошибки биржи для пользователя: ключ/секрет/ID, если биржа их процитировала, — «•••»; не длиннее limit."""
+    for sec in secrets:
+        if sec and len(sec) >= 4:
+            text = text.replace(sec, "•••")
+    return text[:limit]
+
+
+def bingx_error_text(j, *secrets):
+    """Короткая подсказка по коду ошибки BingX; незнакомый код — код и текст биржи (без ключа и секрета)."""
+    j = j if isinstance(j, dict) else {}
+    code = j.get("code")
+    try:
+        code = int(code)
+    except (TypeError, ValueError):
+        pass
+    if code in BINGX_ERRORS:
+        return f"{BINGX_ERRORS[code]} (код {code})"
+    msg = str(j.get("msg") or "")
+    return _scrub(f"ошибка BingX (код {code})" + (f": {msg}" if msg else ""), *secrets)
+
+
+BINGX_READ_CODE = 2   # apiPermissions (docs-v3): 2 — чтение, остальные коды — права сверх чтения
+BINGX_PERM_CODES = {1: "торговля спот", 3: "фьючерсы", 4: "переводы между своими счетами",
+                    5: "вывод и переводы другим пользователям BingX", 7: "переводы между субаккаунтами"}
+BINGX_PERM_FLAGS = (   # apiPermissions (api-ai-skills): флаги enable* -> что даёт ключ
+    ("enableSpotAndMarginTrading", "торговля спот"), ("enableFutures", "фьючерсы"), ("enableVanillaOptions", "опционы"),
+    ("permitsUniversalTransfer", "переводы между своими счетами"),
+    ("enableWithdrawals", "вывод и переводы другим пользователям BingX"),
+    ("enableInternalTransfer", "переводы между субаккаунтами"))
+
+
+def bingx_key_safety(data):
+    """Права ключа BingX по `data` ответа /openApi/v1/account/apiPermissions: (safe, detail), как key_permissions.
+
+    Официальные источники расходятся — принимаем обе формы: docs-v3 {permissions: [коды], ipAddresses: [...]}
+    (2 — чтение, 1 спот, 3 фьючерсы, 4 переводы между своими счетами, 5 вывод и переводы другим пользователям,
+    7 переводы между субаккаунтами; незнакомый код — тоже сверх чтения) и api-ai-skills {enableReading,
+    enableSpotAndMarginTrading, enableWithdrawals, ..., ipRestrict}. Непонятная форма — (None, "")."""
+    if isinstance(data, list) and len(data) == 1:
+        data = data[0]
+    if not isinstance(data, dict):
+        return None, ""
+    if "permissions" in data:
+        raw = data["permissions"]
+        raw = raw.split(",") if isinstance(raw, str) else raw
+        if not isinstance(raw, list):
+            return None, ""
+        try:
+            codes = {int(str(c).strip()) for c in raw if str(c).strip()}
+        except ValueError:
+            return None, ""
+        bad = [BINGX_PERM_CODES.get(c, f"право {c}") for c in sorted(codes - {BINGX_READ_CODE})]
+        no_ip = "ipAddresses" in data and not data["ipAddresses"]
+    elif "enableReading" in data or any(flag in data for flag, _ in BINGX_PERM_FLAGS):
+        bad = [label for flag, label in BINGX_PERM_FLAGS if data.get(flag) in (True, "true")]
+        no_ip = data.get("ipRestrict") in (False, "false")
+    else:
+        return None, ""
+    if not bad:
+        return True, ""
+    return False, ", ".join(dict.fromkeys(bad)) + ("; без привязки к IP" if no_ip else "")
+
+
+# Cryptomus: у любого ключа есть права двигать деньги — поэтому только эти пары (метод, путь)
+CRYPTOMUS_READ_CALLS = frozenset({
+    ("GET", "/v2/user-api/balance"),              # личный кабинет (userId): result.balances[]
+    ("POST", "/v1/balance"),                      # бизнес-кабинет (merchant): result[0].balance.merchant[]/.user[]
+    ("POST", "/v2/user-api/transaction/list"),    # история личного кабинета, первая страница
+})
+CRYPTOMUS_MODES = ("user", "merchant")            # личный кабинет (User API) и бизнес (Merchant API)
+CRYPTOMUS_BALANCE = {"user": ("GET", "/v2/user-api/balance", None), "merchant": ("POST", "/v1/balance", {})}
+CRYPTOMUS_KEY_RIGHTS = {   # что даёт ключ Cryptomus сверх чтения — ключей «только чтение» у Cryptomus нет
+    "user": "у Cryptomus нет ключей только для чтения: ключ личного кабинета даёт конвертации и ордера "
+            "на бирже Cryptomus, отмену ордеров, покупку AML-пакетов",
+    "merchant": "у Cryptomus нет ключей только для чтения: ключ бизнес-кабинета даёт возвраты платежей "
+                "на любой адрес, выплаты и переводы между кошельками",
+}
+CRYPTOMUS_CODES = {"GRAM": "TON"}   # Toncoin у Cryptomus — код GRAM
+_CRYPTOMUS_MODE = {}   # {ID: "user"/"merchant"} — какой кабинет принял этот ID (в памяти процесса)
+
+
+def cryptomus_sign(body, api_key):
+    """Подпись Cryptomus (заголовок sign): md5_hex(base64(тело запроса ровно как отправлено) + API key).
+    Без тела — base64("") = "", то есть md5(API key)."""
+    return hashlib.md5(base64.b64encode(body.encode("utf-8")) + api_key.encode("utf-8")).hexdigest()
+
+
+async def cryptomus_call(s, uid, api_key, method, path, body=None, mode="user"):
+    """Подписанный запрос к Cryptomus. Пара (метод, путь) не из CRYPTOMUS_READ_CALLS — ValueError до подписи
+    и отправки. mode="user" — заголовок userId (личный кабинет), "merchant" — merchant (бизнес). Тело — компактный
+    JSON, подписывается ровно отправляемая строка. Заголовки, подпись и тело не логируются."""
+    method = str(method).upper()
+    if (method, path) not in CRYPTOMUS_READ_CALLS:
+        raise ValueError(f"Cryptomus: {method} {path} не входит в список чтения")
+    if mode not in CRYPTOMUS_MODES:
+        raise ValueError(f"Cryptomus: неизвестный режим {mode}")
+    payload = "" if body is None else json.dumps(body, separators=(",", ":"))
+    headers = {"userId" if mode == "user" else "merchant": uid, "sign": cryptomus_sign(payload, api_key),
+               "Content-Type": "application/json"}
+    url = f"{CRYPTOMUS_BASE}{path}"
+    req = s.get(url, headers=headers) if method == "GET" else s.post(url, headers=headers, data=payload)
+    async with req as r:
+        r.raise_for_status()
+        return await r.json(content_type=None)
+
+
+def _cryptomus_ok(j):
+    """Успешный ответ Cryptomus: есть result, а state (у v1 и не-биржевых v2) — 0 или его нет вовсе."""
+    return isinstance(j, dict) and "result" in j and j.get("state", 0) in (0, "0")
+
+
+def _cryptomus_err(j):
+    """Текст ошибки из ответа Cryptomus: message, иначе первая ошибка из errors, иначе state."""
+    if not isinstance(j, dict):
+        return "неожиданный ответ"
+    if j.get("message"):
+        return str(j["message"])
+    errors = j.get("errors")
+    if isinstance(errors, dict) and errors:
+        first = next(iter(errors.values()))
+        return str(first[0] if isinstance(first, list) and first else first)
+    if isinstance(errors, list) and errors and isinstance(errors[0], dict):
+        return str(errors[0].get("message"))
+    return f"state {j.get('state')}"
+
+
+async def cryptomus_detect(s, uid, api_key):
+    """Какой кабинет Cryptomus принимает ID и ключ: (режим, ответ баланса). Сначала личный (userId, GET
+    /v2/user-api/balance), не вышло — бизнес (merchant, POST /v1/balance); подошедший режим запоминается по ID
+    и дальше пробуется первым. Не подошёл ни один — (None, текст последней ошибки)."""
+    cached = _CRYPTOMUS_MODE.get(uid)
+    err = ""
+    for mode in sorted(CRYPTOMUS_MODES, key=lambda m: m != cached):
+        method, path, body = CRYPTOMUS_BALANCE[mode]
+        try:
+            j = await cryptomus_call(s, uid, api_key, method, path, body, mode=mode)
+        except Exception as e:
+            err = api_error_text(e)
+            continue
+        if _cryptomus_ok(j):
+            _CRYPTOMUS_MODE[uid] = mode
+            return mode, j
+        err = _cryptomus_err(j)
+    return None, err
+
+
 KUCOIN_READONLY_PERMS = {"General"}    # остальные значения permission у KuCoin дают торговлю/вывод/переводы
 
 
@@ -368,6 +566,15 @@ async def key_permissions(s, exchange):
             perms = {p.strip() for p in (j.get("data", {}).get("permission") or "").split(",") if p.strip()}
             bad = sorted(perms - KUCOIN_READONLY_PERMS)
             return not bad, ", ".join(bad)
+        elif ex == "bingx":
+            j = await bingx_get(s, api_key, api_secret, "/openApi/v1/account/apiPermissions")
+            if not isinstance(j, dict) or j.get("code") != 0:
+                return None, ""
+            return bingx_key_safety(j.get("data"))
+        elif ex == "cryptomus":
+            # прав ключа Cryptomus не отдаёт, read-only ключей нет: ключ принят — значит, даёт больше, чем чтение
+            mode, _ = await cryptomus_detect(s, api_key, api_secret)   # key = ID кабинета, secret = API key
+            return (False, CRYPTOMUS_KEY_RIGHTS[mode]) if mode else (None, "")
     except Exception:
         return None, ""
     return None, ""
@@ -416,7 +623,64 @@ async def mexc_balances(s, api_key, api_secret):
     return totals
 
 
-BALANCE_FETCHERS = {"bybit": bybit_balances, "mexc": mexc_balances}   # биржи, для которых уже есть /balance
+async def bingx_balances(s, api_key, api_secret):
+    """Балансы монет на BingX: спот + Fund-счёт (с 2025-10 BingX отдаёт их раздельно), free+locked по монете.
+    Один из счетов не ответил — считаем по второму."""
+    totals = {}
+    for path in ("/openApi/spot/v1/account/balance", "/openApi/fund/v1/account/balance"):
+        try:
+            j = await bingx_get(s, api_key, api_secret, path)
+        except Exception:
+            continue
+        if not isinstance(j, dict) or j.get("code") != 0:
+            continue
+        data = j.get("data")
+        rows = data.get("balances") if isinstance(data, dict) else data   # форма Fund-ответа подтверждена не до конца
+        for b in rows if isinstance(rows, list) else []:
+            try:
+                amt = float(b.get("free") or 0) + float(b.get("locked") or 0)
+            except (AttributeError, TypeError, ValueError):
+                continue
+            if amt and b.get("asset"):
+                totals[b["asset"]] = totals.get(b["asset"], 0) + amt
+    return totals
+
+
+def _cryptomus_rows(result):
+    """Строки кошельков из result баланса Cryptomus: личный кабинет — {balances: [...]}, бизнес — [{balance:
+    {merchant: [...], user: [...]}}] (бизнес- и личный кошелёк)."""
+    if isinstance(result, list):
+        return [row for part in result for row in _cryptomus_rows(part)]
+    if not isinstance(result, dict):
+        return []
+    if "balances" in result:
+        return result["balances"] if isinstance(result["balances"], list) else []
+    bal = result.get("balance")
+    if isinstance(bal, dict):
+        return [row for part in ("merchant", "user") for row in bal.get(part) or [] if isinstance(row, dict)]
+    return []
+
+
+async def cryptomus_balances(s, uid, api_key):
+    """Балансы Cryptomus (key = ID кабинета, secret = API key): ключ личного кабинета — личный кошелёк, ключ
+    бизнес-кабинета — бизнес- и личный кошельки; GRAM (так Cryptomus зовёт Toncoin) -> TON. Ключ не принят — {}."""
+    mode, j = await cryptomus_detect(s, uid, api_key)
+    totals = {}
+    for b in _cryptomus_rows(j.get("result")) if mode else []:
+        code = str(b.get("currency_code") or "").upper()
+        code = CRYPTOMUS_CODES.get(code, code)
+        try:
+            amt = float(b.get("balance") or 0)
+        except (TypeError, ValueError):
+            continue
+        if amt and code:
+            totals[code] = totals.get(code, 0) + amt
+    return totals
+
+
+# биржи, для которых уже есть /balance; у всех (s, key, secret) — у Cryptomus key = ID кабинета, secret = API key
+BALANCE_FETCHERS = {"bybit": bybit_balances, "mexc": mexc_balances, "bingx": bingx_balances,
+                    "cryptomus": cryptomus_balances}
 
 
 async def portfolio(s):
@@ -465,6 +729,17 @@ async def verify(s, exchange):
             j = await kucoin_get(s, api_key, api_secret, pp, "/api/v1/accounts")
             if j.get("code") != "200000":
                 return False, j.get("msg", "ошибка KuCoin")
+        elif ex == "bingx":
+            j = await bingx_get(s, api_key, api_secret, "/openApi/spot/v1/account/balance")
+            if not isinstance(j, dict) or j.get("code") != 0:
+                return False, bingx_error_text(j, api_key, api_secret)
+        elif ex == "cryptomus":
+            mode, err = await cryptomus_detect(s, api_key, api_secret)   # key = ID кабинета, secret = API key
+            if not mode:
+                return False, _scrub(f"ID и ключ не подошли ни к личному, ни к бизнес-кабинету Cryptomus ({err})",
+                                     api_key, api_secret)
+            place = "личный кабинет" if mode == "user" else "бизнес-кабинет"
+            return True, f"ключ рабочий ({place}), бот делает только запросы на чтение"
         else:
             return False, f"{exchange}: подпись запросов пока не реализована"
     except Exception as e:
@@ -472,20 +747,24 @@ async def verify(s, exchange):
     return True, "ключ рабочий, доступ только для чтения"
 
 
-def _hist_ts(v):
-    """Время записи истории аккаунта: epoch-мс (большинство бирж) или "YYYY-MM-DD HH:MM:SS" (MEXC-выводы)."""
+def _hist_ts(v, tz=timezone.utc):
+    """Время записи истории аккаунта: epoch-мс (большинство бирж), "YYYY-MM-DD HH:MM:SS" (MEXC-выводы, Cryptomus;
+    зона не указана — `tz`, по умолчанию UTC) или ISO-8601 со смещением ("2023-12-14T04:05:02.000+08:00", выводы
+    BingX). Не разобрали — 0.0."""
     try:
         return int(v) / 1000
     except (TypeError, ValueError):
-        try:
-            return datetime.strptime(str(v), "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc).timestamp()
-        except (ValueError, TypeError):
-            return 0.0
-
-
-def _hist_item(kind, asset, amount, ts):
+        pass
     try:
-        return {"kind": kind, "asset": asset, "amount": float(amount or 0), "ts": _hist_ts(ts)}
+        dt = datetime.fromisoformat(str(v).strip().replace("Z", "+00:00"))
+    except ValueError:
+        return 0.0
+    return (dt if dt.tzinfo else dt.replace(tzinfo=tz)).timestamp()
+
+
+def _hist_item(kind, asset, amount, ts, tz=timezone.utc):
+    try:
+        return {"kind": kind, "asset": asset, "amount": float(amount or 0), "ts": _hist_ts(ts, tz)}
     except (TypeError, ValueError):
         return None
 
@@ -555,7 +834,90 @@ async def kucoin_history(s, api_key, api_secret, passphrase_value, limit=20):
     return _merge_hist(*sources, limit=limit)
 
 
-HISTORY_FETCHERS = {"htx": htx_history}  # mexc/kucoin — своя цепочка фолбэков ниже, bybit — P2P-эндпоинт
+BINGX_NETWORKS = ("TRC20", "ERC20", "BEP20", "BEP2", "TON", "SOL", "SPL", "POLYGON", "ARBITRUM", "OPTIMISM",
+                  "AVAXC", "BASE")   # хвосты сети в поле coin истории BingX ("USDTTRC20")
+
+
+def _bingx_coin(coin, network=""):
+    """Монета из записи истории BingX без хвоста сети: "USDTTRC20" -> "USDT". Хвост срезаем, если он равен полю
+    network записи или известной сети и остаток — монета бота (иначе, например, "ETHW" стал бы "ETH")."""
+    c, net = str(coin or "").upper(), str(network or "").upper()
+    if net and c.endswith(net) and len(c) > len(net):
+        return c[:-len(net)]
+    for suffix in BINGX_NETWORKS:
+        if c.endswith(suffix) and c[:-len(suffix)] in BALANCE_COINS:
+            return c[:-len(suffix)]
+    return c
+
+
+async def bingx_history(s, api_key, api_secret, limit=20):
+    """История BingX одной лентой по времени: завершённые депозиты (status 1 или 6; 0 — ещё в пути) и выводы
+    (status 6). Вывод с transferType 2 — перевод другому пользователю BingX, а не на внешний адрес: kind "transfer".
+    Ответы — голые массивы; время депозита — insertTime (мс), вывода — applyTime (ISO-8601 со смещением)."""
+    sources = []
+    for kind, path in (("deposit", "/openApi/api/v3/capital/deposit/hisrec"),
+                       ("withdraw", "/openApi/api/v3/capital/withdraw/history")):
+        try:
+            j = await bingx_get(s, api_key, api_secret, path, {"limit": limit})
+        except Exception:
+            j = None
+        if isinstance(j, dict) and j.get("code") == 0 and isinstance(j.get("data"), list):
+            j = j["data"]   # на случай, если BingX завернёт ответ в {code, data}
+        if not isinstance(j, list):
+            sources.append(None)   # ошибка ({code, msg}) или сбой — пустоту истории не подтвердить
+            continue
+        items = []
+        for it in j:
+            if not isinstance(it, dict):
+                continue
+            status = str(it.get("status"))
+            if kind == "deposit" and status in ("1", "6"):
+                items.append(_hist_item("deposit", _bingx_coin(it.get("coin"), it.get("network")), it.get("amount"),
+                                        it.get("insertTime")))
+            elif kind == "withdraw" and status == "6":
+                k = "transfer" if str(it.get("transferType")) == "2" else "withdraw"
+                items.append(_hist_item(k, _bingx_coin(it.get("coin"), it.get("network")), it.get("amount"),
+                                        it.get("applyTime")))
+        sources.append([it for it in items if it])
+    return _merge_hist(*sources, limit=limit)
+
+
+MSK_TZ = timezone(timedelta(hours=3))
+CRYPTOMUS_HIST_KINDS = {"payment": "deposit", "payout": "withdraw", "transfer": "transfer"}
+
+
+async def cryptomus_history(s, uid, api_key, limit=20):
+    """История личного кабинета Cryptomus (POST /v2/user-api/transaction/list, первая страница): только
+    завершённые (status paid); payment — пришёл платёж, payout — вывод, transfer — перевод между бизнес- и
+    личным кошельком. created_at без зоны — считаем МСК (UTC+3, как у выплат Cryptomus). Ключ бизнес-кабинета
+    или ошибка — None: история необязательна, баланс работает и без неё."""
+    mode = _CRYPTOMUS_MODE.get(uid) or (await cryptomus_detect(s, uid, api_key))[0]
+    if mode != "user":
+        return None
+    try:
+        j = await cryptomus_call(s, uid, api_key, "POST", "/v2/user-api/transaction/list", {}, mode="user")
+    except Exception:
+        return None
+    if not _cryptomus_ok(j):
+        return None
+    result = j.get("result")
+    rows = result.get("items") if isinstance(result, dict) else None
+    if not isinstance(rows, list):
+        return None
+    items = []
+    for it in rows:
+        if not isinstance(it, dict) or str(it.get("status")).lower() != "paid":
+            continue
+        kind = CRYPTOMUS_HIST_KINDS.get(str(it.get("type")).lower())
+        code = str(it.get("currency") or "").upper()
+        if kind:
+            items.append(_hist_item(kind, CRYPTOMUS_CODES.get(code, code), it.get("amount"), it.get("created_at"),
+                                    MSK_TZ))
+    return _merge_hist([it for it in items if it], limit=limit)
+
+
+# mexc/kucoin — своя цепочка фолбэков ниже, bybit — P2P-эндпоинт; у всех (s, key, secret, limit=...)
+HISTORY_FETCHERS = {"htx": htx_history, "bingx": bingx_history, "cryptomus": cryptomus_history}
 
 
 SPOT_TRADE_SYMBOLS = ("USDCUSDT", "BTCUSDT", "ETHUSDT", "TONUSDT")   # монеты бота (DEFAULT_ASSETS в p2p.py) к USDT

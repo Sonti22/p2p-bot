@@ -534,6 +534,15 @@ _(облачный Claude добавляет сюда предложения, к
 - Площадки под санкциями или с сомнительным статусом (Garantex, Grinex, A7A5, ABCeX).
 
 ## Журнал
+- 2026-09-26 — аккаунты BingX и Cryptomus, только чтение: баланс в /balance, история в автожурнал, проверка прав при
+  подключении, по «🔄 Проверить» и при старте. P2P-площадками они не стали — в скан и фильтры не попадают, имена на экранах
+  аккаунтов — `bot.ACCOUNT_NAMES`. Ключи владельца с торговлей, поэтому чтение ограничено в коде: `bingx_get` — только GET
+  по `BINGX_READ_PATHS` (спот и Fund, apiPermissions, депозиты и выводы), POST к BingX в коде нет; `cryptomus_call` — только
+  пары (метод, путь) из `CRYPTOMUS_READ_CALLS`, всё прочее — ValueError до подписи. BingX: HMAC-SHA256 по отсортированным
+  параметрам (тест на официальный пример), права — обе документированные формы apiPermissions (коды 1–7 и флаги enable*).
+  Cryptomus: sign = md5(base64(тело) + ключ), кабинет определяется сам (userId, иначе merchant), GRAM → TON; ключей «только
+  чтение» у Cryptomus нет — ключ всегда «сверх чтения» и остаётся только при ALLOW_UNSAFE_KEYS=1. «🔑 Мои биржи» больше не
+  падает на ключе со статусом «unsafe». Для guard нужны домены bingx.com и cryptomus.com.
 - 2026-09-26 — новая площадка LBank (`p2p.lbank`, только USDT/USDC): публичная выдача без ключа
   `GET www.lbank.com/lbk-api/otc-trade-center/fiat/p2p/adv/advertisementList` (tradeType=buy/sell = сторона бота).
   Стакан RUB на покупку — в основном объявления MEXC, которые LBank показывает у себя (source=MEXC): счётчика сделок
