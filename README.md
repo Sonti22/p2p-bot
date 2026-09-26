@@ -1,7 +1,7 @@
 # P2P-сканер + Telegram-бот
 
-Ищет связки за рубли на P2P Bybit, HTX, KuCoin, MEXC, BitPapa и у обменников BestChange
-по публичным эндпоинтам (без API-ключей). Монеты: USDT, USDC, BTC, ETH, TON (`ASSETS`).
+Ищет связки за рубли на P2P Bybit, HTX, KuCoin, MEXC, BitPapa, LBank и у обменников BestChange
+по публичным эндпоинтам (без API-ключей). Монеты: USDT, USDC, BTC, ETH, TON (`ASSETS`; у LBank — только USDT и USDC).
 Связки: та же монета между площадками и P2P↔спот через USDT (конвертация на споте Bybit, чего там нет — MEXC).
 `/top` показывает и лучшие цены USDT у обменников по сетям (TRC20, BEP20, TON, SOL, ERC20…).
 Считает чистый % на сумму круга с учётом комиссий перевода и спота, отсеивает слабых мерчантов,
