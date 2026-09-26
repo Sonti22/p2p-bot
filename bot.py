@@ -2029,8 +2029,6 @@ class Bot:
         for deal in deals:
             if not self.is_confirmed(deal):
                 continue   # сигнала о ней ещё не было — выброс одного скана не берём
-            if not paper.simple_route(deal):
-                continue   # через спот/промежуточную монету: риск курса на споте прогон пока не моделирует
             d = deal_for_amount(deal, self.cfg, psnap, settings["amount"])
             if d is None or d[0] < self.cfg.min_profit:
                 continue   # на сумму сухого прогона глубины не хватает или прибыль ниже порога
@@ -2047,7 +2045,7 @@ class Bot:
         qty = _route_qty(b, s, dataclasses.replace(self.cfg, amount=settings["amount"]), psnap.spot, over,
                          disable=frozenset({"risk"}))
         cycle = paper.get_cycle(paper.start_cycle(settings["amount"], b, s, route, profit, label=label,
-                                                  sell_qty=qty or s.avail)) or {}
+                                                  sell_qty=qty or s.avail, pay_fee=self.cfg.pay_fee)) or {}
         pay = trades.pay_label(cycle.get("pay_kind", ""), cycle.get("bank", ""), b.pays)
         qty = settings["amount"] / b.price
         text = (f"🧪 <b>Сухой прогон</b>: купил бы {_money(qty)} {b.asset} у {html.escape(b.nick)} "
@@ -2089,7 +2087,8 @@ class Bot:
                 else:
                     paper.set_stage(cycle["id"], "sell")
             elif cycle["stage"] == "sell":
-                action, note, price = paper.check_sell_stage(cycle, snap, stale_minutes=settings["stale_minutes"])
+                action, note, price = paper.check_sell_stage(cycle, snap, cfg=self.cfg,
+                                                              stale_minutes=settings["stale_minutes"])
                 if action == "wait":
                     continue
                 if action == "fail":
@@ -2097,7 +2096,10 @@ class Bot:
                     await self.send(f"🧪 Сухой прогон: круг #{cycle['id']} сорвался на продаже — {note}",
                                     topic="signals")
                 else:
-                    rp = paper.realized_pct(cycle, price)
+                    # тот же пересчёт по свежему snap.spot, что уже решил check_sell_stage — межмонетные/спот
+                    # связки видят движение курса между стартом круга и продажей, а не число со старта
+                    qty = paper.recompute_sell_qty(cycle, self.cfg, snap.spot)
+                    rp = paper.realized_pct(cycle, price, qty)
                     paper.finish_cycle(cycle["id"], "done", rp, note, sell_fact=price)
                     await self.send(f"🧪 Сухой прогон: круг #{cycle['id']} завершён — план "
                                     f"{cycle['planned_pct']:.2f}%, факт {rp:.2f}%"
