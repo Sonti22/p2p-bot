@@ -64,6 +64,7 @@ STATE_NAMES = {"prepared": "готовится", "sending": "отправляе�
                "unknown": "⚠️ исход неясен", "final_paid": "✅ выплачено", "final_failed": "❌ не прошла",
                "rejected": "🚫 отклонена"}
 MISMATCH = "ответ Cryptomus не совпал с заявкой"
+NOT_FOUND = "Cryptomus не находит эту выплату по order_id"
 TOKEN_TTL = 120      # сек: столько живёт кнопка «✅ Отправить» предпросмотра
 MAX_RESEND = 2       # повторов POST с тем же order_id после неясного исхода и «не найдено» в /info
 RETRY_DELAY = 5      # сек × номер попытки: пауза после неясного исхода перед /info и перед повтором
@@ -88,6 +89,31 @@ def _send_lock():
 def enabled():
     """Выключатель: выплаты только при PAYOUTS=1 (читается при каждом обращении)."""
     return os.getenv("PAYOUTS") == "1"
+
+
+def disable():
+    """«⛔ Стоп»: выплаты выключаются в этом процессе сразу, ещё до записи .env (та может и не удаться)."""
+    os.environ["PAYOUTS"] = "0"
+
+
+def switch_from_file(path):
+    """При старте бота: выключатель — только из файла .env. Выплаты остаются включёнными, лишь если в файле есть строка
+    PAYOUTS и ВСЕ такие строки (имя без учёта регистра) равны 1; иначе — PAYOUTS=0 в процессе. Так PAYOUTS=1 из
+    окружения Windows или родительского процесса и «payouts=1» выше записанного «⛔ Стоп» не включат выплаты снова.
+    Только выключает, включить не может."""
+    values = []
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    if k.strip().upper() == "PAYOUTS":
+                        values.append(v.split(" #")[0].strip())
+    except (OSError, ValueError):
+        values = []
+    if not values or any(v != "1" for v in values):
+        disable()
 
 
 def credentials():
@@ -179,6 +205,62 @@ def _bech32_ok(addr):
     return chk == (1 if vals[0] == 0 else 0x2bc830a3) and vals[0] <= 16
 
 
+def _rol64(v, n):
+    n %= 64
+    return ((v << n) | (v >> (64 - n))) & 0xFFFFFFFFFFFFFFFF
+
+
+def _keccak_f(lanes):
+    """Перестановка Keccak-f[1600] (по CompactFIPS202 авторов Keccak), lanes[x][y] — 64-битные слова."""
+    r = 1
+    for _ in range(24):
+        c = [lanes[x][0] ^ lanes[x][1] ^ lanes[x][2] ^ lanes[x][3] ^ lanes[x][4] for x in range(5)]
+        d = [c[(x + 4) % 5] ^ _rol64(c[(x + 1) % 5], 1) for x in range(5)]
+        lanes = [[lanes[x][y] ^ d[x] for y in range(5)] for x in range(5)]
+        x, y = 1, 0
+        cur = lanes[x][y]
+        for t in range(24):
+            x, y = y, (2 * x + 3 * y) % 5
+            cur, lanes[x][y] = lanes[x][y], _rol64(cur, (t + 1) * (t + 2) // 2)
+        for y in range(5):
+            row = [lanes[x][y] for x in range(5)]
+            for x in range(5):
+                lanes[x][y] = row[x] ^ (~row[(x + 1) % 5] & row[(x + 2) % 5])
+        for j in range(7):
+            r = ((r << 1) ^ ((r >> 7) * 0x71)) % 256
+            if r & 2:
+                lanes[0][0] ^= 1 << ((1 << j) - 1)
+    return lanes
+
+
+def _keccak256(data, suffix=0x01):
+    """Keccak-256 как в Ethereum (suffix 0x01). hashlib.sha3_256 — это SHA3 с другим паддингом (suffix 0x06)."""
+    rate = 136
+    msg = bytearray(data) + bytes([suffix])
+    msg += b"\0" * (-len(msg) % rate)
+    msg[-1] |= 0x80
+    lanes = [[0] * 5 for _ in range(5)]
+    for off in range(0, len(msg), rate):
+        for i in range(rate // 8):
+            lanes[i % 5][i // 5] ^= int.from_bytes(msg[off + 8 * i:off + 8 * i + 8], "little")
+        lanes = _keccak_f(lanes)
+    return b"".join(lanes[i % 5][i // 5].to_bytes(8, "little") for i in range(4))
+
+
+def evm_checksummed(address):
+    """EVM-адрес записан со смешанным регистром — значит, несёт контрольную сумму EIP-55."""
+    h = address[2:]
+    return h != h.lower() and h != h.upper()
+
+
+def _eip55_ok(address):
+    """Смешанный регистр — контрольная сумма EIP-55 должна сойтись; все строчные/заглавные — проверять нечего."""
+    if not evm_checksummed(address):
+        return True
+    h = _keccak256(address[2:].lower().encode("ascii")).hex()
+    return all(ch == (ch.upper() if int(h[i], 16) >= 8 else ch.lower()) for i, ch in enumerate(address[2:]))
+
+
 def _crc16(data):
     crc = 0
     for b in data:
@@ -197,7 +279,9 @@ def address_error(network, address):
         body = _b58check(address) if re.fullmatch(rf"T[{_B58}]{{33}}", address) else None
         return None if body and len(body) == 21 and body[0] == 0x41 else "не адрес TRON (T… 34 символа base58)"
     if kind == "evm":
-        return None if re.fullmatch(r"0x[0-9a-fA-F]{40}", address) else "не EVM-адрес (0x + 40 hex)"
+        if not re.fullmatch(r"0x[0-9a-fA-F]{40}", address):
+            return "не EVM-адрес (0x + 40 hex)"
+        return None if _eip55_ok(address) else "EVM-адрес с неверной контрольной суммой (EIP-55): в нём опечатка"
     if kind == "btc":
         if address.startswith("bc1"):
             return None if _bech32_ok(address) else "не адрес BTC bc1… (строчными, с верной контрольной суммой)"
@@ -397,7 +481,7 @@ def _connect(path=None):
                 "wl_id TEXT, wl_name TEXT, currency TEXT, network TEXT, address TEXT, memo TEXT DEFAULT '', "
                 "amount TEXT, fee TEXT, debit TEXT, usdt_value TEXT, state TEXT, uuid TEXT DEFAULT '', "
                 "status TEXT DEFAULT '', is_final INTEGER DEFAULT 0, txid TEXT DEFAULT '', note TEXT DEFAULT '', "
-                "updated_ts REAL)")
+                "updated_ts REAL, create_kind TEXT DEFAULT '')")   # create_kind: "error" — создание получило только отказы
     return con
 
 
@@ -579,22 +663,42 @@ def _mismatch(row, res):
 
 def _apply(row, res):
     """Ответ Cryptomus по выплате (create или info) -> строка журнала и событие: "paid", "failed", "found",
-    "mismatch" или None (без изменений для владельца)."""
+    "stuck" (fail/cancel/system_fail без is_final — только через поддержку), "mismatch", "mismatch_final" (итог по
+    выплате с несовпадением) или None (для владельца ничего нового). Каждое событие — один раз."""
     status = str(res.get("status") or "").lower()
     final = _true(res.get("is_final"))
     fields = {"uuid": str(res.get("uuid") or row["uuid"] or ""), "status": status, "is_final": int(final),
               "txid": str(res.get("txid") or row["txid"] or "")}
     bad = _mismatch(row, res)
-    if bad:
+    if bad:   # в лимите остаётся ("unknown"); владелец проверяет выплату в кабинете
         note = f"{MISMATCH}: {', '.join(bad)}"
-        event = None if row["state"] == "unknown" and row["note"] == note else "mismatch"
+        if row["state"] != "unknown" or row["note"] != note:
+            event = "mismatch"
+        elif final and not row["is_final"]:
+            event = "mismatch_final"
+        else:
+            event = None
         return _update(row["order_id"], state="unknown", note=note, **fields), event
     if final and status == "paid":
         return _update(row["order_id"], state="final_paid", **fields), "paid"
     if final and status in FAIL_STATUSES:
         return _update(row["order_id"], state="final_failed", **fields), "failed"
-    event = "found" if row["state"] == "unknown" else None   # fail без is_final — ещё не итог, ждём
+    if status in FAIL_STATUSES and row["status"] != status:
+        event = "stuck"   # не итог: в лимите остаётся, опрос продолжается, владелец знает, что нужна поддержка
+    else:
+        event = "found" if row["state"] == "unknown" else None
     return _update(row["order_id"], state="sent", **fields), event
+
+
+def _not_found(row):
+    """/v1/payout/info ответил «не найдено» по выплате с неясным исходом. Создание получало только точные отказы и
+    Cryptomus ни разу не выдал uuid — выплаты нет: "rejected" (как в send), событие "rejected". Иначе остаётся
+    "unknown" (в лимите) и одно событие "notfound": владелец проверяет кабинет."""
+    if row["create_kind"] == "error" and not row["uuid"]:
+        return _update(row["order_id"], state="rejected"), "rejected"
+    if NOT_FOUND in (row["note"] or ""):
+        return row, None
+    return _update(row["order_id"], note=f"{row['note']}; {NOT_FOUND}" if row["note"] else NOT_FOUND), "notfound"
 
 
 async def _info(s, creds, order_id):
@@ -667,7 +771,7 @@ async def send(s, entry, amount, q, creds=None):
                 logger.info("выплата %s: %s", order_id, row["state"])
                 return _result(row["state"], row, row["note"], event)
             ambiguous = ambiguous or kind == "ambiguous"
-            _update(order_id, state="unknown", note=msg)
+            _update(order_id, state="unknown", note=msg, create_kind="ambiguous" if ambiguous else "error")
             logger.warning("выплата %s: %s (%s)", order_id, "исход неясен" if kind == "ambiguous" else "отказ", msg)
             if kind == "ambiguous":
                 await asyncio.sleep(RETRY_DELAY * posts)   # первый запрос точно закончился; даём Cryptomus время
@@ -693,7 +797,8 @@ async def send(s, entry, amount, q, creds=None):
 async def poll(s, creds=None):
     """Опрос незавершённых выплат (sent/unknown) через /v1/payout/info по order_id: [(событие, строка)].
     Успех — только status paid и is_final; окончательный провал — is_final и fail/cancel/system_fail; fail без
-    is_final — ещё в обработке. «Не найдено» и ошибки — без изменений, повторов отправки тут нет."""
+    is_final — ещё в обработке (событие "stuck" один раз). «Не найдено» по выплате с неясным исходом — _not_found;
+    ошибки — без изменений. Повторов отправки тут нет."""
     if not pending():
         return []
     creds = creds or credentials()
@@ -703,9 +808,12 @@ async def poll(s, creds=None):
     async with _send_lock():
         for row in pending():
             kind, res, _ = await _info(s, creds, row["order_id"])
-            if kind != "ok":
+            if kind == "ok":
+                row, event = _apply(row, res)
+            elif kind == "notfound" and row["state"] == "unknown":
+                row, event = _not_found(row)
+            else:
                 continue
-            row, event = _apply(row, res)
             if event:
                 events.append((event, row))
     return events

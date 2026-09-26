@@ -31,6 +31,10 @@ BTC = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"
 TON = "EQCD39VS5jcptHL8vMjEXrzGaRcCVYto7HUn4bpAOg8xqB2N"
 TON_UQ = "UQCD39VS5jcptHL8vMjEXrzGaRcCVYto7HUn4bpAOg8xqEBI"
 EVM = "0x" + "ab" * 20
+EIP55_OK = ("0x52908400098527886E0F7030069857D2E4169EE7", "0x8617E340B3D01FA5F11F306F4090FD50E238070D",   # тесты EIP-55
+            "0xde709f2102306220921060314715629080e2fb77", "0x27b1fdb04752bbc536007a920d24acb045561c26",
+            "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed", "0xfB6916095ca1df60bB79Ce92cE3Ea74c37c5d359",
+            "0xdbF03B407c01E7cD3CBea99509d93f8DDDC8C6FB", "0xD1220A0cf47c7B9Be7A2E6BA89F429762e7b9aDb")
 ENTRIES = [
     {"id": "w1", "name": "Мой Bybit <TRC20>", "currency": "USDT", "network": "tron", "address": TRON},
     {"id": "w2", "name": "Холодный BTC", "currency": "BTC", "network": "btc", "address": BTC},
@@ -250,10 +254,11 @@ def test_address_formats_and_checksums():
     ok = [("tron", TRON), ("tron", TRON2), ("btc", BTC), ("btc", "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa"),
           ("btc", "3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy"),
           ("btc", "bc1p0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqzk5jj0"), ("ton", TON), ("ton", TON_UQ),
-          ("ton", "0:" + "0" * 64), ("bsc", EVM), ("eth", "0x" + "AbCdEf0123" * 4), ("polygon", EVM)]
+          ("ton", "0:" + "0" * 64), ("bsc", EVM), ("polygon", EVM), *(("eth", a) for a in EIP55_OK)]
     for net, addr in ok:
         assert payouts.address_error(net, addr) is None, (net, addr)
     bad = [("tron", TRON[:-1] + "u"), ("tron", TRON + " "), ("tron", " " + TRON), ("tron", "T" + "1" * 33),
+           ("eth", "0x" + "AbCdEf0123" * 4), ("bsc", EIP55_OK[4][:-1] + "D"), ("eth", EIP55_OK[5].replace("fB", "Fb")),
            ("tron", EVM), ("btc", BTC[:-1] + "5"), ("btc", BTC.upper()), ("btc", "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNb"),
            ("ton", TON[:-1] + "M"), ("ton", "kQCD39VS5jcptHL8vMjEXrzGaRcCVYto7HUn4bpAOg8xqB2N"), ("bsc", EVM[:-1]),
            ("bsc", "0x" + "g" * 40), ("eth", TRON), ("sol", TRON), ("tron", "T R7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"),
@@ -557,7 +562,8 @@ def _result_for(row, **over):
 
 
 @pytest.mark.parametrize("status,final,state,event", [
-    ("paid", True, "final_paid", "paid"), ("paid", False, "sent", None), ("fail", False, "sent", None),
+    ("paid", True, "final_paid", "paid"), ("paid", False, "sent", None), ("fail", False, "sent", "stuck"),
+    ("cancel", False, "sent", "stuck"), ("system_fail", "false", "sent", "stuck"),
     ("fail", True, "final_failed", "failed"), ("cancel", True, "final_failed", "failed"),
     ("system_fail", True, "final_failed", "failed"), ("process", True, "sent", None), ("check", False, "sent", None),
     ("paid", "true", "final_paid", "paid")])
@@ -575,10 +581,10 @@ def test_poll_unknown_found_and_mismatch_alert_once_and_not_found_unchanged():
     a, b, c = _sent_row(state="unknown"), _sent_row(state="sent"), _sent_row(state="unknown")
     s = Session(routes({INFO: info_for({a["order_id"]: _result_for(a), b["order_id"]: _result_for(b, address=TRON2)})}))
     events = run(payouts.poll(s))
-    assert sorted(e for e, _ in events) == ["found", "mismatch"]
+    assert sorted(e for e, _ in events) == ["found", "mismatch", "notfound"]
     assert payouts.get(a["order_id"])["state"] == "sent" and payouts.get(b["order_id"])["state"] == "unknown"
-    assert payouts.get(c["order_id"])["state"] == "unknown"
-    assert run(payouts.poll(s)) == []                                    # тревога о несовпадении — один раз
+    assert payouts.get(c["order_id"])["state"] == "unknown"                 # «не найдено» — в лимите, одно сообщение
+    assert run(payouts.poll(s)) == []                                    # тревоги — по одному разу
     assert not s.posts()                                                # опрос ничего не отправляет
 
 
@@ -592,8 +598,8 @@ def test_restart_resumes_interrupted_and_pending_payouts():
     s = Session(routes({INFO: info_for({a["order_id"]: _result_for(a),
                                           c["order_id"]: _result_for(c, status="paid", is_final=True)})}))
     events = dict((e, r["order_id"]) for e, r in run(payouts.poll(s)))
-    assert events == {"found": a["order_id"], "paid": c["order_id"]}
-    assert payouts.get(b["order_id"])["state"] == "unknown" and not s.posts()
+    assert events == {"found": a["order_id"], "paid": c["order_id"], "notfound": b["order_id"]}
+    assert payouts.get(b["order_id"])["state"] == "unknown" and not s.posts()   # не отклонена: исход создания неизвестен
 
 
 def test_poll_skips_old_pending_and_without_key(monkeypatch):
@@ -633,6 +639,15 @@ def to_preview(bot, amount="25", eid="w1"):
     return bot.payout_preview["token"]
 
 
+def press(bot, data):
+    """Кнопка владельца. Подтверждённая выплата уходит фоновой задачей — ждём её в том же цикле событий."""
+    async def go():
+        await bot.on_callback(cq(data))
+        if bot.payout_task is not None and not bot.payout_task.done():
+            await bot.payout_task
+    run(go())
+
+
 def test_payout_menu_amount_preview_and_send():
     bot = owner()
     run(bot.handle("/payout"))
@@ -652,7 +667,7 @@ def test_payout_menu_amount_preview_and_send():
     token = bot.payout_preview["token"]
     assert [[b["callback_data"] for b in row] for row in preview["reply_markup"]["inline_keyboard"]] == [
         [f"pay_ok:{token}", f"pay_no:{token}"], ["pay_stop"]]
-    run(bot.on_callback(cq(f"pay_ok:{token}")))
+    press(bot, f"pay_ok:{token}")
     assert ("editMessageReplyMarkup", {"chat_id": "1", "message_id": 77, "reply_markup": {"inline_keyboard": []}}) \
         in bot.out
     assert "Cryptomus принял выплату 1.5 TON (ton)" in texts(bot)[-1]
@@ -668,8 +683,8 @@ def test_preview_escapes_whitelist_name():
 def test_double_tap_and_stale_token_send_only_once():
     bot = owner()
     token = to_preview(bot)
-    run(bot.on_callback(cq(f"pay_ok:{token}")))
-    run(bot.on_callback(cq(f"pay_ok:{token}")))       # второй тап / повтор колбэка
+    press(bot, f"pay_ok:{token}")
+    press(bot, f"pay_ok:{token}")       # второй тап / повтор колбэка
     run(bot.on_callback(cq("pay_ok:forged")))
     assert len(bot.s.posts()) == 1 and len(payouts.history()) == 1
     assert answers(bot)[-2:] == ["Кнопка устарела или уже нажата, ничего не отправлено"] * 2
@@ -679,9 +694,9 @@ def test_expired_token_refused(monkeypatch):
     bot = owner()
     token = to_preview(bot)
     bot.payout_preview["ts"] -= payouts.TOKEN_TTL + 1
-    run(bot.on_callback(cq(f"pay_ok:{token}")))
+    press(bot, f"pay_ok:{token}")
     assert "истекло" in texts(bot)[-1] and not bot.s.posts() and bot.payout_preview is None
-    run(bot.on_callback(cq(f"pay_ok:{token}")))
+    press(bot, f"pay_ok:{token}")
     assert not bot.s.posts()
 
 
@@ -689,7 +704,7 @@ def test_cancel_then_confirm_sends_nothing():
     bot = owner()
     token = to_preview(bot)
     run(bot.on_callback(cq(f"pay_no:{token}")))
-    run(bot.on_callback(cq(f"pay_ok:{token}")))
+    press(bot, f"pay_ok:{token}")
     assert not bot.s.posts() and "отменена" in texts(bot)[-1]
 
 
@@ -701,7 +716,7 @@ def test_stop_button_sets_payouts_0_and_voids_preview(monkeypatch):
     run(bot.on_callback(cq("pay_stop")))
     assert saved == [("PAYOUTS", "0")] and not payouts.enabled() and bot.payout_preview is None
     assert "только на ПК" in texts(bot)[-1]
-    run(bot.on_callback(cq(f"pay_ok:{token}")))
+    press(bot, f"pay_ok:{token}")
     assert not bot.s.posts()
     run(bot.handle("/payout"))
     assert texts(bot)[-1] == B.PAYOUT_OFF_HINT
@@ -713,7 +728,7 @@ def test_kill_switch_flipped_outside_after_preview(monkeypatch):
     bot = owner()
     token = to_preview(bot)
     monkeypatch.setenv("PAYOUTS", "0")
-    run(bot.on_callback(cq(f"pay_ok:{token}")))
+    press(bot, f"pay_ok:{token}")
     assert not bot.s.posts() and "Ничего не отправлено" in texts(bot)[-1]
 
 
@@ -748,7 +763,7 @@ def test_payout_history_view():
     run(bot.handle("/payout history"))
     assert "не было" in texts(bot)[-1]
     token = to_preview(bot)
-    run(bot.on_callback(cq(f"pay_ok:{token}")))
+    press(bot, f"pay_ok:{token}")
     run(bot.on_callback(cq("pay_hist")))
     assert "25 USDT (tron)" in texts(bot)[-1] and "в обработке" in texts(bot)[-1] and "26.00 из 2000.00" in texts(bot)[-1]
 
@@ -771,25 +786,35 @@ def test_guests_cannot_use_payouts(monkeypatch):
 
 
 def test_no_telegram_path_sets_payouts_1(monkeypatch):
-    """В коде бота PAYOUTS пишется только как "0"; перебор кнопок и команд не включает выплаты."""
+    """В коде бота PAYOUTS пишется только как "0" (в .env — save_env, в процесс — только payouts.disable);
+    перебор кнопок (и поддельных колбэков) и команд не включает выплаты."""
     tree = ast.parse(inspect.getsource(B))
     writes = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and getattr(n.func, "id", "") == "save_env"
               and n.args and isinstance(n.args[0], ast.Constant) and n.args[0].value == "PAYOUTS"]
     assert writes and all(isinstance(n.args[1], ast.Constant) and n.args[1].value == "0" for n in writes)
+    env_writes = 0
     for mod in (B, payouts):
         src = inspect.getsource(mod)
-        assert not re.search(r"environ\[\s*[\"']PAYOUTS", src) and "putenv" not in src
+        for n in ast.walk(ast.parse(src)):
+            for t in getattr(n, "targets", []):
+                if isinstance(t, ast.Subscript) and isinstance(t.slice, ast.Constant) and t.slice.value == "PAYOUTS":
+                    assert isinstance(n.value, ast.Constant) and n.value.value == "0"
+                    env_writes += 1
+        assert "putenv" not in src and "environ.update" not in src
         assert not re.search(r"setdefault\(\s*[\"']PAYOUTS", src)
+    assert env_writes == 1   # payouts.disable
     saved = []
     monkeypatch.setattr(B, "save_env", lambda k, v: saved.append((k, v)))
     monkeypatch.setenv("PAYOUTS", "0")
     bot = owner()
     for data in ("pay_on", "pay_set:1", "pay_to:w1", "pay_ok:x", "pay_hist", "pay_stop", "paper_set:on",
-                 "quiet_on", "acc_add:cryptomus_payout", "preset_apply:PAYOUTS", "pay_stop:1"):
+                 "quiet_on", "acc_add:cryptomus_payout", "preset_apply:PAYOUTS", "pay_stop:1",
+                 "flt_a:BTC\nPAYOUTS=1", "flt_e:bybit\nPAYOUTS=1", "flt_a:\rPAYOUTS=1", "flt_e:PAYOUTS=1"):
         run(bot.on_callback(cq(data)))
     for text in ("/payout on", "/payout 1", "/payout enable", "/payout PAYOUTS=1", "/payout history", "PAYOUTS=1"):
         run(bot.handle(text))
     assert os.getenv("PAYOUTS") == "0" and all(v == "0" for k, v in saved if k == "PAYOUTS")
+    assert all("PAYOUTS" not in v and "\n" not in v and "\r" not in v for k, v in saved)
     assert not bot.s.posts()
 
 
@@ -806,7 +831,7 @@ def test_no_key_or_sign_in_logs_or_messages(caplog):
     bot = owner(Session(routes({PAY: Resp(422, {"state": 1, "message": echoed}),
                                   INFO: Resp(422, {"state": 1, "message": echoed})})))
     token = to_preview(bot)
-    run(bot.on_callback(cq(f"pay_ok:{token}")))
+    press(bot, f"pay_ok:{token}")
     run(bot.handle("/payout history"))
     signs = {c["headers"]["sign"] for c in bot.s.calls if c["headers"]}
     dump = json.dumps(bot.out, ensure_ascii=False) + caplog.text + json.dumps(payouts.history(), ensure_ascii=False)
@@ -879,3 +904,231 @@ def test_script_list_and_remove(tmp_path, capsys):
 def test_script_never_touches_keys():
     src = inspect.getsource(payout_whitelist_script)
     assert "accounts" not in src and "keys.json" not in src and "credentials" not in src and ".env" not in src
+
+
+def test_script_evm_without_checksum_needs_explicit_yes(tmp_path, capsys):
+    main, path = payout_whitelist_script.main, tmp_path / "data" / "payout_whitelist.json"
+    chk = EIP55_OK[4]
+    assert main(["add", "--bot-dir", str(tmp_path)], answers_from("USDT", "bsc", "Опечатка", chk[:-1] + "D")) == 1
+    assert "EIP-55" in capsys.readouterr().out and not path.exists()
+    assert main(["add", "--bot-dir", str(tmp_path)], answers_from("ETH", "bsc", "Без суммы", EVM, "n")) == 1
+    assert "без контрольной суммы" in capsys.readouterr().out and not path.exists()
+    assert main(["add", "--bot-dir", str(tmp_path)], answers_from("ETH", "bsc", "Без суммы", EVM, "y", EVM, "y")) == 0
+    assert main(["add", "--bot-dir", str(tmp_path)], answers_from("USDT", "bsc", "С суммой", chk, chk, "y")) == 0
+    assert [e["address"] for e in payouts.load_whitelist(str(path))] == [EVM, chk]
+
+
+# --- исправления по ревью 2026-09-26 ---
+
+def _load_guard():
+    spec = importlib.util.spec_from_file_location(
+        "guard_script", os.path.join(os.path.dirname(os.path.dirname(__file__)), "scripts", "guard.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_guard_blocks_automerge_of_any_payout_change(monkeypatch):
+    """Код выплат не уходит в автомерж: payouts.py, скрипт белого списка и эти тесты — защищённые файлы, а любая
+    добавленная или удалённая строка выплат в других файлах (bot.py…) — ручная проверка."""
+    guard = _load_guard()
+    for f in ("payouts.py", "scripts/payout_whitelist.py", "tests/test_payouts.py"):
+        assert f.startswith(guard.PROTECTED), f
+    diffs = {
+        "payouts.py": '+++ b/payouts.py\n+    ("POST", "/v1/transfer/to-personal"),\n',
+        "bot.py": "--- a/bot.py\n+++ b/bot.py\n-        if not payouts.enabled():\n",
+        ".env.example": "--- a/.env.example\n+++ b/.env.example\n+PAYOUT_DAILY_LIMIT=1000000\n",
+        "accounts.py": '--- a/accounts.py\n+++ b/accounts.py\n+KEYS = ("cryptomus_payout",)\n',
+        "tests/test_guests.py": '--- a/tests/test_guests.py\n+++ b/tests/test_guests.py\n+    run(bot.on_callback(cq("pay_ok:x")))\n',
+    }
+
+    def fake_git(files, diff):
+        return lambda *args: "\n".join(files) + "\n" if "--name-only" in args else diff
+    for name, diff in diffs.items():
+        monkeypatch.setattr(guard, "git", fake_git([name], diff))
+        assert guard.check("origin/main"), name
+    harmless = ("--- a/bot.py\n+++ b/bot.py\n+    x = trades.pay_label(kind, bank, pays)\n"
+                "--- a/ROADMAP.md\n+++ b/ROADMAP.md\n+- payouts: заметка\n")
+    monkeypatch.setattr(guard, "git", fake_git(["bot.py", "ROADMAP.md"], harmless))
+    assert guard.check("origin/main") == []
+    claude_md = open(os.path.join(os.path.dirname(os.path.dirname(__file__)), "CLAUDE.md"), encoding="utf-8").read()
+    assert "`payouts.py`, `scripts/payout_whitelist.py`, `tests/test_payouts.py`" in claude_md
+
+
+def test_stop_is_fail_safe_when_env_cannot_be_written(monkeypatch):
+    def locked(k, v):
+        raise PermissionError(".env read-only")
+    monkeypatch.setattr(B, "save_env", locked)
+    bot = owner()
+    token = to_preview(bot)
+    press(bot, "pay_stop")
+    assert not payouts.enabled() and bot.payout_preview is None and bot.awaiting_payout is None
+    assert answers(bot)[-1] == "Выплаты выключены"
+    assert "до перезапуска" in texts(bot)[-1] and "PermissionError" in texts(bot)[-1] and "вручную" in texts(bot)[-1]
+    press(bot, f"pay_ok:{token}")
+    assert not bot.s.posts() and payouts.history() == []
+
+
+def test_forged_filter_callbacks_cannot_inject_env_lines():
+    path = B.save_env.__defaults__[0]      # .env во временной папке (tests/conftest.py)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("ASSETS=USDT\nPAYOUTS=0\n")
+    bot = owner()
+    bot.cfg.assets, bot.cfg.exchanges = ["USDT"], ["bybit"]
+    for data in ("flt_a:BTC\nPAYOUTS=1", "flt_e:mexc\nPAYOUTS=1", "flt_a:DOGE", "flt_e:evil"):
+        run(bot.on_callback(cq(data)))
+    assert open(path, encoding="utf-8").read() == "ASSETS=USDT\nPAYOUTS=0\n"
+    assert bot.cfg.assets == ["USDT"] and bot.cfg.exchanges == ["bybit"]
+    run(bot.on_callback(cq("flt_a:BTC")))                          # настоящая кнопка работает
+    assert open(path, encoding="utf-8").read() == "ASSETS=USDT,BTC\nPAYOUTS=0\n"
+    for key, value in (("ASSETS", "USDT\nPAYOUTS=1"), ("ASSETS", "USDT\rPAYOUTS=1"), ("PAYOUTS=1\nX", "1"), ("", "1")):
+        with pytest.raises(ValueError):
+            B.save_env(key, value, path)
+    assert "PAYOUTS=1" not in open(path, encoding="utf-8").read()
+
+
+def test_kill_switch_survives_restart_case_and_inherited_env(monkeypatch, tmp_path):
+    path = str(tmp_path / ".env")
+
+    def env(text):
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+
+    env("payouts=1\nX=1\nPayouts=1\n")
+    B.save_env("PAYOUTS", "0", path)                                # «⛔ Стоп»: все строки ключа — одной
+    assert open(path, encoding="utf-8").read() == "PAYOUTS=0\nX=1\n"
+    for text, inherited, on in (("PAYOUTS=0\n", "1", False),        # PAYOUTS=1 из окружения Windows .env не перебьёт
+                                ("payouts=1\nPAYOUTS=0\n", None, False), ("X=1\n", "1", False),
+                                ("PAYOUTS=1\n", None, True), ("PAYOUTS=1\nPAYOUTS=1 # да\n", None, True),
+                                ("PAYOUTS=1\n", "0", False)):
+        env(text)
+        monkeypatch.delenv("PAYOUTS", raising=False)
+        if inherited is not None:
+            monkeypatch.setenv("PAYOUTS", inherited)
+        p2p.load_env(path)
+        payouts.switch_from_file(path)
+        assert payouts.enabled() is on, (text, inherited)
+    monkeypatch.setenv("PAYOUTS", "1")
+    payouts.switch_from_file(str(tmp_path / "нет.env"))
+    assert not payouts.enabled()
+    src = inspect.getsource(B.main)
+    assert src.index("payouts.switch_from_file(ENV_PATH)") > src.index("load_env()")
+
+
+class Gated(Resp):
+    """Запрос «висит», пока тест не откроет ворота, потом таймаут: выплата уже ушла, а ответа нет."""
+    def __init__(self, gate):
+        super().__init__()
+        self.gate = gate
+
+    async def __aenter__(self):
+        await self.gate.wait()
+        raise asyncio.TimeoutError()
+
+
+def test_stop_during_inflight_send_prevents_resends():
+    """Отправка идёт фоном: command_loop принимает «⛔ Стоп», пока первый POST висит, — повторов нет."""
+    s = Session(routes({INFO: info_for({})}))
+    bot = owner(s)
+    token = to_preview(bot)
+
+    def update(data):
+        return {"update_id": 1, "callback_query": {"id": "c", "data": data,
+                                                   "message": {"message_id": 5, "chat": {"id": 1}}}}
+
+    async def go():
+        gate = asyncio.Event()
+        s.routes[PAY] = lambda call: Gated(gate)
+        # как command_loop: обработка «✅ Отправить» не ждёт ответа Cryptomus (иначе — зависание, тест падает)
+        await asyncio.wait_for(bot.on_update(update(f"pay_ok:{token}")), 5)
+        for _ in range(20):
+            await asyncio.sleep(0)
+        assert len(s.posts()) == 1 and not bot.payout_task.done()
+        await bot.on_update(update("pay_stop"))
+        gate.set()
+        await bot.payout_task
+    run(go())
+    assert len(s.posts()) == 1                                     # без Стопа было бы 1 + MAX_RESEND
+    row = payouts.history()[0]
+    assert row["state"] == "unknown" and "повтор не отправлен" in row["note"]
+    assert "неясен" in texts(bot)[-1] and not payouts.enabled()
+
+
+def test_background_send_failure_is_reported(monkeypatch):
+    async def boom(*a, **k):
+        raise RuntimeError("db locked")
+    bot = owner()
+    token = to_preview(bot)
+    monkeypatch.setattr(payouts, "send", boom)
+    press(bot, f"pay_ok:{token}")
+    assert "исход неясен" in texts(bot)[-1] and "/payout history" in texts(bot)[-1]
+
+
+def test_keccak256_and_eip55():
+    assert payouts._keccak256(b"").hex() == "c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470"
+    for m in (b"", b"abc", b"x" * 135, b"x" * 136, b"x" * 300):   # тот же код с паддингом SHA3 = hashlib.sha3_256
+        assert payouts._keccak256(m, 0x06) == hashlib.sha3_256(m).digest()
+    assert all(payouts._eip55_ok(a) for a in EIP55_OK)
+    assert payouts.evm_checksummed(EIP55_OK[4]) and not payouts.evm_checksummed(EVM)
+
+
+def test_fail_not_final_alerts_once_and_shows_in_history():
+    row = _sent_row()
+    s = Session(routes({INFO: info_for({row["order_id"]: _result_for(row, status="fail", is_final=False)})}))
+    events = run(payouts.poll(s))
+    assert [e for e, _ in events] == ["stuck"] and run(payouts.poll(s)) == []
+    text = B.payout_event_text(*events[0])
+    assert "поддержку Cryptomus" in text and "fail" in text and "учтена" in text
+    view = B.payout_history_view(payouts.history(), payouts.used_today(), Decimal(2000))
+    assert "статус fail" in view and "поддержку" in view and payouts.used_today() == Decimal("26")
+    s.routes[INFO] = info_for({row["order_id"]: _result_for(row, status="fail", is_final=True)})
+    assert [e for e, _ in run(payouts.poll(s))] == ["failed"] and payouts.used_today() == 0
+    s2 = Session(routes({PAY: echo(status="fail", final=False)}))  # fail без итога прямо в ответе на создание
+    res = run(payouts.send(s2, entry("w1"), Decimal("25"), quote(s2)))
+    assert res["state"] == "sent" and res["event"] == "stuck"
+    assert B.payout_result_text(res).startswith("⚠️") and "поддержку" in B.payout_result_text(res)
+
+
+def test_mismatch_reports_final_status_once():
+    s = Session(routes({PAY: echo(amount="26.00000000")}))
+    res = run(payouts.send(s, entry("w1"), Decimal("25"), quote(s)))
+    text = B.payout_result_text(res)
+    assert res["state"] == "unknown" and "Проверь её в кабинете" in text and "Итоговый статус" in text
+    row = res["row"]
+    s.routes[INFO] = info_for({row["order_id"]: _result_for(row, amount="26", status="paid", is_final=True)})
+    events = run(payouts.poll(s))
+    assert [e for e, _ in events] == ["mismatch_final"] and run(payouts.poll(s)) == []
+    assert "итоговый статус Cryptomus — paid" in B.payout_event_text(*events[0])
+    assert payouts.get(row["order_id"])["state"] == "unknown" and payouts.used_today() == Decimal("26")
+    s2 = Session(routes({PAY: echo(amount="26", status="paid", final=True)}))   # несовпадение сразу с итогом
+    res = run(payouts.send(s2, entry("w1"), Decimal("25"), quote(s2)))
+    assert res["event"] == "mismatch" and "больше ничего" in B.payout_result_text(res)
+
+
+def test_rejection_with_failed_info_is_resolved_by_poll():
+    s = Session(routes({PAY: Resp(422, {"state": 1, "message": "Not enough funds"}), INFO: Resp(502, b"")}))
+    res = run(payouts.send(s, entry("w1"), Decimal("25"), quote(s)))
+    assert res["state"] == "unknown" and payouts.used_today() == Decimal("26")
+    s.routes[INFO] = info_for({})
+    events = run(payouts.poll(s))
+    assert [e for e, _ in events] == ["rejected"] and run(payouts.poll(s)) == []
+    assert payouts.get(res["row"]["order_id"])["state"] == "rejected" and payouts.used_today() == 0
+    assert "Деньги не ушли" in B.payout_event_text(*events[0]) and "Not enough funds" in B.payout_event_text(*events[0])
+    assert len(s.posts()) == 1                                      # опрос не отправляет
+
+
+def test_ambiguous_then_not_found_stays_counted_with_one_alert():
+    s = Session(routes({PAY: Resp(exc=asyncio.TimeoutError()), INFO: Resp(502, b"")}))
+    res = run(payouts.send(s, entry("w1"), Decimal("25"), quote(s)))
+    s.routes[INFO] = info_for({})
+    assert [e for e, _ in run(payouts.poll(s))] == ["notfound"] and run(payouts.poll(s)) == []
+    row = payouts.get(res["row"]["order_id"])
+    assert row["state"] == "unknown" and payouts.used_today() == Decimal("26") and len(s.posts()) == 1
+    assert "не находит" in B.payout_event_text("notfound", row) and "кабинет" in B.payout_event_text("notfound", row)
+
+
+@pytest.mark.parametrize("status,refund", [("fail", True), ("cancel", False), ("system_fail", False)])
+def test_failed_text_promises_refund_only_for_fail(status, refund):
+    row = dict(_sent_row(), status=status)
+    text = B.payout_event_text("failed", row)
+    assert ("возвращаются на баланс" in text) is refund and ("не обещает" in text) is not refund

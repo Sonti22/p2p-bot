@@ -291,15 +291,25 @@ def key_hint(ex, name):
 
 
 def save_env(key, value, path=ENV_PATH):
+    """KEY=value в .env и в окружение процесса. Ключ сравнивается без учёта регистра (окружение Windows регистр не
+    различает, а load_env берёт первую строку): первая совпавшая строка заменяется, повторы удаляются. Перевод строки
+    в значении — ValueError: иначе через значение (например, данные кнопки) в .env дописывается чужая строка."""
+    value = str(value)
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key) or re.search(r"[\r\n\0]", value):
+        raise ValueError(f"save_env: недопустимый ключ или значение ({key!r})")
     lines = open(path, encoding="utf-8").read().splitlines() if os.path.exists(path) else []
-    for i, line in enumerate(lines):
-        if line.split("=", 1)[0].strip() == key:
-            lines[i] = f"{key}={value}"
-            break
-    else:
-        lines.append(f"{key}={value}")
+    out, done = [], False
+    for line in lines:
+        if line.split("=", 1)[0].strip().upper() == key.upper():
+            if not done:
+                out.append(f"{key}={value}")
+                done = True
+            continue
+        out.append(line)
+    if not done:
+        out.append(f"{key}={value}")
     with open(path, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines) + "\n")
+        f.write("\n".join(out) + "\n")
     # и сразу в окружение процесса: PAPER, PAPER_AMOUNT и др. читаются через os.getenv при каждом обращении —
     # без этого «/paper on» отвечал «включён», а работал только после перезапуска бота
     os.environ[key] = str(value)
@@ -812,7 +822,11 @@ PAYOUT_WL_HINT = ("💸 Белый список адресов пуст. Бот 
                   "файл не меняет. Добавь адрес на ПК: <code>python scripts/payout_whitelist.py add</code> (адрес "
                   "вводится дважды). Посмотреть список: <code>list</code>, убрать адрес: <code>remove</code>.")
 PAYOUT_STOPPED = ("⛔ Выплаты выключены (PAYOUTS=0). Включить снова можно только на ПК: PAYOUTS=1 в .env бота, затем "
-                  "перезапуск. Статус выплат, которые уже в обработке, бот продолжает отслеживать.")
+                  "перезапуск. Если выплата сейчас отправляется, повторов её запроса не будет; ушедший запрос не "
+                  "отозвать. Статус выплат, которые уже в обработке, бот продолжает отслеживать.")
+PAYOUT_STOPPED_NO_ENV = ("⛔ Выплаты остановлены, но только до перезапуска бота: записать PAYOUTS=0 в .env не удалось "
+                         "({err}). Впиши PAYOUTS=0 в .env бота на ПК вручную, иначе после перезапуска выплаты снова "
+                         "будут включены.")
 PAYOUT_STOP_BTN = {"text": "⛔ Стоп выплаты", "callback_data": "pay_stop"}
 
 
@@ -853,20 +867,40 @@ def _payout_what(row):
 
 
 def payout_event_text(event, row):
-    """Сообщение о выплате: итог опроса статуса (paid/failed/found/mismatch) или перезапуск посреди отправки."""
+    """Сообщение о выплате: итог опроса статуса (paid/failed/found/stuck/mismatch/mismatch_final/notfound/rejected)
+    или перезапуск посреди отправки."""
     what, order = _payout_what(row), f"заявка <code>{row['order_id']}</code>"
+    status = html.escape(row["status"] or "?")
     if event == "paid":
         txid = f", TXID <code>{html.escape(row['txid'])}</code>" if row["txid"] else ""
         return f"✅ Выплата {what} выполнена{txid}."
     if event == "failed":
-        return (f"❌ Выплата {what} не прошла (статус {html.escape(row['status'])}), {order}. По документации "
-                f"Cryptomus средства возвращаются на баланс — проверь баланс в кабинете. Автоповтора нет: новую "
-                f"выплату запускай через /payout.")
+        refund = ("По документации Cryptomus при таком провале средства возвращаются на баланс — проверь баланс в "
+                  "кабинете." if row["status"] == "fail" else
+                  "Возврат средств при таком статусе Cryptomus не обещает — сначала проверь баланс в кабинете, потом "
+                  "запускай новую выплату.")
+        return (f"❌ Выплата {what} не прошла (статус {status}), {order}. {refund} Автоповтора нет: новую выплату "
+                f"запускай через /payout.")
+    if event == "stuck":
+        return (f"⚠️ Выплата {what}: статус {status}, но Cryptomus не считает его итоговым ({order}). Переотправить "
+                f"такую выплату можно только через поддержку Cryptomus — проверь её в кабинете. В дневном лимите "
+                f"она учтена, бот продолжает проверять статус.")
     if event == "found":
-        return f"ℹ️ Выплата {what} нашлась в Cryptomus ({order}), статус {html.escape(row['status'])}. Итог пришлю сюда."
+        return f"ℹ️ Выплата {what} нашлась в Cryptomus ({order}), статус {status}. Итог пришлю сюда."
     if event == "mismatch":
+        tail = (f"Cryptomus уже считает её завершённой (статус {status}), бот больше ничего по ней не пришлёт."
+                if row["is_final"] else "Итоговый статус Cryptomus бот пришлёт сюда.")
         return (f"🚨 Выплата {what}: {html.escape(row['note'])} ({order}). Проверь её в кабинете Cryptomus. "
-                f"В дневном лимите она учтена.")
+                f"В дневном лимите она учтена. {tail}")
+    if event == "mismatch_final":
+        return (f"🚨 Выплата {what}: итоговый статус Cryptomus — {status}, но {html.escape(row['note'])} ({order}). "
+                f"Проверь её в кабинете Cryptomus. В дневном лимите она учтена.")
+    if event == "notfound":
+        return (f"⚠️ Выплата {what}: {payouts.NOT_FOUND} ({order}). Проверь кабинет Cryptomus: если выплаты там нет, "
+                f"она не ушла. В дневном лимите она пока учтена, бот продолжает проверять статус.")
+    if event == "rejected":
+        return (f"🚫 Cryptomus отклонил выплату {what} и не находит её ({order}): {html.escape(row['note'])}. Деньги "
+                f"не ушли, из дневного лимита она убрана. Новая попытка — через /payout.")
     if event == "resumed":
         return (f"⚠️ Бот перезапустился во время отправки выплаты {what} ({order}). Исход неясен, проверяю статус "
                 f"в Cryptomus. В дневном лимите выплата учтена.")
@@ -882,9 +916,14 @@ def payout_result_text(res):
     if state == "rejected":
         return (f"🚫 Cryptomus отклонил выплату {what}: {reason}. Деньги не ушли, в лимит не засчитано. "
                 f"Новая попытка — снова через /payout.")
+    if state == "unknown" and payouts.MISMATCH in (res.get("reason") or ""):
+        tail = ("Cryptomus уже считает её завершённой, бот больше ничего по ней не пришлёт." if row["is_final"] else
+                "Итоговый статус Cryptomus бот пришлёт в «📒 Журнал».")
+        return (f"🚨 Исход выплаты {what} неясен: {reason}. Проверь её в кабинете Cryptomus. Заявка "
+                f"<code>{row['order_id']}</code> учтена в дневном лимите. {tail} Не повторяй эту выплату, пока не "
+                f"разберёшься.")
     if state == "unknown":
-        alarm = "🚨" if payouts.MISMATCH in (res.get("reason") or "") else "⚠️"
-        return (f"{alarm} Исход выплаты {what} неясен: {reason}. Заявка <code>{row['order_id']}</code> учтена в "
+        return (f"⚠️ Исход выплаты {what} неясен: {reason}. Заявка <code>{row['order_id']}</code> учтена в "
                 f"дневном лимите. "
                 f"Бот проверяет её статус в Cryptomus и напишет в «📒 Журнал». Не повторяй эту выплату, пока "
                 f"статус не выяснится.")
@@ -892,6 +931,8 @@ def payout_result_text(res):
         return payout_event_text("paid", row)
     if state == "final_failed":
         return payout_event_text("failed", row)
+    if row["status"] in payouts.FAIL_STATUSES:
+        return payout_event_text("stuck", row)
     return (f"✅ Cryptomus принял выплату {what}, {order}, статус {html.escape(row['status'] or '?')}. "
             f"Итог пришлю в «📒 Журнал».")
 
@@ -904,6 +945,8 @@ def payout_history_view(rows, used, daily):
         ts = datetime.fromtimestamp(r["created_ts"], MSK).strftime("%d.%m %H:%M")
         txid = f", TXID <code>{html.escape(r['txid'][:16])}…</code>" if r["txid"] else ""
         note = f" ({html.escape(r['note'])})" if r["state"] in ("rejected", "unknown") and r["note"] else ""
+        if r["state"] == "sent" and r["status"] in payouts.FAIL_STATUSES:
+            note = f" (статус {r['status']}, не итоговый: переотправка только через поддержку Cryptomus)"
         lines.append(f"• {ts} {_payout_what(r)}: {payouts.STATE_NAMES.get(r['state'], r['state'])}{note}{txid}")
     return "\n".join(lines)
 
@@ -1142,6 +1185,7 @@ class Bot:
         self.awaiting_payout = None   # id записи белого списка — ждём сумму выплаты текстом после выбора получателя
         self.payout_preview = None    # {"token", "entry", "amount", "quote", "ts"} — последний предпросмотр выплаты
         self.resumed_payouts = []     # выплаты, прерванные перезапуском (payouts.resume в main), — сообщить владельцу
+        self.payout_task = None       # фоновая отправка подтверждённой выплаты: command_loop тем временем принимает «⛔ Стоп»
         self.onboarding = None   # {"step": "amount"/"banks"/"min", "banks": set()} — мастер первого /start
         self.sent = {}
         self.live_msg = {}   # (ex,asset,ex,asset) -> последнее сообщение сигнала для «живой карточки» (editMessage)
@@ -1226,13 +1270,15 @@ class Bot:
         logger.warning("Telegram: цветные кнопки/copy_text не поддерживаются, дальше обычные: %s", r.get("description"))
         return True
 
-    async def send(self, text, chat_id=None, markup=None, topic=None):
+    async def send(self, text, chat_id=None, markup=None, topic=None, thread=None):
+        """thread — явный топик (ответ фоновой задачи: cur_thread к тому времени мог смениться)."""
         chat_id = self.chat_for(chat_id)
         params = dict(chat_id=chat_id, text=text, parse_mode="HTML", disable_web_page_preview=True)
         if markup:
             params["reply_markup"] = self.markup(markup)
-        if self.thread_for(topic, chat_id):
-            params["message_thread_id"] = self.thread_for(topic, chat_id)
+        thread = thread or self.thread_for(topic, chat_id)
+        if thread:
+            params["message_thread_id"] = thread
         r = await self.call("sendMessage", **params)
         if self._fancy_failed(r, markup):
             params["reply_markup"] = plain_markup(markup)
@@ -1885,8 +1931,11 @@ class Bot:
         await self.show_top(snap)
         await self.show_best(snap)
 
-    def _toggle(self, values, item, env_key, label):
-        """Вкл/выкл монету или площадку в списке фильтра; нельзя выключить последнюю. Пишет в .env."""
+    def _toggle(self, values, item, env_key, label, allowed):
+        """Вкл/выкл монету или площадку в списке фильтра; нельзя выключить последнюю. Пишет в .env.
+        Только значения с кнопок (allowed): данные колбэка может подделать клиент."""
+        if item not in allowed:
+            return "Нет такой кнопки"
         if item in values:
             if len(values) == 1:
                 return f"Нельзя выключить последнюю {label}"
@@ -1992,9 +2041,9 @@ class Bot:
             save_env("QUIET_HOURS_ON", "1" if self.quiet_on else "0")
             return f"Тихие часы ({self.quiet_hours} МСК) " + ("включены" if self.quiet_on else "выключены")
         if data.startswith("flt_a:"):
-            return self._toggle(self.cfg.assets, data[6:], "ASSETS", "монету")
+            return self._toggle(self.cfg.assets, data[6:], "ASSETS", "монету", ASSET_LIST)
         if data.startswith("flt_e:"):
-            return self._toggle(self.cfg.exchanges, data[6:], "EXCHANGES", "площадку")
+            return self._toggle(self.cfg.exchanges, data[6:], "EXCHANGES", "площадку", EXCHANGE_LIST)
         if data.startswith("preset_apply:"):
             return self.apply_preset(data[len("preset_apply:"):])
         return ""
@@ -3068,19 +3117,26 @@ class Bot:
         await self.send(text, markup=kb)
 
     def payout_stop(self):
-        """«⛔ Стоп выплаты»: PAYOUTS=0 в .env и в окружении процесса. Включить обратно из Telegram нельзя."""
-        save_env("PAYOUTS", "0")
+        """«⛔ Стоп выплаты»: сначала PAYOUTS=0 в процессе и сброс предпросмотра — это не может не сработать, — потом
+        PAYOUTS=0 в .env. Возвращает None или причину, по которой .env не записан. Включить обратно из Telegram нельзя."""
+        payouts.disable()
         self.payout_preview = None
         self.awaiting_payout = None
+        try:
+            save_env("PAYOUTS", "0")
+        except Exception as e:   # .env только для чтения, занят антивирусом/редактором и т. п.
+            logger.error("⛔ Стоп выплат: PAYOUTS=0 в .env не записан: %s", type(e).__name__)
+            return type(e).__name__
+        return None
 
     async def payout_callback(self, cq, data):
         """Кнопки выплат: pay_to:<id> — получатель из белого списка, pay_ok/pay_no:<токен> — кнопки предпросмотра,
         pay_hist — история, pay_stop — выключить выплаты."""
         kind, _, arg = data.partition(":")
         if kind == "pay_stop":
-            self.payout_stop()
+            err = self.payout_stop()
             await self.call("answerCallbackQuery", callback_query_id=cq["id"], text="Выплаты выключены")
-            await self.send(PAYOUT_STOPPED)
+            await self.send(PAYOUT_STOPPED_NO_ENV.format(err=html.escape(err)) if err else PAYOUT_STOPPED)
         elif kind == "pay_hist":
             await self.call("answerCallbackQuery", callback_query_id=cq["id"])
             await self.cmd_payout("history")
@@ -3151,8 +3207,20 @@ class Bot:
             await self.send(f"⛔ Ничего не отправлено: {payouts.OFF}.")
             return
         await self.call("answerCallbackQuery", callback_query_id=cq["id"], text="Отправляю…")
-        res = await payouts.send(self.s, p["entry"], p["amount"], p["quote"])
-        await self.send(payout_result_text(res))
+        # в фоне: отправка с разбором неясного исхода может идти минуты (таймауты, /info, повторы), а command_loop
+        # обрабатывает обновления по одному — «⛔ Стоп» иначе дошёл бы только после всех повторов
+        self.payout_task = asyncio.create_task(self.payout_send(p, self.thread_for(None)))
+
+    async def payout_send(self, p, thread):
+        """Фоновая отправка подтверждённой выплаты (одна за раз — замок в payouts.send) и итог владельцу."""
+        try:
+            res = await payouts.send(self.s, p["entry"], p["amount"], p["quote"])
+            text = payout_result_text(res)
+        except Exception as e:
+            logger.error("выплата: сбой отправки: %s", accounts.api_error_text(e))
+            text = ("⚠️ Сбой бота при отправке выплаты — исход неясен. Не повторяй её вслепую: проверь /payout history "
+                    "и кабинет Cryptomus. В дневном лимите она учтена.")
+        await self.send(text, thread=thread)
 
     async def drop_buttons(self, cq):
         mid = (cq.get("message") or {}).get("message_id")
@@ -3213,6 +3281,7 @@ class Bot:
 async def main():
     setup_logging()
     load_env()
+    payouts.switch_from_file(ENV_PATH)   # выключатель выплат — только из .env: PAYOUTS=1 извне его не перебьёт
     token = os.getenv("TG_TOKEN", "").strip()
     if not token:
         raise SystemExit("TG_TOKEN не задан: создай бота у @BotFather и пропиши токен в .env")

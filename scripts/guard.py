@@ -7,7 +7,11 @@ import re
 import subprocess
 import sys
 
-PROTECTED = (".github/", "scripts/guard.py", "launcher.py", "CLAUDE.md", ".gitignore")
+PROTECTED = (".github/", "scripts/guard.py", "launcher.py", "CLAUDE.md", ".gitignore",
+             "payouts.py", "scripts/payout_whitelist.py", "tests/test_payouts.py")   # выплаты — только вручную
+# код выплат в остальных файлах (bot.py: /payout, кнопки pay_*, PAYOUTS; accounts.py, .env.example…): любая добавленная
+# или удалённая строка — ручная проверка владельца. Документацию (.md) не проверяем.
+PAYOUT_CODE = r"payout|\bpay_(?:to|ok|no|hist|stop)\b"
 ALLOWED_DOMAINS = ("bybit.com", "mexc.com", "htx.com", "kucoin.com", "bitpapa.com", "bestchange.ru",
                    "rapira.net", "telegram.org", "t.me", "lbank.com", "bingx.com", "cryptomus.com")
 FORBIDDEN = (r"\bsubprocess\b", r"\bos\.system\b", r"\bos\.popen\b", r"\beval\(", r"\bexec\(", r"captcha",
@@ -24,11 +28,19 @@ def check(base):
     for f in filter(None, git("diff", "--name-only", f"{base}...HEAD").splitlines()):
         if f.startswith(PROTECTED):
             problems.append(f"изменён защищённый файл: {f}")
-    cur = ""
+    cur = old = ""
+    payout_lines = {}
     for line in git("diff", "-U0", f"{base}...HEAD", "--", ".", ":(exclude)tests/fixtures").splitlines():
+        if line.startswith("--- "):
+            old = line[6:] if line.startswith("--- a/") else ""
+            continue
         if line.startswith("+++ "):
             cur = line[6:] if line.startswith("+++ b/") else ""
             continue
+        name = cur or old
+        if (line.startswith(("+", "-")) and not name.endswith(".md") and not name.startswith(PROTECTED)
+                and re.search(PAYOUT_CODE, line[1:], re.I)):
+            payout_lines[name] = payout_lines.get(name, 0) + 1
         if not line.startswith("+"):
             continue
         text = line[1:]
@@ -43,6 +55,8 @@ def check(base):
         for pat in SECRETS:
             if re.search(pat, text):
                 problems.append(f"{cur}: похоже на секрет")
+    for name, n in payout_lines.items():
+        problems.append(f"{name}: изменён код выплат ({n} стр.) — только ручная проверка владельца")
     return problems
 
 

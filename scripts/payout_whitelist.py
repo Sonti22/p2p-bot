@@ -64,6 +64,12 @@ def cmd_add(path, ask=input):
     if why:
         print(f"Адрес не подходит: {why} — ничего не записано.")
         return 1
+    if payouts.NETWORKS.get(net) == "evm" and not payouts.evm_checksummed(address):
+        print("⚠️ Адрес без контрольной суммы EIP-55 (все буквы одного регистра): опечатку в нём не поймать. Лучше "
+              "скопируй адрес со смешанным регистром букв, как его показывает кошелёк или биржа.")
+        if ask("Всё равно добавить адрес без контрольной суммы? [y/N]: ").strip().lower() not in YES:
+            print("Отменено — ничего не записано.")
+            return 1
     if ask("Адрес ещё раз (вставь заново): ").strip() != address:
         print("Адреса не совпали — ничего не записано.")
         return 1
