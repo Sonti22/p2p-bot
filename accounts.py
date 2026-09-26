@@ -451,7 +451,11 @@ def bingx_key_safety(data):
         except ValueError:
             return None, ""
         bad = [BINGX_PERM_CODES.get(c, f"право {c}") for c in sorted(codes - {BINGX_READ_CODE})]
-        confirmed = codes == {BINGX_READ_CODE}
+        # вдруг в ответе рядом с кодами ещё и флаги enable*/permits* — их тоже учитываем, а не только коды
+        flags = {k: _bingx_flag(v) for k, v in data.items()
+                 if str(k).lower().startswith(("enable", "permit")) and k != "enableReading"}
+        bad += [BINGX_PERM_FLAGS.get(k, f"право {k}") for k, v in flags.items() if v]
+        confirmed = codes == {BINGX_READ_CODE} and None not in flags.values()
         no_ip = "ipAddresses" in data and not data["ipAddresses"]
     elif any(str(k).lower().startswith(("enable", "permit")) for k in data):
         rights = {k: _bingx_flag(v) for k, v in data.items() if str(k).lower().startswith(("enable", "permit"))}

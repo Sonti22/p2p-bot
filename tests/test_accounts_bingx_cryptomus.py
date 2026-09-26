@@ -387,6 +387,17 @@ def test_bingx_key_safety_unknown_flag_and_partial_answer():
     assert accounts.bingx_key_safety({"permissions": [1]}) == (False, "торговля спот")   # без Read, но с торговлей
 
 
+def test_bingx_key_safety_mixed_codes_and_flags():
+    """Коды и флаги в одном ответе: флаг сверх чтения не прячется за permissions [2]; нераспознанный флаг —
+    «только чтение» не подтверждено."""
+    assert accounts.bingx_key_safety({"permissions": [2], "ipAddresses": [], "enableWithdrawals": True}) == (
+        False, "вывод и переводы другим пользователям BingX; без привязки к IP")
+    assert accounts.bingx_key_safety({"permissions": "2", "enableSpotAndMarginTrading": "true"}) == (
+        False, "торговля спот")
+    assert accounts.bingx_key_safety({"permissions": [2], "enableFutures": "maybe"}) == (None, "")
+    assert accounts.bingx_key_safety({"permissions": [2], "enableReading": True, "enableFutures": False}) == (True, "")
+
+
 BX_DOCS_V3_PERMS = {"apiKey": "", "permissions": [1, 2], "ipAddresses": [], "note": "demo"}   # пример из docs-v3
 
 
