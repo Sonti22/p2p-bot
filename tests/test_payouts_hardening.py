@@ -147,7 +147,7 @@ def test_guard_protects_pytest_config_and_python_startup_files_at_any_depth(monk
     старте), requirements.txt — на любой глубине только вручную: через них тесты выплат выпадали бы или подменялись."""
     from test_payouts import _load_guard
     guard = _load_guard()
-    monkeypatch.setattr(guard, "git", lambda *args: path + "\n" if "--name-only" in args else "")
+    monkeypatch.setattr(guard, "git", lambda *args: path + "\0" if "--name-only" in args else "")
     assert bool(guard.check("origin/main")) is protected
     assert guard.protected(path) is protected
 
@@ -187,6 +187,24 @@ def test_payout_handlers_refuse_non_owner_even_past_routing():
         await bot.payout_task
     run(owner_press())
     assert len(bot.s.posts()) == posts + 1                         # владелец отправляет как обычно
+
+
+def test_guard_reads_non_ascii_and_spaced_paths(tmp_path, monkeypatch):
+    """Пути с русскими буквами и пробелами: без -z и core.quotepath=false git берёт их в кавычки с октальными кодами,
+    а «+++ b/путь с пробелом» кончается на \\t — защита по префиксу и проверка FORBIDDEN в .py их пропускали."""
+    from test_payouts import _load_guard
+    guard = _load_guard()
+    g = _repo(tmp_path, monkeypatch, guard)
+    (tmp_path / ".github" / "workflows").mkdir(parents=True)
+    (tmp_path / ".github" / "workflows" / "проверка.yml").write_text("on: push\n", encoding="utf-8")
+    (tmp_path / "my tool.py").write_text("import subprocess\n", encoding="utf-8")
+    (tmp_path / "заметки.md").write_text("subprocess — это просто слово в тексте\n", encoding="utf-8")
+    g("add", "-A")
+    g("commit", "-q", "-m", "paths")
+    found = guard.check("main")
+    assert any("изменён защищённый файл: .github/workflows/проверка.yml" == p for p in found), found
+    assert any(p.startswith("my tool.py: запрещено") for p in found), found
+    assert not any("заметки.md" in p for p in found)
 
 
 def test_forged_onboarding_bank_callback_is_ignored():

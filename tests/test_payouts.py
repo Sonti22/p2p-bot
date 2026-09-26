@@ -934,22 +934,25 @@ def test_guard_blocks_automerge_of_any_payout_change(monkeypatch):
     guard = _load_guard()
     for f in ("payouts.py", "scripts/payout_whitelist.py", "tests/test_payouts.py"):
         assert f.startswith(guard.PROTECTED), f
+    hunk = "@@ -1 +1 @@\n"
     diffs = {
-        "payouts.py": '+++ b/payouts.py\n+    ("POST", "/v1/transfer/to-personal"),\n',
-        "bot.py": "--- a/bot.py\n+++ b/bot.py\n-        if not payouts.enabled():\n",
-        ".env.example": "--- a/.env.example\n+++ b/.env.example\n+PAYOUT_DAILY_LIMIT=1000000\n",
-        "accounts.py": '--- a/accounts.py\n+++ b/accounts.py\n+KEYS = ("cryptomus_payout",)\n',
-        "tests/test_guests.py": '--- a/tests/test_guests.py\n+++ b/tests/test_guests.py\n+    run(bot.on_callback(cq("pay_ok:x")))\n',
+        "payouts.py": '+++ b/payouts.py\n' + hunk + '+    ("POST", "/v1/transfer/to-personal"),\n',
+        "bot.py": "--- a/bot.py\n+++ b/bot.py\n" + hunk + "-        if not payouts.enabled():\n",
+        ".env.example": "--- a/.env.example\n+++ b/.env.example\n" + hunk + "+PAYOUT_DAILY_LIMIT=1000000\n",
+        "accounts.py": '--- a/accounts.py\n+++ b/accounts.py\n' + hunk + '+KEYS = ("cryptomus_payout",)\n',
+        "tests/test_guests.py": ('--- a/tests/test_guests.py\n+++ b/tests/test_guests.py\n' + hunk
+                                 + '+    run(bot.on_callback(cq("pay_ok:x")))\n'),
     }
 
-    def fake_git(files, diff):
-        return lambda *args: "\n".join(files) + "\n" if "--name-only" in args else diff
+    def fake_git(per_file):
+        """Как git в guard.check: список файлов через -z, потом diff по одному файлу (путь — последний аргумент)."""
+        return lambda *args: ("\0".join(per_file) + "\0" if "--name-only" in args else per_file.get(args[-1], ""))
     for name, diff in diffs.items():
-        monkeypatch.setattr(guard, "git", fake_git([name], diff))
+        monkeypatch.setattr(guard, "git", fake_git({name: diff}))
         assert guard.check("origin/main"), name
-    harmless = ("--- a/bot.py\n+++ b/bot.py\n+    x = trades.pay_label(kind, bank, pays)\n"
-                "--- a/ROADMAP.md\n+++ b/ROADMAP.md\n+- payouts: заметка\n")
-    monkeypatch.setattr(guard, "git", fake_git(["bot.py", "ROADMAP.md"], harmless))
+    harmless = {"bot.py": "--- a/bot.py\n+++ b/bot.py\n" + hunk + "+    x = trades.pay_label(kind, bank, pays)\n",
+                "ROADMAP.md": "--- a/ROADMAP.md\n+++ b/ROADMAP.md\n" + hunk + "+- payouts: заметка\n"}
+    monkeypatch.setattr(guard, "git", fake_git(harmless))
     assert guard.check("origin/main") == []
     claude_md = open(os.path.join(os.path.dirname(os.path.dirname(__file__)), "CLAUDE.md"), encoding="utf-8").read()
     assert "`payouts.py`, `scripts/payout_whitelist.py`, `tests/test_payouts.py`" in claude_md

@@ -48,41 +48,50 @@ def protected(path):
             or base.endswith(PROTECTED_SUFFIXES))
 
 
+GIT_RAW = ("-c", "core.quotepath=false", "--literal-pathspecs")   # пути как есть: не-ASCII без кавычек, «:(…)» не магия
+
+
+def changed_files(base):
+    """Изменённые пути ветки против базы: -z (пробелы, кавычки, не-ASCII — как есть), --no-renames — переименование
+    = удаление старого пути + новый файл целиком, иначе «payouts.py → payouts/__init__.py» проходил бы как «ок»."""
+    return [f for f in git(*GIT_RAW, "diff", "--name-only", "-z", "--no-renames", f"{base}...HEAD").split("\0") if f]
+
+
 def check(base):
     problems = []
-    # --no-renames: переименование = удаление старого пути + новый файл целиком. Иначе git показывает только новое
-    # имя, а перенесённые строки не попадают в diff — «payouts.py → payouts/__init__.py» проходил бы как «ок»
-    for f in filter(None, git("diff", "--name-only", "--no-renames", f"{base}...HEAD").splitlines()):
+    files = changed_files(base)
+    for f in files:
         if protected(f):
             problems.append(f"изменён защищённый файл: {f}")
-    cur = old = ""
     payout_lines = {}
-    for line in git("diff", "-U0", "--no-renames", f"{base}...HEAD", "--", ".",
-                    ":(exclude)tests/fixtures").splitlines():
-        if line.startswith("--- "):
-            old = line[6:] if line.startswith("--- a/") else ""
+    for name in files:
+        if name.startswith("tests/fixtures/"):
             continue
-        if line.startswith("+++ "):
-            cur = line[6:] if line.startswith("+++ b/") else ""
-            continue
-        name = cur or old
-        if (line.startswith(("+", "-")) and not name.endswith(".md") and not protected(name)
-                and re.search(PAYOUT_CODE, line[1:], re.I)):
-            payout_lines[name] = payout_lines.get(name, 0) + 1
-        if not line.startswith("+"):
-            continue
-        text = line[1:]
-        if not cur.endswith(".md"):   # ссылки в документации не проверяем
-            for host in re.findall(r"https?://([A-Za-z0-9.-]+)", text):
-                if not any(host == d or host.endswith("." + d) for d in ALLOWED_DOMAINS):
-                    problems.append(f"{cur}: новый домен {host}")
-        if cur.endswith(".py"):
-            for pat in FORBIDDEN:
-                if re.search(pat, text, re.I):
-                    problems.append(f"{cur}: запрещено /{pat}/: {text.strip()[:80]}")
-        for pat in SECRETS:
-            if re.search(pat, text):
-                problems.append(f"{cur}: похоже на секрет")
+        # по одному файлу: имя берём из -z списка, а не из заголовков «+++ b/…» (там кавычки и \t у путей с пробелом)
+        diff = git(*GIT_RAW, "diff", "-U0", "--no-renames", f"{base}...HEAD", "--", name).splitlines()
+        hunk = False
+        for line in diff:
+            if line.startswith("@@"):
+                hunk = True
+                continue
+            if not hunk or not line.startswith(("+", "-")):
+                continue
+            if not name.endswith(".md") and not protected(name) and re.search(PAYOUT_CODE, line[1:], re.I):
+                payout_lines[name] = payout_lines.get(name, 0) + 1
+            if not line.startswith("+"):
+                continue
+            text = line[1:]
+            if not name.endswith(".md"):   # ссылки в документации не проверяем
+                for host in re.findall(r"https?://([A-Za-z0-9.-]+)", text):
+                    if not any(host == d or host.endswith("." + d) for d in ALLOWED_DOMAINS):
+                        problems.append(f"{name}: новый домен {host}")
+            if name.lower().endswith(".py"):
+                for pat in FORBIDDEN:
+                    if re.search(pat, text, re.I):
+                        problems.append(f"{name}: запрещено /{pat}/: {text.strip()[:80]}")
+            for pat in SECRETS:
+                if re.search(pat, text):
+                    problems.append(f"{name}: похоже на секрет")
     for name, n in payout_lines.items():
         problems.append(f"{name}: изменён код выплат ({n} стр.) — только ручная проверка владельца")
     return problems

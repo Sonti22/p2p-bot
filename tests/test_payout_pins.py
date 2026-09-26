@@ -248,9 +248,13 @@ def test_pin_checks_see_rebinding_decorators_and_new_names(tmp_path):
     assert "payouts" not in _pinned_names("bot", names4)
 
 
-SEND_METHODS = ("post", "put", "delete", "patch", "request", "_request")
+SEND_METHODS = ("post", "put", "delete", "patch", "request", "_request", "send", "urlopen")
 # поиск метода по имени-строке: getattr(s, "post"), s.__getattribute__("post"), operator.methodcaller("post")…
 DYNAMIC_LOOKUP = ("getattr", "__getattribute__", "attrgetter", "methodcaller")
+# другие сетевые клиенты — любой их импорт в accounts.py/payouts.py уже отправитель (запрос без атрибута .post:
+# requests.post как имя, urlopen(Request(..., data=...)), http.client…); из aiohttp — функции/классы, шлющие запрос
+NET_MODULES = ("requests", "httpx", "urllib3", "urllib.request", "http.client", "http", "socket", "ssl", "asyncio.streams")
+AIOHTTP_SENDERS = ("request", "ClientSession", "ClientRequest", "TCPConnector", "Session")
 
 
 def _senders(mod):
@@ -270,13 +274,22 @@ def _senders(mod):
         return any(not (isinstance(a, ast.Constant) and isinstance(a.value, str))
                    or a.value.lower() in SEND_METHODS for a in args) or not args
 
+    def net_import(node):
+        if isinstance(node, ast.Import):
+            return any(a.name in NET_MODULES or a.name.split(".")[0] in NET_MODULES for a in node.names)
+        if isinstance(node, ast.ImportFrom):
+            mod = node.module or ""
+            return (mod in NET_MODULES or mod.split(".")[0] in NET_MODULES
+                    or mod.split(".")[0] == "aiohttp" and any(a.name in AIOHTTP_SENDERS for a in node.names))
+        return False
+
     def visit(node, where):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             where = node.name
         elif isinstance(node, ast.Lambda):
             where = "<lambda>"
         if (isinstance(node, ast.Attribute) and node.attr in SEND_METHODS
-                or isinstance(node, ast.Call) and dynamic(node)):
+                or isinstance(node, ast.Call) and dynamic(node) or net_import(node)):
             found.add(where)
         for child in ast.iter_child_nodes(node):
             visit(child, where)
@@ -303,6 +316,12 @@ def test_only_known_senders_of_state_changing_requests():
     "def f(s):\n    return s.__getattribute__('post')('u')\n",
     "import operator\ndef f(s):\n    return operator.methodcaller('post', 'u')(s)\n",
     "import operator\ndef f(s):\n    return operator.attrgetter('put')(s)('u')\n",
+    # без атрибута .post: другие клиенты и функции-отправители, импортированные по имени
+    "def f(u):\n    from aiohttp import request\n    return request('POST', u)\n",
+    "def f(u):\n    from requests import post\n    return post(u)\n",
+    "def f(u):\n    from urllib.request import urlopen, Request\n    return urlopen(Request(u, data=b'x'))\n",
+    "def f(s, r):\n    return s.send(r)\n",
+    "def f(u):\n    import http.client\n    return http.client.HTTPSConnection(u)\n",
 ])
 def test_senders_see_aliases_and_dynamic_lookup(tmp_path, body):
     """Отправитель виден и без прямого вызова s.post(...): псевдоним, partial, getattr/__getattribute__,

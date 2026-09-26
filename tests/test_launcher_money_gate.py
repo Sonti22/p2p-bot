@@ -36,7 +36,7 @@ def gate(monkeypatch, tmp_path):
     for name, value in paths.items():
         monkeypatch.setattr(launcher, name, str(value))
     st = SimpleNamespace(head=HEAD, github=R1, origin=None, files=["bot.py"], smokes=[], smoked=0, git=[], notes=[],
-                         diff_error=None, env=tmp_path / ".env", approved=paths["APPROVED_PATH"])
+                         diff_error=None, diverged=False, env=tmp_path / ".env", approved=paths["APPROVED_PATH"])
 
     def git(*args, check=True):
         st.git.append(" ".join(args))
@@ -51,6 +51,9 @@ def gate(monkeypatch, tmp_path):
             if st.diff_error:
                 raise RuntimeError(st.diff_error)
             return "".join(n + "\0" for n in st.files)
+        elif args[0] == "merge-base":
+            if st.diverged:   # в папке бота свой коммит: HEAD не предок origin/main
+                raise RuntimeError("git merge-base --is-ancestor: exit 1")
         elif args[0] in ("merge", "reset"):
             st.head = args[-1]
         return ""
@@ -66,7 +69,7 @@ def gate(monkeypatch, tmp_path):
     monkeypatch.setattr(launcher, "write_dev_status", lambda: None)
     monkeypatch.setattr(launcher, "roadmap_progress", lambda: (0, 0, ""))
     monkeypatch.setattr(launcher, "repo_url", lambda: "repo")
-    st.merged = lambda: any(c.startswith("merge") for c in st.git)
+    st.merged = lambda: any(c.startswith("merge --ff-only") for c in st.git)   # merge-base — только проверка
     st.money_notes = lambda: [n for n in st.notes if n.startswith("💸")]
     return st
 
@@ -306,7 +309,26 @@ def test_money_rechecked_after_old_bot_stopped(loop):
         launcher.Launcher().run()
     assert loop.runs() == [("start", HEAD), "stop", ("start", R1), "stop"]
     assert loop.events[2][2] == b"PAYOUTS=0\nTRADING=0\nTG_CHAT_ID=42\n"
-    assert loop.money_notes() == [money_note(R1)]                   # одно сообщение на обновление
+    # первое — о выключении, второе — что пришлось выключить ещё раз (иначе владелец считал бы их включёнными)
+    assert loop.money_notes() == [money_note(R1), launcher.MONEY_OFF_AGAIN_NOTE.format(sha=R1[:7])]
+
+
+def test_money_not_switched_again_note_when_nothing_changed(loop):
+    loop.env.write_bytes(b"PAYOUTS=1\n")
+    with pytest.raises(Stop):
+        launcher.Launcher().run()
+    assert loop.money_notes() == [money_note(R1)]                   # повторно выключать было нечего — без 2-й строки
+
+
+def test_diverged_folder_neither_merges_nor_touches_money(gate):
+    """В папке бота свой коммит (ветки разошлись): обновление не ставится и деньги НЕ выключаются — ничего нового
+    на ПК не запускается; одно предупреждение, коммит в bad."""
+    gate.diverged = True
+    gate.env.write_bytes(b"PAYOUTS=1\n")
+    lau = launcher.Launcher()
+    assert lau.try_update() is False and not gate.merged() and gate.smoked == 0 and R1 in lau.bad
+    assert gate.env.read_bytes() == b"PAYOUTS=1\n" and not gate.money_notes()
+    assert len(gate.notes) == 1 and "разошлись" in gate.notes[0]
 
 
 def test_env_unwritable_right_before_new_bot_keeps_old_version(loop):

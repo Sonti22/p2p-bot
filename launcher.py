@@ -73,6 +73,8 @@ APPROVED_PATH = os.path.join(HERE, "logs", "approved_shas")   # sha, подтв�
 MONEY_KEYS = ("PAYOUTS", "TRADING")
 MONEY_OFF_NOTE = ("💸 Выплаты/торговля выключены после обновления {sha}: проверь изменения и включи на ПК "
                   "(PAYOUTS=1 / TRADING=1 в .env)")
+MONEY_OFF_AGAIN_NOTE = ("💸 Выплаты/торговля снова выключены перед запуском {sha}: их включили, пока шла проверка "
+                        "обновления. Включи ещё раз на ПК, когда бот запустится.")
 USAGE = ("Запуск: python launcher.py                 — бот с автообновлением (обычно через run.bat)\n"
          "        python launcher.py --approve <sha>  — подтвердить обновление с защищёнными файлами")
 
@@ -545,6 +547,12 @@ class Launcher:
                        f"{remote[:7]}) и подтверди на ПК:\npython launcher.py --approve {remote}")
             return False
         docs_only = bool(files) and all(f.endswith(".md") for f in files)
+        try:   # не fast-forward (в папке свой коммит) — merge не пройдёт: не ставим и деньги не трогаем
+            git("merge-base", "--is-ancestor", head, remote)
+        except RuntimeError as e:
+            notify(f"⚠️ Не смог обновиться (ветки разошлись): {e}")
+            self.bad.add(remote)
+            return False
         # деньги — до merge: launcher, убитый между merge и концом смоука, при следующем старте запустил бы новый код
         # (HEAD уже равен origin/main — обновлять «нечего») с включёнными деньгами. Не прошёл смоук — деньги всё равно
         # выключены, это безопасная сторона. .env не записать — не ставим вовсе
@@ -588,13 +596,18 @@ class Launcher:
         self.pending = (head, remote, files)   # остальное — в after_update, когда старый бот уже остановлен
         return True
 
-    def money_off_for(self, head, remote):
+    def money_off_for(self, head, remote, again=False):
         """PAYOUTS/TRADING → 0 перед новым кодом remote. True — выключены (или уже были выключены); False — .env не
-        записать: новый код не ставить. Сообщение владельцу — одно на sha и то и другое."""
+        записать: новый код не ставить. Сообщение владельцу — одно на sha и то и другое; again — повторное выключение
+        перед самым запуском: если что-то снова пришлось выключить (включили, пока шла проверка), — отдельная строка,
+        иначе владелец считал бы выплаты включёнными."""
         try:
-            if money_off(os.path.join(HERE, ".env")) and remote not in self.money_noted:
+            changed = money_off(os.path.join(HERE, ".env"))
+            if changed and remote not in self.money_noted:
                 self.money_noted.add(remote)
                 notify(MONEY_OFF_NOTE.format(sha=remote[:7]))
+            elif changed and again:
+                notify(MONEY_OFF_AGAIN_NOTE.format(sha=remote[:7]))
             return True
         except OSError as e:
             if remote not in self.money_failed:
@@ -616,7 +629,7 @@ class Launcher:
             return False
         head, remote, files = self.pending
         self.pending = None
-        if not self.money_off_for(head, remote):
+        if not self.money_off_for(head, remote, again=True):
             git("reset", "--hard", head)
             return False
         if any(f.lower() == "launcher.py" for f in files):
