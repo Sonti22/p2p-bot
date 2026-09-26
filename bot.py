@@ -2622,14 +2622,25 @@ class Bot:
                 except Exception as e:
                     logger.error("update error: %s", e)
 
+    def _owner_gate(self, chat):
+        """Кто пишет боту: "owner" — чат владельца (TG_CHAT_ID): ему всё, в том числе настройки, ключи и выплаты;
+        "guest" — гость из /allow: только GUEST_CMDS/GUEST_CALLBACKS; None — чужой. Защищённая функция (пин в
+        tests/test_payout_pins.py): от неё зависит, кто может нажимать кнопки выплат."""
+        if chat == self.chat_id:
+            return "owner"
+        if self.is_guest(chat):
+            return "guest"
+        return None
+
     async def on_update(self, u):
         cq = u.get("callback_query")
         if cq:
             chat = str(cq.get("message", {}).get("chat", {}).get("id", ""))
-            if chat == self.chat_id:
+            who = self._owner_gate(chat)
+            if who == "owner":
                 self.cur_thread = cq["message"].get("message_thread_id")   # ответ — в тот же топик
                 await self.on_callback(cq)
-            elif self.is_guest(chat):
+            elif who == "guest":
                 await self.on_guest_callback(cq, chat)
             return
         msg = u.get("message") or {}
@@ -2644,13 +2655,15 @@ class Bot:
             logger.info("chat_id сохранён в .env: %s", chat)
             await self.setup_topics()
             await self.start_onboarding()
-        elif chat == self.chat_id:
+            return
+        who = self._owner_gate(chat)
+        if who == "owner":
             text = (msg.get("text") or "").strip()
             if self.awaiting_key and text and text not in BUTTONS and not text.startswith("/"):
                 await self.handle_key_input(text, msg.get("message_id"))
             else:
                 await self.handle(text)
-        elif self.is_guest(chat):
+        elif who == "guest":
             await self.handle_guest(chat, (msg.get("text") or "").strip())
         else:
             await self.ask_access(chat, msg.get("from") or {})

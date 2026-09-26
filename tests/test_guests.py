@@ -6,21 +6,7 @@ import bot as B
 import p2p
 import trades
 from helpers import make_ad
-
-
-class Stub(B.Bot):
-    def __init__(self, cfg, guests=()):
-        super().__init__(None, "x", "1", cfg)
-        self.guests = set(guests)
-        self.out, self.env = [], {}
-
-    async def call(self, method, **p):
-        self.out.append((method, p))
-        return {"ok": True, "result": {"message_id": len(self.out)}}
-
-    async def _post_photo(self, png, caption, markup, thread=None, chat_id=None):
-        return await self.call("sendPhoto", chat_id=chat_id or self.chat_id, caption=caption, reply_markup=markup,
-                               message_thread_id=thread)
+from payout_stubs import Stub, msg, sent  # noqa: F401  (заглушки — в защищённом файле, отсюда их берут другие тесты)
 
 
 def deal():
@@ -29,14 +15,6 @@ def deal():
 
 def snap(deals):
     return p2p.Snapshot(88.0, "t", {}, {}, deals, {}, {}, {})
-
-
-def sent(bot, method="sendMessage"):
-    return [p for m, p in bot.out if m == method]
-
-
-def msg(chat, text, **sender):
-    return {"message": {"chat": {"id": chat}, "text": text, "from": {"first_name": "Вася", **sender}}}
 
 
 def buttons(markup):

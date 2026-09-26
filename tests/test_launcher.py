@@ -288,7 +288,9 @@ def upd(monkeypatch, tmp_path):
     на GitHub; fetch запоминает его как origin/main, pull берёт с GitHub то, что там сейчас, merge и reset — ровно
     названный sha. st.after_fetch — «облако запушило ещё коммит» сразу после fetch. st.files — вывод
     diff --no-renames, st.renamed — что показал бы diff с поиском переименований. st.smokes — ответы smoke()."""
-    paths = {"LOG_PATH": tmp_path / "launcher.log", "LAST_GOOD": tmp_path / ".last_good"}
+    # HERE — во временную папку: после обновления кода launcher пишет PAYOUTS/TRADING=0 в HERE/.env
+    paths = {"LOG_PATH": tmp_path / "launcher.log", "LAST_GOOD": tmp_path / ".last_good", "HERE": tmp_path,
+             "APPROVED_PATH": tmp_path / "approved_shas"}
     for name, value in paths.items():
         monkeypatch.setattr(launcher, name, str(value))
     st = SimpleNamespace(head=HEAD, github=R1, origin=None, files=["bot.py"], renamed=None, after_fetch=None,

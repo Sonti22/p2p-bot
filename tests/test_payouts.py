@@ -22,7 +22,7 @@ import bot as B
 import jsonstore
 import p2p
 import payouts
-from test_guests import Stub, msg, sent
+from payout_stubs import Stub, msg, sent
 
 MERCHANT, KEY = "11111111-2222-3333-4444-555555555555", "FAKEPAYOUTKEY0123456789ABCDEFGH"
 TRON = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"

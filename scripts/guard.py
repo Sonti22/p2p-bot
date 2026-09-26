@@ -10,8 +10,15 @@ import sys
 PROTECTED = (".github/", "scripts/guard.py", "launcher.py", "CLAUDE.md", ".gitignore",
              "payouts.py", "scripts/payout_whitelist.py", "tests/test_payouts.py",   # выплаты — только вручную
              # настройки pytest: через addopts/--ignore тесты выплат молча выпадали бы из CI
-             "pytest.ini", "pyproject.toml", "setup.cfg", "tox.ini", "conftest.py", "tests/conftest.py")
+             "pytest.ini", "pyproject.toml", "setup.cfg", "tox.ini", "conftest.py", "tests/conftest.py",
+             "tests/test_launcher_money_gate.py",   # тесты барьера launcher: деньги выкл. после обновления, --approve
+             "run.bat")                             # его выполняет cmd на ПК владельца, перечитывая файл на ходу
 PROTECTED_NAME = "payout"   # любой путь со словом payout (payouts/__init__.py, tests/test_payouts_x…) — тоже защищён
+# по имени файла на любой глубине (tests/sub/conftest.py, pkg/pyproject.toml…): настройки pytest и файлы, которые Python
+# выполняет сам при старте (sitecustomize/usercustomize, *.pth), зависимости — тоже только вручную
+PROTECTED_BASENAMES = ("conftest.py", "pytest.ini", "pyproject.toml", "setup.cfg", "tox.ini", "sitecustomize.py",
+                       "usercustomize.py", "requirements.txt")
+PROTECTED_SUFFIXES = (".pth",)
 # код выплат в остальных файлах (bot.py: /payout, кнопки pay_*, PAYOUTS; accounts.py, .env.example…): любая добавленная
 # или удалённая строка — ручная проверка владельца. Документацию (.md) не проверяем.
 PAYOUT_CODE = r"payout|\bpay_(?:to|ok|no|hist|stop)\b"
@@ -26,12 +33,18 @@ def git(*args):
     return subprocess.run(["git", *args], capture_output=True, text=True, encoding="utf-8", check=True).stdout
 
 
+def protected(path):
+    base = path.rsplit("/", 1)[-1].lower()
+    return (path.startswith(PROTECTED) or PROTECTED_NAME in path.lower() or base in PROTECTED_BASENAMES
+            or base.endswith(PROTECTED_SUFFIXES))
+
+
 def check(base):
     problems = []
     # --no-renames: переименование = удаление старого пути + новый файл целиком. Иначе git показывает только новое
     # имя, а перенесённые строки не попадают в diff — «payouts.py → payouts/__init__.py» проходил бы как «ок»
     for f in filter(None, git("diff", "--name-only", "--no-renames", f"{base}...HEAD").splitlines()):
-        if f.startswith(PROTECTED) or PROTECTED_NAME in f.lower():
+        if protected(f):
             problems.append(f"изменён защищённый файл: {f}")
     cur = old = ""
     payout_lines = {}
@@ -44,8 +57,8 @@ def check(base):
             cur = line[6:] if line.startswith("+++ b/") else ""
             continue
         name = cur or old
-        if (line.startswith(("+", "-")) and not name.endswith(".md") and not name.startswith(PROTECTED)
-                and PROTECTED_NAME not in name.lower() and re.search(PAYOUT_CODE, line[1:], re.I)):
+        if (line.startswith(("+", "-")) and not name.endswith(".md") and not protected(name)
+                and re.search(PAYOUT_CODE, line[1:], re.I)):
             payout_lines[name] = payout_lines.get(name, 0) + 1
         if not line.startswith("+"):
             continue

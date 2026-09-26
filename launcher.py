@@ -12,6 +12,13 @@
 - один launcher на папку (замок logs/launcher.lock, второй выходит с кодом 3); бот не переживает launcher:
   при любом выходе из run() он останавливается, а бот-сирота убитого извне launcher (pid в logs/bot.pid)
   завершается при следующем старте — иначе два экземпляра делят один токен.
+
+Локальный барьер (решение владельца 2026-09-26; CI на GitHub запускает ci.yml из самой ветки, ему верить нельзя):
+- обновление, меняющее защищённые пути (список PROTECTED_* зашит здесь, из репозитория не читается), не ставится,
+  пока владелец не подтвердит ровно этот коммит на ПК: python launcher.py --approve <sha> (sha → logs/approved_shas);
+  до того работает прежняя версия, уведомление — один раз на sha;
+- после каждого обновления кода (не только .md) PAYOUTS и TRADING в .env переписываются в 0 — деньги включает снова
+  только владелец на ПК; .env не записать — обновление не ставится (прежняя версия работает дальше).
 """
 import json
 import os
@@ -43,6 +50,23 @@ LOCK_PATH = os.path.join(HERE, "logs", "launcher.lock")
 NO_PYTEST = "pytest не установлен и не ставится сам — выполните вручную: pip install -r requirements.txt"
 TRANSIENT = ("WinError", "PermissionError", "OSError")   # в выводе смоука: сбой ОС под нагрузкой, а не ошибка кода
 _lock_fd = None   # дескриптор замка держим открытым до конца процесса
+
+# Защищённые пути: без --approve владельца обновление с ними не ставится. Сравнение без учёта регистра (на Windows
+# LAUNCHER.PY из коммита записался бы поверх launcher.py). Список — только здесь, а не в репозитории: иначе обновление
+# могло бы само себя «разрешить». Кроме CI, guard, выплат и торгового кода — run.bat (cmd выполняет его, перечитывая
+# на ходу) и локальное состояние: git merge молча перезаписывает игнорируемые файлы, если коммит добавит их в git
+# (.env, data/ с ключами и белым списком, logs/ с approved_shas, .last_good).
+PROTECTED_PREFIXES = (".github/", "launcher.py", "run.bat", "scripts/guard.py", "claude.md", ".gitignore",
+                      ".gitattributes", "payouts.py", "scripts/payout_whitelist.py", "tests/trading/",
+                      "tests/test_launcher_money_gate.py", "data/", "logs/")
+PROTECTED_NAMES = ("payout", "trading")   # подстрока в любом месте пути
+PROTECTED_BASENAMES = ("conftest.py", "pytest.ini", "pyproject.toml", "setup.cfg", "tox.ini", "sitecustomize.py",
+                       "usercustomize.py", "requirements.txt")   # на любой глубине; и *.pth
+PROTECTED_EXACT = (".env", ".last_good", ".dev_status.json")
+APPROVED_PATH = os.path.join(HERE, "logs", "approved_shas")   # sha, подтверждённые владельцем: по одному в строке
+MONEY_KEYS = ("PAYOUTS", "TRADING")
+MONEY_OFF_NOTE = ("💸 Выплаты/торговля выключены после обновления {sha}: проверь изменения и включи на ПК "
+                  "(PAYOUTS=1 / TRADING=1 в .env)")
 
 
 def _mask(text):
@@ -117,6 +141,95 @@ def notify(text):
 
 def clean_tree():
     return git("status", "--porcelain", "--untracked-files=no") == ""
+
+
+def protected_paths(files):
+    """Какие из путей (как их пишет git diff) защищены — см. PROTECTED_*."""
+    out = []
+    for f in files:
+        low = f.lower()
+        base = low.rsplit("/", 1)[-1]
+        if (low.startswith(PROTECTED_PREFIXES) or any(n in low for n in PROTECTED_NAMES) or low in PROTECTED_EXACT
+                or base in PROTECTED_BASENAMES or base.endswith(".pth")):
+            out.append(f)
+    return out
+
+
+def approved(sha):
+    """Подтвердил ли владелец ровно этот коммит (python launcher.py --approve <sha>). Файла нет, не читается — нет."""
+    try:
+        with open(APPROVED_PATH, encoding="utf-8") as f:
+            return sha.lower() in {line.strip().lower() for line in f}
+    except (OSError, ValueError):
+        return False
+
+
+def money_off(env_path):
+    """PAYOUTS и TRADING в .env → 0. Строки разбираются как в payouts.switch_from_file: каждая строка (кроме пустых и
+    комментариев), где имя до «=» без учёта регистра — PAYOUTS или TRADING; значение — до « #». Строки со значением
+    не «0» переписываются в «<имя как было>=0» (перевод строки тот же), остальные байты файла не меняются; запись —
+    через временный файл и os.replace, чтобы обрыв не оставил полфайла. → True — что-то выключили; False — всё уже 0,
+    таких строк или самого .env нет. Не прочитать или не записать — OSError (обновление тогда не ставится)."""
+    try:
+        with open(env_path, "rb") as f:
+            raw = f.read()
+    except FileNotFoundError:
+        return False
+    lines, changed = raw.splitlines(keepends=True), False   # \n, \r\n и \r — как текстовый режим switch_from_file
+    for i, line in enumerate(lines):
+        body = line.rstrip(b"\r\n")
+        text = body.decode("utf-8", "replace").strip()
+        if not text or text.startswith("#") or "=" not in text:
+            continue
+        k, v = text.split("=", 1)
+        if k.strip().lstrip("\ufeff").strip().upper() in MONEY_KEYS and v.split(" #")[0].strip() != "0":
+            lines[i] = body[:body.index(b"=") + 1] + b"0" + line[len(body):]
+            changed = True
+    if not changed:
+        return False
+    tmp = env_path + ".money-off.tmp"
+    try:
+        with open(tmp, "wb") as f:
+            f.write(b"".join(lines))
+        os.replace(tmp, env_path)
+    except OSError:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+    return True
+
+
+def approve(arg):
+    """python launcher.py --approve <sha>: владелец проверил обновление с защищёнными файлами и разрешает ровно этот
+    коммит. Полный sha (40 hex) или однозначное начало (от 4 символов, через git rev-parse) → строка в
+    logs/approved_shas. Код выхода: 0 — записано, 2 — sha не принят."""
+    sha = (arg or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{4,40}", sha):
+        print("Нужен sha коммита: 40 шестнадцатеричных символов (или однозначное начало, от 4 символов). "
+              "Пример: python launcher.py --approve 1a2b3c4d")
+        return 2
+    if len(sha) < 40:
+        try:
+            full = git("rev-parse", "--verify", "--quiet", f"{sha}^{{commit}}", check=False).lower()
+        except RuntimeError as e:
+            full = ""
+            log(e)
+        if not re.fullmatch(r"[0-9a-f]{40}", full) or not full.startswith(sha):
+            print(f"{sha}: такого коммита здесь нет или начало подходит к нескольким — нужен полный sha из уведомления.")
+            return 2
+        sha = full
+    try:
+        os.makedirs(os.path.dirname(APPROVED_PATH), exist_ok=True)
+        with open(APPROVED_PATH, "a", encoding="utf-8") as f:
+            f.write(sha + "\n")
+    except OSError as e:
+        print(f"Не смог записать {APPROVED_PATH}: {e}")
+        return 2
+    log(f"владелец подтвердил обновление {sha}")
+    print(f"Подтверждено: {sha}. Launcher поставит это обновление при следующей проверке (раз в UPDATE_EVERY сек).")
+    return 0
 
 
 def repo_url():
@@ -315,6 +428,8 @@ class Launcher:
         self.seen_prs = set()     # PR, о которых уже сообщили
         self.minutes_at = 0.0     # когда последний раз смотрели минуты GitHub Actions
         self.minutes_warned = ("", 0)   # (год-месяц, старший порог %, о котором уже предупредили)
+        self.asked_approval = set()     # sha с защищёнными файлами, о которых владельцу уже написали
+        self.money_failed = set()       # sha, не поставленные из-за незаписанного .env, — о них уже написали
 
     def check_prs(self):
         """Открытые PR = автомерж не прошёл (тесты/guard) — сообщить один раз со ссылкой."""
@@ -383,9 +498,23 @@ class Launcher:
             return False
         self.warned_dirty = False
         changes = git("log", "--pretty=format:• %s", f"{head}..{remote}", check=False).splitlines()[:10]
-        # --no-renames: иначе helper.py → HELPER.md выглядит как «изменён только .md»; -z — пути без кавычек
-        files = git("diff", "--no-renames", "--name-only", "-z", head, remote, check=False).split("\0")
-        files = [f for f in files if f]
+        # --no-renames: иначе helper.py → HELPER.md выглядит как «изменён только .md»; -z — пути без кавычек.
+        # Без списка файлов не узнать, тронуты ли защищённые пути, — тогда не ставим (до следующей проверки)
+        try:
+            files = [f for f in git("diff", "--no-renames", "--name-only", "-z", head, remote).split("\0") if f]
+        except RuntimeError as e:
+            log(e)
+            return False
+        blocked = protected_paths(files)
+        if blocked and not approved(remote):   # защищённые пути — только после --approve ровно этого sha на ПК
+            if remote not in self.asked_approval:
+                self.asked_approval.add(remote)
+                shown = "\n".join(f"• {f}" for f in blocked[:15]) + (
+                    f"\n… и ещё {len(blocked) - 15}" if len(blocked) > 15 else "")
+                notify(f"🔐 Обновление {remote[:7]} меняет защищённые файлы — без твоего подтверждения не ставлю, "
+                       f"работает прежняя версия {head[:7]}:\n{shown}\n\nПроверь изменения (git diff {head[:7]} "
+                       f"{remote[:7]}) и подтверди на ПК:\npython launcher.py --approve {remote}")
+            return False
         try:   # ровно на проверенный sha: pull сходил бы в origin заново и мог принести ещё не проверенный коммит
             git("merge", "--ff-only", "--quiet", remote)
         except RuntimeError as e:
@@ -413,11 +542,25 @@ class Launcher:
             self.bad.add(remote)
             notify(f"⚠️ Обновление {remote[:7]} не прошло проверку — оставил {head[:7]}.\n{err}")
             return False
+        try:   # новый код стартует только с выключенными деньгами; .env не записать — не стартует вовсе
+            money = money_off(os.path.join(HERE, ".env"))
+        except OSError as e:
+            git("reset", "--hard", head)   # в bad не кладём: починят .env — поставим при следующей проверке
+            if remote not in self.money_failed:
+                self.money_failed.add(remote)
+                notify(f"🚨 Не смог выключить выплаты/торговлю в .env ({type(e).__name__}: {e}) — обновление "
+                       f"{remote[:7]} НЕ ставлю, работает прежняя версия {head[:7]}. Проверь, что .env не занят "
+                       f"и доступен для записи; попробую снова при следующей проверке.")
+            else:
+                log(f"{remote[:7]}: .env по-прежнему не записать ({type(e).__name__}) — обновление не ставлю")
+            return False
         done, total, nxt = roadmap_progress()
         notify(f"🔄 Бот обновился до {remote[:7]}\n\nЧто нового:\n" + "\n".join(changes)
                + (f"\n\n📋 ROADMAP: сделано {done} из {total}" if total else "")
                + (f"\n➡️ Дальше: {nxt}" if nxt else "")
                + f"\n\n{repo_url()}/commits/main")
+        if money:
+            notify(MONEY_OFF_NOTE.format(sha=remote[:7]))
         return True
 
     def rollback(self):
@@ -491,8 +634,14 @@ class Launcher:
             time.sleep(15)
 
 
-if __name__ == "__main__":
+def main(argv):
+    if argv[:1] == ["--approve"]:   # подтверждение владельца: записать sha и выйти, цикл не запускается
+        return approve(argv[1] if len(argv) > 1 else "")
     if not acquire_lock():   # замок — до kill_orphan в run(): второй launcher не должен трогать бота первого
         log("launcher уже запущен в другом окне — выхожу")
-        sys.exit(3)
+        return 3
     Launcher().run()
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

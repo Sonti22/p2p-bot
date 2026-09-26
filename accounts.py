@@ -7,6 +7,7 @@
 торговых/выводных запросов — только подписанные запросы к read-only эндпоинтам. key/secret/passphrase в
 `data/keys.json` хранятся зашифрованными Windows DPAPI (`protect`/`unprotect`) — файл бесполезен вне этой
 учётной записи Windows; открытые значения от прошлой версии шифруются при старте бота (`encrypt_saved_keys`).
+POST к Bybit (`bybit_post`) — только пути из BYBIT_POST_PATHS (история P2P-ордеров), без редиректов.
 
 BingX и Cryptomus — только аккаунты (P2P-площадками бота они не являются). Чтение у них ограничено в самом коде,
 а не правами ключа: `bingx_get` — только GET и только пути из BINGX_READ_PATHS (спот- и Fund-баланс, права ключа,
@@ -272,23 +273,34 @@ async def mexc_get(s, api_key, api_secret, path, params=None):
     return await _get_json(s, url, {"X-MEXC-APIKEY": api_key})
 
 
-async def bybit_post(s, api_key, api_secret, path, body=None, recv_window="5000", timestamp=None):
-    """Подписанный POST к приватному Bybit v5 (например P2P-эндпоинты) — та же формула подписи,
-    что и у GET (ts+key+recv_window+данные), только query заменяется на JSON-тело запроса."""
-    ts = timestamp or str(int(time.time() * 1000))
-    payload = json.dumps(body or {}, separators=(",", ":"))
-    sign = hmac.new(api_secret.encode(), (ts + api_key + recv_window + payload).encode(), hashlib.sha256).hexdigest()
-    headers = {
+BYBIT_POST_PATHS = frozenset({"/v5/p2p/order/simplifyList"})   # POST к Bybit — только чтение истории P2P-ордеров
+
+
+def bybit_post_headers(api_key, api_secret, payload_str, recv_window, timestamp):
+    """Заголовки подписанного POST Bybit v5 — чистая функция: подпись = HMAC_SHA256(secret, ts+key+recv_window+тело),
+    тело — ровно та строка, что уйдёт в запрос."""
+    sign = hmac.new(api_secret.encode(), (timestamp + api_key + recv_window + payload_str).encode(),
+                    hashlib.sha256).hexdigest()
+    return {
         "X-BAPI-API-KEY": api_key,
         "X-BAPI-SIGN": sign,
         "X-BAPI-SIGN-TYPE": "2",
-        "X-BAPI-TIMESTAMP": ts,
+        "X-BAPI-TIMESTAMP": timestamp,
         "X-BAPI-RECV-WINDOW": recv_window,
         "Content-Type": "application/json",
     }
-    async with s.post(f"{BYBIT_BASE}{path}", headers=headers, data=payload) as r:
-        r.raise_for_status()
-        return await r.json(content_type=None)
+
+
+async def bybit_post(s, api_key, api_secret, path, body=None, recv_window="5000", timestamp=None):
+    """Подписанный POST к приватному Bybit v5 — только пути из BYBIT_POST_PATHS (иначе ValueError до подписи и
+    отправки). Формула подписи та же, что у GET, только query заменяется на JSON-тело. За редиректом не идём
+    (3xx — ошибка): иначе путь и хост выбрал бы сервер, а заголовки с ключом и подписью ушли бы туда же."""
+    if path not in BYBIT_POST_PATHS:
+        raise ValueError(f"Bybit: POST {path} не входит в список чтения")
+    ts = timestamp or str(int(time.time() * 1000))
+    payload = json.dumps(body or {}, separators=(",", ":"))
+    headers = bybit_post_headers(api_key, api_secret, payload, recv_window, ts)
+    return await _json_no_redirect(s.post(f"{BYBIT_BASE}{path}", headers=headers, data=payload, allow_redirects=False))
 
 
 def htx_signed_params(api_key, api_secret, method, path, params=None, timestamp=None, host="api.htx.com"):

@@ -126,6 +126,24 @@ def test_guard_sees_renamed_payout_code_and_pytest_config(tmp_path, monkeypatch)
     assert any("pytest.ini" in p for p in guard.check("main"))
 
 
+@pytest.mark.parametrize("path, protected", [
+    ("tests/sub/conftest.py", True), ("conftest.py", True), ("pkg/pytest.ini", True), ("x/pyproject.toml", True),
+    ("a/b/setup.cfg", True), ("tools/tox.ini", True), ("sitecustomize.py", True), ("lib/usercustomize.py", True),
+    ("evil.pth", True), ("site/Evil.PTH", True), ("requirements.txt", True), ("tools/requirements.txt", True),
+    ("tests/Conftest.py", True), ("run.bat", True), ("tests/test_launcher_money_gate.py", True),
+    ("tests/payout_stubs.py", True), ("tests/test_payout_pins.py", True),
+    ("bot.py", False), ("tests/test_bot.py", False), ("tests/helpers.py", False), ("requirements-dev.md", False),
+    ("docs/conftest.md", False), ("pthelper.py", False)])
+def test_guard_protects_pytest_config_and_python_startup_files_at_any_depth(monkeypatch, path, protected):
+    """conftest.py/pytest.ini во вложенной папке, sitecustomize/usercustomize и *.pth (Python выполняет их сам при
+    старте), requirements.txt — на любой глубине только вручную: через них тесты выплат выпадали бы или подменялись."""
+    from test_payouts import _load_guard
+    guard = _load_guard()
+    monkeypatch.setattr(guard, "git", lambda *args: path + "\n" if "--name-only" in args else "")
+    assert bool(guard.check("origin/main")) is protected
+    assert guard.protected(path) is protected
+
+
 def test_forged_onboarding_bank_callback_is_ignored():
     bot = owner()
     bot.onboarding = {"step": "banks", "banks": set()}

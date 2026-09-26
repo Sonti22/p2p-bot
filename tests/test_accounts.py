@@ -276,6 +276,8 @@ def test_kucoin_get_with_params_signs_path_and_query():
 
 
 class _JsonResp:
+    status = 200
+
     def __init__(self, body):
         self.body = body
 
@@ -600,8 +602,10 @@ def test_portfolio_skips_exchange_on_error(tmp_path, monkeypatch):
 
 
 class _FakePostResp:
-    def __init__(self, url, headers, data):
-        self.url, self.headers, self.data = url, headers, data
+    def __init__(self, url, headers, data, status=200):
+        self.url, self.headers, self.data, self.status = url, headers, data, status
+        u = URL(url)
+        self.request_info, self.history = aiohttp.RequestInfo(u, "POST", CIMultiDictProxy(CIMultiDict()), u), ()
 
     async def __aenter__(self):
         return self
@@ -617,26 +621,64 @@ class _FakePostResp:
 
 
 class _FakePostSession:
-    def post(self, url, headers=None, data=None):
-        return _FakePostResp(url, headers, data)
+    def __init__(self, status=200):
+        self.status, self.calls = status, []
+
+    def post(self, url, headers=None, data=None, allow_redirects=True):
+        self.calls.append((url, allow_redirects))
+        return _FakePostResp(url, headers, data, self.status)
 
 
 def test_bybit_post_signs_body():
     ts = "1700000000000"
-    j = asyncio.run(accounts.bybit_post(_FakePostSession(), "k", "s", "/v5/p2p/order/simplifyList",
-                                         {"page": 1, "size": 20}, timestamp=ts))
+    s = _FakePostSession()
+    j = asyncio.run(accounts.bybit_post(s, "k", "s", "/v5/p2p/order/simplifyList", {"page": 1, "size": 20},
+                                        timestamp=ts))
     assert j["url"] == "https://api.bybit.com/v5/p2p/order/simplifyList"
     assert j["headers"]["X-BAPI-API-KEY"] == "k"
     payload = j["data"]
+    assert payload == '{"page":1,"size":20}'
     expected = hmac.new("s".encode(), (ts + "k" + "5000" + payload).encode(), hashlib.sha256).hexdigest()
     assert j["headers"]["X-BAPI-SIGN"] == expected
+    assert j["headers"] == accounts.bybit_post_headers("k", "s", payload, "5000", ts)
+    assert s.calls == [("https://api.bybit.com/v5/p2p/order/simplifyList", False)]   # за редиректом не идём
+
+
+def test_bybit_post_headers_is_pure_documented_formula():
+    """Подпись POST Bybit v5 = HMAC_SHA256(secret, ts+key+recv_window+тело); те же данные — те же заголовки."""
+    body = '{"page":1,"size":20,"status":50}'
+    h = accounts.bybit_post_headers("apikey123", "secretxyz", body, "5000", "1700000000000")
+    sign = hmac.new(b"secretxyz", ("1700000000000" + "apikey123" + "5000" + body).encode(), hashlib.sha256).hexdigest()
+    assert h == {"X-BAPI-API-KEY": "apikey123", "X-BAPI-SIGN": sign, "X-BAPI-SIGN-TYPE": "2",
+                 "X-BAPI-TIMESTAMP": "1700000000000", "X-BAPI-RECV-WINDOW": "5000", "Content-Type": "application/json"}
+    assert h == accounts.bybit_post_headers("apikey123", "secretxyz", body, "5000", "1700000000000")
+
+
+@pytest.mark.parametrize("path", ["/v5/p2p/order/pay", "/v5/p2p/order/finish", "/v5/asset/withdraw/create",
+                                  "/v5/order/create", "/v5/p2p/item/create", "/v5/p2p/order/simplifyList/",
+                                  "/v5/p2p/order/simplifyList?x=1", "/v5/p2p/order/../order/finish", ""])
+def test_bybit_post_refuses_paths_outside_allowlist_before_sending(path):
+    s = _FakePostSession()
+    with pytest.raises(ValueError):
+        asyncio.run(accounts.bybit_post(s, "k", "s", path, {"orderId": "1"}))
+    assert s.calls == []
+
+
+@pytest.mark.parametrize("status", [301, 302, 307, 308])
+def test_bybit_post_redirect_is_error(status):
+    s = _FakePostSession(status)
+    with pytest.raises(aiohttp.ClientResponseError):
+        asyncio.run(accounts.bybit_post(s, "k", "s", "/v5/p2p/order/simplifyList", {"page": 1}))
+    assert s.calls[0][1] is False
+    assert asyncio.run(accounts.bybit_p2p_orders(s, "k", "s")) is None   # автожурнал — «P2P недоступно», не падение
 
 
 class _P2pSession:
     def __init__(self, body):
         self.body = body
 
-    def post(self, url, headers=None, data=None):
+    def post(self, url, headers=None, data=None, allow_redirects=True):
+        assert allow_redirects is False
         return _JsonResp(self.body)
 
 
@@ -696,7 +738,7 @@ def test_bybit_p2p_orders_returns_none_on_bad_retcode():
 
 def test_bybit_p2p_orders_returns_none_on_error():
     class _Boom:
-        def post(self, url, headers=None, data=None):
+        def post(self, url, headers=None, data=None, allow_redirects=True):
             raise RuntimeError("network down")
 
     assert asyncio.run(accounts.bybit_p2p_orders(_Boom(), "k", "s")) is None
