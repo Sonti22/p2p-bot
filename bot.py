@@ -2341,10 +2341,16 @@ class Bot:
         # межмонетных связок позже (ROADMAP «межмонетные, часть 2»); сейчас связка простая (paper.simple_route)
         # — venues пусто, один хоп, но сохраняем и для неё, чтобы данные были у всех кругов подряд
         hops = route_hops(b, s, route_cfg, psnap.spot, over)
+        # для разбора (этап 1 «измерения»): индекс и причины надёжности, серия «живости», запас глубины и id снимка
+        # скана — снимок пишется после сигналов, но id (время начала скана) известен уже сейчас
+        measures = {"index": reliability_index(d, self.cfg, snap), "reasons": reasons,
+                    "streak": self.live.get(self._deal_key(d), {}).get("streak", 0),
+                    "depth": paper.depth_margin(psnap, b, s, settings["amount"], qty or s.avail),
+                    "snapshot_id": snapshots.scan_id(snap)}
         # over — тот же, что в плане и qty: банк оплаты и комиссия СБП в круге совпадут с планом
         cycle = paper.get_cycle(paper.start_cycle(settings["amount"], b, s, route, profit, label=label,
                                                   sell_qty=qty or s.avail, pay_fee=self.cfg.pay_fee, over=over,
-                                                  planned_raw=raw, hops=hops)) or {}
+                                                  planned_raw=raw, hops=hops, **measures)) or {}
         pay = trades.pay_label(cycle.get("pay_kind", ""), cycle.get("bank", ""), b.pays)
         qty = settings["amount"] / b.price
         text = (f"🧪 <b>Сухой прогон</b>: купил бы {_money(qty)} {b.asset} у {html.escape(b.nick)} "
@@ -2370,6 +2376,7 @@ class Bot:
                                                      stale_minutes=settings["stale_minutes"])
                 if action == "wait":
                     continue
+                paper.set_buy_check(cycle["id"], *paper.buy_observed(cycle, snap))   # цена и объём на проверке
                 if action == "fail":
                     if not paper.finish_cycle(cycle["id"], "failed_buy", 0.0, note):
                         continue   # круга уже нет (/paper reset посреди обработки)
