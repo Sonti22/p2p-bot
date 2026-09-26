@@ -1,6 +1,7 @@
 """Точность сухого прогона (разбор 25.09): межмонетный маршрут, покупка из нескольких объявлений, объём продажи =
 выход маршрута, сеть обменника, сбой площадки — ожидание, план ниже порога — не берём, без двойного запаса на курс."""
 import asyncio
+import dataclasses
 import json
 import time
 
@@ -15,8 +16,8 @@ def ad(ex, side, price, nick=None, asset="USDT", avail=10000, max_amt=500000, mi
                   net, "")
 
 
-def snap(groups, errors=None, refs=None):
-    return p2p.Snapshot(88.0, "t", refs or {}, {}, [], {}, {}, errors or {}, groups=groups)
+def snap(groups, errors=None, refs=None, spot=None):
+    return p2p.Snapshot(88.0, "t", refs or {}, {}, [], {}, {}, errors or {}, groups=groups, spot=spot or {})
 
 
 def test_cross_asset_cycle_sells_the_coin_it_actually_has():
@@ -158,25 +159,45 @@ def test_transfer_stage_checks_only_real_transfers():
     assert paper.check_transfer_stage(out, cfg, transfer_minutes=3, now=1300.0)[0] == "fail"
 
 
-def test_simple_route_filter():
-    b, s = ad("Bybit", "buy", 87.0), ad("MEXC", "sell", 90.0)
-    assert paper.simple_route((3.0, b, s, "перевод −1 USDT (TRC20) на MEXC"))
-    assert not paper.simple_route((3.0, ad("Bybit", "buy", 6e6, asset="BTC"), s, "спот BTC→USDT на Bybit (−0.1%)"))
-    assert not paper.simple_route((3.0, b, s, "спот USDT→TON на Bybit (−0.1%) → перевод … → спот TON→USDT на MEXC"))
-
-
-def test_spot_routes_are_not_taken_into_dry_run(monkeypatch):
+def test_spot_routes_are_taken_into_dry_run(monkeypatch):
+    """Раньше связки через спот пропускались (риск курса между стартом и продажей не моделировался) —
+    теперь заводим круг и сохраняем данные маршрута (buy_net/buy_pays/sell_parts), нужные, чтобы на
+    стадии sell пересчитать выход по свежему курсу (recompute_sell_qty)."""
     monkeypatch.setattr(B, "deal_card", lambda d, c, a=None, r=None, breakdown=None: b"png")
     monkeypatch.setenv("PAPER", "1")
     monkeypatch.setenv("PAPER_AMOUNT", "10000")
-    b, s = ad("Bybit", "buy", 6_000_000.0, asset="BTC"), ad("Bybit", "sell", 93.0)
+    b, s = ad("Bybit", "buy", 6_000_000.0, asset="BTC"), ad("Bybit", "sell", 105.0)
     deal = (5.0, b, s, "спот BTC→USDT на Bybit (−0.1%)")
     sn = p2p.Snapshot(88.0, "t", {}, {}, [deal], {}, {}, {},
-                      groups={("Bybit", "buy", "BTC"): [b], ("Bybit", "sell", "USDT"): [s]})
+                      groups={("Bybit", "buy", "BTC"): [b], ("Bybit", "sell", "USDT"): [s]},
+                      spot={"Bybit": {"BTC": (60000.0, 60100.0)}})
     bot = Stub(p2p.Config(min_profit=2.0))
     bot.live_scans = 1
     asyncio.run(bot.maybe_start_paper_cycle([deal], sn))
-    assert not paper.open_cycles()
+    (c,) = paper.open_cycles()
+    assert c["buy_asset"] == "BTC" and c["sell_asset"] == "USDT" and c["sell_qty"] > 0
+    assert json.loads(c["buy_pays"]) == ["SBP"] and c["sell_parts"] == 1
+
+
+def test_cross_asset_sell_recomputes_output_from_fresh_spot():
+    """Купили BTC, продаём USDT через спот-конвертацию на Bybit — курс BTC/USDT между стартом круга и
+    стадией sell вырос: факт должен получить больше монеты на выходе, а не застрявшее на старте число."""
+    b = ad("Bybit", "buy", 6_000_000.0, asset="BTC")
+    s = ad("Bybit", "sell", 105.0, asset="USDT", avail=1_000_000)
+    cfg = p2p.Config(min_profit=2.0, pay_fee=0.0)
+    start_spot = {"Bybit": {"BTC": (60000.0, 60100.0)}}
+    qty_start = p2p._route_qty(b, s, dataclasses.replace(cfg, amount=10000), start_spot, disable=frozenset({"risk"}))
+    cid = paper.start_cycle(10000, b, s, "спот BTC→USDT на Bybit", 1.0, ts=time.time() - 400,
+                            sell_qty=qty_start, pay_fee=0.0)
+    paper.set_stage(cid, "sell")
+    c = paper.get_cycle(cid)
+    up_spot = {"Bybit": {"BTC": (66000.0, 66100.0)}}   # курс BTC/USDT вырос на 10% к моменту продажи
+    fresh = snap({("Bybit", "sell", "USDT"): [s]}, spot=up_spot)
+    action, note, price = paper.check_sell_stage(c, fresh, cfg=cfg)
+    assert action == "advance"
+    qty_fresh = paper.recompute_sell_qty(c, cfg, up_spot)
+    assert qty_fresh > qty_start * 1.05          # выход вырос вместе с курсом, а не остался на уровне старта
+    assert paper.realized_pct(c, price, qty_fresh) > paper.realized_pct(c, price, qty_start)
 
 
 def test_virtually_exhausted_sbp_limit_puts_fee_into_plan_and_volume(monkeypatch):
