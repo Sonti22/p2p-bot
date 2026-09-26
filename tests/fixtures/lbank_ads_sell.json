@@ -1,0 +1,224 @@
+{
+ "data": {
+  "resultList": [
+   {
+    "uuid": "a0edc7f8-0872-49bd-a879-799f33d0749a",
+    "tradeType": "buy",
+    "currencyCode": "RUB",
+    "assetCode": "USDT",
+    "advType": 0,
+    "price": "82.40000000000000000000",
+    "quantity": "3000.00000000000000000000",
+    "realQuantity": "3000.00000000000000000000",
+    "minAmount": "5000.00000000000000000000",
+    "maxAmount": "150000.00000000000000000000",
+    "advSource": 1,
+    "source": "LBANK",
+    "adRemark": "ОПЛАЧИВАЮ В 1-платежИз за блокировки карт копейки не перевожу, указывайте пожалуйста суммы без копеек. Спасибо за понимание  Всем добра  Взаимный отзыв по окончанию сделки  ",
+    "payMethods": [
+     {
+      "code": "Raiffeisen",
+      "name": "Raiffeisen",
+      "channelId": 291
+     },
+     {
+      "code": "Sberbank",
+      "name": "Sberbank",
+      "channelId": 516
+     },
+     {
+      "code": "T-Bank",
+      "name": "T-Bank",
+      "channelId": 535
+     },
+     {
+      "code": "AIfa-bank",
+      "name": "AIfa-bank",
+      "channelId": 536
+     },
+     {
+      "code": "VTB Bank",
+      "name": "VTB Bank",
+      "channelId": 537
+     },
+     {
+      "code": "Gazprombank",
+      "name": "Gazprombank",
+      "channelId": 543
+     },
+     {
+      "code": "Yandex Bank",
+      "name": "Yandex Bank",
+      "channelId": 548
+     },
+     {
+      "code": "OZON Bank",
+      "name": "OZON Bank",
+      "channelId": 549
+     },
+     {
+      "code": "OTP Bank",
+      "name": "OTP Bank",
+      "channelId": 551
+     }
+    ],
+    "nickName": "$~DIMASIK~$",
+    "online": false,
+    "proportion": "0",
+    "lastDaysTurnoverRate": "0.00%",
+    "turnoverRateTotal": "0.00%",
+    "dealOrderTotal": "0",
+    "enable": true,
+    "currencySymbol": "₽"
+   },
+   {
+    "uuid": "923f8d60-f54a-4063-90d0-e4543031311b",
+    "tradeType": "buy",
+    "currencyCode": "RUB",
+    "assetCode": "USDT",
+    "advType": 0,
+    "price": "82.38000000000000000000",
+    "quantity": "1000.00000000000000000000",
+    "realQuantity": "1000.00000000000000000000",
+    "minAmount": "1000.00000000000000000000",
+    "maxAmount": "5000.00000000000000000000",
+    "advSource": 1,
+    "source": "LBANK",
+    "adRemark": "Приветствую.Оплата доверенного лица ОДНИМ платежом, чек отправлю.Работаю с 3-ми лицами, если банк у вас на руках.Заходите на РОВНЫЕ суммы кратно 100 1000",
+    "payMethods": [
+     {
+      "code": "Sberbank",
+      "name": "Sberbank",
+      "channelId": 516
+     },
+     {
+      "code": "T-Bank",
+      "name": "T-Bank",
+      "channelId": 535
+     },
+     {
+      "code": "AIfa-bank",
+      "name": "AIfa-bank",
+      "channelId": 536
+     },
+     {
+      "code": "VTB Bank",
+      "name": "VTB Bank",
+      "channelId": 537
+     },
+     {
+      "code": "Yandex Bank",
+      "name": "Yandex Bank",
+      "channelId": 548
+     },
+     {
+      "code": "OZON Bank",
+      "name": "OZON Bank",
+      "channelId": 549
+     }
+    ],
+    "nickName": "O.E.LLIaMaH",
+    "online": false,
+    "orderCnt": "1",
+    "proportion": "0",
+    "lastDaysTurnoverRate": "0.00%",
+    "turnoverRateTotal": "50.00%",
+    "dealOrderTotal": "1",
+    "enable": true,
+    "currencySymbol": "₽"
+   },
+   {
+    "uuid": "86a68d36-615d-4e34-b678-e878a1b80c98",
+    "tradeType": "buy",
+    "currencyCode": "RUB",
+    "assetCode": "USDT",
+    "advType": 0,
+    "price": "82.30000000000000000000",
+    "quantity": "10000.00000000000000000000",
+    "realQuantity": "10000.00000000000000000000",
+    "minAmount": "10000.00000000000000000000",
+    "maxAmount": "100000.00000000000000000000",
+    "advSource": 1,
+    "source": "LBANK",
+    "adRemark": "Приветствую Оплата от карты доверенного лица Оплата одним платежом Перевожу по СБП на любой банк РФИногда бывают задержки Предоставляю чек об оплате",
+    "payMethods": [
+     {
+      "code": "Raiffeisen",
+      "name": "Raiffeisen",
+      "channelId": 291
+     },
+     {
+      "code": "Sberbank",
+      "name": "Sberbank",
+      "channelId": 516
+     },
+     {
+      "code": "T-Bank",
+      "name": "T-Bank",
+      "channelId": 535
+     },
+     {
+      "code": "AIfa-bank",
+      "name": "AIfa-bank",
+      "channelId": 536
+     },
+     {
+      "code": "VTB Bank",
+      "name": "VTB Bank",
+      "channelId": 537
+     },
+     {
+      "code": "ЮMoney",
+      "name": "ЮMoney",
+      "channelId": 538
+     }
+    ],
+    "nickName": "☄️dimaxcec☄️",
+    "online": false,
+    "proportion": "0",
+    "lastDaysTurnoverRate": "0.00%",
+    "turnoverRateTotal": "0.00%",
+    "dealOrderTotal": "0",
+    "enable": true,
+    "currencySymbol": "₽"
+   },
+   {
+    "uuid": "1bc231f5-d32d-4944-8830-e22a81b2490b",
+    "tradeType": "buy",
+    "currencyCode": "RUB",
+    "assetCode": "USDT",
+    "advType": 0,
+    "price": "70.00000000000000000000",
+    "quantity": "30000.00000000000000000000",
+    "realQuantity": "29967.08000000000000000000",
+    "minAmount": "1600.00000000000000000000",
+    "maxAmount": "5000000.00000000000000000000",
+    "advSource": 1,
+    "source": "LBANK",
+    "adRemark": "no trade if u want",
+    "payMethods": [
+     {
+      "code": "OZON Bank",
+      "name": "OZON Bank",
+      "channelId": 549
+     }
+    ],
+    "nickName": "ko****",
+    "online": true,
+    "orderCnt": "1",
+    "successOrderCnt": "1",
+    "proportion": "100.00",
+    "lastDaysTurnoverRate": "66.00%",
+    "turnoverRateTotal": "66.00%",
+    "dealOrderTotal": "2",
+    "enable": true,
+    "currencySymbol": "₽"
+   }
+  ],
+  "hasNext": false,
+  "totalCount": 4,
+  "totalPage": 1
+ },
+ "code": 200,
+ "message": "Success!"
+}

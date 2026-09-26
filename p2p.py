@@ -1,4 +1,4 @@
-"""P2P scanner: Bybit, HTX, KuCoin, MEXC, BitPapa + обменники BestChange (public endpoints, no API keys).
+"""P2P scanner: Bybit, HTX, KuCoin, MEXC, BitPapa, LBank + обменники BestChange (public endpoints, no API keys).
 
 Монеты USDT/USDC/BTC/ETH/TON за рубли, связки P2P↔спот через USDT, сравнение сетей у обменников.
 One-off snapshot:  python p2p.py
@@ -36,7 +36,7 @@ HEADERS = {
 HTX_FIAT = {"RUB": 11}
 HTX_COIN = {"USDT": 2, "BTC": 1, "ETH": 3}
 DEFAULT_EXCLUDE = "mobile top-up,cash,наличн,чат,chat,api,qr"  # пополнение телефона, наличные, реквизиты «в чат», шлюзы
-ALL_EXCHANGES = "bybit,mexc,htx,kucoin,bitpapa,bestchange"
+ALL_EXCHANGES = "bybit,mexc,htx,kucoin,bitpapa,lbank,bestchange"
 DEFAULT_ASSETS = "USDT,USDC,BTC,ETH,TON"
 DEFAULT_FEES = "USDT:1,USDC:1,BTC:0.0002,ETH:0.001,TON:0.05"   # комиссия вывода по умолчанию, в единицах монеты
 # Комиссии вывода по биржам и сетям, в монете (агрегаторы Yieldo 31.07.2026 и ChainCost 01.2026 — сверять на бирже).
@@ -335,6 +335,36 @@ async def bitpapa(s, cfg, side, asset):
     return out
 
 
+LBANK_ASSETS = ("USDT", "USDC")   # монеты P2P LBank (справочник config/assetAndCurrency); остальных там нет
+LBANK_PAY_FIX = {"AIfa-bank": "Alfa-bank"}   # LBank пишет Альфу с заглавной I вместо l — иначе банк не узнать
+
+
+async def lbank(s, cfg, side, asset):
+    """P2P LBank. В стакане и свои объявления (source=LBANK), и объявления MEXC, которые LBank показывает у себя
+    (source=MEXC): сделка идёт через LBank, но счётчика сделок у таких мерчантов LBank не отдаёт — orders=0, и
+    фильтр MIN_ORDERS их отсеет. Сделки и % завершения — dealOrderTotal/turnoverRateTotal: их LBank и показывает
+    в строке мерчанта. Акционные объявления (topTag/templateCode, «New User Flash Sale» — 1 USDT по цене
+    ниже рынка для первой сделки новичка) пропускаем: эта цена не для всех."""
+    if asset not in LBANK_ASSETS:
+        return []
+    url = ("https://www.lbank.com/lbk-api/otc-trade-center/fiat/p2p/adv/advertisementList?tradeType=%s&assetCode=%s"
+           "&currencyCode=%s&showOnlyPurchasable=false&certifiedOnly=false&isFollow=false&pageNo=1&pageSize=20"
+           "&sortByPrice=0&sortByOrderCount=0&sortByCompletionRate=0" % (side, asset, cfg.fiat))
+    j = await _json(s, "GET", url)
+    if j.get("code") != 200:
+        raise ValueError(f"LBank: {j.get('code')} {j.get('message')}")
+    out = []
+    for i in (j.get("data") or {}).get("resultList") or []:
+        if i.get("topTag") or i.get("templateCode") or i.get("enable") is False:
+            continue
+        out.append(Ad("LBank", side, float(i["price"]), float(i["minAmount"]), float(i["maxAmount"]),
+                      float(i["realQuantity"]), [LBANK_PAY_FIX.get(p["name"], p["name"]) for p in i.get("payMethods") or []],
+                      i.get("nickName") or "?", int(i.get("dealOrderTotal") or 0),
+                      float((i.get("turnoverRateTotal") or "0").rstrip("%") or 0), asset=asset,
+                      terms=(i.get("adRemark") or "").strip()))
+    return out
+
+
 _bc = {"t": 0.0, "ads": [], "local": None}   # local — локальный адрес, с которого выгрузка дошла в обход VPN
 _bc_lock = asyncio.Lock()
 BC_URL = "http://api.bestchange.ru/info.zip"
@@ -440,7 +470,8 @@ async def bestchange(s, cfg, side, asset):
     return [a for a in _bc["ads"] if a.side == side and a.asset == asset]
 
 
-FETCHERS = {"bybit": bybit, "htx": htx, "kucoin": kucoin, "mexc": mexc, "bitpapa": bitpapa, "bestchange": bestchange}
+FETCHERS = {"bybit": bybit, "htx": htx, "kucoin": kucoin, "mexc": mexc, "bitpapa": bitpapa, "lbank": lbank,
+            "bestchange": bestchange}
 
 
 async def rapira_mid(s):
@@ -1350,6 +1381,7 @@ def venue_url(a, fiat="RUB"):
         "HTX": f"https://www.htx.com/ru-ru/fiat-crypto/trade/{'buy' if buy else 'sell'}-{t.lower()}-{fiat.lower()}/",
         "KuCoin": f"https://www.kucoin.com/ru/otc/{'buy' if buy else 'sell'}/{t}-{fiat}",
         "BitPapa": "https://bitpapa.com/ru",
+        "LBank": f"https://www.lbank.com/crypto/{'buy' if buy else 'sell'}?assetCode={t}&currencyCode={fiat}",
     }.get(a.ex, "")
 
 

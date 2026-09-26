@@ -74,6 +74,13 @@ def _bitpapa_ads(url):
     return load(_ads_name("bitpapa", asset, "type=buy" in url))
 
 
+def _lbank_ads(url):
+    """LBank кодирует сторону бота в query `tradeType` как есть: buy — бот покупает (объявления продавцов),
+    sell — бот продаёт. Монеты — только USDT/USDC (p2p.LBANK_ASSETS), USDC отдаёт фикстуру USDT."""
+    asset = re.search(r"assetCode=([^&]+)", url).group(1)
+    return load(_ads_name("lbank", asset, "tradeType=sell" in url))
+
+
 # подстрока URL -> файл фикстуры (урезанные живые ответы площадок) или функция от URL
 ROUTES = [
     # спот-тикеры и справочники сетей — раньше общих правил по доменам htx.com / kucoin.com
@@ -82,7 +89,7 @@ ROUTES = [
     ("queryAllPaymentList", "bybit_pay.json"),
     ("htx.com", _htx_ads), ("kucoin.com", _kucoin_ads),
     ("payment/method", "mexc_pay.json"), ("common/coins", "mexc_coins.json"),
-    ("p2p.mexc.com/api/market", _mexc_ads), ("bitpapa.com", _bitpapa_ads),
+    ("p2p.mexc.com/api/market", _mexc_ads), ("bitpapa.com", _bitpapa_ads), ("lbank.com", _lbank_ads),
     ("api.bybit.com/v5/market/tickers", "spot_bybit.json"), ("api.mexc.com/api/v3/ticker", "spot_mexc.json"),
     ("rapira.net", "rapira.json"),
 ]

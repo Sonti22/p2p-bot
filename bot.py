@@ -106,7 +106,7 @@ COMMANDS = [{"command": "best", "description": "Лучшая связка сей
             {"command": "help", "description": "Как работать с сигналами"}]
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEV_STATUS = os.path.join(HERE, ".dev_status.json")   # пишет launcher.py при каждом запуске
-DESCRIPTION = ("Сканирую P2P Bybit, MEXC, HTX, KuCoin, BitPapa и обменники BestChange. "
+DESCRIPTION = ("Сканирую P2P Bybit, MEXC, HTX, KuCoin, BitPapa, LBank и обменники BestChange. "
                "Присылаю связки USDT, USDC, BTC, ETH, TON за рубли: чистая прибыль, карточка, ссылки на площадки.")
 SHORT_DESCRIPTION = "Сигналы P2P-связок за рубли"
 GUIDE_BODY = ("<b>Как работать с сигналом</b>\n"
@@ -173,7 +173,8 @@ VENUE_DOWN_AFTER = 900      # сек: площадка отдаёт ошибку
 VENUE_FAIL_STREAK = 3       # или столько сканов подряд с ошибкой
 VENUE_ALERT_COOLDOWN = 3600  # не чаще раза в час на площадку
 LADDER_ALERT_COOLDOWN = 86400  # предложение лестницы суммы сухого прогона — не чаще раза в сутки
-EXCHANGE_NAMES = {"bybit": "Bybit", "mexc": "MEXC", "htx": "HTX", "kucoin": "KuCoin", "bitpapa": "BitPapa"}
+EXCHANGE_NAMES = {"bybit": "Bybit", "mexc": "MEXC", "htx": "HTX", "kucoin": "KuCoin", "bitpapa": "BitPapa",
+                  "lbank": "LBank"}
 ASSET_LIST = tuple(DEFAULT_ASSETS.split(","))       # монеты для кнопок «🎛 Фильтры»
 EXCHANGE_LIST = tuple(ALL_EXCHANGES.split(","))      # площадки для кнопок «🎛 Фильтры»
 VENUE_NAMES = dict(EXCHANGE_NAMES, bestchange="BestChange")  # + обменник, которого нет в EXCHANGE_NAMES

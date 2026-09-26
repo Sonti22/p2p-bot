@@ -16,7 +16,7 @@ BG, PANEL, BORDER = "#0F1419", "#18212C", "#2A3441"
 TEXT, MUTED = "#E8EDF2", "#8B98A5"
 GREEN, RED, AMBER, BLUE = "#22C55E", "#EF4444", "#F59E0B", "#3B82F6"
 VENUE_COLORS = {"Bybit": "#F7A600", "MEXC": "#2D7FF9", "HTX": "#1F6FEB", "KuCoin": "#24AE8F",
-                "BitPapa": "#7C4DFF", "BestChange": "#10B981"}
+                "BitPapa": "#7C4DFF", "LBank": "#EC4899", "BestChange": "#10B981"}
 
 
 def _font(size, weight="regular"):
