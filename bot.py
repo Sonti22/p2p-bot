@@ -295,7 +295,10 @@ def save_env(key, value, path=ENV_PATH):
     различает, а load_env берёт первую строку): первая совпавшая строка заменяется, повторы удаляются. Перевод строки
     в значении — ValueError: иначе через значение (например, данные кнопки) в .env дописывается чужая строка."""
     value = str(value)
-    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key) or re.search(r"[\r\n\0]", value):
+    # любой разделитель строк, который понимает str.splitlines (\x0b, \x0c, \x1c-\x1e, \x85, U+2028/2029…): файл
+    # читается ниже именно splitlines, и такое значение при следующей записи распалось бы на две строки .env
+    if (not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key) or "\0" in value
+            or "".join(value.splitlines()) != value or len(value.splitlines()) > 1):
         raise ValueError(f"save_env: недопустимый ключ или значение ({key!r})")
     lines = open(path, encoding="utf-8").read().splitlines() if os.path.exists(path) else []
     out, done = [], False
@@ -2778,6 +2781,8 @@ class Bot:
                             text=text, parse_mode="HTML", reply_markup=kb)
         elif data.startswith("onb_bank:") and ob["step"] == "banks":
             name = data[len("onb_bank:"):]
+            if name not in ONBOARD_BANKS:   # только банки с кнопок: имя уходит в .env (INCLUDE_PAY)
+                return
             ob["banks"].symmetric_difference_update({name})
             text, kb = onboarding_banks_view(ob["banks"])
             await self.call("editMessageText", chat_id=self.chat_id, message_id=mid,

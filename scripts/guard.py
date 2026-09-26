@@ -8,7 +8,10 @@ import subprocess
 import sys
 
 PROTECTED = (".github/", "scripts/guard.py", "launcher.py", "CLAUDE.md", ".gitignore",
-             "payouts.py", "scripts/payout_whitelist.py", "tests/test_payouts.py")   # выплаты — только вручную
+             "payouts.py", "scripts/payout_whitelist.py", "tests/test_payouts.py",   # выплаты — только вручную
+             # настройки pytest: через addopts/--ignore тесты выплат молча выпадали бы из CI
+             "pytest.ini", "pyproject.toml", "setup.cfg", "tox.ini", "conftest.py", "tests/conftest.py")
+PROTECTED_NAME = "payout"   # любой путь со словом payout (payouts/__init__.py, tests/test_payouts_x…) — тоже защищён
 # код выплат в остальных файлах (bot.py: /payout, кнопки pay_*, PAYOUTS; accounts.py, .env.example…): любая добавленная
 # или удалённая строка — ручная проверка владельца. Документацию (.md) не проверяем.
 PAYOUT_CODE = r"payout|\bpay_(?:to|ok|no|hist|stop)\b"
@@ -25,12 +28,15 @@ def git(*args):
 
 def check(base):
     problems = []
-    for f in filter(None, git("diff", "--name-only", f"{base}...HEAD").splitlines()):
-        if f.startswith(PROTECTED):
+    # --no-renames: переименование = удаление старого пути + новый файл целиком. Иначе git показывает только новое
+    # имя, а перенесённые строки не попадают в diff — «payouts.py → payouts/__init__.py» проходил бы как «ок»
+    for f in filter(None, git("diff", "--name-only", "--no-renames", f"{base}...HEAD").splitlines()):
+        if f.startswith(PROTECTED) or PROTECTED_NAME in f.lower():
             problems.append(f"изменён защищённый файл: {f}")
     cur = old = ""
     payout_lines = {}
-    for line in git("diff", "-U0", f"{base}...HEAD", "--", ".", ":(exclude)tests/fixtures").splitlines():
+    for line in git("diff", "-U0", "--no-renames", f"{base}...HEAD", "--", ".",
+                    ":(exclude)tests/fixtures").splitlines():
         if line.startswith("--- "):
             old = line[6:] if line.startswith("--- a/") else ""
             continue
@@ -39,7 +45,7 @@ def check(base):
             continue
         name = cur or old
         if (line.startswith(("+", "-")) and not name.endswith(".md") and not name.startswith(PROTECTED)
-                and re.search(PAYOUT_CODE, line[1:], re.I)):
+                and PROTECTED_NAME not in name.lower() and re.search(PAYOUT_CODE, line[1:], re.I)):
             payout_lines[name] = payout_lines.get(name, 0) + 1
         if not line.startswith("+"):
             continue

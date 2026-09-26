@@ -482,6 +482,9 @@ def _connect(path=None):
                 "amount TEXT, fee TEXT, debit TEXT, usdt_value TEXT, state TEXT, uuid TEXT DEFAULT '', "
                 "status TEXT DEFAULT '', is_final INTEGER DEFAULT 0, txid TEXT DEFAULT '', note TEXT DEFAULT '', "
                 "updated_ts REAL, create_kind TEXT DEFAULT '')")   # create_kind: "error" — создание получило только отказы
+    if "create_kind" not in {r[1] for r in con.execute("PRAGMA table_info(payouts)")}:   # база первой версии
+        con.execute("ALTER TABLE payouts ADD COLUMN create_kind TEXT DEFAULT ''")
+        con.commit()
     return con
 
 

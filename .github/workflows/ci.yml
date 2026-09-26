@@ -26,6 +26,11 @@ jobs:
       - run: pip install -r requirements.txt pytest
       - run: python -m py_compile *.py scripts/*.py
       - run: python -m pytest -q
+      - name: Тесты выплат отдельно (без addopts из конфига; выпали или стало меньше — CI красный)
+        run: |
+          n=$(python -m pytest -q -o addopts= -p no:cacheprovider tests/test_payouts.py tests/test_payouts_hardening.py 2>&1 | tail -1 | grep -oE '^[0-9]+ passed$' | cut -d' ' -f1 || true)
+          echo "payout tests passed: ${n:-0}"
+          test "${n:-0}" -ge 135
       - name: Guard (защищённые файлы, домены, опасные вызовы, секреты)
         run: python scripts/guard.py origin/main
 
