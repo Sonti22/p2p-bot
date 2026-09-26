@@ -229,8 +229,8 @@ def test_scan_offline_keeps_prices_near_reference(offline):
     assert snap.ref > 0 and not snap.errors
     for a in snap.best.values():
         assert abs(a.price / snap.ref - 1) * 100 <= c.max_dev
-    scores = [d[0] - c.risk_penalty * len(p2p.reliability(d, c, snap)[1]) for d in snap.deals]
-    assert scores == sorted(scores, reverse=True)   # отсортировано по прибыли с поправкой на надёжность
+    scores = [p2p.score(d, c, snap) for d in snap.deals]
+    assert scores == sorted(scores, reverse=True)   # отсортировано по прибыли с поправкой на веса рисков
 
 
 def test_scan_offline_btc_prices_near_reference(offline):

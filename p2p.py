@@ -176,7 +176,7 @@ class Config:
     alt_interval: int = 60         # сек между опросами монет кроме USDT
     bc_refresh: int = 120          # сек между скачиваниями выгрузки BestChange (~16 МБ)
     pay_fee: float = 0.0           # % комиссии банка за оплату продавцу (СБП сверх 100 тыс./мес — до 0.5%)
-    risk_penalty: float = 1.5      # штраф в п.п. профита за каждую причину риска при сортировке связок
+    risk_penalty: float = 1.5      # п.п. профита за единицу веса риска (_risks: вес 1 или 2) — score(), сортировка
     spot_fees: dict = field(default_factory=lambda: _fees(DEFAULT_SPOT_FEES, upper=False))
     risk_buffer: dict = field(default_factory=lambda: _fees(DEFAULT_RISK))
     assets: list = field(default_factory=lambda: DEFAULT_ASSETS.split(","))
@@ -1448,8 +1448,8 @@ async def scan(s, cfg, force_alt=False):
             if d:
                 deals.append(d)
     snap = Snapshot(ref or 0, ref_src, refs, best, [], networks, dropped, errors, groups, spot, over_banks, book)
-    # сортировка «прибыль × надёжность»: каждая причина риска снимает risk_penalty п.п. с профита
-    deals.sort(key=lambda d: d[0] - cfg.risk_penalty * len(reliability(d, cfg, snap)[1]), reverse=True)
+    # сортировка «прибыль × надёжность» — score(): каждая единица веса риска снимает risk_penalty п.п. с профита
+    deals.sort(key=lambda d: score(d, cfg, snap), reverse=True)
     # обменники разных сетей дают по связке на одну и ту же пару площадок; бот сигналит по паре
     # (b.ex, b.asset, s.ex, s.asset) — оставляем лучшую, чтобы дубли не вытеснили из топ-N другие площадки
     seen = set()
@@ -1558,13 +1558,29 @@ def reliability(deal, cfg, snap):
     return label, reasons
 
 
+def risk_weight(deal, cfg, snap):
+    """Сумма весов рисков связки (_risks): 0 — чисто. Одна мера и для индекса надёжности, и для score()."""
+    return sum(w for w, _ in _risks(deal, cfg, snap))
+
+
 def reliability_index(deal, cfg, snap):
     """Индекс надёжности 0–10 для карточки: 10 минус веса рисков (_risks), не ниже 0."""
-    return max(0, 10 - sum(w for w, _ in _risks(deal, cfg, snap)))
+    return max(0, 10 - risk_weight(deal, cfg, snap))
 
 
-def fmt_reliability(label, reasons, index=None):
+def score(deal, cfg, snap):
+    """Оценка связки: прибыль % − RISK_PENALTY × сумма весов рисков (_risks: вес 1 — обычная причина, 2 — тяжёлая),
+    в п.п. По ней сортирует scan(), выбирает связку сухой прогон, её же показывают карточка, /top и прогон. Веса те
+    же, что у reliability_index: при равной прибыли выше связка с большим индексом. Метку ✅/⚠️/🪤 не меняет — та
+    по-прежнему по числу причин (reliability)."""
+    return deal[0] - cfg.risk_penalty * risk_weight(deal, cfg, snap)
+
+
+def fmt_reliability(label, reasons, index=None, rank=None):
+    """«метка · надёжность N/10 · оценка ±X (причины)»; rank — score() связки, None — без оценки."""
     head = label if index is None else f"{label} · надёжность {index}/10"
+    if rank is not None:
+        head += f" · оценка {rank:+.2f}"
     return head if not reasons else f"{head} ({'; '.join(reasons)})"
 
 
@@ -1597,7 +1613,8 @@ def fmt_deal(d, cfg, snap=None):
     profit, b, s, route = d
     text = (f"<b>{profit:+.2f}%</b> на {_money(cfg.amount)} {cfg.fiat} ({route})\n")
     if snap is not None:
-        text += html.escape(fmt_reliability(*reliability(d, cfg, snap), reliability_index(d, cfg, snap))) + "\n"
+        text += html.escape(fmt_reliability(*reliability(d, cfg, snap), reliability_index(d, cfg, snap),
+                                            score(d, cfg, snap))) + "\n"
         prem = premium_line(b, s, snap)
         if prem:
             text += html.escape(prem) + "\n"
@@ -1649,7 +1666,7 @@ def fmt_signal(d, cfg, snap=None, limit=SIGNAL_MAX):
     def build(tail=True, why=True, terms=True):
         lines = [f"<b>{profit:+.2f}% чистыми</b> на {_money(cfg.amount)} {cur}: {b.ex} → {s.ex}"]
         if label:
-            lines.append(f"{label} · надёжность {reliability_index(d, cfg, snap)}/10")
+            lines.append(f"{label} · надёжность {reliability_index(d, cfg, snap)}/10 · оценка {score(d, cfg, snap):+.2f}")
             lines += [f"  – {html.escape(r)}" for r in reasons[:2]] if why else []
         lines += ["", f"<b>{KEYCAPS[0]} Купить {b.asset} на {b.ex}</b> по {_price(b.price)} ₽"]
         lines += _signal_ad(b, "Продавец", "Оплатить через", terms)

@@ -29,7 +29,7 @@ from p2p import ALL_EXCHANGES, AMOUNT_MAX, AMOUNT_MIN, DEFAULT_ASSETS, ENV_PATH,
     MIN_PROFIT_MIN, TRAP, Config, fmt_signal, sell_step_number, _money, _price, _route_qty, bank_liquidity, book_spread, deal_amounts, \
     deal_for_amount, fmt_ad, fmt_breakeven, fmt_deal, fmt_top, load_env, maker_neighbors, maker_place, maker_quote, \
     maker_round_fee, parse_amount, parse_min_profit, profit_breakdown, reliability, reliability_index, route_hops, scan, \
-    setup_logging, spot_url, traps_log, venue_url
+    score, setup_logging, spot_url, traps_log, venue_url
 
 logger = logging.getLogger(__name__)
 
@@ -196,6 +196,12 @@ def account_poll_interval():
     """Читаем ACCOUNT_POLL_INTERVAL при каждом обращении, а не при импорте модуля — иначе значение
     из .env не подхватывается: load_env() вызывается в main() уже после импорта bot.py."""
     return int(os.getenv("ACCOUNT_POLL_INTERVAL", ACCOUNT_POLL_INTERVAL_DEFAULT))
+
+
+def signal_traps():
+    """SIGNAL_TRAPS=1 — «🪤 ловушки» тоже приходят сигналом (обычные, избранные, ночной дайджест). По умолчанию
+    нет: их видно только в /top и /best с пометкой. Читаем при каждом обращении, как paper.settings()."""
+    return os.getenv("SIGNAL_TRAPS", "0").strip().lower() in ("1", "true", "yes", "on")
 
 
 def parse_quiet_hours(spec):
@@ -1626,10 +1632,12 @@ class Bot:
             await self.send(WAIT)
             return
         nets = sorted(((v["sell"].price, net) for net, v in snap.networks.items() if v.get("sell")), reverse=True)[:3]
+        traps = sum(1 for d in snap.deals if reliability(d, cfg, snap)[0] == TRAP)
         caption = (f"📊 <b>Топ связок</b> · USDT {snap.ref:.2f} ₽ · круг {_money(cfg.amount)} ₽\n"
                    + (f"Лучше продать USDT обменнику: {', '.join(f'{n} {p:.2f}' for p, n in nets)}\n" if nets else "")
                    + f"Связок всего: {len(snap.deals)} · от {cfg.min_profit:g}%: "
-                   + f"{sum(1 for d in snap.deals if d[0] >= cfg.min_profit)}")
+                   + f"{sum(1 for d in snap.deals if d[0] >= cfg.min_profit)}"
+                   + (f"\n🪤 Ловушек: {traps} — помечены, сигналом не приходят" if traps and not signal_traps() else ""))
         await self.photo_or_text(lambda: top_chart(snap, cfg), caption, TOP_MARKUP)
 
     async def show_history(self):
@@ -2046,11 +2054,13 @@ class Bot:
         _, b, s, _ = d
         return (b.ex, b.asset, s.ex, s.asset)
 
-    def _signal_deals(self, snap):
-        """Связки выше порога в порядке сканера (прибыль × надёжность), не больше MAX_SIGNALS.
-        Сначала порог, потом топ-N: надёжная связка ниже порога, стоящая выше в списке, не должна
-        закрывать связки выше порога за ней."""
-        return [d for d in snap.deals if d[0] >= self.cfg.min_profit][:self.max_signals]
+    def _signal_deals(self, snap, traps=None):
+        """Связки выше порога в порядке сканера (p2p.score), не больше MAX_SIGNALS.
+        Сначала порог и отсев «🪤 ловушек», потом топ-N: надёжная связка ниже порога или ловушка, стоящая выше
+        в списке, не должна закрывать связки за ней. traps — брать и ловушки (None — по SIGNAL_TRAPS)."""
+        traps = signal_traps() if traps is None else traps
+        return [d for d in snap.deals if d[0] >= self.cfg.min_profit
+                and (traps or reliability(d, self.cfg, snap)[0] != TRAP)][:self.max_signals]
 
     def track_liveness(self, snap, now=None):
         """Сколько сканов подряд связка держится выше порога: минутный выброс не сигналим, устойчивую — да."""
@@ -2081,9 +2091,10 @@ class Bot:
         return f"⏱ держится {minutes} мин · "
 
     async def maybe_start_paper_cycle(self, deals, snap):
-        """Сухой прогон (paper.py): при свободном слоте виртуально «берём» первую связку из тех, о которых
-        владелец получает сигнал (выше порога и держится LIVE_SCANS сканов), если стакана хватает на сумму
-        PAPER_AMOUNT (deal_for_amount/_stack) и она не «🪤 ловушка» (PAPER_TRAPS=1 — брать и их). Пишем
+        """Сухой прогон (paper.py): при свободном слоте виртуально «берём» лучшую по p2p.score (на сумме
+        PAPER_AMOUNT) связку из тех, о которых владелец получает сигнал (выше порога и держится LIVE_SCANS
+        сканов), если стакана хватает на PAPER_AMOUNT (deal_for_amount/_stack) и она не «🪤 ловушка»
+        (PAPER_TRAPS=1 — брать и их, notify тогда отдаёт их сюда и при SIGNAL_TRAPS=0). Пишем
         круг с меткой надёжности в data/paper.db со стадией buy. Карточка — только владельцу, гостям про
         сухой прогон ничего не идёт."""
         settings = paper.settings()
@@ -2095,6 +2106,7 @@ class Bot:
         own = trades.own_banks()[0]
         over = frozenset(snap.over_banks) | {b for b in own if paper.bank_month_total(b) >= trades.free_limit(b)}
         psnap = dataclasses.replace(snap, over_banks=over)
+        picked = None   # лучшая по p2p.score уже на сумме прогона, а не первая в списке (тот отсортирован на AMOUNT)
         for deal in deals:
             if not self.is_confirmed(deal):
                 continue   # сигнала о ней ещё не было — выброс одного скана не берём
@@ -2106,9 +2118,12 @@ class Bot:
             label, reasons = reliability(d, self.cfg, snap)
             if label == TRAP and not settings["traps"]:
                 continue
-            break
-        else:
+            rank = score(d, self.cfg, snap)
+            if picked is None or rank > picked[0]:
+                picked = (rank, d, label, reasons)
+        if picked is None:
             return
+        rank, d, label, reasons = picked
         profit, b, s, route = d
         paper.init_balance(settings["amount"])
         # выход маршрута в монете продажи по итоговому стеку s (его parts: переводов на каждый обменник) — без
@@ -2127,7 +2142,8 @@ class Bot:
         pay = trades.pay_label(cycle.get("pay_kind", ""), cycle.get("bank", ""), b.pays)
         qty = settings["amount"] / b.price
         text = (f"🧪 <b>Сухой прогон</b>: купил бы {_money(qty)} {b.asset} у {html.escape(b.nick)} "
-                f"по {_price(b.price)} ₽, оплата: {html.escape(pay)} · план {profit:.2f}% · {label}")
+                f"по {_price(b.price)} ₽, оплата: {html.escape(pay)} · план {profit:.2f}% · {label}"
+                f" · оценка {rank:+.2f}")
         if reasons:
             text += "\n" + "\n".join(f"• {html.escape(r)}" for r in reasons)
         await self.send(text, topic="signals")
@@ -2216,7 +2232,9 @@ class Bot:
     async def notify(self, snap):
         now = time.time()
         deals = self._signal_deals(snap)   # сначала порог, потом топ-N по надёжности
-        await self.maybe_start_paper_cycle(deals, snap)
+        # PAPER_TRAPS=1 — прогону нужны и ловушки, даже когда сигналом они не приходят (SIGNAL_TRAPS=0)
+        await self.maybe_start_paper_cycle(self._signal_deals(snap, traps=True) if paper.settings()["traps"]
+                                           else deals, snap)
         active = {self._deal_key(d) for d in deals}   # заранее: обрыв отправки не делает связки «устаревшими»
         for d in deals:
             profit = d[0]
@@ -2250,13 +2268,17 @@ class Bot:
 
     async def notify_favorites(self, snap, active, now):
         """⭐ Избранные маршруты: сигнал от FAV_MIN_PROFIT, даже ниже общего порога и вне топа MAX_SIGNALS; тот же
-        антидубль и «живость», что у обычных сигналов. Только владельцу. active дополняется — связка не «устареет»."""
+        антидубль и «живость», что у обычных сигналов. Только владельцу. active дополняется — связка не «устареет».
+        «🪤 Ловушку» и по избранному маршруту не шлём (SIGNAL_TRAPS=1 — шлём)."""
         favs, fav_min = favorites.keys(), favorites.fav_min_profit()
         if not favs:
             return
+        traps = signal_traps()
         for d in snap.deals:
             key = self._deal_key(d)
             if key in active or favorites.key_str(key) not in favs or d[0] < fav_min or not self.is_confirmed(d):
+                continue
+            if not traps and reliability(d, self.cfg, snap)[0] == TRAP:
                 continue
             active.add(key)
             prev = self.sent.get(key)
