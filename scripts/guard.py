@@ -9,7 +9,7 @@ import sys
 
 PROTECTED = (".github/", "scripts/guard.py", "launcher.py", "CLAUDE.md", ".gitignore")
 ALLOWED_DOMAINS = ("bybit.com", "mexc.com", "htx.com", "kucoin.com", "bitpapa.com", "bestchange.ru",
-                   "rapira.net", "telegram.org", "t.me", "lbank.com")
+                   "rapira.net", "telegram.org", "t.me", "lbank.com", "bingx.com", "cryptomus.com")
 FORBIDDEN = (r"\bsubprocess\b", r"\bos\.system\b", r"\bos\.popen\b", r"\beval\(", r"\bexec\(", r"captcha",
              r"selenium", r"playwright", r"pyautogui", r"pywinauto", r"\badb\b", r"uiautomator")
 SECRETS = (r"\b\d{8,10}:[A-Za-z0-9_-]{30,}", r"ghp_[A-Za-z0-9]{20,}", r"github_pat_[A-Za-z0-9_]{20,}", r"\bsk-[A-Za-z0-9-]{20,}")
