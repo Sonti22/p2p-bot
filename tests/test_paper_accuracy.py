@@ -159,10 +159,16 @@ def test_transfer_stage_checks_only_real_transfers():
     assert paper.check_transfer_stage(out, cfg, transfer_minutes=3, now=1300.0)[0] == "fail"
 
 
-def test_spot_routes_are_taken_into_dry_run(monkeypatch):
-    """Раньше связки через спот пропускались (риск курса между стартом и продажей не моделировался) —
-    теперь заводим круг и сохраняем данные маршрута (buy_net/buy_pays/sell_parts), нужные, чтобы на
-    стадии sell пересчитать выход по свежему курсу (recompute_sell_qty)."""
+def test_simple_route_filter():
+    b, s = ad("Bybit", "buy", 87.0), ad("MEXC", "sell", 90.0)
+    assert paper.simple_route((3.0, b, s, "перевод −1 USDT (TRC20) на MEXC"))
+    assert not paper.simple_route((3.0, ad("Bybit", "buy", 6e6, asset="BTC"), s, "спот BTC→USDT на Bybit (−0.1%)"))
+    assert not paper.simple_route((3.0, b, s, "спот USDT→TON на Bybit (−0.1%) → перевод … → спот TON→USDT на MEXC"))
+
+
+def test_spot_routes_are_not_taken_into_dry_run(monkeypatch):
+    """Разбор #110: связка через спот на сумму прогона проходит по глубине и порогу, но круг не заводится —
+    площадка конвертации в круге не хранится (условия возврата — ROADMAP «межмонетные связки, часть 2»)."""
     monkeypatch.setattr(B, "deal_card", lambda d, c, a=None, r=None, breakdown=None: b"png")
     monkeypatch.setenv("PAPER", "1")
     monkeypatch.setenv("PAPER_AMOUNT", "10000")
@@ -171,12 +177,13 @@ def test_spot_routes_are_taken_into_dry_run(monkeypatch):
     sn = p2p.Snapshot(88.0, "t", {}, {}, [deal], {}, {}, {},
                       groups={("Bybit", "buy", "BTC"): [b], ("Bybit", "sell", "USDT"): [s]},
                       spot={"Bybit": {"BTC": (60000.0, 60100.0)}})
-    bot = Stub(p2p.Config(min_profit=2.0))
+    cfg = p2p.Config(min_profit=2.0)
+    d = p2p.deal_for_amount(deal, cfg, sn, 10000)
+    assert d is not None and d[0] > cfg.min_profit     # без фильтра круг бы завёлся
+    bot = Stub(cfg)
     bot.live_scans = 1
     asyncio.run(bot.maybe_start_paper_cycle([deal], sn))
-    (c,) = paper.open_cycles()
-    assert c["buy_asset"] == "BTC" and c["sell_asset"] == "USDT" and c["sell_qty"] > 0
-    assert json.loads(c["buy_pays"]) == ["SBP"] and c["sell_parts"] == 1
+    assert not paper.open_cycles()
 
 
 def test_cross_asset_sell_recomputes_output_from_fresh_spot():

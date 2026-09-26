@@ -8,7 +8,8 @@ SQLite data/paper.db, таблицы:
             итог (result: done/failed_buy/failed_transfer/failed_sell, пока NULL — круг открыт),
             реализованная прибыль (realized_pct) по ценам на момент стадий, как платили (pay_kind:
             intra — внутри банка, sbp — по СБП со своего банка, trades.pay_plan) и банк (bank) — для учёта
-            виртуального оборота по бесплатному лимиту СБП.
+            виртуального оборота по бесплатному лимиту СБП. planned_pct — план с запасом на курс (его видит
+            владелец), planned_raw — тот же план без запаса: с ним сравнивается факт (в факте запаса нет).
   balance — один виртуальный баланс: старт = PAPER_AMOUNT, меняется на realized_pct каждого
             завершённого круга.
 """
@@ -48,7 +49,10 @@ LADDER_DOWN_MIN_FAILED = 0.4   # доля сорвавшихся за недел
 _COLUMNS = ("id", "ts_start", "amount", "buy_ex", "buy_asset", "buy_price", "buy_nick",
             "sell_ex", "sell_asset", "sell_price", "sell_nick", "route", "planned_pct",
             "stage", "ts_stage", "realized_pct", "result", "note", "bank", "label", "sell_fact", "pay_kind",
-            "sell_qty", "sell_net", "buy_nicks", "buy_net", "buy_pays", "sell_parts", "pay_fee_used")
+            "sell_qty", "sell_net", "buy_nicks", "buy_net", "buy_pays", "sell_parts", "pay_fee_used",
+            "planned_raw")
+# план для сравнения с фактом: без запаса на курс; у кругов до planned_raw — план с запасом, как раньше
+_PLAN_CMP = "COALESCE(planned_raw, planned_pct)"
 
 
 def settings():
@@ -79,13 +83,13 @@ def _connect(path):
                 "bank TEXT DEFAULT '', label TEXT DEFAULT '', sell_fact REAL DEFAULT NULL, pay_kind TEXT DEFAULT '', "
                 "sell_qty REAL DEFAULT NULL, sell_net TEXT DEFAULT '', buy_nicks TEXT DEFAULT '', "
                 "buy_net TEXT DEFAULT '', buy_pays TEXT DEFAULT '[]', sell_parts INTEGER DEFAULT 1, "
-                "pay_fee_used REAL DEFAULT 0)")
+                "pay_fee_used REAL DEFAULT 0, planned_raw REAL DEFAULT NULL)")
     cols = [r[1] for r in con.execute("PRAGMA table_info(cycles)")]
     for col, ddl in (("bank", "TEXT DEFAULT ''"), ("label", "TEXT DEFAULT ''"), ("sell_fact", "REAL DEFAULT NULL"),
                      ("pay_kind", "TEXT DEFAULT ''"), ("sell_qty", "REAL DEFAULT NULL"), ("sell_net", "TEXT DEFAULT ''"),
                      ("buy_nicks", "TEXT DEFAULT ''"), ("buy_net", "TEXT DEFAULT ''"),
                      ("buy_pays", "TEXT DEFAULT '[]'"), ("sell_parts", "INTEGER DEFAULT 1"),
-                     ("pay_fee_used", "REAL DEFAULT 0")):
+                     ("pay_fee_used", "REAL DEFAULT 0"), ("planned_raw", "REAL DEFAULT NULL")):
         if col not in cols:   # база от прошлой версии — добавляем колонку, данные не трогаем
             con.execute(f"ALTER TABLE cycles ADD COLUMN {col} {ddl}")
     con.execute("CREATE TABLE IF NOT EXISTS balance (id INTEGER PRIMARY KEY CHECK (id = 1), "
@@ -127,7 +131,8 @@ def apply_result(realized_pct, amount, path=DB_PATH, ts=None):
     con.close()
 
 
-def start_cycle(amount, buy, sell, route, planned_pct, path=DB_PATH, ts=None, label="", sell_qty=None, pay_fee=0.0):
+def start_cycle(amount, buy, sell, route, planned_pct, path=DB_PATH, ts=None, label="", sell_qty=None, pay_fee=0.0,
+                over=None, planned_raw=None):
     """Завести новый виртуальный круг со стадией buy. buy/sell — объявления покупки/продажи
     (p2p.Ad) на момент старта. Как платим (trades.pay_plan: внутри банка или по СБП со своего банка, у
     которого виртуальный лимит ещё есть) пишется сразу — в реальности рубли уходят в момент оплаты, до
@@ -139,10 +144,15 @@ def start_cycle(amount, buy, sell, route, planned_pct, path=DB_PATH, ts=None, la
     покупки и число частей стакана продажи, нужные, чтобы на стадии sell пересчитать выход межмонетной/спот
     связки по свежему курсу (recompute_sell_qty); pay_fee — % комиссии банка (cfg.pay_fee), которой уже
     учтён при расчёте sell_qty на старте (сверх нужного — SBP_OVER_FEE, если банк за лимитом), запоминаем
-    как pay_fee_used, чтобы recompute_sell_qty не пересчитывал её заново с чужим over_banks. Возвращает id круга."""
+    как pay_fee_used, чтобы recompute_sell_qty не пересчитывал её заново с чужим over_banks. over — банки за
+    лимитом СБП, с которыми бот считал план и sell_qty (реальные сделки trades + виртуальный оборот прогона):
+    банк оплаты и pay_fee_used берём по ним же, иначе комиссия в круге разошлась бы с планом; не передан —
+    только виртуальный оборот прогона. planned_raw — план без запаса на курс (для сравнения с фактом).
+    Возвращает id круга."""
     ts = ts if ts is not None else time.time()
-    own = trades.own_banks()[0]
-    over = {b for b in own if bank_month_total(b, path, ts) >= trades.free_limit(b)}
+    if over is None:
+        own = trades.own_banks()[0]
+        over = {b for b in own if bank_month_total(b, path, ts) >= trades.free_limit(b)}
     kind, bank = trades.pay_plan(buy.pays, over=over)
     pay_fee_used = trades.SBP_OVER_FEE if kind == "sbp" and bank in over and pay_fee < trades.SBP_OVER_FEE else pay_fee
     con = _connect(path)
@@ -150,12 +160,13 @@ def start_cycle(amount, buy, sell, route, planned_pct, path=DB_PATH, ts=None, la
         cur = con.execute(
             "INSERT INTO cycles (ts_start, amount, buy_ex, buy_asset, buy_price, buy_nick, sell_ex, sell_asset, "
             "sell_price, sell_nick, route, planned_pct, stage, ts_stage, bank, label, pay_kind, sell_qty, sell_net, "
-            "buy_nicks, buy_net, buy_pays, sell_parts, pay_fee_used) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'buy', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "buy_nicks, buy_net, buy_pays, sell_parts, pay_fee_used, planned_raw) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'buy', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (ts, amount, buy.ex, buy.asset, buy.price, buy.nick,
              sell.ex, sell.asset, sell.price, sell.nick, route, planned_pct, ts, bank, label, kind,
              sell_qty, sell.net or "", json.dumps(list(buy.nicks or (buy.nick,)), ensure_ascii=False),
-             buy.net or "", json.dumps(list(buy.pays or []), ensure_ascii=False), sell.parts or 1, pay_fee_used))
+             buy.net or "", json.dumps(list(buy.pays or []), ensure_ascii=False), sell.parts or 1, pay_fee_used,
+             planned_raw))
         cycle_id = cur.lastrowid
     con.close()
     return cycle_id
@@ -253,6 +264,17 @@ def check_transfer_stage(cycle, cfg, transfer_minutes, now=None):
     if not p2p.withdraw_open(cfg, cycle["buy_ex"], cycle["buy_asset"], receiver=cycle["sell_ex"]):
         return "fail", f"вывод {cycle['buy_asset']} с {cycle['buy_ex']} закрыт"
     return "advance", ""
+
+
+def simple_route(deal):
+    """Связку можно честно прогнать: покупка и продажа одной монеты без конвертаций на споте. Межмонетные и через
+    промежуточную монету пока не берём (разбор #110): площадка конвертации и сети хопов в круге не хранятся —
+    пересчёт на продаже мог уйти на другую биржу, сбой спота срывал круг сразу, transfer проверял не ту монету.
+    Условия возврата — ROADMAP «Прогон: межмонетные связки, часть 2». «через Bybit» (обменник → свой кошелёк на
+    Bybit → другой обменник) тоже не берём: стадия transfer такой ретранслятор не проверяет, а круги BestChange ↔
+    BestChange в прогоне 25.09 завышали баланс."""
+    _, b, s, route = deal
+    return b.asset == s.asset and "спот" not in (route or "") and "через" not in (route or "")
 
 
 def sell_qty(cycle):
@@ -401,8 +423,8 @@ def stats(path=DB_PATH, now=None):
     """{"day"/"week"/"all": {"total", "done", "failed", "failed_by_reason", "avg_diff"}} — для /paper.
     Считаем по завершённым кругам (result IS NOT NULL): total — сколько завершилось, done — исполнились
     полностью, failed/failed_by_reason — сколько и на какой стадии сорвалось, avg_diff — средняя
-    (факт − план) в п.п. по исполнившимся (None — исполнившихся ещё не было). «day» — календарные сутки
-    по МСК, «week» — последние 7 суток, «all» — за всё время."""
+    (факт − план) в п.п. по исполнившимся (None — исполнившихся ещё не было; план — без запаса на курс,
+    _PLAN_CMP). «day» — календарные сутки по МСК, «week» — последние 7 суток, «all» — за всё время."""
     now = time.time() if now is None else now
     starts = {"day": _day_start(now), "week": now - STATS_WEEK, "all": 0.0}
     empty = {"total": 0, "done": 0, "failed": 0, "failed_by_reason": {}, "avg_diff": None}
@@ -411,7 +433,7 @@ def stats(path=DB_PATH, now=None):
     con = _connect(path)
     out = {}
     for period, start in starts.items():
-        rows = con.execute("SELECT result, planned_pct, realized_pct FROM cycles "
+        rows = con.execute(f"SELECT result, {_PLAN_CMP}, realized_pct FROM cycles "
                            "WHERE result IS NOT NULL AND ts_start >= ?", (start,)).fetchall()
         done_diffs = [r - p for res, p, r in rows if res == "done"]
         failed_by_reason = {}
@@ -439,7 +461,8 @@ def ladder_suggestion(path=DB_PATH, now=None):
     """Лестница суммы круга — предложение, не смена настройки (её пишет вызывающий по кнопке).
     Повышение (LADDER_LOW → LADDER_HIGH): за всё время набралось ≥ LADDER_UP_MIN_CYCLES завершённых
     кругов, доля сорвавшихся ≤ LADDER_UP_MAX_FAILED и медиана (факт − план) по исполнившимся ≥
-    LADDER_UP_MIN_MEDIAN п.п. Понижение (обратно на LADDER_LOW): сумма сейчас LADDER_HIGH и за
+    LADDER_UP_MIN_MEDIAN п.п. (план без запаса на курс — иначе запас сдвигал бы факт вверх и прятал
+    неблагоприятный курс). Понижение (обратно на LADDER_LOW): сумма сейчас LADDER_HIGH и за
     последнюю неделю доля сорвавшихся > LADDER_DOWN_MIN_FAILED.
     Возвращает {"action": "up"/"down", "amount": ...} или None — предлагать нечего."""
     amount = settings()["amount"]
@@ -447,7 +470,7 @@ def ladder_suggestion(path=DB_PATH, now=None):
         return None
     now = time.time() if now is None else now
     con = _connect(path)
-    all_rows = con.execute("SELECT result, planned_pct, realized_pct FROM cycles "
+    all_rows = con.execute(f"SELECT result, {_PLAN_CMP}, realized_pct FROM cycles "
                            "WHERE result IS NOT NULL").fetchall()
     week_rows = con.execute("SELECT result FROM cycles WHERE result IS NOT NULL AND ts_start >= ?",
                             (now - STATS_WEEK,)).fetchall()
@@ -469,12 +492,13 @@ def report_rows(path=DB_PATH):
     """План/факт, срывы по причинам, средняя длительность круга и нехватка глубины стакана —
     по каждой связке площадка/монета покупки → площадка/монета продажи (для `/paper report` и
     экспорта CSV). Только завершённые круги (result IS NOT NULL); depth_shortfall считает срывы
-    на продаже с причиной «не хватает глубины стакана продажи» (текст из check_sell_stage)."""
+    на продаже с причиной «не хватает глубины стакана продажи» (текст из check_sell_stage). План — без запаса
+    на курс (_PLAN_CMP), чтобы сравнивался с фактом."""
     if not os.path.exists(path):
         return []
     con = _connect(path)
     rows = con.execute(
-        "SELECT buy_ex, buy_asset, sell_ex, sell_asset, result, planned_pct, realized_pct, "
+        f"SELECT buy_ex, buy_asset, sell_ex, sell_asset, result, {_PLAN_CMP}, realized_pct, "
         "ts_start, ts_stage, note FROM cycles WHERE result IS NOT NULL").fetchall()
     con.close()
     groups = {}
@@ -518,11 +542,12 @@ def first_start(path=DB_PATH):
 
 def label_stats(path=DB_PATH):
     """Итоги завершённых кругов по метке надёжности на старте (✅/⚠️/🪤, p2p.reliability): сколько
-    кругов, сколько исполнилось, средний план и факт исполнившихся — видно, оправдывает ли себя метка."""
+    кругов, сколько исполнилось, средний план (без запаса на курс) и факт исполнившихся — видно, оправдывает
+    ли себя метка."""
     if not os.path.exists(path):
         return {}
     con = _connect(path)
-    rows = con.execute("SELECT label, result, planned_pct, realized_pct FROM cycles "
+    rows = con.execute(f"SELECT label, result, {_PLAN_CMP}, realized_pct FROM cycles "
                        "WHERE result IS NOT NULL").fetchall()
     con.close()
     out = {}
@@ -561,3 +586,29 @@ def balance_change(path=DB_PATH):
         "SELECT COALESCE(SUM(amount * realized_pct / 100.0), 0) FROM cycles WHERE result IS NOT NULL").fetchone()
     con.close()
     return total
+
+
+def reset(path=DB_PATH, now=None):
+    """/paper reset: база прогона уходит в архив рядом — paper-archive-ГГГГММДД-ЧЧММ.db (по МСК; архив не
+    удаляется, второй сброс в ту же минуту — с суффиксом -2, -3…), на её месте — пустая база той же схемы
+    (статистика, баланс и лестница — с нуля, открытые круги тоже в архиве). Соединений модуль не держит —
+    каждая функция закрывает своё, файл свободен. Настройки PAPER/PAPER_AMOUNT живут в .env — не трогаем.
+    Кругов нет — архивировать нечего, None; иначе {"archive": путь архива, "cycles": сколько кругов,
+    "change": итог завершённых, ₽}."""
+    if not os.path.exists(path):
+        return None
+    con = _connect(path)
+    total, = con.execute("SELECT COUNT(*) FROM cycles").fetchone()
+    con.close()
+    if not total:
+        return None
+    change = balance_change(path)
+    stamp = datetime.datetime.fromtimestamp(time.time() if now is None else now, MSK).strftime("%Y%m%d-%H%M")
+    base = os.path.join(os.path.dirname(path), f"paper-archive-{stamp}")
+    archive, n = base + ".db", 1
+    while os.path.exists(archive):
+        n += 1
+        archive = f"{base}-{n}.db"
+    os.rename(path, archive)
+    _connect(path).close()
+    return {"archive": archive, "cycles": total, "change": change}
