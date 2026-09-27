@@ -8,6 +8,8 @@
 `data/keys.json` хранятся зашифрованными Windows DPAPI (`protect`/`unprotect`) — файл бесполезен вне этой
 учётной записи Windows; открытые значения от прошлой версии шифруются при старте бота (`encrypt_saved_keys`).
 POST к Bybit (`bybit_post`) — только пути из BYBIT_POST_PATHS (история P2P-ордеров), без редиректов.
+Подписанные GET (`bybit_get`, `mexc_get`, `htx_get`, `kucoin_get`) — только пути из BYBIT/MEXC/HTX/KUCOIN_READ_PATHS
+(балансы, права ключа, история, сети монет); другой путь — ValueError до подписи и отправки.
 
 BingX и Cryptomus — только аккаунты (P2P-площадками бота они не являются). Чтение у них ограничено в самом коде,
 а не правами ключа: `bingx_get` — только GET и только пути из BINGX_READ_PATHS (спот- и Fund-баланс, права ключа,
@@ -259,15 +261,54 @@ def api_error_text(e):
     return type(e).__name__   # прочие ошибки: str(e) может содержать URL
 
 
+# Подписанные GET Bybit/MEXC/HTX/KuCoin — только эти пути чтения (как BINGX_READ_PATHS): балансы, права ключа, история
+# депозитов/выводов и спот-сделок, сети монет (netstatus). Другой путь (ордера, позиции, вывод, переводы) — ValueError
+# до подписи и отправки: ключ владельца может давать больше, чем чтение.
+BYBIT_READ_PATHS = frozenset({
+    "/v5/user/query-api",                               # права ключа
+    "/v5/account/wallet-balance",                       # баланс Unified Trading Account
+    "/v5/asset/transfer/query-account-coins-balance",   # баланс Funding wallet (чтение, не перевод)
+    "/v5/asset/coin/query-info",                        # сети монеты: вывод/депозит открыт (netstatus)
+})
+MEXC_READ_PATHS = frozenset({
+    "/api/v3/account",                    # баланс и права ключа
+    "/api/v3/capital/deposit/hisrec",     # история депозитов
+    "/api/v3/capital/withdraw/history",   # история выводов
+    "/api/v3/myTrades",                   # спот-сделки (фолбэк истории)
+    "/api/v3/capital/config/getall",      # сети монет (netstatus)
+})
+HTX_READ_PATHS = frozenset({
+    "/v2/user/uid",                  # uid владельца ключа (нужен для прав ключа)
+    "/v2/user/api-key",              # права ключа
+    "/v1/account/accounts",          # проверка ключа
+    "/v1/query/deposit-withdraw",    # история депозитов и выводов
+})
+KUCOIN_READ_PATHS = frozenset({
+    "/api/v1/user/api-key",   # права ключа
+    "/api/v1/accounts",       # проверка ключа
+    "/api/v1/deposits",       # история депозитов
+    "/api/v1/withdrawals",    # история выводов (GET — чтение)
+    "/api/v1/fills",          # спот-сделки (фолбэк истории)
+})
+
+
+def _read_path(venue, allowed, path):
+    """Путь подписанного GET — только из списка чтения этой биржи, иначе ValueError (до подписи и отправки)."""
+    if path not in allowed:
+        raise ValueError(f"{venue}: путь {path} не входит в список чтения")
+
+
 async def bybit_get(s, api_key, api_secret, path, params=None):
-    """Подписанный GET к приватному Bybit v5 (например path='/v5/account/wallet-balance')."""
+    """Подписанный GET к приватному Bybit v5 — только пути из BYBIT_READ_PATHS (например '/v5/account/wallet-balance')."""
+    _read_path("Bybit", BYBIT_READ_PATHS, path)
     params = params or {}
     url = f"{BYBIT_BASE}{path}" + (f"?{urlencode(params)}" if params else "")
     return await _get_json(s, url, bybit_headers(api_key, api_secret, params=params))
 
 
 async def mexc_get(s, api_key, api_secret, path, params=None):
-    """Подписанный GET к приватному MEXC v3 (например path='/api/v3/account')."""
+    """Подписанный GET к приватному MEXC v3 — только пути из MEXC_READ_PATHS (например '/api/v3/account')."""
+    _read_path("MEXC", MEXC_READ_PATHS, path)
     signed = mexc_signed_params(api_secret, params)
     url = f"{MEXC_BASE}{path}?{urlencode(signed)}"
     return await _get_json(s, url, {"X-MEXC-APIKEY": api_key})
@@ -317,7 +358,8 @@ def htx_signed_params(api_key, api_secret, method, path, params=None, timestamp=
 
 
 async def htx_get(s, api_key, api_secret, path, params=None):
-    """Подписанный GET к приватному HTX v1 (например path='/v1/account/accounts')."""
+    """Подписанный GET к приватному HTX — только пути из HTX_READ_PATHS (например '/v1/account/accounts')."""
+    _read_path("HTX", HTX_READ_PATHS, path)
     signed = htx_signed_params(api_key, api_secret, "GET", path, params)
     url = f"{HTX_BASE}{path}?{urlencode(sorted(signed.items()))}"
     return await _get_json(s, url, {})
@@ -342,7 +384,8 @@ def kucoin_headers(api_key, api_secret, passphrase_value, method, path_with_quer
 
 
 async def kucoin_get(s, api_key, api_secret, passphrase_value, path, params=None):
-    """Подписанный GET к приватному KuCoin v2 (например path='/api/v1/accounts')."""
+    """Подписанный GET к приватному KuCoin — только пути из KUCOIN_READ_PATHS (например '/api/v1/accounts')."""
+    _read_path("KuCoin", KUCOIN_READ_PATHS, path)
     full_path = path + (f"?{urlencode(params)}" if params else "")
     headers = kucoin_headers(api_key, api_secret, passphrase_value, "GET", full_path)
     return await _get_json(s, f"{KUCOIN_BASE}{full_path}", headers)
