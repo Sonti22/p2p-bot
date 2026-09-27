@@ -1403,10 +1403,18 @@ class Bot:
             return False
         return True
 
+    def snap_cfg(self, snap):
+        """Настройки расчёта снимка — копия, с которой его собрал fresh_scan (snap.cfg): %, сумма круга на карточке и
+        запись «✅ Сделал» — из одного расчёта, даже если сумму сменили после скана. Порог сигнала в расчёт не входит —
+        он текущий. У снимка нет snap.cfg (собран не fresh_scan) — текущие настройки."""
+        if snap is None or snap.cfg is None:
+            return self.cfg
+        return dataclasses.replace(snap.cfg, min_profit=self.cfg.min_profit)
+
     def remember_deal(self, d, cfg=None, snap=None):
         """Запомнить связку под кнопками «✅ Сделал»/«📝 Инструкция»; хранится ограниченное число последних."""
-        cfg = copy.deepcopy(cfg or self.cfg)   # снимок настроек (и списков): старая карточка не увидит новые сумму/порог
         snap = snap if snap is not None else self.last
+        cfg = copy.deepcopy(cfg or self.snap_cfg(snap))   # копия и списков: старая карточка не увидит новые сумму/порог
         snap = _lean(snap)
         deal_id, self.next_deal_id = self.next_deal_id, self.next_deal_id + 1
         self.deals_by_id[deal_id] = (d, cfg, snap)
@@ -1416,8 +1424,8 @@ class Bot:
 
     async def send_deal(self, d, prefix="", cfg=None, snap=None, topic=None, chat_id=None, nav=True):
         """Карточка связки (картинка или текст); возвращает ответ Telegram — ok ли доставка."""
-        cfg = cfg or self.cfg
         snap = snap if snap is not None else self.last
+        cfg = cfg or self.snap_cfg(snap)
         guest = self.is_guest(self.chat_for(chat_id))
         deal_id = None if guest else self.remember_deal(d, cfg, snap)   # у гостя нет «✅ Сделал»/«📝 Инструкция»/«🚫»
         # фишки сумм — по стакану скана: карточка уходит сразу, уточнение под каждую сумму (chip_refresh) — потом, фоном
@@ -1906,7 +1914,7 @@ class Bot:
 
     async def show_best(self, snap=None, cfg=None):
         snap = self.last if snap is None else snap
-        cfg = cfg or self.cfg
+        cfg = cfg or self.snap_cfg(snap)
         if not snap:
             await self.send(WAIT)
         elif not snap.deals:
@@ -1916,7 +1924,7 @@ class Bot:
 
     async def show_top(self, snap=None, cfg=None):
         snap = self.last if snap is None else snap
-        cfg = cfg or self.cfg
+        cfg = cfg or self.snap_cfg(snap)
         if not snap:
             await self.send(WAIT)
             return
@@ -2187,9 +2195,12 @@ class Bot:
         return snap
 
     async def fresh_scan(self, cfg=None, force_alt=False):
-        """Скан (p2p.scan) и, при EV_RANK=1, порядок по EV (ev_rank) — до того, как снимок увидят команды и сигналы."""
-        cfg = cfg or self.cfg
+        """Скан (p2p.scan) и, при EV_RANK=1, порядок по EV (ev_rank) — до того, как снимок увидят команды и сигналы.
+        Скан идёт по копии настроек, она же остаётся в snap.cfg: сумма, сменённая во время скана или после него, не
+        смешается с % этого снимка (snap_cfg)."""
+        cfg = copy.deepcopy(cfg or self.cfg)
         snap = await (scan(self.s, cfg, force_alt=True) if force_alt else scan(self.s, cfg))
+        snap.cfg = cfg
         return await self.ev_rank(snap, cfg)
 
     async def scan_loop(self):
@@ -2200,7 +2211,7 @@ class Bot:
                 snap = self.last = await self.fresh_scan()
                 self.last_scan_ts, self.last_scan_duration = time.time(), time.time() - t0
                 self.track_liveness(self.last)
-                if history.record(self.last, self.cfg.amount):   # не чаще раза в 5 минут, независимо от чата
+                if history.record(snap, self.snap_cfg(snap).amount):   # не чаще раза в 5 минут, независимо от чата
                     history.cleanup()
 
                 if simmaker.enabled():   # бумажный мейкер (SIM_MAKER=1): только расчёт по снимку, объявлений нет
@@ -2236,7 +2247,7 @@ class Bot:
         if not (due or keep):
             return None
         try:
-            data = snapshots.collect(snap, self.cfg, self.live)
+            data = snapshots.collect(snap, self.snap_cfg(snap), self.live)
             return await asyncio.to_thread(snapshots.write, data)
         except Exception as e:
             logger.warning("snapshot: %s", e)
@@ -2422,7 +2433,7 @@ class Bot:
             rows = [(key, d[0], reason is None, reason)
                     for key, d, reason in self.signal_reasons(snap, since, quiet, paused)]
             self.signal_rows = await asyncio.to_thread(history.track_signals, rows, snap.ts or since, self.signal_rows,
-                                                       self.cfg.amount, self.cfg.min_profit)
+                                                       self.snap_cfg(snap).amount, self.cfg.min_profit)
         except Exception as e:
             logger.warning("signals: %s", e)
 
@@ -2785,7 +2796,8 @@ class Bot:
         live = self.live_msg.get(key)
         if not live or live["stale"] or now - live["last_edit"] < LIVE_EDIT_INTERVAL:
             return
-        caption = "🔔 " + self.held_label(d, now) + fmt_signal(d, self.cfg, snap)
+        cfg = self.snap_cfg(snap)
+        caption = "🔔 " + self.held_label(d, now) + fmt_signal(d, cfg, snap)
         chips = live.get("chips")   # строка уточнённых фишек сумм (chip_refresh) при живых правках остаётся
         if chips and len(caption) + len(chips) + 1 <= (1024 if live["photo"] else 4096):
             caption += "\n" + chips
@@ -2800,10 +2812,10 @@ class Bot:
         except Exception as e:
             logger.warning("live card edit error: %s", e)
             return
-        # подпись теперь по новой связке и текущим настройкам — кнопки «✅ Сделал»/«📝 Инструкция»/«🚫» этого
+        # подпись теперь по новой связке и настройкам её снимка — кнопки «✅ Сделал»/«📝 Инструкция»/«🚫» этого
         # сообщения тоже, иначе в журнал уйдёт сумма, которой на карточке уже нет
         if r.get("ok") and live.get("deal_id") in self.deals_by_id:
-            self.deals_by_id[live["deal_id"]] = (d, copy.deepcopy(self.cfg), _lean(snap))
+            self.deals_by_id[live["deal_id"]] = (d, copy.deepcopy(cfg), _lean(snap))
 
     async def mark_stale_deals(self, active):
         """Связка пропала из топа — один раз пометить последний сигнал по ней «⌛ устарел»."""
@@ -3166,7 +3178,7 @@ class Bot:
         elif data == "backtest":
             await self.send(backtest_view(self.cfg))
         elif data == "detail":
-            await self.send(fmt_top(self.last, self.cfg) if self.last else WAIT)
+            await self.send(fmt_top(self.last, self.snap_cfg(self.last)) if self.last else WAIT)
         elif data == "settings":
             text, kb = self.settings_view()
             await self.send(text, markup=kb)

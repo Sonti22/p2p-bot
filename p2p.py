@@ -1496,6 +1496,9 @@ class Snapshot:
     ev: dict = field(default_factory=dict)
     # доп. запросы глубины этого скана: {"page2": вторые страницы (collect), "amounts": под фишки сумм (depth_for_deal)}
     extra: dict = field(default_factory=dict)
+    # копия Config, по которой собран снимок (bot.fresh_scan): % связок, сумма круга на карточке и в журнале — из неё;
+    # None — снимок собран не ботом (replay, тесты)
+    cfg: Config = None
 
 
 # key — (монеты, площадки, сумма круга), под которые собран кэш; jobs — замеры запросов, которыми он собран
