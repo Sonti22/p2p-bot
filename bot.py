@@ -25,6 +25,7 @@ import jsonstore
 import netstatus
 import paper
 import payouts
+import perp
 import presets
 import simmaker
 import snapshots
@@ -112,6 +113,7 @@ COMMANDS = [{"command": "best", "description": "Лучшая связка сей
             {"command": "help", "description": "Как работать с сигналами"}]
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEV_STATUS = os.path.join(HERE, ".dev_status.json")   # пишет launcher.py при каждом запуске
+PERP_LOOP_TICK = 5   # сек: как часто perp_loop проверяет, пора ли опросить перпы (сам интервал — PERP_INTERVAL)
 DESCRIPTION = ("Сканирую P2P Bybit, MEXC, HTX, KuCoin, BitPapa, LBank и обменники BestChange. "
                "Присылаю связки USDT, USDC, BTC, ETH, TON за рубли: чистая прибыль, карточка, ссылки на площадки.")
 SHORT_DESCRIPTION = "Сигналы P2P-связок за рубли"
@@ -2106,6 +2108,16 @@ class Bot:
             logger.warning("snapshot: %s", e)
             return None
 
+    async def perp_loop(self):
+        """Публичные данные перпов (perp.py) со своим интервалом PERP_INTERVAL — отдельно от скана P2P, чтобы
+        медленная площадка фьючерсов не задерживала сигналы. Только чтение, без ключей и ордеров."""
+        while True:
+            try:
+                await perp.refresh_if_due(self.s)
+            except Exception as e:
+                logger.error("perp_loop error: %s", e)
+            await asyncio.sleep(PERP_LOOP_TICK)
+
     def status_view(self, status_path=DEV_STATUS):
         """Текст «/status»: версия, аптайм, время/длительность последнего скана, ошибки площадок,
         сколько связок сейчас выше порога сигнала."""
@@ -3408,6 +3420,7 @@ async def main():
         if bot.chat_id:
             await bot.setup_topics()
             await bot.check_key_safety()
+        bot.perp_task = asyncio.ensure_future(bot.perp_loop())   # публичные данные перпов — своим циклом (perp.py)
         logger.info("Бот запущен: каждые %ss, порог %g%%, биржи %s", cfg.interval, cfg.min_profit,
                     ', '.join(cfg.exchanges))
         await asyncio.gather(bot.scan_loop(), bot.command_loop(), bot.accounts_loop(), bot.payouts_loop())

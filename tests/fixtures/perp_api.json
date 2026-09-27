@@ -1,0 +1,645 @@
+{
+ "bybit_time": {
+  "retCode": 0,
+  "retMsg": "OK",
+  "result": {
+   "timeSecond": "1790494000",
+   "timeNano": "1790494000000000000"
+  },
+  "retExtInfo": {},
+  "time": 1790494000000
+ },
+ "bybit_instr_BTCUSDT": {
+  "retCode": 0,
+  "retMsg": "OK",
+  "result": {
+   "category": "linear",
+   "list": [
+    {
+     "symbol": "BTCUSDT",
+     "contractType": "LinearPerpetual",
+     "status": "Trading",
+     "baseCoin": "BTC",
+     "quoteCoin": "USDT",
+     "priceScale": "2",
+     "priceFilter": {
+      "minPrice": "0.10",
+      "maxPrice": "1999999.80",
+      "tickSize": "0.10"
+     },
+     "lotSizeFilter": {
+      "maxOrderQty": "1500.000",
+      "minOrderQty": "0.001",
+      "qtyStep": "0.001",
+      "postOnlyMaxOrderQty": "1500.000",
+      "maxMktOrderQty": "150.000",
+      "minNotionalValue": "5"
+     },
+     "unifiedMarginTrade": true,
+     "fundingInterval": 480,
+     "settleCoin": "USDT"
+    }
+   ],
+   "nextPageCursor": ""
+  },
+  "retExtInfo": {},
+  "time": 1790494000000
+ },
+ "bybit_instr_ETHUSDT": {
+  "retCode": 0,
+  "retMsg": "OK",
+  "result": {
+   "category": "linear",
+   "list": [
+    {
+     "symbol": "ETHUSDT",
+     "contractType": "LinearPerpetual",
+     "status": "Trading",
+     "baseCoin": "ETH",
+     "quoteCoin": "USDT",
+     "priceScale": "2",
+     "priceFilter": {
+      "minPrice": "0.10",
+      "maxPrice": "1999999.80",
+      "tickSize": "0.10"
+     },
+     "lotSizeFilter": {
+      "maxOrderQty": "1500.000",
+      "minOrderQty": "0.01",
+      "qtyStep": "0.01",
+      "postOnlyMaxOrderQty": "1500.000",
+      "maxMktOrderQty": "150.000",
+      "minNotionalValue": "5"
+     },
+     "unifiedMarginTrade": true,
+     "fundingInterval": 480,
+     "settleCoin": "USDT"
+    }
+   ],
+   "nextPageCursor": ""
+  },
+  "retExtInfo": {},
+  "time": 1790494000000
+ },
+ "bybit_instr_TONUSDT": {
+  "retCode": 0,
+  "retMsg": "OK",
+  "result": {
+   "category": "linear",
+   "list": [
+    {
+     "symbol": "TONUSDT",
+     "contractType": "LinearPerpetual",
+     "status": "Closed",
+     "baseCoin": "TON",
+     "quoteCoin": "USDT",
+     "priceScale": "2",
+     "priceFilter": {
+      "minPrice": "0.10",
+      "maxPrice": "1999999.80",
+      "tickSize": "0.10"
+     },
+     "lotSizeFilter": {
+      "maxOrderQty": "1500.000",
+      "minOrderQty": "0.1",
+      "qtyStep": "0.1",
+      "postOnlyMaxOrderQty": "1500.000",
+      "maxMktOrderQty": "150.000",
+      "minNotionalValue": "5"
+     },
+     "unifiedMarginTrade": true,
+     "fundingInterval": 240,
+     "settleCoin": "USDT"
+    }
+   ],
+   "nextPageCursor": ""
+  },
+  "retExtInfo": {},
+  "time": 1790494000000
+ },
+ "bybit_ticker_BTCUSDT": {
+  "retCode": 0,
+  "retMsg": "OK",
+  "result": {
+   "category": "linear",
+   "list": [
+    {
+     "symbol": "BTCUSDT",
+     "lastPrice": "84477.20",
+     "indexPrice": "84515.90",
+     "markPrice": "84477.45",
+     "prevPrice24h": "84477.20",
+     "price24hPcnt": "0.006",
+     "fundingRate": "0.00002264",
+     "nextFundingTime": "1790496000000",
+     "bid1Price": "84477.10",
+     "bid1Size": "1.615",
+     "ask1Price": "84477.20",
+     "ask1Size": "4.056",
+     "fundingIntervalHour": "8",
+     "fundingCap": "0.00333",
+     "basis": "",
+     "deliveryTime": "0"
+    }
+   ]
+  },
+  "retExtInfo": {},
+  "time": 1790494000000
+ },
+ "bybit_ticker_ETHUSDT": {
+  "retCode": 0,
+  "retMsg": "OK",
+  "result": {
+   "category": "linear",
+   "list": [
+    {
+     "symbol": "ETHUSDT",
+     "lastPrice": "2709.55",
+     "indexPrice": "2710.45",
+     "markPrice": "2709.54",
+     "prevPrice24h": "2709.55",
+     "price24hPcnt": "0.006",
+     "fundingRate": "0.00009888",
+     "nextFundingTime": "1790496000000",
+     "bid1Price": "2709.55",
+     "bid1Size": "1.615",
+     "ask1Price": "2709.56",
+     "ask1Size": "4.056",
+     "fundingIntervalHour": "8",
+     "fundingCap": "0.00333",
+     "basis": "",
+     "deliveryTime": "0"
+    }
+   ]
+  },
+  "retExtInfo": {},
+  "time": 1790494000000
+ },
+ "bybit_book_BTCUSDT": {
+  "retCode": 0,
+  "retMsg": "OK",
+  "result": {
+   "s": "BTCUSDT",
+   "b": [
+    [
+     "84477.10",
+     "0.001"
+    ],
+    [
+     "84477.00",
+     "0.002"
+    ],
+    [
+     "84476.50",
+     "1.5"
+    ]
+   ],
+   "a": [
+    [
+     "84477.20",
+     "0.001"
+    ],
+    [
+     "84477.40",
+     "0.002"
+    ],
+    [
+     "84478.00",
+     "2.0"
+    ]
+   ],
+   "ts": 1790494000000,
+   "u": 1,
+   "seq": 1,
+   "cts": 1790494000000
+  },
+  "retExtInfo": {},
+  "time": 1790494000000
+ },
+ "bybit_book_ETHUSDT": {
+  "retCode": 0,
+  "retMsg": "OK",
+  "result": {
+   "s": "ETHUSDT",
+   "b": [
+    [
+     "2709.55",
+     "140.67"
+    ],
+    [
+     "2709.50",
+     "3.2"
+    ],
+    [
+     "2709.40",
+     "20"
+    ]
+   ],
+   "a": [
+    [
+     "2709.56",
+     "13.10"
+    ],
+    [
+     "2709.60",
+     "9.02"
+    ],
+    [
+     "2709.70",
+     "9.04"
+    ]
+   ],
+   "ts": 1790494000000,
+   "u": 1,
+   "seq": 1,
+   "cts": 1790494000000
+  },
+  "retExtInfo": {},
+  "time": 1790494000000
+ },
+ "bybit_spot_BTCUSDT": {
+  "retCode": 0,
+  "retMsg": "OK",
+  "result": {
+   "s": "BTCUSDT",
+   "b": [
+    [
+     "84514.3",
+     "0.237371"
+    ],
+    [
+     "84514.2",
+     "0.003"
+    ],
+    [
+     "84512.8",
+     "0.5"
+    ]
+   ],
+   "a": [
+    [
+     "84514.4",
+     "0.623397"
+    ],
+    [
+     "84514.5",
+     "0.017073"
+    ],
+    [
+     "84516.2",
+     "0.5"
+    ]
+   ],
+   "ts": 1790494000000,
+   "u": 1,
+   "seq": 1,
+   "cts": 1790494000000
+  },
+  "retExtInfo": {},
+  "time": 1790494000000
+ },
+ "bybit_spot_ETHUSDT": {
+  "retCode": 0,
+  "retMsg": "OK",
+  "result": {
+   "s": "ETHUSDT",
+   "b": [
+    [
+     "2710.10",
+     "12.5"
+    ],
+    [
+     "2710.00",
+     "30"
+    ]
+   ],
+   "a": [
+    [
+     "2710.11",
+     "8.4"
+    ],
+    [
+     "2710.20",
+     "25"
+    ]
+   ],
+   "ts": 1790494000000,
+   "u": 1,
+   "seq": 1,
+   "cts": 1790494000000
+  },
+  "retExtInfo": {},
+  "time": 1790494000000
+ },
+ "bybit_spot_TONUSDT": {
+  "retCode": 0,
+  "retMsg": "OK",
+  "result": {
+   "s": "TONUSDT",
+   "b": [
+    [
+     "1.2345",
+     "5000"
+    ],
+    [
+     "1.2340",
+     "9000"
+    ]
+   ],
+   "a": [
+    [
+     "1.2350",
+     "4000"
+    ],
+    [
+     "1.2360",
+     "8000"
+    ]
+   ],
+   "ts": 1790494000000,
+   "u": 1,
+   "seq": 1,
+   "cts": 1790494000000
+  },
+  "retExtInfo": {},
+  "time": 1790494000000
+ },
+ "bybit_kline_BTCUSDT": {
+  "retCode": 0,
+  "retMsg": "OK",
+  "result": {
+   "symbol": "BTCUSDT",
+   "category": "linear",
+   "list": [
+    [
+     "1790492400000",
+     "84480.1",
+     "84521.9",
+     "84448.3",
+     "84477.1",
+     "165.171",
+     "13954623.9907"
+    ],
+    [
+     "1790488800000",
+     "84431.4",
+     "84598.6",
+     "84431.4",
+     "84480.1",
+     "497.234",
+     "42026558.8339"
+    ],
+    [
+     "1790485200000",
+     "84304.4",
+     "84624",
+     "84284",
+     "84431.4",
+     "864.463",
+     "73041352.618"
+    ]
+   ]
+  },
+  "retExtInfo": {},
+  "time": 1790494000000
+ },
+ "bybit_kline_ETHUSDT": {
+  "retCode": 0,
+  "retMsg": "OK",
+  "result": {
+   "symbol": "ETHUSDT",
+   "category": "linear",
+   "list": [
+    [
+     "1790492400000",
+     "2706.1",
+     "2712.3",
+     "2705.0",
+     "2709.5",
+     "9165.1",
+     "24830000.1"
+    ],
+    [
+     "1790488800000",
+     "2701.4",
+     "2708.6",
+     "2699.4",
+     "2706.1",
+     "12497.2",
+     "33800000.2"
+    ]
+   ]
+  },
+  "retExtInfo": {},
+  "time": 1790494000000
+ },
+ "bingx_time": {
+  "code": 0,
+  "msg": "",
+  "data": {
+   "serverTime": 1790494000500
+  }
+ },
+ "bingx_contracts": {
+  "code": 0,
+  "msg": "",
+  "data": [
+   {
+    "contractId": "100",
+    "symbol": "BTC-USDT",
+    "size": "0.0001",
+    "quantityPrecision": 4,
+    "pricePrecision": 1,
+    "feeRate": 0.0005,
+    "makerFeeRate": 0.0002,
+    "takerFeeRate": 0.0005,
+    "tradeMinLimit": 0,
+    "tradeMinQuantity": 0.0001,
+    "tradeMinUSDT": 2,
+    "currency": "USDT",
+    "asset": "BTC",
+    "status": 1,
+    "apiStateOpen": "true",
+    "apiStateClose": "true",
+    "displayName": "BTC-USDT"
+   },
+   {
+    "contractId": "101",
+    "symbol": "ETH-USDT",
+    "size": "0.01",
+    "quantityPrecision": 2,
+    "pricePrecision": 2,
+    "feeRate": 0.0005,
+    "makerFeeRate": 0.0002,
+    "takerFeeRate": 0.0005,
+    "tradeMinLimit": 0,
+    "tradeMinQuantity": 0.01,
+    "tradeMinUSDT": 2,
+    "currency": "USDT",
+    "asset": "ETH",
+    "status": 1,
+    "apiStateOpen": "true",
+    "apiStateClose": "true",
+    "displayName": "ETH-USDT"
+   },
+   {
+    "contractId": "102",
+    "symbol": "SOL-USDT",
+    "size": "0.01",
+    "quantityPrecision": 2,
+    "pricePrecision": 3,
+    "feeRate": 0.0005,
+    "makerFeeRate": 0.0002,
+    "takerFeeRate": 0.0005,
+    "tradeMinQuantity": 0.01,
+    "tradeMinUSDT": 2,
+    "currency": "USDT",
+    "asset": "SOL",
+    "status": 1,
+    "apiStateOpen": "true"
+   }
+  ]
+ },
+ "bingx_premium_BTC-USDT": {
+  "code": 0,
+  "msg": "",
+  "data": {
+   "symbol": "BTC-USDT",
+   "markPrice": "84474.5",
+   "indexPrice": "84516.3",
+   "lastFundingRate": "0.00002400",
+   "nextFundingTime": 1790496000000,
+   "fundingIntervalHours": 8,
+   "minFundingRate": "-0.003000",
+   "maxFundingRate": "0.003000",
+   "updateTime": 1790467200000
+  }
+ },
+ "bingx_premium_ETH-USDT": {
+  "code": 0,
+  "msg": "",
+  "data": {
+   "symbol": "ETH-USDT",
+   "markPrice": "2709.31",
+   "indexPrice": "2710.40",
+   "lastFundingRate": "0.00010000",
+   "nextFundingTime": 1790496000000,
+   "fundingIntervalHours": 8
+  }
+ },
+ "bingx_depth_BTC-USDT": {
+  "code": 0,
+  "msg": "",
+  "data": {
+   "T": 1790493991870,
+   "bids": [
+    [
+     "84474.5",
+     "46.5591"
+    ],
+    [
+     "84474.4",
+     "1.9170"
+    ],
+    [
+     "84474.2",
+     "1.7322"
+    ]
+   ],
+   "asks": [
+    [
+     "84474.8",
+     "0.7683"
+    ],
+    [
+     "84475.0",
+     "0.1783"
+    ],
+    [
+     "84475.1",
+     "0.0206"
+    ]
+   ],
+   "bidsCoin": [
+    [
+     "84474.5",
+     "0.0010"
+    ],
+    [
+     "84474.4",
+     "0.0020"
+    ],
+    [
+     "84474.2",
+     "1.7322"
+    ]
+   ],
+   "asksCoin": [
+    [
+     "84475.1",
+     "0.0206"
+    ],
+    [
+     "84474.8",
+     "0.0010"
+    ],
+    [
+     "84475.0",
+     "0.0020"
+    ]
+   ]
+  }
+ },
+ "bingx_depth_ETH-USDT": {
+  "code": 0,
+  "msg": "",
+  "data": {
+   "T": 1790493991870,
+   "bids": [
+    [
+     "2709.30",
+     "50"
+    ],
+    [
+     "2709.20",
+     "40"
+    ]
+   ],
+   "asks": [
+    [
+     "2709.40",
+     "30"
+    ],
+    [
+     "2709.50",
+     "20"
+    ]
+   ],
+   "bidsCoin": [
+    [
+     "2709.30",
+     "50"
+    ],
+    [
+     "2709.20",
+     "40"
+    ]
+   ],
+   "asksCoin": [
+    [
+     "2709.40",
+     "30"
+    ],
+    [
+     "2709.50",
+     "20"
+    ]
+   ]
+  }
+ },
+ "bingx_premium_missing": {
+  "code": 109425,
+  "msg": "TON-USDT not exist, please verify it in api: /openApi/swap/v2/quote/contracts",
+  "data": {}
+ }
+}
