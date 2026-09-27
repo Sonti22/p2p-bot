@@ -393,7 +393,37 @@ def _example():
     return out
 
 
+def _bc_info_zip(exchangers=snapshots.TOP_N + 5):
+    """Выгрузка BestChange (info.zip) вместо сети: каждая монета/сеть BC_COINS × каждый банк BC_BANKS × `exchangers`
+    обменников в обе стороны — полные группы по TOP_N, как у популярных пар на живой выгрузке."""
+    import io
+    import zipfile
+    price = {"USDT": 90.0, "USDC": 90.0, "BTC": 7_000_000.0, "ETH": 300_000.0}
+    coins = {str(i): name for i, name in enumerate(p2p.BC_COINS, 1)}
+    banks = {str(100 + i): name for i, name in enumerate(p2p.BC_BANKS)}
+    cy = [f"{k};{k};{name};{name};840;0;x" for k, name in coins.items()]
+    cy += [f"{k};{k};{name};{name};643;3;x" for k, name in banks.items()]
+    exch = [f"{2000 + e};Exchanger{e};;0;1" for e in range(exchangers)]
+    rates = []
+    for c, name in coins.items():
+        p = price[p2p.BC_COINS[name][0]]
+        for b in banks:
+            for e in range(exchangers):
+                k = 1 + e / 1000
+                rates.append(f"{c};{b};{2000 + e};1;{p / k:.2f};10000000;0.{100 + e};1;0.001;1000;0")   # продать
+                rates.append(f"{b};{c};{2000 + e};{p * k:.2f};1;50;1.{200 + e};1;2000;3000000;0")         # купить
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        for name, lines in (("bm_cy.dat", cy), ("bm_exch.dat", exch), ("bm_rates.dat", rates)):
+            z.writestr(name, "\n".join(lines).encode("cp1251"))
+    return buf.getvalue()
+
+
 def test_default_cap_holds_14_days_at_default_interval(offline, monkeypatch):
+    async def bc_download(s, local=None):   # выгрузка BestChange из фикстуры — тесты в сеть не ходят
+        return _bc_info_zip()
+
+    monkeypatch.setattr(p2p, "_bc_download", bc_download)
     example = _example()
     assert int(example["SNAPSHOT_EVERY"]) == snapshots.DEFAULT_EVERY
     assert float(example["SNAPSHOT_MAX_MB"]) == snapshots.DEFAULT_MAX_MB
@@ -408,7 +438,7 @@ def test_default_cap_holds_14_days_at_default_interval(offline, monkeypatch):
     n = 12
     for d in _changed_series(data, n, 1_000_000.0, step):
         snapshots.write(d, now=d["ts"])
-    per_scan = snapshots.stats()["bytes"] / n                            # ~26 КБ на фикстуре
+    per_scan = snapshots.stats()["bytes"] / n                            # ~20 КБ на фикстуре
     days = snapshots.max_bytes() / (per_scan * 86400 / step)
     assert days >= 14, f"{per_scan:.0f} байт на снимок — {days:.1f} дней в лимите"
     assert snapshots.RETENTION == 14 * 86400

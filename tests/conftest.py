@@ -273,6 +273,8 @@ def offline(monkeypatch):
     # ходил на bestchange.ru с реального адреса ПК
     monkeypatch.setattr(p2p, "_bc_download", no_bestchange)
     monkeypatch.setattr(p2p, "_local_addrs", lambda: [])
+    # кэш выгрузки BestChange — свой на тест: иначе объявления, оставленные другим тестом, меняют результат скана
+    monkeypatch.setattr(p2p, "_bc", {"t": 0.0, "ads": [], "local": None})
     netstatus.reset()
     for cache in (p2p._bybit_pay, p2p._mexc_pay, p2p._mexc_coins):
         cache.clear()
