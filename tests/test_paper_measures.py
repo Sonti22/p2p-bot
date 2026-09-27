@@ -86,6 +86,36 @@ def test_cycles_read_by_column_name_not_position(tmp_path):
     assert o == c
 
 
+def test_cycles_read_by_name_after_migrations_in_other_order(tmp_path):
+    """Колонки прошлых миграций и этапа 1 добавлены в обратном порядке (как если бы их добавляла другая ветка) —
+    все чтения (get_cycle/open_cycles по именам из курсора, отчёты — по явному списку колонок) дают те же значения."""
+    db = str(tmp_path / "reversed.db")
+    con = sqlite3.connect(db)
+    con.execute("CREATE TABLE cycles (id INTEGER PRIMARY KEY AUTOINCREMENT, ts_start REAL, amount REAL, "
+                "buy_ex TEXT, buy_asset TEXT, buy_price REAL, buy_nick TEXT, sell_ex TEXT, sell_asset TEXT, "
+                "sell_price REAL, sell_nick TEXT, route TEXT, planned_pct REAL, stage TEXT, ts_stage REAL, "
+                "realized_pct REAL DEFAULT NULL, result TEXT DEFAULT NULL, note TEXT DEFAULT '')")
+    later = [c for c in paper._COLUMNS if c not in {r[1] for r in con.execute("PRAGMA table_info(cycles)")}]
+    ddl = dict(paper._MEASURE_DDL)
+    for col in reversed(later):
+        con.execute(f"ALTER TABLE cycles ADD COLUMN {col} {ddl.get(col, 'TEXT DEFAULT NULL')}")
+    con.commit()
+    con.close()
+    assert tuple(_cols(db))[:18] == paper._COLUMNS[:18] and tuple(_cols(db)) != paper._COLUMNS
+    buy, sell = _ads()
+    cid = paper.start_cycle(10000, buy, sell, "r", 2.0, path=db, ts=1000.0, label="✅", index=7, streak=4,
+                            depth=3.25, snapshot_id=1000123)
+    c = paper.get_cycle(cid, path=db)
+    assert (c["index_start"], c["streak_start"], c["depth_margin"], c["snapshot_id"]) == (7, 4, 3.25, 1000123)
+    assert (c["buy_orders"], c["sell_rate"], c["label"], c["stage"]) == (300, 97.0, "✅", "buy")
+    assert paper.open_cycles(path=db) == [c]
+    paper.set_stage(cid, "transfer", path=db, ts=1300.0)
+    paper.finish_cycle(cid, "done", 1.5, path=db, ts=1600.0)
+    (row,) = paper.report_rows(path=db)
+    assert row["avg_index_start"] == 7 and row["avg_depth_margin"] == 3.25 and row["avg_duration_min"] == 10.0
+    assert paper.get_cycle(cid, path=db)["ts_buy_done"] == 1300.0
+
+
 def test_start_cycle_stores_start_measures():
     buy, sell = _ads()
     cid = paper.start_cycle(10000, buy, sell, "r", 2.0, ts=1000.0, index=7, reasons=["мерчант у порога"],
