@@ -2571,7 +2571,7 @@ def test_quiet_hours_blocks_signal_and_stores_for_digest(monkeypatch):
     d = deal(5, "MEXC")
     asyncio.run(bot.quiet_and_pause_tick(snap([d])))
     assert not bot.out                              # сигнал не отправлен
-    assert list(bot.night_deals.values()) == [d]     # но накоплен для утреннего дайджеста
+    assert [dc[0] for dc in bot.night_deals.values()] == [d]   # но накоплен для утреннего дайджеста
 
 
 def test_night_digest_collects_after_low_deal(monkeypatch):
@@ -2581,7 +2581,7 @@ def test_night_digest_collects_after_low_deal(monkeypatch):
     bot.quiet_on = True
     asyncio.run(bot.quiet_and_pause_tick(snap([deal(1.5, "MEXC"), deal(3, "KuCoin")])))
     assert not bot.out
-    assert [d[0] for d in bot.night_deals.values()] == [3]
+    assert [dc[0][0] for dc in bot.night_deals.values()] == [3]
 
 
 def test_quiet_hours_off_sends_signal_as_usual(monkeypatch):

@@ -14,7 +14,8 @@ import p2p
 import trades
 from helpers import make_ad
 from test_accounts import MEXC_EMPTY, _UrlJsonSession
-from test_bot import Stub, _callbacks, photos, texts
+from test_bot import Stub, _callbacks, deal, msk_ts, photos, texts
+from test_bot import snap as bot_snap
 
 
 # --- №3: % связки, сумма на карточке и запись «✅ Сделал» — из одного расчёта ---------------------------------------
@@ -227,3 +228,181 @@ def test_favdel_button_fits_telegram_callback_limit():
     favorites.toggle(("BestChange", "USDT", "BitPapa", "USDT"))
     _, kb = bot.favorites_view()
     assert all(len(b["callback_data"].encode()) <= 64 for row in kb["inline_keyboard"] for b in row)
+
+
+# --- ревью ветки: №8 и на HTX/KuCoin, депозиты MEXC — в ленту только успешные операции -----------------------------
+
+TS = 1_790_000_000_000
+
+
+def _htx(kind, state):
+    rec = [{"currency": "usdt", "amount": 30, "created-at": TS, "state": state}] if state else []
+    other = "withdraw" if kind == "deposit" else "deposit"
+    return {f"type={kind}": {"status": "ok", "data": rec}, f"type={other}": {"status": "ok", "data": []}}
+
+
+def _kucoin(kind, status):
+    empty = {"code": "200000", "data": {"items": []}}
+    rec = {"code": "200000", "data": {"items": [{"currency": "USDT", "amount": "30", "createdAt": TS,
+                                                  "status": status}]}} if status else empty
+    path = "api/v1/deposits" if kind == "deposit" else "api/v1/withdrawals"
+    return {"api/v1/deposits": empty, "api/v1/withdrawals": empty, "api/v1/fills": empty, path: rec}
+
+
+def _mexc(kind, status):
+    rec = [{"coin": "USDT", "amount": "30", "insertTime": TS, "applyTime": "2026-09-27 10:00:00",
+            "status": status}] if status else []
+    return dict(MEXC_EMPTY, **{"capital/deposit/hisrec" if kind == "deposit" else "capital/withdraw/history": rec})
+
+
+VENUES = {"htx": _htx, "kucoin": _kucoin, "mexc": _mexc}
+LABEL = {"deposit": "пришёл депозит", "withdraw": "исполнен вывод"}
+
+
+def _account_texts(tmp_path, monkeypatch, ex, kind, statuses):
+    """Один и тот же депозит/вывод площадки ex проходит статусы statuses (после базового пустого опроса): что ушло
+    в чат о депозите/выводе после каждого опроса — список на каждый статус."""
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    accounts.save_key(ex, "k", "s", passphrase="pp" if ex == "kucoin" else None)
+    bot = Stub(p2p.Config())
+    bot.s = _UrlJsonSession(VENUES[ex](kind, None))
+    asyncio.run(bot.check_accounts())                                   # первый опрос — база
+    steps = []
+    for status in statuses:
+        bot.s = _UrlJsonSession(VENUES[ex](kind, status))
+        before = len(bot.out)
+        asyncio.run(bot.check_accounts())
+        steps.append([p["text"] for m, p in bot.out[before:] if m == "sendMessage"
+                      and ("депозит" in p["text"] or "вывод" in p["text"])])
+    return steps
+
+
+NOT_DONE = [("htx", "withdraw", ["submitted", "canceled"]), ("htx", "withdraw", ["pre-transfer", "wallet-reject"]),
+            ("htx", "deposit", ["confirming", "orphan"]), ("kucoin", "withdraw", ["PROCESSING", "FAILURE"]),
+            ("kucoin", "withdraw", ["WALLET_PROCESSING"]), ("kucoin", "deposit", ["PROCESSING", "FAILURE"]),
+            ("mexc", "deposit", [4, 7]), ("mexc", "deposit", [6, 8])]
+DONE = [("htx", "withdraw", ["submitted", "pass", "confirmed", "confirmed"], 2),       # (…, первый успешный статус)
+        ("htx", "deposit", ["confirming", "confirmed", "safe"], 1),
+        ("kucoin", "withdraw", ["PROCESSING", "WALLET_PROCESSING", "SUCCESS", "SUCCESS"], 2),
+        ("kucoin", "deposit", ["PROCESSING", "SUCCESS"], 1), ("mexc", "deposit", [4, 5, 12], 1)]
+
+
+@pytest.mark.parametrize("ex,kind,statuses", NOT_DONE)
+def test_unfinished_or_failed_operation_is_not_announced(tmp_path, monkeypatch, ex, kind, statuses):
+    """В обработке → не прошла/отменена: «исполнен вывод»/«пришёл депозит» в чат не уходит."""
+    assert _account_texts(tmp_path, monkeypatch, ex, kind, statuses) == [[] for _ in statuses]
+
+
+@pytest.mark.parametrize("ex,kind,statuses,done_at", DONE)
+def test_pending_then_success_is_announced_once(tmp_path, monkeypatch, ex, kind, statuses, done_at):
+    """В обработке → исполнена: ровно одно уведомление — на опросе, где операция впервые успешна."""
+    steps = _account_texts(tmp_path, monkeypatch, ex, kind, statuses)
+    assert [len(s) for s in steps] == [int(i == done_at) for i in range(len(statuses))]
+    assert LABEL[kind] in steps[done_at][0] and "30 " in steps[done_at][0]
+
+
+# --- ревью ветки: №3 и в утреннем дайджесте — % и сумма круга из одного снимка -------------------------------------
+
+def test_night_digest_signs_deal_with_its_snapshot_amount(monkeypatch):
+    """Ночью связку посчитали на 50 000 ₽ (+1.14%), до конца тихих часов сумму сменили на 1 000 ₽: в дайджесте
+    «+1.14% на 50 000», а не «+1.14% на 1 000» (на 1 000 ₽ маршрут даёт −0.54%)."""
+    bot = _scan_bot(monkeypatch)
+    bot.quiet_on = True
+    monkeypatch.setattr(B.time, "time", lambda: msk_ts(2, 0))
+    snap = asyncio.run(bot.fresh_scan())
+    asyncio.run(bot.quiet_and_pause_tick(snap))
+    bot.apply("amt:1000")
+    monkeypatch.setattr(B.time, "time", lambda: msk_ts(9, 0))
+    asyncio.run(bot.quiet_and_pause_tick(p2p.Snapshot(88.0, "test", {}, {}, [], {}, {}, {})))
+    digest = [t for t in texts(bot) if "Топ-3 связки за ночь" in t]
+    assert len(digest) == 1
+    assert f"+1.14%</b> на {p2p._money(50000)} RUB" in digest[0] and f"на {p2p._money(1000)} RUB" not in digest[0]
+
+
+# --- ревью ветки: живая правка и «⌛ устарела» не снимают кнопки с сигнальной карточки ------------------------------
+
+def _live_bot(monkeypatch):
+    monkeypatch.setattr(B, "deal_card", lambda d, c, a=None, r=None, breakdown=None: b"png")
+    bot = Stub(p2p.Config(min_profit=2.0))
+    bot.live_scans = 1
+
+    async def fake_send_photo(png, caption, markup=None):
+        bot.out.append(("sendPhoto", {"caption": caption, "markup": markup}))
+        return {"ok": True, "result": {"message_id": 555}}
+    bot.send_photo = fake_send_photo
+    return bot
+
+
+def _caption_edits(bot):
+    return [p for m, p in bot.out if m == "editMessageCaption"]
+
+
+def test_live_edit_and_stale_mark_keep_card_buttons(monkeypatch):
+    """Без reply_markup Telegram снимает с сообщения все кнопки: и живая правка, и «⌛ устарела» передают их."""
+    bot = _live_bot(monkeypatch)
+    asyncio.run(bot.notify(bot_snap([deal(5)])))
+    bot.live_msg[next(iter(bot.live_msg))]["last_edit"] -= B.LIVE_EDIT_INTERVAL + 1
+    asyncio.run(bot.notify(bot_snap([deal(5.1)])))
+    live_edit = _caption_edits(bot)[-1]
+    assert "did" in _callbacks(live_edit.get("reply_markup") or {"inline_keyboard": []})
+    asyncio.run(bot.notify(bot_snap([])))                           # связка ушла из топа
+    stale = _caption_edits(bot)[-1]
+    assert "устарел" in stale["caption"]
+    buttons = _callbacks(stale.get("reply_markup") or {"inline_keyboard": []})
+    assert {"steps", "did", "fav", "bl"} <= set(buttons)
+    asyncio.run(bot.on_callback({"id": "1", "data": buttons["did"], "message": {"message_id": 555}}))
+    assert trades.stats()["day"]["count"] == 1 and trades.stats()["day"]["avg_profit"] == pytest.approx(5.1)
+
+
+def test_stale_mark_after_done_keeps_buttons_without_journal(monkeypatch):
+    """«✅ Сделал» уже нажали — «⌛ устарела» не возвращает журнальные кнопки, но и купить/продать не снимает."""
+    bot = _live_bot(monkeypatch)
+    asyncio.run(bot.notify(bot_snap([deal(5)])))
+    did = _callbacks(photos(bot)[-1][1]["markup"])["did"]
+    asyncio.run(bot.on_callback({"id": "1", "data": did, "message": {"message_id": 555}}))
+    asyncio.run(bot.notify(bot_snap([])))
+    stale = _caption_edits(bot)[-1]
+    kb = (stale.get("reply_markup") or {"inline_keyboard": []})["inline_keyboard"]
+    assert kb and not _callbacks({"inline_keyboard": kb})
+    assert any("url" in b for row in kb for b in row)
+
+
+def test_stale_mark_429_with_colored_buttons_waits_and_keeps_colors(monkeypatch):
+    """429 на правке с цветными кнопками — не «цвета не поддерживаются»: без мгновенного повтора, цвета остаются,
+    повтор — после retry_after, и уже с кнопками."""
+    bot = _live_bot(monkeypatch)
+    bot.fancy = True
+    asyncio.run(bot.notify(bot_snap([deal(5)])))
+    answers = [{"ok": False, "error_code": 429, "parameters": {"retry_after": 5}}, {"ok": True}]
+
+    async def call(method, **p):
+        bot.out.append((method, p))
+        return answers.pop(0) if method == "editMessageCaption" else {"ok": True}
+    bot.call = call
+    now = [1_790_000_000.0]
+    monkeypatch.setattr(B.time, "time", lambda: now[0])
+    asyncio.run(bot.mark_stale_deals(set()))
+    assert len(_caption_edits(bot)) == 1 and bot.fancy
+    now[0] += 6
+    asyncio.run(bot.mark_stale_deals(set()))
+    edits = _caption_edits(bot)
+    assert len(edits) == 2 and B.is_fancy(edits[-1]["reply_markup"]) and "did" in _callbacks(edits[-1]["reply_markup"])
+    assert bot.live_msg[next(iter(bot.live_msg))]["stale"]
+
+
+def test_live_edit_falls_back_to_plain_buttons(monkeypatch):
+    """Цветные кнопки сервер не принял (400) — та же правка повторяется с обычными, кнопки на карточке остаются."""
+    bot = _live_bot(monkeypatch)
+    bot.fancy = True
+    asyncio.run(bot.notify(bot_snap([deal(5)])))
+
+    async def call(method, **p):
+        bot.out.append((method, p))
+        if B.is_fancy(p.get("reply_markup")):
+            return {"ok": False, "error_code": 400, "description": "Bad Request: can't parse reply keyboard markup"}
+        return {"ok": True}
+    bot.call = call
+    asyncio.run(bot.mark_stale_deals(set()))
+    edits = _caption_edits(bot)
+    assert len(edits) == 2 and not B.is_fancy(edits[-1]["reply_markup"]) and not bot.fancy
+    assert "did" in _callbacks(edits[-1]["reply_markup"]) and bot.live_msg[next(iter(bot.live_msg))]["stale"]
