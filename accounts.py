@@ -889,14 +889,26 @@ def _merge_hist(*sources, limit=20):
     return items[:limit]
 
 
-MEXC_WITHDRAW_SUCCESS = "7"   # статус вывода MEXC: 7 — исполнен; 4 — в обработке, 8 — не прошёл, 9 — отменён
+# Статусы исполненных депозитов/выводов (бот пишет «пришёл депозит»/«исполнен вывод» — операция в пути, отклонённая
+# или отменённая в ленту не попадает). Запись истории — без статуса, а ключ отсева повторов (bot.hist_key) — состав и
+# время создания: при переходе «в пути» → «исполнена» запись впервые появится в ленте — ровно одно уведомление.
+# MEXC v3: депозит 5 SUCCESS, 12 COMPLETED (4 PENDING, 6 AUDITING, 7 REJECTED, 8 REFUND, 9 PRE_SUCCESS, 10 INVALID…);
+# вывод 7 SUCCESS (1–6 и 10 — в пути/ручная проверка, 8 FAILED, 9 CANCEL).
+MEXC_DONE = {"deposit": ("5", "12"), "withdraw": ("7",)}
+# HTX /v1/query/deposit-withdraw, поле state: депозит confirmed/safe (confirming — в пути, orphan/unknown — не зачтён);
+# вывод confirmed (submitted, reexamine, pass, pre-transfer, wallet-transfer — в пути; canceled, reject, wallet-reject,
+# confirm-error, repealed — не прошёл).
+HTX_DONE = {"deposit": ("confirmed", "safe"), "withdraw": ("confirmed",)}
+# KuCoin /api/v1/deposits и /api/v1/withdrawals, поле status: SUCCESS (PROCESSING, WALLET_PROCESSING, REVIEW — в пути;
+# FAILURE — не прошёл).
+KUCOIN_DONE = "SUCCESS"
 
 
 async def mexc_history(s, api_key, api_secret, limit=20):
     """История MEXC для автожурнала (нет отдельного P2P API, как у Bybit): депозиты и выводы
     объединяются в одну ленту по времени, а не берётся первый непустой источник — иначе старый
-    депозит скрывает более свежий вывод. Вывод — только исполненный (MEXC_WITHDRAW_SUCCESS), как у BingX: запись
-    «в обработке» не выдаём за исполненную, а при переходе 4 → 7 она впервые появится в ленте — одно уведомление."""
+    депозит скрывает более свежий вывод. Только исполненные (MEXC_DONE), как у BingX: запись «в обработке» не выдаём
+    за исполненную, а при переходе 4 → 7 она впервые появится в ленте — одно уведомление."""
     sources = []
     for kind, path, ts_field in (("deposit", "/api/v3/capital/deposit/hisrec", "insertTime"),
                                   ("withdraw", "/api/v3/capital/withdraw/history", "applyTime")):
@@ -907,16 +919,15 @@ async def mexc_history(s, api_key, api_secret, limit=20):
         if not isinstance(j, list):
             sources.append(None)   # не ответил — пустоту истории им не подтвердить
             continue
-        if kind == "withdraw":
-            j = [it for it in j if str(it.get("status")) == MEXC_WITHDRAW_SUCCESS]
         sources.append([it for it in (_hist_item(kind, it.get("coin"), it.get("amount"), it.get(ts_field))
-                                       for it in j) if it])
+                                       for it in j if isinstance(it, dict)
+                                       and str(it.get("status")) in MEXC_DONE[kind]) if it])
     return _merge_hist(*sources, limit=limit)
 
 
 async def htx_history(s, api_key, api_secret, limit=20):
     """История HTX: депозиты и выводы (единый эндпоинт, два запроса по `type`) объединяются в одну
-    ленту по времени."""
+    ленту по времени. Только исполненные (HTX_DONE)."""
     sources = []
     for kind in ("deposit", "withdraw"):
         try:
@@ -927,12 +938,13 @@ async def htx_history(s, api_key, api_secret, limit=20):
             sources.append(None)
             continue
         sources.append([it for it in (_hist_item(kind, it.get("currency"), it.get("amount"), it.get("created-at"))
-                                       for it in j.get("data") or []) if it])
+                                       for it in j.get("data") or [] if isinstance(it, dict)
+                                       and str(it.get("state")).lower() in HTX_DONE[kind]) if it])
     return _merge_hist(*sources, limit=limit)
 
 
 async def kucoin_history(s, api_key, api_secret, passphrase_value, limit=20):
-    """История KuCoin: депозиты и выводы объединяются в одну ленту по времени."""
+    """История KuCoin: депозиты и выводы объединяются в одну ленту по времени. Только исполненные (KUCOIN_DONE)."""
     sources = []
     for kind, path in (("deposit", "/api/v1/deposits"), ("withdraw", "/api/v1/withdrawals")):
         try:
@@ -944,7 +956,8 @@ async def kucoin_history(s, api_key, api_secret, passphrase_value, limit=20):
             continue
         items = (j.get("data") or {}).get("items") or []
         sources.append([it for it in (_hist_item(kind, it.get("currency"), it.get("amount"), it.get("createdAt"))
-                                       for it in items) if it])
+                                       for it in items if isinstance(it, dict)
+                                       and str(it.get("status")).upper() == KUCOIN_DONE) if it])
     return _merge_hist(*sources, limit=limit)
 
 
