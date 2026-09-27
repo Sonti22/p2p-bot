@@ -24,6 +24,7 @@ import jsonstore
 import netstatus
 import paper
 import presets
+import simmaker
 import trades
 from cards import deal_card, history_card, history_compare_card, portfolio_card, top_chart
 from p2p import ALL_EXCHANGES, AMOUNT_MAX, AMOUNT_MIN, DEFAULT_ASSETS, ENV_PATH, LOG_PATH, MIN_PROFIT_MAX, \
@@ -1682,6 +1683,14 @@ class Bot:
         if not asset:
             await self.send(MAKER_HELP)
             return
+
+        if asset == "PAPER":   # /maker paper — отчёт бумажного мейкера (simmaker), только владельцу
+            if REPLY_CHAT.get() is not None:
+                await self.send(GUEST_DENIED)
+                return
+            await self.send(simmaker.report_view(self.cfg))
+            return
+
         if asset not in self.cfg.assets:
             await self.send(f"Монета {asset} не отслеживается ботом ({', '.join(self.cfg.assets)}).")
             return
@@ -1882,6 +1891,13 @@ class Bot:
                 self.track_liveness(self.last)
                 if history.record(self.last, self.cfg.amount):   # не чаще раза в 5 минут, независимо от чата
                     history.cleanup()
+
+                if simmaker.enabled():   # бумажный мейкер (SIM_MAKER=1): только расчёт по снимку, объявлений нет
+                    try:
+                        simmaker.on_scan(self.last, self.cfg)
+                    except Exception as e:
+                        logger.error("simmaker: %s", e)
+
                 if self.chat_id:
                     await self.check_venues(self.last)
                     await self.check_alerts(self.last)
