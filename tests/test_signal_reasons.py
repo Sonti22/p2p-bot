@@ -1,7 +1,6 @@
 """Таблица signals (history.db): эпизоды связок выше порога, был ли сигнал и почему нет — первая преграда в порядке
 notify (quiet / paused / trap / max_signals / unconfirmed / cooldown / unsent). Пишет Bot.record_signals после
 отправки сигналов скана (quiet_and_pause_tick)."""
-import asyncio
 import logging
 import sqlite3
 import time
@@ -10,6 +9,7 @@ import favorites
 import history
 import p2p
 from test_signal_traps import _bot, ad, good_deal, trap_deal
+from helpers import arun
 
 KEY_GOOD = ("HTX", "USDT", "KuCoin", "USDT")
 KEY_TRAP = ("Bybit", "USDT", "MEXC", "USDT")
@@ -86,13 +86,13 @@ def test_tick_writes_episodes(monkeypatch):
     bot.live_scans = 2
     first = snap_of([trap_deal(), good_deal()], 1000.0)
     bot.track_liveness(first)
-    asyncio.run(bot.quiet_and_pause_tick(first))
+    arun(bot.quiet_and_pause_tick(first))
     got = rows()
     assert got[KEY_GOOD] == (1000.0, 1000.0, 1, 3.9, 0, None, "unconfirmed")
     assert got[KEY_TRAP] == (1000.0, 1000.0, 1, 8.0, 0, None, "trap")
     second = snap_of([good_deal()], 1020.0)                   # ловушка ушла под порог, чистая держится 2 скана
     bot.track_liveness(second)
-    asyncio.run(bot.quiet_and_pause_tick(second))
+    arun(bot.quiet_and_pause_tick(second))
     got = rows()
     assert got[KEY_GOOD] == (1000.0, 1020.0, 2, 3.9, 1, 1020.0, None)   # сигнал ушёл на втором скане
     assert got[KEY_TRAP][1] == 1000.0 and set(bot.signal_rows) == {KEY_GOOD}
@@ -105,14 +105,14 @@ def test_send_failure_is_unsent(monkeypatch):
     async def boom(*a, **k):
         raise OSError("net down")
     monkeypatch.setattr(bot, "send_deal", boom)
-    asyncio.run(bot.quiet_and_pause_tick(snap_of([good_deal()], 1000.0)))
+    arun(bot.quiet_and_pause_tick(snap_of([good_deal()], 1000.0)))
     assert rows()[KEY_GOOD][4:] == (0, None, "unsent")
 
 
 def test_paused_tick_records_paused(monkeypatch):
     bot = _bot(monkeypatch)
     bot.paused = True
-    asyncio.run(bot.quiet_and_pause_tick(snap_of([good_deal()], 1000.0)))
+    arun(bot.quiet_and_pause_tick(snap_of([good_deal()], 1000.0)))
     assert rows()[KEY_GOOD][6] == "paused" and not bot.out
 
 
@@ -123,6 +123,6 @@ def test_record_error_logged_not_raised(monkeypatch, caplog):
         raise sqlite3.OperationalError("disk I/O error")
     monkeypatch.setattr(history, "track_signals", broken)
     with caplog.at_level(logging.WARNING, logger="bot"):
-        asyncio.run(bot.quiet_and_pause_tick(snap_of([good_deal()], 1000.0)))
+        arun(bot.quiet_and_pause_tick(snap_of([good_deal()], 1000.0)))
     assert "signals: disk I/O error" in caplog.text
     assert [m for m, _p in bot.out if m == "sendPhoto"]           # сигнал при этом ушёл

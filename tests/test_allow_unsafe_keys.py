@@ -1,9 +1,9 @@
 """ALLOW_UNSAFE_KEYS: по умолчанию ключ с торговлей/выводом удаляется; при =1 остаётся по решению владельца."""
-import asyncio
 
 import accounts
 import bot as B
 import p2p
+from helpers import arun
 
 
 class Stub(B.Bot):
@@ -34,7 +34,7 @@ def fake_exchange(monkeypatch, safe=False, detail="Trade, Withdraw", ok=True):
 
 def connect(bot):
     bot.awaiting_key = {"ex": "bybit", "step": "secret", "key": "FAKEKEY1234567890AB"}
-    asyncio.run(bot.handle_key_input("FAKESECRET0123456789012345678901234", None))
+    arun(bot.handle_key_input("FAKESECRET0123456789012345678901234", None))
 
 
 def test_default_still_deletes_unsafe_key_on_connect(tmp_path, monkeypatch):
@@ -67,10 +67,10 @@ def test_allow_check_button_and_startup_keep_key_silently(tmp_path, monkeypatch)
     accounts.save_key("bybit", "FAKEKEY1234567890AB", "FAKESECRET0123456789012345678901234")
     fake_exchange(monkeypatch)
     bot = Stub(p2p.Config())
-    asyncio.run(bot.check_key_safety())                  # старт: не удаляем и не шлём сообщений
+    arun(bot.check_key_safety())                  # старт: не удаляем и не шлём сообщений
     assert accounts.keys("bybit") is not None and texts(bot) == []
     assert accounts.verify_status("bybit")[0] == "unsafe"
-    asyncio.run(bot.on_callback({"id": "1", "data": "acc_check:bybit", "message": {"message_id": 5}}))
+    arun(bot.on_callback({"id": "1", "data": "acc_check:bybit", "message": {"message_id": 5}}))
     assert accounts.keys("bybit") is not None
     assert any("Ключ рабочий" in t and "больше, чем чтение" in t for t in texts(bot))
 
@@ -81,7 +81,7 @@ def test_allow_off_again_deletes_on_next_start(tmp_path, monkeypatch):
     fake_exchange(monkeypatch)
     monkeypatch.setenv("ALLOW_UNSAFE_KEYS", "0")
     bot = Stub(p2p.Config())
-    asyncio.run(bot.check_key_safety())
+    arun(bot.check_key_safety())
     assert accounts.keys("bybit") is None
 
 

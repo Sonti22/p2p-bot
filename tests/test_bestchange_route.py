@@ -4,6 +4,7 @@ import asyncio
 import pytest
 
 import p2p
+from helpers import arun
 
 
 @pytest.fixture(autouse=True)
@@ -24,7 +25,7 @@ def fake_download(monkeypatch, working, log):
 
 
 def run_fetch():
-    return asyncio.run(p2p._bc_fetch(None))
+    return arun(p2p._bc_fetch(None))
 
 
 def test_default_path_works_no_local_addr_remembered(monkeypatch):
@@ -104,7 +105,7 @@ def test_bestchange_fetcher_uses_fetch_and_parse(monkeypatch):
     monkeypatch.setattr(p2p, "_bc_parse", lambda data: ads)
     monkeypatch.setitem(p2p._bc, "t", 0.0)
     monkeypatch.setitem(p2p._bc, "tried", 0.0)
-    got = asyncio.run(p2p.bestchange(None, p2p.Config(bc_refresh=120), "buy", "USDT"))
+    got = arun(p2p.bestchange(None, p2p.Config(bc_refresh=120), "buy", "USDT"))
     assert [a.price for a in got] == [90.0]
 
     async def boom(s):
@@ -114,4 +115,4 @@ def test_bestchange_fetcher_uses_fetch_and_parse(monkeypatch):
     monkeypatch.setitem(p2p._bc, "t", 0.0)
     monkeypatch.setitem(p2p._bc, "tried", 0.0)
     with pytest.raises(asyncio.TimeoutError):
-        asyncio.run(p2p.bestchange(None, p2p.Config(bc_refresh=120), "buy", "USDT"))
+        arun(p2p.bestchange(None, p2p.Config(bc_refresh=120), "buy", "USDT"))

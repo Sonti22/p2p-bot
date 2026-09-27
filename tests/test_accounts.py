@@ -13,6 +13,7 @@ from multidict import CIMultiDict, CIMultiDictProxy
 from yarl import URL
 
 import accounts
+from helpers import arun
 
 
 def test_bybit_headers_signature_matches_documented_formula():
@@ -102,7 +103,7 @@ class _FakeSession:
 
 
 def test_bybit_get_signs_and_builds_url():
-    j = asyncio.run(accounts.bybit_get(_FakeSession(), "k", "s", "/v5/account/wallet-balance",
+    j = arun(accounts.bybit_get(_FakeSession(), "k", "s", "/v5/account/wallet-balance",
                                         {"accountType": "UNIFIED"}))
     assert j["url"] == "https://api.bybit.com/v5/account/wallet-balance?accountType=UNIFIED"
     assert j["headers"]["X-BAPI-API-KEY"] == "k"
@@ -110,7 +111,7 @@ def test_bybit_get_signs_and_builds_url():
 
 
 def test_mexc_get_signs_and_builds_url():
-    j = asyncio.run(accounts.mexc_get(_FakeSession(), "k", "s", "/api/v3/account"))
+    j = arun(accounts.mexc_get(_FakeSession(), "k", "s", "/api/v3/account"))
     assert j["url"].startswith("https://api.mexc.com/api/v3/account?")
     assert "signature=" in j["url"]
     assert j["headers"] == {"X-MEXC-APIKEY": "k"}
@@ -257,21 +258,21 @@ def test_kucoin_headers_matches_documented_formula():
 
 
 def test_htx_get_signs_and_builds_url():
-    j = asyncio.run(accounts.htx_get(_FakeSession(), "k", "s", "/v1/account/accounts"))
+    j = arun(accounts.htx_get(_FakeSession(), "k", "s", "/v1/account/accounts"))
     assert j["url"].startswith("https://api.htx.com/v1/account/accounts?")
     assert "Signature=" in j["url"] and "AccessKeyId=k" in j["url"]
     assert j["headers"] == {}
 
 
 def test_kucoin_get_signs_and_builds_url():
-    j = asyncio.run(accounts.kucoin_get(_FakeSession(), "k", "s", "pp", "/api/v1/accounts"))
+    j = arun(accounts.kucoin_get(_FakeSession(), "k", "s", "pp", "/api/v1/accounts"))
     assert j["url"] == "https://api.kucoin.com/api/v1/accounts"
     assert j["headers"]["KC-API-KEY"] == "k"
     assert j["headers"]["KC-API-KEY-VERSION"] == "2"
 
 
 def test_kucoin_get_with_params_signs_path_and_query():
-    j = asyncio.run(accounts.kucoin_get(_FakeSession(), "k", "s", "pp", "/api/v1/accounts", {"currency": "USDT"}))
+    j = arun(accounts.kucoin_get(_FakeSession(), "k", "s", "pp", "/api/v1/accounts", {"currency": "USDT"}))
     assert j["url"] == "https://api.kucoin.com/api/v1/accounts?currency=USDT"
 
 
@@ -304,70 +305,70 @@ class _JsonSession:
 
 def test_verify_no_keys_saved(tmp_path, monkeypatch):
     monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
-    ok, msg = asyncio.run(accounts.verify(_JsonSession({}), "bybit"))
+    ok, msg = arun(accounts.verify(_JsonSession({}), "bybit"))
     assert not ok and "не сохранён" in msg
 
 
 def test_verify_bybit_ok(tmp_path, monkeypatch):
     monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
     accounts.save_key("bybit", "k", "s")
-    ok, msg = asyncio.run(accounts.verify(_JsonSession({"retCode": 0, "result": {}}), "bybit"))
+    ok, msg = arun(accounts.verify(_JsonSession({"retCode": 0, "result": {}}), "bybit"))
     assert ok and "чтени" in msg
 
 
 def test_verify_bybit_bad_key(tmp_path, monkeypatch):
     monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
     accounts.save_key("bybit", "k", "s")
-    ok, msg = asyncio.run(accounts.verify(_JsonSession({"retCode": 10003, "retMsg": "Invalid api_key"}), "bybit"))
+    ok, msg = arun(accounts.verify(_JsonSession({"retCode": 10003, "retMsg": "Invalid api_key"}), "bybit"))
     assert not ok and "Invalid api_key" in msg
 
 
 def test_verify_mexc_ok(tmp_path, monkeypatch):
     monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
     accounts.save_key("mexc", "k", "s")
-    ok, msg = asyncio.run(accounts.verify(_JsonSession({"balances": []}), "mexc"))
+    ok, msg = arun(accounts.verify(_JsonSession({"balances": []}), "mexc"))
     assert ok
 
 
 def test_verify_unsupported_exchange(tmp_path, monkeypatch):
     monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
     accounts.save_key("bitpapa", "k", "s")
-    ok, msg = asyncio.run(accounts.verify(_JsonSession({}), "bitpapa"))
+    ok, msg = arun(accounts.verify(_JsonSession({}), "bitpapa"))
     assert not ok and "не реализована" in msg
 
 
 def test_verify_htx_ok(tmp_path, monkeypatch):
     monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
     accounts.save_key("htx", "k", "s")
-    ok, msg = asyncio.run(accounts.verify(_JsonSession({"status": "ok", "data": []}), "htx"))
+    ok, msg = arun(accounts.verify(_JsonSession({"status": "ok", "data": []}), "htx"))
     assert ok and "чтени" in msg
 
 
 def test_verify_htx_bad_key(tmp_path, monkeypatch):
     monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
     accounts.save_key("htx", "k", "s")
-    ok, msg = asyncio.run(accounts.verify(_JsonSession({"status": "error", "err-msg": "Api key not found"}), "htx"))
+    ok, msg = arun(accounts.verify(_JsonSession({"status": "error", "err-msg": "Api key not found"}), "htx"))
     assert not ok and "Api key not found" in msg
 
 
 def test_verify_kucoin_ok(tmp_path, monkeypatch):
     monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
     accounts.save_key("kucoin", "k", "s", "pp")
-    ok, msg = asyncio.run(accounts.verify(_JsonSession({"code": "200000", "data": []}), "kucoin"))
+    ok, msg = arun(accounts.verify(_JsonSession({"code": "200000", "data": []}), "kucoin"))
     assert ok and "чтени" in msg
 
 
 def test_verify_kucoin_without_passphrase(tmp_path, monkeypatch):
     monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
     accounts.save_key("kucoin", "k", "s")   # без passphrase
-    ok, msg = asyncio.run(accounts.verify(_JsonSession({}), "kucoin"))
+    ok, msg = arun(accounts.verify(_JsonSession({}), "kucoin"))
     assert not ok and "passphrase" in msg
 
 
 def test_verify_kucoin_bad_key(tmp_path, monkeypatch):
     monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
     accounts.save_key("kucoin", "k", "s", "pp")
-    ok, msg = asyncio.run(accounts.verify(_JsonSession({"code": "400003", "msg": "KC-API-KEY not exists"}), "kucoin"))
+    ok, msg = arun(accounts.verify(_JsonSession({"code": "400003", "msg": "KC-API-KEY not exists"}), "kucoin"))
     assert not ok and "KC-API-KEY not exists" in msg
 
 
@@ -398,7 +399,7 @@ def test_verify_htx_http_error_hides_key(tmp_path, monkeypatch):
     monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
     accounts.save_key("htx", "AKID-TEST-KEY-1234", "s")
     s = _HttpErrorSession()
-    ok, msg = asyncio.run(accounts.verify(s, "htx"))
+    ok, msg = arun(accounts.verify(s, "htx"))
     assert "AKID-TEST-KEY-1234" in str(s.errors[0])   # сама ошибка aiohttp несёт ключ в URL
     assert not ok and "401" in msg
     assert "AKID-TEST-KEY-1234" not in msg and "Signature" not in msg and "https://" not in msg
@@ -407,7 +408,7 @@ def test_verify_htx_http_error_hides_key(tmp_path, monkeypatch):
 def test_verify_mexc_http_error_hides_signature(tmp_path, monkeypatch):
     monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
     accounts.save_key("mexc", "k", "s")
-    ok, msg = asyncio.run(accounts.verify(_HttpErrorSession(429, "Too Many Requests"), "mexc"))
+    ok, msg = arun(accounts.verify(_HttpErrorSession(429, "Too Many Requests"), "mexc"))
     assert not ok and msg == "HTTP 429: Too Many Requests"
 
 
@@ -419,7 +420,7 @@ def test_verify_timeout_readable(tmp_path, monkeypatch):
         def get(self, url, headers=None):
             raise asyncio.TimeoutError()
 
-    ok, msg = asyncio.run(accounts.verify(_Slow(), "bybit"))
+    ok, msg = arun(accounts.verify(_Slow(), "bybit"))
     assert not ok and "таймаут" in msg   # str(TimeoutError()) пустой — пользователь видел пустое «⚠️ »
 
 
@@ -439,7 +440,7 @@ def test_api_error_text_has_no_url_or_query(exc):
 
 def test_api_permissions_no_key_is_safe(tmp_path, monkeypatch):
     monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
-    safe, detail = asyncio.run(accounts.api_permissions(_JsonSession({}), "bybit"))
+    safe, detail = arun(accounts.api_permissions(_JsonSession({}), "bybit"))
     assert safe and detail == ""
 
 
@@ -447,7 +448,7 @@ def test_api_permissions_bybit_readonly_is_safe(tmp_path, monkeypatch):
     monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
     accounts.save_key("bybit", "k", "s")
     body = {"retCode": 0, "result": {"readOnly": 1, "permissions": {"Spot": [], "Wallet": []}}}
-    safe, detail = asyncio.run(accounts.api_permissions(_JsonSession(body), "bybit"))
+    safe, detail = arun(accounts.api_permissions(_JsonSession(body), "bybit"))
     assert safe and detail == ""
 
 
@@ -455,7 +456,7 @@ def test_api_permissions_bybit_trade_key_is_unsafe(tmp_path, monkeypatch):
     monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
     accounts.save_key("bybit", "k", "s")
     body = {"retCode": 0, "result": {"readOnly": 0, "permissions": {"Spot": ["SpotTrade"], "Wallet": []}}}
-    safe, detail = asyncio.run(accounts.api_permissions(_JsonSession(body), "bybit"))
+    safe, detail = arun(accounts.api_permissions(_JsonSession(body), "bybit"))
     assert not safe and "Spot" in detail
 
 
@@ -463,7 +464,7 @@ def test_api_permissions_mexc_readonly_is_safe(tmp_path, monkeypatch):
     monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
     accounts.save_key("mexc", "k", "s")
     body = {"canTrade": False, "canWithdraw": False, "balances": []}
-    safe, detail = asyncio.run(accounts.api_permissions(_JsonSession(body), "mexc"))
+    safe, detail = arun(accounts.api_permissions(_JsonSession(body), "mexc"))
     assert safe and detail == ""
 
 
@@ -471,7 +472,7 @@ def test_api_permissions_mexc_withdraw_key_is_unsafe(tmp_path, monkeypatch):
     monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
     accounts.save_key("mexc", "k", "s")
     body = {"canTrade": False, "canWithdraw": True, "balances": []}
-    safe, detail = asyncio.run(accounts.api_permissions(_JsonSession(body), "mexc"))
+    safe, detail = arun(accounts.api_permissions(_JsonSession(body), "mexc"))
     assert not safe and "вывод" in detail
 
 
@@ -495,7 +496,7 @@ class _HtxKeySession:
 def test_api_permissions_htx_readonly_is_safe(tmp_path, monkeypatch):
     monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
     accounts.save_key("htx", "k", "s")
-    safe, detail = asyncio.run(accounts.api_permissions(_HtxKeySession("readOnly"), "htx"))
+    safe, detail = arun(accounts.api_permissions(_HtxKeySession("readOnly"), "htx"))
     assert safe and detail == ""
 
 
@@ -503,7 +504,7 @@ def test_api_permissions_htx_trade_key_is_unsafe(tmp_path, monkeypatch):
     monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
     accounts.save_key("htx", "k", "s")
     s = _HtxKeySession("readOnly,trade,withdraw")
-    safe, detail = asyncio.run(accounts.api_permissions(s, "htx"))
+    safe, detail = arun(accounts.api_permissions(s, "htx"))
     # сначала uid, затем api-key с uid в подписанной query
     assert [u.split("?")[0] for u in s.urls] == ["https://api.htx.com/v2/user/uid",
                                                   "https://api.htx.com/v2/user/api-key"]
@@ -516,7 +517,7 @@ def test_api_permissions_htx_uid_error_fails_open(tmp_path, monkeypatch):
     monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
     accounts.save_key("htx", "k", "s")
     s = _HtxKeySession("readOnly,trade", uid_body={"code": 1002, "message": "unauthorized"})
-    safe, detail = asyncio.run(accounts.api_permissions(s, "htx"))
+    safe, detail = arun(accounts.api_permissions(s, "htx"))
     assert safe and detail == ""
     assert len(s.urls) == 1   # api-key без uid не запрашиваем
 
@@ -525,7 +526,7 @@ def test_api_permissions_kucoin_general_only_is_safe(tmp_path, monkeypatch):
     monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
     accounts.save_key("kucoin", "k", "s", "pp")
     body = {"code": "200000", "data": {"permission": "General"}}
-    safe, detail = asyncio.run(accounts.api_permissions(_JsonSession(body), "kucoin"))
+    safe, detail = arun(accounts.api_permissions(_JsonSession(body), "kucoin"))
     assert safe and detail == ""
 
 
@@ -533,7 +534,7 @@ def test_api_permissions_kucoin_spot_key_is_unsafe(tmp_path, monkeypatch):
     monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
     accounts.save_key("kucoin", "k", "s", "pp")
     body = {"code": "200000", "data": {"permission": "General,Spot,Withdraw"}}
-    safe, detail = asyncio.run(accounts.api_permissions(_JsonSession(body), "kucoin"))
+    safe, detail = arun(accounts.api_permissions(_JsonSession(body), "kucoin"))
     assert not safe and "Spot" in detail and "Withdraw" in detail
 
 
@@ -556,7 +557,7 @@ def test_bybit_balances_sums_unified_and_funding():
         "accountType=FUND": {"retCode": 0, "result": {"balance": [
             {"coin": "USDT", "walletBalance": "2.5"}, {"coin": "TON", "walletBalance": "3"}]}},
     })
-    bal = asyncio.run(accounts.bybit_balances(session, "k", "s"))
+    bal = arun(accounts.bybit_balances(session, "k", "s"))
     assert bal == {"USDT": 13.0, "TON": 3.0}   # нулевой BTC не попадает в результат
 
 
@@ -565,20 +566,20 @@ def test_bybit_balances_ignores_failed_call():
         "accountType=UNIFIED": {"retCode": 10003, "retMsg": "Invalid api_key"},
         "accountType=FUND": {"retCode": 0, "result": {"balance": [{"coin": "USDT", "walletBalance": "1"}]}},
     })
-    bal = asyncio.run(accounts.bybit_balances(session, "k", "s"))
+    bal = arun(accounts.bybit_balances(session, "k", "s"))
     assert bal == {"USDT": 1.0}
 
 
 def test_mexc_balances_sums_free_and_locked():
     session = _JsonSession({"balances": [{"asset": "USDT", "free": "5", "locked": "1.5"},
                                           {"asset": "ETH", "free": "0", "locked": "0"}]})
-    bal = asyncio.run(accounts.mexc_balances(session, "k", "s"))
+    bal = arun(accounts.mexc_balances(session, "k", "s"))
     assert bal == {"USDT": 6.5}   # нулевой ETH не попадает в результат
 
 
 def test_portfolio_skips_exchange_without_keys(tmp_path, monkeypatch):
     monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
-    port = asyncio.run(accounts.portfolio(_JsonSession({})))
+    port = arun(accounts.portfolio(_JsonSession({})))
     assert port == {}
 
 
@@ -586,7 +587,7 @@ def test_portfolio_filters_to_balance_coins(tmp_path, monkeypatch):
     monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
     accounts.save_key("mexc", "k", "s")
     body = {"balances": [{"asset": "USDT", "free": "10", "locked": "0"}, {"asset": "SHIB", "free": "1000", "locked": "0"}]}
-    port = asyncio.run(accounts.portfolio(_JsonSession(body)))
+    port = arun(accounts.portfolio(_JsonSession(body)))
     assert port == {"mexc": {"USDT": 10.0}}   # SHIB не в BALANCE_COINS
 
 
@@ -598,7 +599,7 @@ def test_portfolio_skips_exchange_on_error(tmp_path, monkeypatch):
         def get(self, url, headers=None):
             raise RuntimeError("network down")
 
-    assert asyncio.run(accounts.portfolio(_Boom())) == {}
+    assert arun(accounts.portfolio(_Boom())) == {}
 
 
 class _FakePostResp:
@@ -632,7 +633,7 @@ class _FakePostSession:
 def test_bybit_post_signs_body():
     ts = "1700000000000"
     s = _FakePostSession()
-    j = asyncio.run(accounts.bybit_post(s, "k", "s", "/v5/p2p/order/simplifyList", {"page": 1, "size": 20},
+    j = arun(accounts.bybit_post(s, "k", "s", "/v5/p2p/order/simplifyList", {"page": 1, "size": 20},
                                         timestamp=ts))
     assert j["url"] == "https://api.bybit.com/v5/p2p/order/simplifyList"
     assert j["headers"]["X-BAPI-API-KEY"] == "k"
@@ -660,7 +661,7 @@ def test_bybit_post_headers_is_pure_documented_formula():
 def test_bybit_post_refuses_paths_outside_allowlist_before_sending(path):
     s = _FakePostSession()
     with pytest.raises(ValueError):
-        asyncio.run(accounts.bybit_post(s, "k", "s", path, {"orderId": "1"}))
+        arun(accounts.bybit_post(s, "k", "s", path, {"orderId": "1"}))
     assert s.calls == []
 
 
@@ -668,9 +669,9 @@ def test_bybit_post_refuses_paths_outside_allowlist_before_sending(path):
 def test_bybit_post_redirect_is_error(status):
     s = _FakePostSession(status)
     with pytest.raises(aiohttp.ClientResponseError):
-        asyncio.run(accounts.bybit_post(s, "k", "s", "/v5/p2p/order/simplifyList", {"page": 1}))
+        arun(accounts.bybit_post(s, "k", "s", "/v5/p2p/order/simplifyList", {"page": 1}))
     assert s.calls[0][1] is False
-    assert asyncio.run(accounts.bybit_p2p_orders(s, "k", "s")) is None   # автожурнал — «P2P недоступно», не падение
+    assert arun(accounts.bybit_p2p_orders(s, "k", "s")) is None   # автожурнал — «P2P недоступно», не падение
 
 
 class _P2pSession:
@@ -691,7 +692,7 @@ def test_bybit_p2p_orders_parses_completed_items():
         {"id": "2", "side": 0, "tokenId": "USDT", "currencyId": "RUB", "amount": "9500", "price": "95",
          "notifyTokenQuantity": "100", "status": 50, "createDate": "1700000001000"},
     ]}}
-    orders = asyncio.run(accounts.bybit_p2p_orders(_P2pSession(body), "k", "s"))
+    orders = arun(accounts.bybit_p2p_orders(_P2pSession(body), "k", "s"))
     assert orders == [
         {"id": "1", "side": "sell", "asset": "USDT", "fiat": "EUR", "amount": 70.0, "price": 0.92, "ts": 1700000000.0},
         {"id": "2", "side": "buy", "asset": "USDT", "fiat": "RUB", "amount": 100.0, "price": 95.0, "ts": 1700000001.0},
@@ -708,14 +709,14 @@ def test_bybit_p2p_orders_documented_example():
             "notifyTokenId": "USDT", "fee": "0", "status": 50, "createDate": "1741769000000",
         }]},
     }
-    orders = asyncio.run(accounts.bybit_p2p_orders(_P2pSession(body), "k", "s"))
+    orders = arun(accounts.bybit_p2p_orders(_P2pSession(body), "k", "s"))
     assert orders == [{"id": "1899742990873296896", "side": "sell", "asset": "USDT", "fiat": "EUR",
                        "amount": 70.0, "price": 0.92, "ts": 1741769000.0}]
 
 
 def test_bybit_p2p_orders_accepts_camel_retcode():
     body = {"retCode": 0, "result": {"items": []}}
-    assert asyncio.run(accounts.bybit_p2p_orders(_P2pSession(body), "k", "s")) == []
+    assert arun(accounts.bybit_p2p_orders(_P2pSession(body), "k", "s")) == []
 
 
 def test_bybit_p2p_orders_quantity_falls_back_to_amount_over_price():
@@ -726,14 +727,14 @@ def test_bybit_p2p_orders_quantity_falls_back_to_amount_over_price():
         {"id": "2", "side": 0, "tokenId": "USDT", "currencyId": "EUR", "amount": "64.4", "price": "0",
          "createDate": "1700000000000"},
     ]}}
-    orders = asyncio.run(accounts.bybit_p2p_orders(_P2pSession(body), "k", "s"))
+    orders = arun(accounts.bybit_p2p_orders(_P2pSession(body), "k", "s"))
     assert orders[0]["amount"] == pytest.approx(70.0)
     assert orders[1]["amount"] == 0.0   # цены нет — не делим на ноль
 
 
 def test_bybit_p2p_orders_returns_none_on_bad_retcode():
     body = {"ret_code": 10005, "ret_msg": "Permission denied"}
-    assert asyncio.run(accounts.bybit_p2p_orders(_P2pSession(body), "k", "s")) is None
+    assert arun(accounts.bybit_p2p_orders(_P2pSession(body), "k", "s")) is None
 
 
 def test_bybit_p2p_orders_returns_none_on_error():
@@ -741,7 +742,7 @@ def test_bybit_p2p_orders_returns_none_on_error():
         def post(self, url, headers=None, data=None, allow_redirects=True):
             raise RuntimeError("network down")
 
-    assert asyncio.run(accounts.bybit_p2p_orders(_Boom(), "k", "s")) is None
+    assert arun(accounts.bybit_p2p_orders(_Boom(), "k", "s")) is None
 
 
 def test_mexc_history_merges_deposits_and_withdrawals_by_time():
@@ -749,7 +750,7 @@ def test_mexc_history_merges_deposits_and_withdrawals_by_time():
         "capital/deposit/hisrec": [{"coin": "USDT", "amount": "100.5", "insertTime": 1700000000000}],
         "capital/withdraw/history": [{"coin": "USDT", "amount": "9", "applyTime": "2023-11-16 00:00:00"}],
     })
-    hist = asyncio.run(accounts.mexc_history(session, "k", "s"))
+    hist = arun(accounts.mexc_history(session, "k", "s"))
     assert hist == [
         {"kind": "withdraw", "asset": "USDT", "amount": 9.0,
          "ts": datetime(2023, 11, 16, 0, 0, 0, tzinfo=timezone.utc).timestamp()},
@@ -762,21 +763,21 @@ def test_mexc_history_falls_back_to_withdrawals_when_no_deposits():
         "capital/deposit/hisrec": [],
         "capital/withdraw/history": [{"coin": "USDT", "amount": "9", "applyTime": "2023-11-14 22:13:20"}],
     })
-    hist = asyncio.run(accounts.mexc_history(session, "k", "s"))
+    hist = arun(accounts.mexc_history(session, "k", "s"))
     assert hist == [{"kind": "withdraw", "asset": "USDT", "amount": 9.0,
                      "ts": datetime(2023, 11, 14, 22, 13, 20, tzinfo=timezone.utc).timestamp()}]
 
 
 def test_mexc_history_returns_empty_list_when_both_sources_empty():
     session = _UrlJsonSession({"capital/deposit/hisrec": [], "capital/withdraw/history": []})
-    assert asyncio.run(accounts.mexc_history(session, "k", "s")) == []
+    assert arun(accounts.mexc_history(session, "k", "s")) == []
 
 
 def test_mexc_history_returns_none_when_a_source_fails():
     """Депозитов нет, а выводы не ответили — пустоту подтвердить нечем, это не «история пуста»."""
     session = _UrlJsonSession({"capital/deposit/hisrec": [],
                                "capital/withdraw/history": {"code": 700002, "msg": "Signature for this request is not valid."}})
-    assert asyncio.run(accounts.mexc_history(session, "k", "s")) is None
+    assert arun(accounts.mexc_history(session, "k", "s")) is None
 
 
 def test_htx_history_merges_deposits_and_withdrawals_by_time():
@@ -784,7 +785,7 @@ def test_htx_history_merges_deposits_and_withdrawals_by_time():
         "type=deposit": {"status": "ok", "data": [{"currency": "usdt", "amount": 50, "created-at": 1700000000000}]},
         "type=withdraw": {"status": "ok", "data": [{"currency": "usdt", "amount": 5, "created-at": 1700000009000}]},
     })
-    hist = asyncio.run(accounts.htx_history(session, "k", "s"))
+    hist = arun(accounts.htx_history(session, "k", "s"))
     assert hist == [
         {"kind": "withdraw", "asset": "usdt", "amount": 5.0, "ts": 1700000009.0},
         {"kind": "deposit", "asset": "usdt", "amount": 50.0, "ts": 1700000000.0},
@@ -793,13 +794,13 @@ def test_htx_history_merges_deposits_and_withdrawals_by_time():
 
 def test_htx_history_returns_empty_list_when_both_sources_empty():
     session = _UrlJsonSession({"type=deposit": {"status": "ok", "data": []}, "type=withdraw": {"status": "ok", "data": []}})
-    assert asyncio.run(accounts.htx_history(session, "k", "s")) == []
+    assert arun(accounts.htx_history(session, "k", "s")) == []
 
 
 def test_htx_history_returns_none_when_one_source_fails():
     session = _UrlJsonSession({"type=deposit": {"status": "ok", "data": []},
                                "type=withdraw": {"status": "error", "err-msg": "no permission"}})
-    assert asyncio.run(accounts.htx_history(session, "k", "s")) is None
+    assert arun(accounts.htx_history(session, "k", "s")) is None
 
 
 def test_htx_history_returns_none_on_error_status():
@@ -807,7 +808,7 @@ def test_htx_history_returns_none_on_error_status():
         "type=deposit": {"status": "error", "err-msg": "no permission"},
         "type=withdraw": {"status": "error", "err-msg": "no permission"},
     })
-    assert asyncio.run(accounts.htx_history(session, "k", "s")) is None
+    assert arun(accounts.htx_history(session, "k", "s")) is None
 
 
 def test_kucoin_history_reads_paginated_items():
@@ -816,7 +817,7 @@ def test_kucoin_history_reads_paginated_items():
             {"currency": "USDT", "amount": "30", "createdAt": 1700000000000}]}},
         "api/v1/withdrawals": {"code": "200000", "data": {"items": []}},
     })
-    hist = asyncio.run(accounts.kucoin_history(session, "k", "s", "pp"))
+    hist = arun(accounts.kucoin_history(session, "k", "s", "pp"))
     assert hist == [{"kind": "deposit", "asset": "USDT", "amount": 30.0, "ts": 1700000000.0}]
 
 
@@ -827,7 +828,7 @@ def test_kucoin_history_merges_deposits_and_withdrawals_by_time():
         "api/v1/withdrawals": {"code": "200000", "data": {"items": [
             {"currency": "USDT", "amount": "12", "createdAt": 1700000005000}]}},
     })
-    hist = asyncio.run(accounts.kucoin_history(session, "k", "s", "pp"))
+    hist = arun(accounts.kucoin_history(session, "k", "s", "pp"))
     assert hist == [
         {"kind": "withdraw", "asset": "USDT", "amount": 12.0, "ts": 1700000005.0},
         {"kind": "deposit", "asset": "USDT", "amount": 30.0, "ts": 1700000000.0},
@@ -836,9 +837,9 @@ def test_kucoin_history_merges_deposits_and_withdrawals_by_time():
 
 def test_kucoin_history_empty_success_and_error():
     empty = _JsonSession({"code": "200000", "data": {"items": []}})
-    assert asyncio.run(accounts.kucoin_history(empty, "k", "s", "pp")) == []
+    assert arun(accounts.kucoin_history(empty, "k", "s", "pp")) == []
     bad = _JsonSession({"code": "400003", "msg": "KC-API-KEY not exists"})
-    assert asyncio.run(accounts.kucoin_history(bad, "k", "s", "pp")) is None
+    assert arun(accounts.kucoin_history(bad, "k", "s", "pp")) is None
 
 
 def test_mexc_spot_trades_merges_symbols_and_sorts_by_time():
@@ -848,7 +849,7 @@ def test_mexc_spot_trades_merges_symbols_and_sorts_by_time():
         "symbol=ETHUSDT": [{"isBuyer": False, "qty": "0.2", "price": "3000", "time": 1700000005000}],
         "symbol=TONUSDT": [],
     })
-    hist = asyncio.run(accounts.mexc_spot_trades(session, "k", "s"))
+    hist = arun(accounts.mexc_spot_trades(session, "k", "s"))
     assert hist == [
         {"kind": "trade", "asset": "ETH", "side": "sell", "amount": 0.2, "price": 3000.0, "ts": 1700000005.0},
         {"kind": "trade", "asset": "BTC", "side": "buy", "amount": 0.001, "price": 60000.0, "ts": 1700000000.0},
@@ -857,30 +858,30 @@ def test_mexc_spot_trades_merges_symbols_and_sorts_by_time():
 
 def test_mexc_spot_trades_returns_empty_list_when_no_symbol_has_trades():
     session = _UrlJsonSession({sym: [] for sym in accounts.SPOT_TRADE_SYMBOLS})
-    assert asyncio.run(accounts.mexc_spot_trades(session, "k", "s")) == []
+    assert arun(accounts.mexc_spot_trades(session, "k", "s")) == []
 
 
 def test_mexc_spot_trades_returns_none_when_a_symbol_fails_and_no_trades():
     bodies = {f"symbol={sym}": [] for sym in accounts.SPOT_TRADE_SYMBOLS}
     bodies["symbol=TONUSDT"] = {"code": 10007, "msg": "bad symbol"}
-    assert asyncio.run(accounts.mexc_spot_trades(_UrlJsonSession(bodies), "k", "s")) is None
+    assert arun(accounts.mexc_spot_trades(_UrlJsonSession(bodies), "k", "s")) is None
 
 
 def test_kucoin_spot_trades_reads_fills_without_symbol():
     session = _JsonSession({"code": "200000", "data": {"items": [
         {"symbol": "TON-USDT", "side": "buy", "size": "12.5", "price": "5.1", "createdAt": 1700000000000}]}})
-    hist = asyncio.run(accounts.kucoin_spot_trades(session, "k", "s", "pp"))
+    hist = arun(accounts.kucoin_spot_trades(session, "k", "s", "pp"))
     assert hist == [{"kind": "trade", "asset": "TON", "side": "buy", "amount": 12.5, "price": 5.1, "ts": 1700000000.0}]
 
 
 def test_kucoin_spot_trades_returns_empty_list_when_no_items():
     session = _JsonSession({"code": "200000", "data": {"items": []}})
-    assert asyncio.run(accounts.kucoin_spot_trades(session, "k", "s", "pp")) == []
+    assert arun(accounts.kucoin_spot_trades(session, "k", "s", "pp")) == []
 
 
 def test_kucoin_spot_trades_returns_none_on_error_code():
     session = _JsonSession({"code": "400003", "msg": "KC-API-KEY not exists"})
-    assert asyncio.run(accounts.kucoin_spot_trades(session, "k", "s", "pp")) is None
+    assert arun(accounts.kucoin_spot_trades(session, "k", "s", "pp")) is None
 
 
 def test_account_history_mexc_falls_back_to_spot_trades(tmp_path, monkeypatch):
@@ -894,7 +895,7 @@ def test_account_history_mexc_falls_back_to_spot_trades(tmp_path, monkeypatch):
         "symbol=ETHUSDT": [],
         "symbol=TONUSDT": [],
     })
-    hist = asyncio.run(accounts.account_history(session, "mexc"))
+    hist = arun(accounts.account_history(session, "mexc"))
     assert hist == [{"kind": "trade", "asset": "BTC", "side": "buy", "amount": 0.001, "price": 60000.0, "ts": 1700000000.0}]
 
 
@@ -907,7 +908,7 @@ def test_account_history_kucoin_falls_back_to_spot_trades(tmp_path, monkeypatch)
         "api/v1/fills": {"code": "200000", "data": {"items": [
             {"symbol": "TON-USDT", "side": "sell", "size": "3", "price": "5.2", "createdAt": 1700000000000}]}},
     })
-    hist = asyncio.run(accounts.account_history(session, "kucoin"))
+    hist = arun(accounts.account_history(session, "kucoin"))
     assert hist == [{"kind": "trade", "asset": "TON", "side": "sell", "amount": 3.0, "price": 5.2, "ts": 1700000000.0}]
 
 
@@ -924,7 +925,7 @@ def test_account_history_mexc_does_not_hide_fresh_trade_behind_old_deposit(tmp_p
         "symbol=ETHUSDT": [],
         "symbol=TONUSDT": [],
     })
-    hist = asyncio.run(accounts.account_history(session, "mexc"))
+    hist = arun(accounts.account_history(session, "mexc"))
     assert hist == [
         {"kind": "trade", "asset": "BTC", "side": "buy", "amount": 0.001, "price": 60000.0, "ts": 1700000009.0},
         {"kind": "deposit", "asset": "USDT", "amount": 100.5, "ts": 1700000000.0},
@@ -941,7 +942,7 @@ def test_account_history_kucoin_does_not_hide_fresh_trade_behind_old_deposit(tmp
         "api/v1/fills": {"code": "200000", "data": {"items": [
             {"symbol": "TON-USDT", "side": "sell", "size": "3", "price": "5.2", "createdAt": 1700000009000}]}},
     })
-    hist = asyncio.run(accounts.account_history(session, "kucoin"))
+    hist = arun(accounts.account_history(session, "kucoin"))
     assert hist == [
         {"kind": "trade", "asset": "TON", "side": "sell", "amount": 3.0, "price": 5.2, "ts": 1700000009.0},
         {"kind": "deposit", "asset": "USDT", "amount": 30.0, "ts": 1700000000.0},
@@ -956,7 +957,7 @@ def test_account_history_mexc_empty_success_returns_empty_list(tmp_path, monkeyp
     """Все источники MEXC ответили пусто — [], чтобы бот считал это первым опросом (см. check_accounts)."""
     monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
     accounts.save_key("mexc", "k", "s")
-    assert asyncio.run(accounts.account_history(_UrlJsonSession(MEXC_EMPTY), "mexc")) == []
+    assert arun(accounts.account_history(_UrlJsonSession(MEXC_EMPTY), "mexc")) == []
 
 
 def test_account_history_mexc_partial_failure_returns_none(tmp_path, monkeypatch):
@@ -965,9 +966,9 @@ def test_account_history_mexc_partial_failure_returns_none(tmp_path, monkeypatch
     err = {"code": 700002, "msg": "Signature for this request is not valid."}
     for key in ("capital/withdraw/history", "symbol=BTCUSDT"):   # не ответили выводы / одна из спот-пар
         bodies = dict(MEXC_EMPTY, **{key: err})
-        assert asyncio.run(accounts.account_history(_UrlJsonSession(bodies), "mexc")) is None, key
+        assert arun(accounts.account_history(_UrlJsonSession(bodies), "mexc")) is None, key
     all_fail = {k: err for k in MEXC_EMPTY}
-    assert asyncio.run(accounts.account_history(_UrlJsonSession(all_fail), "mexc")) is None
+    assert arun(accounts.account_history(_UrlJsonSession(all_fail), "mexc")) is None
 
 
 def test_account_history_kucoin_empty_success_and_failure(tmp_path, monkeypatch):
@@ -976,10 +977,10 @@ def test_account_history_kucoin_empty_success_and_failure(tmp_path, monkeypatch)
     empty = {"code": "200000", "data": {"items": []}}
     err = {"code": "400003", "msg": "KC-API-KEY not exists"}
     bodies = {"api/v1/deposits": empty, "api/v1/withdrawals": empty, "api/v1/fills": empty}
-    assert asyncio.run(accounts.account_history(_UrlJsonSession(bodies), "kucoin")) == []
+    assert arun(accounts.account_history(_UrlJsonSession(bodies), "kucoin")) == []
     for key in ("api/v1/withdrawals", "api/v1/fills"):
         failed = dict(bodies, **{key: err})
-        assert asyncio.run(accounts.account_history(_UrlJsonSession(failed), "kucoin")) is None, key
+        assert arun(accounts.account_history(_UrlJsonSession(failed), "kucoin")) is None, key
 
 
 def test_account_history_dispatches_bybit_to_p2p_orders(tmp_path, monkeypatch):
@@ -988,19 +989,19 @@ def test_account_history_dispatches_bybit_to_p2p_orders(tmp_path, monkeypatch):
     body = {"ret_code": 0, "ret_msg": "SUCCESS", "result": {"items": [
         {"id": "1", "side": 0, "tokenId": "USDT", "currencyId": "RUB", "amount": "950", "price": "95",
          "notifyTokenQuantity": "10", "createDate": "1700000000000"}]}}
-    hist = asyncio.run(accounts.account_history(_P2pSession(body), "bybit"))
+    hist = arun(accounts.account_history(_P2pSession(body), "bybit"))
     assert hist[0]["id"] == "1" and hist[0]["side"] == "buy" and hist[0]["amount"] == 10.0
 
 
 def test_account_history_returns_none_without_keys(tmp_path, monkeypatch):
     monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
-    assert asyncio.run(accounts.account_history(_JsonSession({}), "mexc")) is None
+    assert arun(accounts.account_history(_JsonSession({}), "mexc")) is None
 
 
 def test_account_history_kucoin_without_passphrase_returns_none(tmp_path, monkeypatch):
     monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
     accounts.save_key("kucoin", "k", "s")   # без passphrase
-    assert asyncio.run(accounts.account_history(_JsonSession({}), "kucoin")) is None
+    assert arun(accounts.account_history(_JsonSession({}), "kucoin")) is None
 
 
 def test_api_permissions_fails_open_when_api_errors(tmp_path, monkeypatch):
@@ -1012,7 +1013,7 @@ def test_api_permissions_fails_open_when_api_errors(tmp_path, monkeypatch):
         def get(self, url, headers=None):
             raise RuntimeError("network down")
 
-    safe, detail = asyncio.run(accounts.api_permissions(_Boom(), "bybit"))
+    safe, detail = arun(accounts.api_permissions(_Boom(), "bybit"))
     assert safe and detail == ""
 
 
@@ -1020,22 +1021,22 @@ def test_api_permissions_fails_open_when_api_errors(tmp_path, monkeypatch):
 
 def test_key_permissions_no_key_is_unknown(tmp_path, monkeypatch):
     monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
-    assert asyncio.run(accounts.key_permissions(_JsonSession({}), "bybit")) == (None, "")
+    assert arun(accounts.key_permissions(_JsonSession({}), "bybit")) == (None, "")
 
 
 def test_key_permissions_bybit_readonly_is_confirmed(tmp_path, monkeypatch):
     monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
     accounts.save_key("bybit", "k", "s")
     body = {"retCode": 0, "result": {"readOnly": 1, "permissions": {"Spot": [], "Wallet": []}}}
-    assert asyncio.run(accounts.key_permissions(_JsonSession(body), "bybit")) == (True, "")
+    assert arun(accounts.key_permissions(_JsonSession(body), "bybit")) == (True, "")
 
 
 def test_key_permissions_bybit_api_error_is_unknown(tmp_path, monkeypatch):
     monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
     accounts.save_key("bybit", "k", "s")
     body = {"retCode": 10005, "retMsg": "Permission denied"}
-    assert asyncio.run(accounts.key_permissions(_JsonSession(body), "bybit")) == (None, "")
-    assert asyncio.run(accounts.api_permissions(_JsonSession(body), "bybit")) == (True, "")   # старт — fail-open
+    assert arun(accounts.key_permissions(_JsonSession(body), "bybit")) == (None, "")
+    assert arun(accounts.api_permissions(_JsonSession(body), "bybit")) == (True, "")   # старт — fail-open
 
 
 def test_key_permissions_network_error_is_unknown(tmp_path, monkeypatch):
@@ -1046,7 +1047,7 @@ def test_key_permissions_network_error_is_unknown(tmp_path, monkeypatch):
         def get(self, url, headers=None):
             raise RuntimeError("network down")
 
-    assert asyncio.run(accounts.key_permissions(_Boom(), "bybit")) == (None, "")
+    assert arun(accounts.key_permissions(_Boom(), "bybit")) == (None, "")
 
 
 def test_key_permissions_mexc_error_body_is_unknown(tmp_path, monkeypatch):
@@ -1054,8 +1055,8 @@ def test_key_permissions_mexc_error_body_is_unknown(tmp_path, monkeypatch):
     monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
     accounts.save_key("mexc", "k", "s")
     body = {"code": 700002, "msg": "Signature for this request is not valid."}
-    assert asyncio.run(accounts.key_permissions(_JsonSession(body), "mexc")) == (None, "")
-    assert asyncio.run(accounts.api_permissions(_JsonSession(body), "mexc")) == (True, "")
+    assert arun(accounts.key_permissions(_JsonSession(body), "mexc")) == (None, "")
+    assert arun(accounts.api_permissions(_JsonSession(body), "mexc")) == (True, "")
 
 
 def test_key_permissions_mexc_readonly_and_trade(tmp_path, monkeypatch):
@@ -1063,8 +1064,8 @@ def test_key_permissions_mexc_readonly_and_trade(tmp_path, monkeypatch):
     accounts.save_key("mexc", "k", "s")
     ro = {"canTrade": False, "canWithdraw": False, "balances": []}
     trade = {"canTrade": True, "canWithdraw": True, "balances": []}
-    assert asyncio.run(accounts.key_permissions(_JsonSession(ro), "mexc")) == (True, "")
-    assert asyncio.run(accounts.key_permissions(_JsonSession(trade), "mexc")) == (False, "торговля, вывод")
+    assert arun(accounts.key_permissions(_JsonSession(ro), "mexc")) == (True, "")
+    assert arun(accounts.key_permissions(_JsonSession(trade), "mexc")) == (False, "торговля, вывод")
 
 
 def test_key_permissions_htx_uid_error_is_unknown(tmp_path, monkeypatch):
@@ -1072,7 +1073,7 @@ def test_key_permissions_htx_uid_error_is_unknown(tmp_path, monkeypatch):
     monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
     accounts.save_key("htx", "k", "s")
     s = _HtxKeySession("readOnly,trade", uid_body={"code": 1002, "message": "unauthorized"})
-    assert asyncio.run(accounts.key_permissions(s, "htx")) == (None, "")
+    assert arun(accounts.key_permissions(s, "htx")) == (None, "")
 
 
 def test_key_permissions_htx_unknown_key_and_kucoin_no_passphrase_are_unknown(tmp_path, monkeypatch):
@@ -1080,8 +1081,8 @@ def test_key_permissions_htx_unknown_key_and_kucoin_no_passphrase_are_unknown(tm
     accounts.save_key("htx", "k", "s")
     accounts.save_key("kucoin", "k", "s")   # без passphrase
     other = {"code": 200, "data": [{"accessKey": "другой", "permission": "readOnly"}]}
-    assert asyncio.run(accounts.key_permissions(_JsonSession(other), "htx")) == (None, "")
-    assert asyncio.run(accounts.key_permissions(_JsonSession({}), "kucoin")) == (None, "")
+    assert arun(accounts.key_permissions(_JsonSession(other), "htx")) == (None, "")
+    assert arun(accounts.key_permissions(_JsonSession({}), "kucoin")) == (None, "")
 
 
 # verify_status/set_verified: статус последней проверки ключа для «🔑 Мои биржи» — отдельно от самого

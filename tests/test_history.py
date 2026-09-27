@@ -1,11 +1,10 @@
-import asyncio
 import dataclasses
 import datetime
 import sqlite3
 
 import history
 import p2p
-from helpers import make_ad
+from helpers import arun, make_ad
 
 # Понедельник, 07:00 UTC = 10:00 МСК — не задевает границу суток при +3ч.
 BASE = datetime.datetime(2026, 1, 5, 7, 0, 0, tzinfo=datetime.timezone.utc).timestamp()
@@ -53,7 +52,7 @@ _FIXTURE = {}
 def _fixture_snap():
     """Живой скан на фикстурах площадок (все монеты по умолчанию) — один на модуль: скан долгий."""
     if "snap" not in _FIXTURE:
-        _FIXTURE["snap"] = asyncio.run(p2p.scan(None, p2p.Config()))
+        _FIXTURE["snap"] = arun(p2p.scan(None, p2p.Config()))
     return _FIXTURE["snap"]
 
 

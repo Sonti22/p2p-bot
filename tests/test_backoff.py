@@ -1,7 +1,7 @@
-import asyncio
 import time
 
 import p2p
+from helpers import arun
 
 
 def test_backoff_grows_then_caps_at_ten_minutes():
@@ -42,12 +42,12 @@ def test_scan_skips_paused_venue_and_marks_pause_in_errors(offline, monkeypatch)
     monkeypatch.setitem(p2p.FETCHERS, "fake", failing)
     c = p2p.Config(exchanges=["fake"], assets=["USDT"], min_orders=0, min_rate=0)
 
-    snap1 = asyncio.run(p2p.scan(None, c))   # первая ошибка — площадка ещё не была на паузе
+    snap1 = arun(p2p.scan(None, c))   # первая ошибка — площадка ещё не была на паузе
     assert len(calls) == 2                    # buy + sell
     assert "fake/USDT" in snap1.errors
     assert p2p._venue_paused_until("fake") is not None
 
-    snap2 = asyncio.run(p2p.scan(None, c))    # теперь площадка на паузе — фетчер не дёргаем
+    snap2 = arun(p2p.scan(None, c))    # теперь площадка на паузе — фетчер не дёргаем
     assert len(calls) == 2                     # звонков не прибавилось
     assert "fake" in snap2.errors and "пауза до" in snap2.errors["fake"]
 
@@ -65,13 +65,13 @@ def test_scan_backoff_resets_after_pause_expires_and_success(offline, monkeypatc
     monkeypatch.setitem(p2p.FETCHERS, "fake", flaky)
     c = p2p.Config(exchanges=["fake"], assets=["USDT"], min_orders=0, min_rate=0)
 
-    asyncio.run(p2p.scan(None, c))
+    arun(p2p.scan(None, c))
     assert p2p._venue_paused_until("fake") is not None
     assert len(calls) == 2
 
     p2p._venue_backoff["fake"]["until"] = time.time() - 1   # эмулируем окончание паузы
     fail[0] = False
-    snap = asyncio.run(p2p.scan(None, c))
+    snap = arun(p2p.scan(None, c))
     assert len(calls) == 4                                   # снова опросили (buy+sell)
     assert "fake" not in snap.errors
     assert p2p._venue_paused_until("fake") is None            # сброс после успеха
@@ -83,8 +83,8 @@ def test_scan_pause_message_shows_hhmm(offline, monkeypatch):
 
     monkeypatch.setitem(p2p.FETCHERS, "fake", failing)
     c = p2p.Config(exchanges=["fake"], assets=["USDT"], min_orders=0, min_rate=0)
-    asyncio.run(p2p.scan(None, c))
+    arun(p2p.scan(None, c))
     until = p2p._venue_paused_until("fake")
-    snap = asyncio.run(p2p.scan(None, c))
+    snap = arun(p2p.scan(None, c))
     expected = time.strftime("%H:%M", time.localtime(until))
     assert snap.errors["fake"] == f"пауза до {expected}"

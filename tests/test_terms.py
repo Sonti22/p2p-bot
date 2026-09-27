@@ -1,10 +1,9 @@
-import asyncio
 
 import pytest
 
 import cards
 import p2p
-from helpers import make_ad
+from helpers import arun, make_ad
 
 
 @pytest.mark.parametrize("text,blocked,notes", [
@@ -32,16 +31,16 @@ def test_usable_drops_blocked_terms():
 
 def test_adapters_fill_terms(offline):
     for name in ("bybit", "kucoin", "mexc", "bitpapa"):
-        ads = asyncio.run(p2p.FETCHERS[name](None, p2p.Config(), "buy", "USDT"))
+        ads = arun(p2p.FETCHERS[name](None, p2p.Config(), "buy", "USDT"))
         assert any(a.terms for a in ads), name
-    bp = asyncio.run(p2p.bitpapa(None, p2p.Config(), "buy", "USDT"))
+    bp = arun(p2p.bitpapa(None, p2p.Config(), "buy", "USDT"))
     assert any("[только верифицированные]" in a.terms for a in bp)   # флаг for_identified_people → заметка
     assert any("требует верификацию" in p2p.terms_flags(a.terms)[1] for a in bp)
 
 
 def test_scan_offline_excludes_offplatform_ads(offline):
     c = p2p.Config(exchanges=["bitpapa"], assets=["USDT"], min_orders=0, min_rate=0)
-    snap = asyncio.run(p2p.scan(None, c))
+    snap = arun(p2p.scan(None, c))
     for a in snap.best.values():
         assert "telegram" not in a.terms.lower()
 
@@ -88,7 +87,7 @@ def test_scan_keeps_risky_terms_after_stacking(offline, monkeypatch):
 
     monkeypatch.setitem(p2p.FETCHERS, "r", fake_r)
     c = p2p.Config(exchanges=["r"], assets=["USDT"], min_orders=0, min_rate=0)
-    snap = asyncio.run(p2p.scan(None, c))
+    snap = arun(p2p.scan(None, c))
     d = snap.deals[0]
     assert d[1].terms == RISKY_TERMS and d[2].terms == RISKY_TERMS
     label, reasons = p2p.reliability(d, c, snap)

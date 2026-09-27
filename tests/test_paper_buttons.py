@@ -1,5 +1,4 @@
 """Сухой прогон включается кнопкой под «/paper»: ссылка «/paper» в тексте шлёт команду без аргумента."""
-import asyncio
 import functools
 
 import bot as B
@@ -7,6 +6,7 @@ import p2p
 import paper
 from test_bot import Stub, texts
 from test_guests import Stub as GuestStub, msg
+from helpers import arun
 
 
 def _env(monkeypatch, tmp_path):
@@ -20,15 +20,15 @@ def _buttons(markup):
 
 
 def _press(bot, data):
-    asyncio.run(bot.on_callback({"id": "1", "data": data, "message": {"message_id": 7}}))
+    arun(bot.on_callback({"id": "1", "data": data, "message": {"message_id": 7}}))
     return [p for m, p in bot.out if m == "editMessageText"][-1]
 
 
 def test_paper_without_arg_and_dev_button_show_control_buttons(monkeypatch):
     monkeypatch.delenv("PAPER", raising=False)
     bot = Stub(p2p.Config())
-    asyncio.run(bot.cmd_paper(""))
-    asyncio.run(bot.on_callback({"id": "1", "data": "paper", "message": {"message_id": 7}}))
+    arun(bot.cmd_paper(""))
+    arun(bot.on_callback({"id": "1", "data": "paper", "message": {"message_id": 7}}))
     sent = [p for m, p in bot.out if m == "sendMessage"]
     for p in sent[-2:]:
         buttons = _buttons(p["reply_markup"])
@@ -61,7 +61,7 @@ def test_amount_buttons_mark_current_and_ignore_unknown_values(monkeypatch, tmp_
 
 def test_report_button_sends_report(monkeypatch):
     bot = Stub(p2p.Config())
-    asyncio.run(bot.on_callback({"id": "1", "data": "paper_report", "message": {"message_id": 7}}))
+    arun(bot.on_callback({"id": "1", "data": "paper_report", "message": {"message_id": 7}}))
     assert "Отчёт сухого прогона" in texts(bot)[-1]
 
 
@@ -72,8 +72,8 @@ def test_guest_cannot_press_paper_buttons(monkeypatch, tmp_path):
     for data in ("paper", "paper_set:on", "paper_amt:20000", "paper_report"):
         before = len(bot.out)
         cq = {"id": "1", "data": data, "message": {"chat": {"id": 42}, "message_id": 5}}
-        asyncio.run(bot.on_update({"callback_query": cq}))
+        arun(bot.on_update({"callback_query": cq}))
         assert [m for m, _ in bot.out[before:]] == ["answerCallbackQuery"], data
     assert not paper.settings()["on"] and not env.exists()
-    asyncio.run(bot.on_update(msg(42, "/paper on")))
+    arun(bot.on_update(msg(42, "/paper on")))
     assert not paper.settings()["on"]

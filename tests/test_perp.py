@@ -1,5 +1,4 @@
 """perp.py: разбор публичных ответов Bybit/BingX, опрос с бэкоффом, стакан, лоты, точный учёт фандинга."""
-import asyncio
 import inspect
 import json
 import os
@@ -10,6 +9,7 @@ import pytest
 import p2p
 import perp
 from perpfx import api, install, make_get, quote
+from helpers import arun
 
 NOW = 1790494000.0
 
@@ -73,7 +73,7 @@ def test_walk_and_lots():
 
 def test_refresh_builds_quotes_and_skips_closed_symbols():
     calls = []
-    errors = asyncio.run(perp.refresh(None, make_get(calls=calls), now=NOW))
+    errors = arun(perp.refresh(None, make_get(calls=calls), now=NOW))
     assert errors == {}
     q = perp._quotes[("Bybit", "BTCUSDT")]
     assert q.mark == 84477.45 and q.bid == 84477.10 and q.ask == 84477.20 and q.lot == 0.001
@@ -107,7 +107,7 @@ def test_closed_or_offline_symbol_is_skipped_not_an_error(monkeypatch):
     monkeypatch.setenv("PERP_ASSETS", "BTC,TON")
     calls = []
     j = api()
-    errors = asyncio.run(perp.refresh(None, make_get({"bybit_spot_TONUSDT": j["bybit_spot_TONUSDT_error"]},
+    errors = arun(perp.refresh(None, make_get({"bybit_spot_TONUSDT": j["bybit_spot_TONUSDT_error"]},
                                                      calls=calls), now=NOW))
     assert errors == {}
     assert ("Bybit", "TONUSDT") not in perp._quotes and ("Bybit", "BTCUSDT") in perp._quotes
@@ -120,30 +120,30 @@ def test_closed_or_offline_symbol_is_skipped_not_an_error(monkeypatch):
 
 
 def test_backoff_per_venue_and_recovery():
-    errors = asyncio.run(perp.refresh(None, make_get(fail=("open-api.bingx.com",)), now=NOW))
+    errors = arun(perp.refresh(None, make_get(fail=("open-api.bingx.com",)), now=NOW))
     assert "BingX" in errors and ("Bybit", "BTCUSDT") in perp._quotes
     assert perp._backoff["BingX"]["delay"] == perp.BACKOFF_BASE
     calls = []
-    asyncio.run(perp.refresh(None, make_get(calls=calls), now=NOW + 1))   # BingX на паузе — не опрашиваем
+    arun(perp.refresh(None, make_get(calls=calls), now=NOW + 1))   # BingX на паузе — не опрашиваем
     assert not any("bingx" in u for u in calls)
     assert "BingX" in perp.status(now=NOW + 1)["paused"]
-    asyncio.run(perp.refresh(None, make_get(), now=NOW + perp.BACKOFF_BASE + 1))
+    arun(perp.refresh(None, make_get(), now=NOW + perp.BACKOFF_BASE + 1))
     assert "BingX" not in perp._backoff and ("BingX", "BTCUSDT") in perp._quotes
 
 
 def test_refresh_if_due_interval_and_switch(monkeypatch):
     calls = []
-    assert asyncio.run(perp.refresh_if_due(None, make_get(calls=calls), now=NOW)) == {}
+    assert arun(perp.refresh_if_due(None, make_get(calls=calls), now=NOW)) == {}
     n = len(calls)
-    assert asyncio.run(perp.refresh_if_due(None, make_get(calls=calls), now=NOW + 5)) is None
+    assert arun(perp.refresh_if_due(None, make_get(calls=calls), now=NOW + 5)) is None
     assert len(calls) == n
     monkeypatch.setenv("PERPS", "0")
-    assert asyncio.run(perp.refresh_if_due(None, make_get(calls=calls), now=NOW + 100)) is None
+    assert arun(perp.refresh_if_due(None, make_get(calls=calls), now=NOW + 100)) is None
 
 
 def test_get_refuses_other_hosts():
     with pytest.raises(ValueError):
-        asyncio.run(perp._get(None, "https://api.mexc.com/api/v3/time"))   # домен разрешён guard, но не perp
+        arun(perp._get(None, "https://api.mexc.com/api/v3/time"))   # домен разрешён guard, но не perp
 
 
 def test_quote_freshness():
@@ -184,7 +184,7 @@ def test_funding_windows():
 
 def test_scan_attaches_perps(offline):
     install(quote())
-    snap = asyncio.run(p2p.scan(None, p2p.Config(assets=["USDT"], exchanges=["bybit"])))
+    snap = arun(p2p.scan(None, p2p.Config(assets=["USDT"], exchanges=["bybit"])))
     assert ("Bybit", "BTCUSDT") in snap.perps and snap.perps[("Bybit", "BTCUSDT")].mid == 84000.0
 
 
@@ -192,7 +192,7 @@ def test_assemble_never_reads_live_perps(offline):
     """Живые котировки кладёт только scan() после сборки: assemble чистая — replay старого снимка их не подмешивает."""
     install(quote())
     cfg = p2p.Config(assets=["USDT"], exchanges=["bybit"])
-    raw = asyncio.run(p2p.collect(None, cfg))
+    raw = arun(p2p.collect(None, cfg))
     assert p2p.assemble(cfg, **raw).perps == {}
 
 
@@ -249,7 +249,7 @@ def test_get_requires_https_allowed_host_and_no_redirect():
                 perp.BYBIT + ":8443/v5/market/time",                        # чужой порт
                 perp.BYBIT.replace("://", "://x@") + "/v5/market/time"):    # userinfo
         with pytest.raises(ValueError):
-            asyncio.run(perp._get(None, url))
+            arun(perp._get(None, url))
 
     seen = {}
 
@@ -274,12 +274,12 @@ def test_get_requires_https_allowed_host_and_no_redirect():
             return Resp()
 
     with pytest.raises(ValueError):   # 3xx: не идём по редиректу и не читаем тело как ответ
-        asyncio.run(perp._get(Session(), perp.BYBIT + "/v5/market/time"))
+        arun(perp._get(Session(), perp.BYBIT + "/v5/market/time"))
     assert seen["allow_redirects"] is False and seen["timeout"].total == perp.REQUEST_TIMEOUT
 
 
 def test_time_sync_failure_keeps_quotes():
-    errors = asyncio.run(perp.refresh(None, make_get(fail=("/v5/market/time", "server/time")), now=NOW))
+    errors = arun(perp.refresh(None, make_get(fail=("/v5/market/time", "server/time")), now=NOW))
     assert errors == {} and ("Bybit", "BTCUSDT") in perp._quotes and ("BingX", "BTCUSDT") in perp._quotes
     assert not perp._backoff
 
@@ -287,7 +287,7 @@ def test_time_sync_failure_keeps_quotes():
 def test_bybit_empty_book_is_an_error_not_a_zero_quote():
     j = api()
     empty = dict(j["bybit_book_BTCUSDT"], result={"s": "BTCUSDT", "b": [], "a": []})
-    errors = asyncio.run(perp.refresh(None, make_get({"bybit_book_BTCUSDT": empty}), now=NOW))
+    errors = arun(perp.refresh(None, make_get({"bybit_book_BTCUSDT": empty}), now=NOW))
     assert "Bybit/BTCUSDT" in errors and ("Bybit", "BTCUSDT") not in perp._quotes
     assert ("Bybit", "ETHUSDT") in perp._quotes
 
@@ -297,13 +297,13 @@ def test_bingx_interval_inferred_from_roll_when_missing():
     j = api()
     prem = j["bingx_premium_GRAMTON-USDT"]
     prem["data"].pop("fundingIntervalHours")
-    asyncio.run(perp.refresh(None, make_get({"bingx_premium_GRAMTON-USDT": prem}), now=NOW))
+    arun(perp.refresh(None, make_get({"bingx_premium_GRAMTON-USDT": prem}), now=NOW))
     assert perp._quotes[("BingX", "GRAMTONUSDT")].interval_h == 8   # пока не видно — по умолчанию
     rolled = json_copy(prem)
     rolled["data"]["nextFundingTime"] += 4 * 3600 * 1000
-    asyncio.run(perp.refresh(None, make_get({"bingx_premium_GRAMTON-USDT": rolled}), now=NOW + 30))
+    arun(perp.refresh(None, make_get({"bingx_premium_GRAMTON-USDT": rolled}), now=NOW + 30))
     assert perp._quotes[("BingX", "GRAMTONUSDT")].interval_h == 4
-    asyncio.run(perp.refresh(None, make_get({"bingx_premium_GRAMTON-USDT": rolled}), now=NOW + 60))
+    arun(perp.refresh(None, make_get({"bingx_premium_GRAMTON-USDT": rolled}), now=NOW + 60))
     assert perp._quotes[("BingX", "GRAMTONUSDT")].interval_h == 4   # держится до следующего сдвига
 
 
@@ -317,7 +317,7 @@ def test_klines_refetched_right_after_hour_close_and_timestamped():
 
     def kline_calls(now):
         calls = []
-        asyncio.run(perp.refresh(None, make_get(calls=calls, fail=no_time), now=now))
+        arun(perp.refresh(None, make_get(calls=calls, fail=no_time), now=now))
         return [u for u in calls if "kline" in u and "BTCUSDT" in u]
 
     assert kline_calls(edge - 10) and perp.kline_time("Bybit", "BTCUSDT") == edge - 10

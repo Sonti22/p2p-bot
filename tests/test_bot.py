@@ -19,7 +19,7 @@ import p2p
 import paper
 import presets
 import trades
-from helpers import make_ad
+from helpers import arun, make_ad
 
 
 class Stub(B.Bot):
@@ -74,16 +74,16 @@ def test_notify_top_n_and_dedup(monkeypatch):
     bot.live_scans = 1   # тест про антидубль/паузу, не про живость
     bot.max_signals = 2
     ds = [deal(5, "MEXC"), deal(4, "KuCoin"), deal(3, "HTX")]
-    asyncio.run(bot.notify(snap(ds)))
+    arun(bot.notify(snap(ds)))
     assert len(photos(bot)) == 2
-    asyncio.run(bot.notify(snap(ds)))
+    arun(bot.notify(snap(ds)))
     assert len(photos(bot)) == 2          # повтор той же связки не шлём
 
 
 def test_below_threshold_not_sent(monkeypatch):
     monkeypatch.setattr(B, "deal_card", lambda d, c, a=None, r=None, breakdown=None: b"png")
     bot = Stub(p2p.Config(min_profit=5.0))
-    asyncio.run(bot.notify(snap([deal(3)])))
+    arun(bot.notify(snap([deal(3)])))
     assert not bot.out
 
 
@@ -114,7 +114,7 @@ def test_paper_cycle_starts_on_signal_when_enabled(monkeypatch, tmp_path):
     bot.live_scans = 1
     bot.guests = {"999"}   # гостям про сухой прогон — ничего
     ds = [deal(5)]
-    asyncio.run(bot.notify(snap_groups(ds)))
+    arun(bot.notify(snap_groups(ds)))
     cycles = paper.open_cycles(path=db)
     assert len(cycles) == 1
     c = cycles[0]
@@ -135,7 +135,7 @@ def test_paper_cycle_off_by_default(monkeypatch, tmp_path):
     _patch_paper_db(monkeypatch, db)
     bot = Stub(p2p.Config(min_profit=2.0))
     bot.live_scans = 1
-    asyncio.run(bot.notify(snap_groups([deal(5)])))
+    arun(bot.notify(snap_groups([deal(5)])))
     assert not paper.open_cycles(path=db)
     assert not [t for t in texts(bot) if "Сухой прогон" in t]
 
@@ -151,7 +151,7 @@ def test_paper_cycle_skips_when_slot_full(monkeypatch, tmp_path):
     paper.start_cycle(10000, buy, sell, "route", 2.0, path=db)   # слот уже занят
     bot = Stub(p2p.Config(min_profit=2.0))
     bot.live_scans = 1
-    asyncio.run(bot.notify(snap_groups([deal(5)])))
+    arun(bot.notify(snap_groups([deal(5)])))
     assert len(paper.open_cycles(path=db)) == 1   # новый круг не завёлся
     assert not [t for t in texts(bot) if "Сухой прогон" in t]
 
@@ -163,7 +163,7 @@ def test_process_paper_cycles_waits_before_pay_minutes(monkeypatch, tmp_path):
     buy, sell = make_ad("Bybit", "buy", 85.0), make_ad("MEXC", "sell", 90.0)
     cid = paper.start_cycle(10000, buy, sell, "route", 2.0, path=db, ts=time.time())
     bot = Stub(p2p.Config(min_profit=2.0))
-    asyncio.run(bot.process_paper_cycles(snap_groups([deal(5)])))
+    arun(bot.process_paper_cycles(snap_groups([deal(5)])))
     c = paper.get_cycle(cid, path=db)
     assert c["stage"] == "buy" and c["result"] is None   # рано — ещё не прошло PAPER_PAY_MINUTES
 
@@ -176,7 +176,7 @@ def test_process_paper_cycles_advances_when_ad_still_there(monkeypatch, tmp_path
     cid = paper.start_cycle(10000, buy, sell, "route", 2.0, path=db, ts=time.time() - 400)
     bot = Stub(p2p.Config(min_profit=2.0))
     s = snap_groups([deal(5)])   # groups: (Bybit, buy, USDT) -> [та же связка, цена 85.0]
-    asyncio.run(bot.process_paper_cycles(s))
+    arun(bot.process_paper_cycles(s))
     c = paper.get_cycle(cid, path=db)
     assert c["stage"] == "transfer" and c["result"] is None
     assert not [t for t in texts(bot) if "сорвался" in t]
@@ -191,7 +191,7 @@ def test_process_paper_cycles_fails_when_ad_gone(monkeypatch, tmp_path):
     bot = Stub(p2p.Config(min_profit=2.0))
     s = p2p.Snapshot(88.0, "test", {}, {}, [], {}, {}, {},
                      groups={("Bybit", "buy", "USDT"): []})   # площадка ответила, объявления нет
-    asyncio.run(bot.process_paper_cycles(s))
+    arun(bot.process_paper_cycles(s))
     c = paper.get_cycle(cid, path=db)
     assert c["stage"] == "buy" and c["result"] == "failed_buy" and c["realized_pct"] == 0.0
     msgs = [t for t in texts(bot) if "сорвался" in t]
@@ -209,14 +209,14 @@ def test_process_paper_cycles_buy_rechecks_price(monkeypatch, tmp_path):
     bot = Stub(p2p.Config(min_profit=2.0))
     slightly = make_ad("Bybit", "buy", 85.4)
     s = p2p.Snapshot(88.0, "test", {}, {}, [], {}, {}, {}, groups={("Bybit", "buy", "USDT"): [slightly]})
-    asyncio.run(bot.process_paper_cycles(s))
+    arun(bot.process_paper_cycles(s))
     c = paper.get_cycle(cid, path=db)
     assert c["stage"] == "transfer" and c["result"] is None
     assert c["buy_fill_price"] == 85.4 and abs(c["buy_slip_pct"] - (85.4 / 85 - 1) * 100) < 1e-9
     assert not [t for t in texts(bot) if "сорвался" in t]
     gone = paper.start_cycle(10000, buy, sell, "route", 2.0, path=db, ts=time.time() - 400)
     worse = make_ad("Bybit", "buy", 86.0)
-    asyncio.run(bot.process_paper_cycles(p2p.Snapshot(88.0, "test", {}, {}, [], {}, {}, {},
+    arun(bot.process_paper_cycles(p2p.Snapshot(88.0, "test", {}, {}, [], {}, {}, {},
                                                       groups={("Bybit", "buy", "USDT"): [worse]})))
     g = paper.get_cycle(gone, path=db)
     assert g["result"] == "failed_buy" and "цена ушла" in g["note"]
@@ -229,7 +229,7 @@ def test_process_paper_cycles_noop_without_chat_id(monkeypatch, tmp_path):
     cid = paper.start_cycle(10000, buy, sell, "route", 2.0, path=db, ts=time.time() - 400)
     bot = Stub(p2p.Config(min_profit=2.0))
     bot.chat_id = None
-    asyncio.run(bot.process_paper_cycles(snap_groups([deal(5)])))
+    arun(bot.process_paper_cycles(snap_groups([deal(5)])))
     c = paper.get_cycle(cid, path=db)
     assert c["stage"] == "buy" and c["result"] is None   # без chat_id стадии не проверяем
 
@@ -242,7 +242,7 @@ def test_process_paper_cycles_transfer_waits_before_transfer_minutes(monkeypatch
     cid = paper.start_cycle(10000, buy, sell, "route", 2.0, path=db, ts=time.time())
     paper.set_stage(cid, "transfer", path=db)
     bot = Stub(p2p.Config(min_profit=2.0))
-    asyncio.run(bot.process_paper_cycles(snap([])))
+    arun(bot.process_paper_cycles(snap([])))
     c = paper.get_cycle(cid, path=db)
     assert c["stage"] == "transfer" and c["result"] is None   # рано — ещё не прошло PAPER_TRANSFER_MINUTES
 
@@ -255,7 +255,7 @@ def test_process_paper_cycles_transfer_advances_to_sell(monkeypatch, tmp_path):
     cid = paper.start_cycle(10000, buy, sell, "route", 2.0, path=db, ts=time.time() - 400)
     paper.set_stage(cid, "transfer", path=db, ts=time.time() - 400)
     bot = Stub(p2p.Config(min_profit=2.0))
-    asyncio.run(bot.process_paper_cycles(snap([])))
+    arun(bot.process_paper_cycles(snap([])))
     c = paper.get_cycle(cid, path=db)
     assert c["stage"] == "sell" and c["result"] is None
     assert not [t for t in texts(bot) if "сорвался" in t]
@@ -272,7 +272,7 @@ def test_process_paper_cycles_transfer_fails_when_withdraw_closed(monkeypatch, t
     cid = paper.start_cycle(10000, buy, sell, "route", 2.0, path=db, ts=time.time() - 400)
     paper.set_stage(cid, "transfer", path=db, ts=time.time() - 400)
     bot = Stub(p2p.Config(min_profit=2.0))
-    asyncio.run(bot.process_paper_cycles(snap([])))
+    arun(bot.process_paper_cycles(snap([])))
     c = paper.get_cycle(cid, path=db)
     assert c["stage"] == "transfer" and c["result"] == "failed_transfer" and c["realized_pct"] == 0.0
     msgs = [t for t in texts(bot) if "сорвался" in t]
@@ -292,7 +292,7 @@ def test_process_paper_cycles_sell_completes_and_updates_balance(monkeypatch, tm
     paper.init_balance(10000, path=db)
     bot = Stub(p2p.Config(min_profit=2.0))
     better = make_ad("MEXC", "sell", 91.0)   # продали дороже плана — факт лучше плана
-    asyncio.run(bot.process_paper_cycles(_sell_stage_snap(ads=[better])))
+    arun(bot.process_paper_cycles(_sell_stage_snap(ads=[better])))
     c = paper.get_cycle(cid, path=db)
     assert c["stage"] == "sell" and c["result"] == "done"
     assert c["realized_pct"] == pytest.approx((1.02 * 91.0 / 90.0 - 1) * 100)
@@ -308,7 +308,7 @@ def test_process_paper_cycles_sell_fails_when_nobody_buys(monkeypatch, tmp_path)
     cid = paper.start_cycle(10000, buy, sell, "route", 2.0, path=db, ts=time.time() - 400)
     paper.set_stage(cid, "sell", path=db)
     bot = Stub(p2p.Config(min_profit=2.0))
-    asyncio.run(bot.process_paper_cycles(_sell_stage_snap(ads=[])))
+    arun(bot.process_paper_cycles(_sell_stage_snap(ads=[])))
     c = paper.get_cycle(cid, path=db)
     assert c["stage"] == "sell" and c["result"] == "failed_sell" and c["realized_pct"] == 0.0
     msgs = [t for t in texts(bot) if "сорвался" in t]
@@ -324,7 +324,7 @@ def test_paper_cycle_skips_when_depth_insufficient(monkeypatch, tmp_path):
     _patch_paper_db(monkeypatch, db)
     bot = Stub(p2p.Config(min_profit=2.0))
     bot.live_scans = 1
-    asyncio.run(bot.notify(snap_groups([deal(5)])))
+    arun(bot.notify(snap_groups([deal(5)])))
     assert not paper.open_cycles(path=db)
     assert not [t for t in texts(bot) if "Сухой прогон" in t]
 
@@ -335,7 +335,7 @@ def test_notify_threshold_before_top_n(monkeypatch):
     bot = Stub(p2p.Config(min_profit=2.0))
     bot.live_scans = 1
     bot.max_signals = 3
-    asyncio.run(bot.notify(snap([deal(1.5, "MEXC"), deal(3, "KuCoin")])))
+    arun(bot.notify(snap([deal(1.5, "MEXC"), deal(3, "KuCoin")])))
     caps = [p["caption"] for m, p in photos(bot)]
     assert len(caps) == 1 and "KuCoin" in caps[0] and "+3.00%" in caps[0]
 
@@ -346,7 +346,7 @@ def test_notify_slices_after_threshold(monkeypatch):
     bot = Stub(p2p.Config(min_profit=2.0))
     bot.live_scans = 1
     bot.max_signals = 3
-    asyncio.run(bot.notify(snap([deal(1.5, "MEXC"), deal(1.5, "HTX"), deal(1.5, "Bitpapa"), deal(3, "KuCoin")])))
+    arun(bot.notify(snap([deal(1.5, "MEXC"), deal(1.5, "HTX"), deal(1.5, "Bitpapa"), deal(3, "KuCoin")])))
     caps = [p["caption"] for m, p in photos(bot)]
     assert len(caps) == 1 and "KuCoin" in caps[0]
 
@@ -356,7 +356,7 @@ def test_notify_top_n_counts_only_above_threshold(monkeypatch):
     bot = Stub(p2p.Config(min_profit=2.0))
     bot.live_scans = 1
     bot.max_signals = 2
-    asyncio.run(bot.notify(snap([deal(1.5, "MEXC"), deal(5, "KuCoin"), deal(4, "HTX"), deal(3, "Bitpapa")])))
+    arun(bot.notify(snap([deal(1.5, "MEXC"), deal(5, "KuCoin"), deal(4, "HTX"), deal(3, "Bitpapa")])))
     caps = [p["caption"] for m, p in photos(bot)]
     assert len(caps) == 2 and "KuCoin" in caps[0] and "HTX" in caps[1]
 
@@ -383,7 +383,7 @@ def _env_bot(tmp_path, monkeypatch, **cfg):
 def test_amount_command_rejects_bad_values(tmp_path, monkeypatch):
     bot, env = _env_bot(tmp_path, monkeypatch, amount=50000)
     for arg in ("0", "-5", "nan", "inf", "1e999", "99999999"):
-        asyncio.run(bot.handle(f"/amount {arg}"))
+        arun(bot.handle(f"/amount {arg}"))
         assert "от 1 000 до 5 000 000" in texts(bot)[-1], arg
         assert bot.cfg.amount == 50000, arg
     assert "AMOUNT" not in env.read_text(encoding="utf-8")
@@ -391,7 +391,7 @@ def test_amount_command_rejects_bad_values(tmp_path, monkeypatch):
 
 def test_amount_command_accepts_units(tmp_path, monkeypatch):
     bot, env = _env_bot(tmp_path, monkeypatch, amount=50000)
-    asyncio.run(bot.handle("/amount 20к"))
+    arun(bot.handle("/amount 20к"))
     assert bot.cfg.amount == 20000
     assert "AMOUNT=20000" in env.read_text(encoding="utf-8")
     assert "20 000" in texts(bot)[-1]
@@ -400,7 +400,7 @@ def test_amount_command_accepts_units(tmp_path, monkeypatch):
 def test_min_command_rejects_bad_values(tmp_path, monkeypatch):
     bot, env = _env_bot(tmp_path, monkeypatch, min_profit=2.0)
     for arg in ("nan", "-100", "inf", "1e308", "0"):
-        asyncio.run(bot.handle(f"/min {arg}"))
+        arun(bot.handle(f"/min {arg}"))
         assert "Не понял порог" in texts(bot)[-1], arg
         assert bot.cfg.min_profit == 2.0, arg
     assert "MIN_PROFIT" not in env.read_text(encoding="utf-8")
@@ -408,7 +408,7 @@ def test_min_command_rejects_bad_values(tmp_path, monkeypatch):
 
 def test_min_command_accepts_comma(tmp_path, monkeypatch):
     bot, env = _env_bot(tmp_path, monkeypatch, min_profit=2.0)
-    asyncio.run(bot.handle("/min 1,5"))
+    arun(bot.handle("/min 1,5"))
     assert bot.cfg.min_profit == 1.5
     assert "MIN_PROFIT=1.5" in env.read_text(encoding="utf-8")
     assert "Порог 1.5%" in texts(bot)[-1]
@@ -418,7 +418,7 @@ def test_apply_callback_rejects_forged_values(tmp_path, monkeypatch):
     """callback_data «amt:»/«min:» можно подделать клиентом — apply проверяет значение тем же парсером."""
     bot, env = _env_bot(tmp_path, monkeypatch, amount=50000, min_profit=2.0)
     for data in ("amt:nan", "amt:0", "min:inf", "min:-1"):
-        asyncio.run(bot.on_callback({"id": "1", "data": data, "message": {"message_id": 3}}))
+        arun(bot.on_callback({"id": "1", "data": data, "message": {"message_id": 3}}))
         assert ("answerCallbackQuery", {"callback_query_id": "1", "text": "Некорректное значение"}) in bot.out, data
     assert bot.cfg.amount == 50000 and bot.cfg.min_profit == 2.0
     assert env.read_text(encoding="utf-8") == "TG_CHAT_ID=1\n"
@@ -448,7 +448,7 @@ def test_send_deal_passes_amount_breakdown_from_snap(monkeypatch):
     monkeypatch.setattr(B, "deal_card", fake_deal_card)
     bot = Stub(p2p.Config())
     d = deal(5, "MEXC")
-    asyncio.run(bot.send_deal(d, snap=snap([d])))
+    arun(bot.send_deal(d, snap=snap([d])))
     assert captured["amounts"] is not None and set(captured["amounts"]) == set(p2p.DEPTH_AMOUNTS)
 
 
@@ -463,12 +463,12 @@ def test_live_card_edits_instead_of_resending(monkeypatch):
         return {"ok": True, "result": {"message_id": 555}}
 
     bot.send_photo = fake_send_photo
-    asyncio.run(bot.notify(snap([deal(5)])))
+    arun(bot.notify(snap([deal(5)])))
     assert len(photos(bot)) == 1
     key = next(iter(bot.live_msg))
     bot.live_msg[key]["last_edit"] -= B.LIVE_EDIT_INTERVAL + 1   # прошло достаточно времени для правки
 
-    asyncio.run(bot.notify(snap([deal(5.1)])))   # почти та же прибыль — новое сообщение не шлём
+    arun(bot.notify(snap([deal(5.1)])))   # почти та же прибыль — новое сообщение не шлём
     assert len(photos(bot)) == 1
     edits = [p for m, p in bot.out if m == "editMessageCaption"]
     assert len(edits) == 1 and edits[0]["message_id"] == 555
@@ -484,8 +484,8 @@ def test_live_card_too_soon_not_edited(monkeypatch):
         return {"ok": True, "result": {"message_id": 1}}
 
     bot.send_photo = fake_send_photo
-    asyncio.run(bot.notify(snap([deal(5)])))
-    asyncio.run(bot.notify(snap([deal(5.1)])))
+    arun(bot.notify(snap([deal(5)])))
+    arun(bot.notify(snap([deal(5.1)])))
     assert not [p for m, p in bot.out if m == "editMessageCaption"]
 
 
@@ -499,12 +499,12 @@ def test_live_card_marks_stale_when_deal_disappears(monkeypatch):
         return {"ok": True, "result": {"message_id": 42}}
 
     bot.send_photo = fake_send_photo
-    asyncio.run(bot.notify(snap([deal(5)])))
-    asyncio.run(bot.notify(snap([])))   # связка пропала из скана
+    arun(bot.notify(snap([deal(5)])))
+    arun(bot.notify(snap([])))   # связка пропала из скана
     edits = [p for m, p in bot.out if m == "editMessageCaption"]
     assert len(edits) == 1 and "устарел" in edits[0]["caption"] and edits[0]["message_id"] == 42
 
-    asyncio.run(bot.notify(snap([])))   # повторно помечать не нужно
+    arun(bot.notify(snap([])))   # повторно помечать не нужно
     assert len([p for m, p in bot.out if m == "editMessageCaption"]) == 1
 
 
@@ -523,10 +523,10 @@ def test_fmt_top_fits_telegram():
 def test_venue_alert_after_fail_streak():
     bot = Stub(p2p.Config(exchanges=["bybit"]))
     bad = err_snap({"bybit/USDT": "TimeoutError: x"})
-    asyncio.run(bot.check_venues(bad))
-    asyncio.run(bot.check_venues(bad))
+    arun(bot.check_venues(bad))
+    arun(bot.check_venues(bad))
     assert not texts(bot)                 # 2 подряд — ещё рано
-    asyncio.run(bot.check_venues(bad))
+    arun(bot.check_venues(bad))
     assert any("bybit" in t and "недоступна" in t for t in texts(bot))
 
 
@@ -534,9 +534,9 @@ def test_venue_alert_cooldown_then_recovery():
     bot = Stub(p2p.Config(exchanges=["bybit"]))
     bad, ok = err_snap({"bybit/USDT": "err"}), err_snap({})
     for _ in range(5):
-        asyncio.run(bot.check_venues(bad))
+        arun(bot.check_venues(bad))
     assert len(texts(bot)) == 1            # повтор в течение часа не шлём
-    asyncio.run(bot.check_venues(ok))
+    arun(bot.check_venues(ok))
     msgs = texts(bot)
     assert len(msgs) == 2 and "снова доступна" in msgs[-1]
 
@@ -544,15 +544,15 @@ def test_venue_alert_cooldown_then_recovery():
 def test_venue_alert_after_15min_without_streak():
     bot = Stub(p2p.Config(exchanges=["bybit"]))
     bad = err_snap({"bybit/USDT": "err"})
-    asyncio.run(bot.check_venues(bad))     # streak 1, down_since = сейчас
+    arun(bot.check_venues(bad))     # streak 1, down_since = сейчас
     bot.venue["bybit"]["down_since"] = time.time() - B.VENUE_DOWN_AFTER - 1
-    asyncio.run(bot.check_venues(bad))     # streak 2, но уже дольше 15 мин
+    arun(bot.check_venues(bad))     # streak 2, но уже дольше 15 мин
     assert any("bybit" in t and "недоступна" in t for t in texts(bot))
 
 
 def test_venue_no_alert_when_healthy():
     bot = Stub(p2p.Config(exchanges=["bybit", "mexc"]))
-    asyncio.run(bot.check_venues(err_snap({})))
+    arun(bot.check_venues(err_snap({})))
     assert not texts(bot)
 
 
@@ -578,7 +578,7 @@ def test_dev_view_without_files(tmp_path):
 def test_send_deal_adds_done_button(monkeypatch):
     monkeypatch.setattr(B, "deal_card", lambda d, c, a=None, r=None, breakdown=None: b"png")
     bot = Stub(p2p.Config())
-    asyncio.run(bot.send_deal(deal(), "🔔 "))
+    arun(bot.send_deal(deal(), "🔔 "))
     markup = photos(bot)[0][1]["markup"]
     buttons = [b for row in markup["inline_keyboard"] for b in row]
     assert any(b.get("callback_data", "").startswith("did:") for b in buttons)
@@ -590,7 +590,7 @@ def test_mark_done_logs_trade_and_clears_button(tmp_path, monkeypatch):
     monkeypatch.setattr(B.trades, "log_trade", functools.partial(B.trades.log_trade, path=db))
     bot = Stub(p2p.Config(amount=70000))
     deal_id = bot.remember_deal(deal(5.0))
-    asyncio.run(bot.mark_done({"id": "1", "message": {"message_id": 9}}, deal_id))
+    arun(bot.mark_done({"id": "1", "message": {"message_id": 9}}, deal_id))
     st = trades.stats(path=db)
     assert st["day"]["count"] == 1 and st["day"]["amount"] == 70000
     assert deal_id not in bot.deals_by_id
@@ -607,7 +607,7 @@ def test_mark_done_uses_amount_at_signal_time(tmp_path, monkeypatch):
     bot = Stub(p2p.Config(amount=50000))
     deal_id = bot.remember_deal(deal(5.0))
     bot.cfg.amount = 200000
-    asyncio.run(bot.mark_done({"id": "1", "message": {"message_id": 9}}, deal_id))
+    arun(bot.mark_done({"id": "1", "message": {"message_id": 9}}, deal_id))
     assert trades.stats(path=db)["day"]["amount"] == 50000
 
 
@@ -616,7 +616,7 @@ def test_show_steps_uses_cfg_at_signal_time():
     d = deal(5.0)
     deal_id = bot.remember_deal(d, snap=snap([d]))
     bot.cfg.amount = 200000
-    asyncio.run(bot.show_steps({"id": "1"}, deal_id))
+    arun(bot.show_steps({"id": "1"}, deal_id))
     head = texts(bot)[-1].splitlines()[0]
     assert "50 000" in head and "200 000" not in head
 
@@ -629,11 +629,11 @@ def test_amount_change_via_settings_keeps_old_card_amount(tmp_path, monkeypatch)
     monkeypatch.setattr(B.trades, "log_trade", functools.partial(B.trades.log_trade, path=db))
     bot = Stub(p2p.Config(amount=50000, min_profit=2.0))
     bot.live_scans = 1
-    asyncio.run(bot.notify(snap([deal(5.0)])))
+    arun(bot.notify(snap([deal(5.0)])))
     deal_id = next(iter(bot.deals_by_id))
     assert bot.deals_by_id[deal_id][1] is not bot.cfg
     bot.apply("amt:200000")
-    asyncio.run(bot.on_callback({"id": "1", "data": f"did:{deal_id}", "message": {"message_id": 9}}))
+    arun(bot.on_callback({"id": "1", "data": f"did:{deal_id}", "message": {"message_id": 9}}))
     assert trades.stats(path=db)["day"]["amount"] == 50000
 
 
@@ -652,18 +652,18 @@ def test_live_card_edit_moves_buttons_to_edited_amount(tmp_path, monkeypatch):
         return {"ok": True, "result": {"message_id": 555}}
 
     bot.send_photo = fake_send_photo
-    asyncio.run(bot.notify(snap([deal(5.0)])))
+    arun(bot.notify(snap([deal(5.0)])))
     buttons = _callbacks(photos(bot)[0][1]["markup"])
     bot.apply("amt:200000")
     bot.live_msg[next(iter(bot.live_msg))]["last_edit"] -= B.LIVE_EDIT_INTERVAL + 1
-    asyncio.run(bot.notify(snap([deal(5.1)])))   # в пределах cooldown — правка вместо нового сообщения
+    arun(bot.notify(snap([deal(5.1)])))   # в пределах cooldown — правка вместо нового сообщения
     edits = [p for m, p in bot.out if m == "editMessageCaption"]
     assert len(photos(bot)) == 1 and len(edits) == 1 and "200 000" in edits[0]["caption"]
 
-    asyncio.run(bot.on_callback({"id": "1", "data": buttons["steps"], "message": {"message_id": 555}}))
+    arun(bot.on_callback({"id": "1", "data": buttons["steps"], "message": {"message_id": 555}}))
     head = texts(bot)[-1].splitlines()[0]
     assert "200 000" in head and "50 000" not in head
-    asyncio.run(bot.on_callback({"id": "2", "data": buttons["did"], "message": {"message_id": 555}}))
+    arun(bot.on_callback({"id": "2", "data": buttons["did"], "message": {"message_id": 555}}))
     assert trades.stats(path=db)["day"]["amount"] == 200000
     assert any(t.startswith("Расчёт был +5.10%") for t in texts(bot))   # по связке из правки
 
@@ -686,12 +686,12 @@ def test_live_card_edit_failed_keeps_buttons_on_old_snapshot(tmp_path, monkeypat
         return {"ok": False, "error_code": 400} if method == "editMessageCaption" else {"ok": True}
 
     bot.send_photo, bot.call = fake_send_photo, call
-    asyncio.run(bot.notify(snap([deal(5.0)])))
+    arun(bot.notify(snap([deal(5.0)])))
     buttons = _callbacks(photos(bot)[0][1]["markup"])
     bot.apply("amt:200000")
     bot.live_msg[next(iter(bot.live_msg))]["last_edit"] -= B.LIVE_EDIT_INTERVAL + 1
-    asyncio.run(bot.notify(snap([deal(5.1)])))
-    asyncio.run(bot.on_callback({"id": "2", "data": buttons["did"], "message": {"message_id": 555}}))
+    arun(bot.notify(snap([deal(5.1)])))
+    arun(bot.on_callback({"id": "2", "data": buttons["did"], "message": {"message_id": 555}}))
     assert trades.stats(path=db)["day"]["amount"] == 50000
 
 
@@ -713,10 +713,10 @@ def _restarted_bots(monkeypatch):
     monkeypatch.setattr(B, "deal_card", lambda d, c, a=None, r=None, breakdown=None: b"png")
     monkeypatch.setattr(B.time, "time", lambda: 1_790_000_000.0)
     old = Stub(p2p.Config())
-    asyncio.run(old.send_deal(deal(5.0, "MEXC")))
+    arun(old.send_deal(deal(5.0, "MEXC")))
     monkeypatch.setattr(B.time, "time", lambda: 1_790_000_600.0)   # рестарт через 10 минут
     new = Stub(p2p.Config())
-    asyncio.run(new.send_deal(deal(5.0, "KuCoin")))
+    arun(new.send_deal(deal(5.0, "KuCoin")))
     new.out.clear()
     return new, _callbacks(photos(old)[0][1]["markup"])
 
@@ -731,7 +731,7 @@ def test_old_did_button_after_restart_is_stale(tmp_path, monkeypatch):
     monkeypatch.setattr(B.trades, "log_trade", functools.partial(B.trades.log_trade, path=db))
     new, old_buttons = _restarted_bots(monkeypatch)
     for data in (old_buttons["did"], "did:1"):   # кнопка прошлого запуска и кнопка до этой правки
-        asyncio.run(new.on_callback({"id": "1", "data": data, "message": {"message_id": 9}}))
+        arun(new.on_callback({"id": "1", "data": data, "message": {"message_id": 9}}))
         assert new.out[-1] == ("answerCallbackQuery", {"callback_query_id": "1", "text": "Сигнал устарел, не записан"})
     assert trades.stats(path=db)["day"]["count"] == 0
     assert not [m for m, p in new.out if m == "editMessageReplyMarkup"]
@@ -741,10 +741,10 @@ def test_old_bl_and_steps_buttons_after_restart_are_stale(tmp_path, monkeypatch)
     db = str(tmp_path / "blacklist.db")
     monkeypatch.setattr(B.blacklist, "add", functools.partial(B.blacklist.add, path=db))
     new, old_buttons = _restarted_bots(monkeypatch)
-    asyncio.run(new.on_callback({"id": "1", "data": old_buttons["bl"], "message": {"message_id": 9}}))
+    arun(new.on_callback({"id": "1", "data": old_buttons["bl"], "message": {"message_id": 9}}))
     assert "устарел" in new.out[-1][1]["text"]
     assert blacklist.blocked(path=db) == set()
-    asyncio.run(new.on_callback({"id": "1", "data": old_buttons["steps"], "message": {"message_id": 9}}))
+    arun(new.on_callback({"id": "1", "data": old_buttons["steps"], "message": {"message_id": 9}}))
     assert "устарел" in new.out[-1][1]["text"]
     assert not any("Шаги связки" in t for t in texts(new))
 
@@ -761,7 +761,7 @@ def test_hide_deal_blacklists_both_sides_and_clears_button(tmp_path, monkeypatch
     bot = Stub(p2p.Config())
     d = deal(5.0)
     deal_id = bot.remember_deal(d)
-    asyncio.run(bot.hide_deal({"id": "1", "message": {"message_id": 9}}, deal_id))
+    arun(bot.hide_deal({"id": "1", "message": {"message_id": 9}}, deal_id))
     assert blacklist.blocked(path=db) == {("Bybit", "nick"), ("MEXC", "nick")}
     assert deal_id not in bot.deals_by_id
     method, params = bot.out[-1]
@@ -774,7 +774,7 @@ def test_hide_deal_unknown_id_not_blacklisted(tmp_path, monkeypatch):
     db = str(tmp_path / "blacklist.db")
     monkeypatch.setattr(B.blacklist, "add", functools.partial(B.blacklist.add, path=db))
     bot = Stub(p2p.Config())
-    asyncio.run(bot.hide_deal({"id": "1", "message": {"message_id": 9}}, 999))
+    arun(bot.hide_deal({"id": "1", "message": {"message_id": 9}}, 999))
     assert blacklist.blocked(path=db) == set()
     assert "устарел" in bot.out[-1][1]["text"]
 
@@ -784,14 +784,14 @@ def test_blacklist_command_lists_entries(tmp_path, monkeypatch):
     monkeypatch.setattr(B.blacklist, "list_all", functools.partial(B.blacklist.list_all, path=db))
     blacklist.add("Bybit", "Плохой", path=db)
     bot = Stub(p2p.Config())
-    asyncio.run(bot.handle("/blacklist"))
+    arun(bot.handle("/blacklist"))
     text = texts(bot)[-1]
     assert "Плохой" in text
 
 
 def test_blacklist_command_empty():
     bot = Stub(p2p.Config())
-    asyncio.run(bot.handle("/blacklist"))
+    arun(bot.handle("/blacklist"))
     assert "пуст" in texts(bot)[-1].lower()
 
 
@@ -802,7 +802,7 @@ def test_unbl_callback_removes_entry(tmp_path, monkeypatch):
     blacklist.add("Bybit", "Плохой", path=db)
     entry_id = blacklist.list_all(path=db)[0][0]
     bot = Stub(p2p.Config())
-    asyncio.run(bot.on_callback({"id": "1", "data": f"unbl:{entry_id}", "message": {"message_id": 3}}))
+    arun(bot.on_callback({"id": "1", "data": f"unbl:{entry_id}", "message": {"message_id": 3}}))
     assert blacklist.list_all(path=db) == []
     method, params = bot.out[-1]
     assert method == "editMessageText" and "пуст" in params["text"].lower()
@@ -825,7 +825,7 @@ def test_hide_deal_tells_how_to_add_reason(tmp_path, monkeypatch):
     monkeypatch.setattr(B.blacklist, "add", functools.partial(B.blacklist.add, path=db))
     bot = Stub(p2p.Config())
     deal_id = bot.remember_deal(deal(5.0))
-    asyncio.run(bot.hide_deal({"id": "1", "message": {"message_id": 9}}, deal_id))
+    arun(bot.hide_deal({"id": "1", "message": {"message_id": 9}}, deal_id))
     rows = blacklist.list_all(path=db)
     ids = {ex: entry_id for entry_id, ex, *_ in rows}
     text = texts(bot)[-1]
@@ -839,7 +839,7 @@ def _hide(monkeypatch, tmp_path, d):
     db = str(tmp_path / "blacklist.db")
     monkeypatch.setattr(B.blacklist, "add", functools.partial(B.blacklist.add, path=db))
     bot = Stub(p2p.Config())
-    asyncio.run(bot.hide_deal({"id": "1", "message": {"message_id": 9}}, bot.remember_deal(d)))
+    arun(bot.hide_deal({"id": "1", "message": {"message_id": 9}}, bot.remember_deal(d)))
     return {(ex, nick): entry_id for entry_id, ex, nick, *_ in blacklist.list_all(path=db)}, texts(bot)[-1], bot
 
 
@@ -875,23 +875,23 @@ def test_hide_deal_single_ad_unchanged(tmp_path, monkeypatch):
 def test_blacklist_note_command_valid_and_invalid_id():
     entry_id = blacklist.add("Bybit", "Плохой")
     bot = Stub(p2p.Config())
-    asyncio.run(bot.handle(f"/blacklist note {entry_id} тянул с оплатой"))
+    arun(bot.handle(f"/blacklist note {entry_id} тянул с оплатой"))
     assert "Причина записана" in texts(bot)[-1]
     assert blacklist.list_all()[0][4] == "тянул с оплатой"
-    asyncio.run(bot.handle(f"/blacklist note {entry_id + 50} другое"))
+    arun(bot.handle(f"/blacklist note {entry_id + 50} другое"))
     assert f"нет записи с id {entry_id + 50}" in texts(bot)[-1]
     for bad in ("/blacklist note abc текст", f"/blacklist note {entry_id}", "/blacklist что-то"):
-        asyncio.run(bot.handle(bad))
+        arun(bot.handle(bad))
         assert "/blacklist note &lt;id&gt;" in texts(bot)[-1], bad
     assert blacklist.list_all()[0][4] == "тянул с оплатой"               # ни одна кривая команда не затёрла
-    asyncio.run(bot.handle("/blacklist"))
+    arun(bot.handle("/blacklist"))
     assert "📝 тянул с оплатой" in texts(bot)[-1]
 
 
 def test_help_points_to_safety_where_sbp_delay_rule_lives():
     """Правило ЦБ ОД-2506 — общая информация: одна справка для всех, само правило — в /safety."""
     bot = Stub(p2p.Config())
-    asyncio.run(bot.handle("/help"))
+    arun(bot.handle("/help"))
     assert "/safety" in texts(bot)[-1] and B.OWNER_GUIDE == B.GUIDE
     assert "ОД-2506" in B.SAFETY and "200 000 ₽" in B.SAFETY
 
@@ -900,7 +900,7 @@ def test_add_alert_creates_entry(tmp_path, monkeypatch):
     db = str(tmp_path / "alerts.db")
     monkeypatch.setattr(B.alerts, "add", functools.partial(B.alerts.add, path=db))
     bot = Stub(p2p.Config())
-    asyncio.run(bot.handle("/alert USDT sell 92 7d"))
+    arun(bot.handle("/alert USDT sell 92 7d"))
     rows = B.alerts.list_all("1", path=db)
     assert [(a, s, r, c, v, rl) for _, a, s, r, _, c, v, rl in rows] == \
         [("USDT", "sell", 92.0, None, None, 0)]
@@ -911,7 +911,7 @@ def test_add_alert_repeat_creates_entry_with_cooldown(tmp_path, monkeypatch):
     db = str(tmp_path / "alerts.db")
     monkeypatch.setattr(B.alerts, "add", functools.partial(B.alerts.add, path=db))
     bot = Stub(p2p.Config())
-    asyncio.run(bot.handle("/alert USDT sell 92 7d repeat 1h"))
+    arun(bot.handle("/alert USDT sell 92 7d repeat 1h"))
     rows = B.alerts.list_all("1", path=db)
     assert [(a, s, r, c) for _, a, s, r, _, c, _, _ in rows] == [("USDT", "sell", 92.0, 3600)]
     assert "повтор" in texts(bot)[-1].lower()
@@ -921,7 +921,7 @@ def test_add_alert_volume_and_reliable_creates_entry(tmp_path, monkeypatch):
     db = str(tmp_path / "alerts.db")
     monkeypatch.setattr(B.alerts, "add", functools.partial(B.alerts.add, path=db))
     bot = Stub(p2p.Config())
-    asyncio.run(bot.handle("/alert USDT sell 92 7d vol 50к reliable repeat 1h"))
+    arun(bot.handle("/alert USDT sell 92 7d vol 50к reliable repeat 1h"))
     rows = B.alerts.list_all("1", path=db)
     assert [(a, s, r, c, v, rl) for _, a, s, r, _, c, v, rl in rows] == \
         [("USDT", "sell", 92.0, 3600, 50_000.0, 1)]
@@ -931,37 +931,37 @@ def test_add_alert_volume_and_reliable_creates_entry(tmp_path, monkeypatch):
 
 def test_add_alert_bad_volume():
     bot = Stub(p2p.Config())
-    asyncio.run(bot.handle("/alert USDT sell 92 7d vol abc"))
+    arun(bot.handle("/alert USDT sell 92 7d vol abc"))
     assert "Объём" in texts(bot)[-1]
 
 
 def test_add_alert_unknown_token_sends_help():
     bot = Stub(p2p.Config())
-    asyncio.run(bot.handle("/alert USDT sell 92 7d bogus"))
+    arun(bot.handle("/alert USDT sell 92 7d bogus"))
     assert "Формат" in texts(bot)[-1]
 
 
 def test_add_alert_bad_repeat_duration():
     bot = Stub(p2p.Config())
-    asyncio.run(bot.handle("/alert USDT sell 92 7d repeat 999d"))
+    arun(bot.handle("/alert USDT sell 92 7d repeat 999d"))
     assert "Кулдаун" in texts(bot)[-1]
 
 
 def test_add_alert_bad_format_sends_help():
     bot = Stub(p2p.Config())
-    asyncio.run(bot.handle("/alert USDT sell"))
+    arun(bot.handle("/alert USDT sell"))
     assert "Формат" in texts(bot)[-1]
 
 
 def test_add_alert_unknown_asset():
     bot = Stub(p2p.Config(assets=["USDT"]))
-    asyncio.run(bot.handle("/alert BTC sell 92 7d"))
+    arun(bot.handle("/alert BTC sell 92 7d"))
     assert "не отслеживается" in texts(bot)[-1]
 
 
 def test_add_alert_bad_duration():
     bot = Stub(p2p.Config())
-    asyncio.run(bot.handle("/alert USDT sell 92 999d"))
+    arun(bot.handle("/alert USDT sell 92 999d"))
     assert "Срок" in texts(bot)[-1]
 
 
@@ -970,13 +970,13 @@ def test_alerts_command_lists_entries(tmp_path, monkeypatch):
     monkeypatch.setattr(B.alerts, "list_all", functools.partial(B.alerts.list_all, path=db))
     B.alerts.add("1", "USDT", "sell", 92.0, time.time() + 86400, path=db)
     bot = Stub(p2p.Config())
-    asyncio.run(bot.handle("/alerts"))
+    arun(bot.handle("/alerts"))
     assert "USDT" in texts(bot)[-1]
 
 
 def test_alerts_command_empty():
     bot = Stub(p2p.Config())
-    asyncio.run(bot.handle("/alerts"))
+    arun(bot.handle("/alerts"))
     assert "нет" in texts(bot)[-1].lower()
 
 
@@ -986,7 +986,7 @@ def test_delalert_callback_removes_entry(tmp_path, monkeypatch):
     monkeypatch.setattr(B.alerts, "remove", functools.partial(B.alerts.remove, path=db))
     alert_id = B.alerts.add("1", "USDT", "sell", 92.0, time.time() + 86400, path=db)
     bot = Stub(p2p.Config())
-    asyncio.run(bot.on_callback({"id": "1", "data": f"delalert:{alert_id}", "message": {"message_id": 3}}))
+    arun(bot.on_callback({"id": "1", "data": f"delalert:{alert_id}", "message": {"message_id": 3}}))
     assert B.alerts.list_all("1", path=db) == []
     method, params = bot.out[-1]
     assert method == "editMessageText" and "нет" in params["text"].lower()
@@ -998,7 +998,7 @@ def test_check_alerts_sends_message(monkeypatch):
     marked = []
     monkeypatch.setattr(B.alerts, "mark_fired", marked.append)
     bot = Stub(p2p.Config())
-    asyncio.run(bot.check_alerts(snap([])))
+    arun(bot.check_alerts(snap([])))
     assert "Алерт сработал" in texts(bot)[-1]
     assert marked == [1]   # доставлено — помечаем сработавшим
 
@@ -1035,10 +1035,10 @@ def test_notify_not_marked_sent_when_telegram_raises(monkeypatch):
     bot = Flaky(p2p.Config(min_profit=2.0))
     bot.live_scans = 1
     ds = [deal(5, "MEXC"), deal(4, "KuCoin")]
-    asyncio.run(bot.notify(snap(ds)))
+    arun(bot.notify(snap(ds)))
     assert bot.sent == {} and not photos(bot)
     bot.fail = None                      # сеть вернулась — обе связки уходят в следующем скане
-    asyncio.run(bot.notify(snap(ds)))
+    arun(bot.notify(snap(ds)))
     assert len(photos(bot)) == 2 and len(bot.sent) == 2
 
 
@@ -1046,10 +1046,10 @@ def test_notify_not_marked_sent_when_not_ok(monkeypatch):
     monkeypatch.setattr(B, "deal_card", lambda d, c, a=None, r=None, breakdown=None: b"png")
     bot = Flaky(p2p.Config(min_profit=2.0), fail="not_ok")
     bot.live_scans = 1
-    asyncio.run(bot.notify(snap([deal(5)])))
+    arun(bot.notify(snap([deal(5)])))
     assert bot.sent == {}
     bot.fail = None
-    asyncio.run(bot.notify(snap([deal(5)])))
+    arun(bot.notify(snap([deal(5)])))
     assert len(photos(bot)) == 1 and len(bot.sent) == 1
 
 
@@ -1059,10 +1059,10 @@ def test_notify_permanent_refusal_consumes_signal(monkeypatch):
     for code in (400, 403):
         bot = Flaky(p2p.Config(min_profit=2.0), fail=code)
         bot.live_scans = 1
-        asyncio.run(bot.notify(snap([deal(5)])))
+        arun(bot.notify(snap([deal(5)])))
         tries = bot.tries
         assert tries and bot._deal_key(deal(5)) in bot.sent, code
-        asyncio.run(bot.notify(snap([deal(5)])))
+        arun(bot.notify(snap([deal(5)])))
         assert bot.tries == tries, code
 
 
@@ -1070,9 +1070,9 @@ def test_notify_rate_limit_retries_next_scan(monkeypatch):
     monkeypatch.setattr(B, "deal_card", lambda d, c, a=None, r=None, breakdown=None: b"png")
     bot = Flaky(p2p.Config(min_profit=2.0), fail=429)
     bot.live_scans = 1
-    asyncio.run(bot.notify(snap([deal(5)])))
+    arun(bot.notify(snap([deal(5)])))
     tries = bot.tries
-    asyncio.run(bot.notify(snap([deal(5)])))
+    arun(bot.notify(snap([deal(5)])))
     assert bot.sent == {} and bot.tries > tries
 
 
@@ -1095,9 +1095,9 @@ def test_telegram_send_errors_logged_without_bot_token(monkeypatch, caplog):
 
     bot.call, bot.send_photo = call, send_photo
     caplog.set_level(logging.WARNING)
-    assert asyncio.run(bot.delete_message(5)) is False
-    asyncio.run(bot.notify(snap([deal(5)])))
-    asyncio.run(bot.check_alerts(snap([])))
+    assert arun(bot.delete_message(5)) is False
+    arun(bot.notify(snap([deal(5)])))
+    arun(bot.check_alerts(snap([])))
     assert caplog.text.count("HTTP 502") == 3
     assert "TEST-BOT-TOKEN" not in caplog.text
 
@@ -1114,10 +1114,10 @@ def test_check_alerts_keeps_alert_when_send_fails(tmp_path, monkeypatch):
     B.alerts.add("1", "USDT", "sell", 92.0, time.time() + 86400)
     s = p2p.Snapshot(88.0, "test", {}, best, [], {}, {}, {})
     bot = Flaky(p2p.Config())
-    asyncio.run(bot.check_alerts(s))
+    arun(bot.check_alerts(s))
     assert len(B.alerts.list_all("1")) == 1          # одноразовый не удалён: сообщение не дошло
     bot.fail = None
-    asyncio.run(bot.check_alerts(s))
+    arun(bot.check_alerts(s))
     assert "Алерт сработал" in texts(bot)[-1]
     assert B.alerts.list_all("1") == []
 
@@ -1134,7 +1134,7 @@ def test_check_alerts_marks_only_delivered(tmp_path, monkeypatch):
         return {"ok": p.get("chat_id") != "2", "description": "Bad Request: chat not found"}
 
     bot.call = call
-    asyncio.run(bot.check_alerts(s))
+    arun(bot.check_alerts(s))
     assert len(texts(bot)) == 2
     assert len(B.alerts.list_all("2")) == 1 and B.alerts.list_all("1") == []
 
@@ -1145,10 +1145,10 @@ def test_check_alerts_permanent_refusal_marks_fired(tmp_path, monkeypatch):
     B.alerts.add("1", "USDT", "sell", 92.0, time.time() + 86400)
     s = p2p.Snapshot(88.0, "test", {}, best, [], {}, {}, {})
     bot = Flaky(p2p.Config(), fail=429)
-    asyncio.run(bot.check_alerts(s))
+    arun(bot.check_alerts(s))
     assert len(B.alerts.list_all("1")) == 1
     bot.fail = 403
-    asyncio.run(bot.check_alerts(s))
+    arun(bot.check_alerts(s))
     assert B.alerts.list_all("1") == []
 
 
@@ -1156,7 +1156,7 @@ def test_mark_done_unknown_id_not_logged(monkeypatch):
     logged = []
     monkeypatch.setattr(B.trades, "log_trade", lambda *a, **k: logged.append(a))
     bot = Stub(p2p.Config())
-    asyncio.run(bot.mark_done({"id": "1", "message": {"message_id": 9}}, 999))
+    arun(bot.mark_done({"id": "1", "message": {"message_id": 9}}, 999))
     assert not logged
     assert "устарел" in bot.out[-1][1]["text"]
 
@@ -1166,7 +1166,7 @@ def test_calc_command_scans_with_custom_amount(offline, monkeypatch):
     monkeypatch.setattr(B, "top_chart", lambda snap, c: b"png")
     bot = Stub(p2p.Config(exchanges=["bybit", "htx", "kucoin", "mexc", "bitpapa"], assets=["USDT"],
                           min_orders=0, min_rate=0, amount=50000))
-    asyncio.run(bot.handle("/calc 20000"))
+    arun(bot.handle("/calc 20000"))
     caps = [p["caption"] for m, p in photos(bot)]
     assert any("20 000" in c for c in caps)
     assert bot.cfg.amount == 50000            # настройки не изменились
@@ -1174,14 +1174,14 @@ def test_calc_command_scans_with_custom_amount(offline, monkeypatch):
 
 def test_calc_command_rejects_garbage_amount():
     bot = Stub(p2p.Config())
-    asyncio.run(bot.handle("/calc много"))
+    arun(bot.handle("/calc много"))
     assert "сумму" in texts(bot)[-1].lower()
     assert not bot.out or bot.out[-1][0] == "sendMessage"
 
 
 def test_calc_command_needs_argument():
     bot = Stub(p2p.Config())
-    asyncio.run(bot.handle("/calc"))
+    arun(bot.handle("/calc"))
     assert "сумма" in texts(bot)[-1].lower()
 
 
@@ -1194,7 +1194,7 @@ def test_settings_view_has_custom_amount_button():
 
 def test_amt_custom_button_arms_waiting_state():
     bot = Stub(p2p.Config())
-    asyncio.run(bot.on_callback({"id": "1", "data": "amt_custom", "message": {"message_id": 1}}))
+    arun(bot.on_callback({"id": "1", "data": "amt_custom", "message": {"message_id": 1}}))
     assert bot.awaiting_amount
     assert "сумму" in texts(bot)[-1].lower()
 
@@ -1208,7 +1208,7 @@ def test_custom_amount_text_scans_and_saves(tmp_path, monkeypatch, offline):
     bot = Stub(p2p.Config(exchanges=["bybit", "htx", "kucoin", "mexc", "bitpapa"], assets=["USDT"],
                           min_orders=0, min_rate=0, amount=50000))
     bot.awaiting_amount = True
-    asyncio.run(bot.handle("30 000"))
+    arun(bot.handle("30 000"))
     assert not bot.awaiting_amount
     assert bot.cfg.amount == 30000
     assert "AMOUNT=30000" in env.read_text(encoding="utf-8")
@@ -1219,7 +1219,7 @@ def test_custom_amount_text_scans_and_saves(tmp_path, monkeypatch, offline):
 def test_custom_amount_garbage_reports_error():
     bot = Stub(p2p.Config())
     bot.awaiting_amount = True
-    asyncio.run(bot.handle("ерунда"))
+    arun(bot.handle("ерунда"))
     assert not bot.awaiting_amount
     assert "сумму" in texts(bot)[-1].lower()
 
@@ -1227,14 +1227,14 @@ def test_custom_amount_garbage_reports_error():
 def test_awaiting_amount_reset_by_other_button():
     bot = Stub(p2p.Config())
     bot.awaiting_amount = True
-    asyncio.run(bot.on_callback({"id": "1", "data": "best", "message": {"message_id": 1}}))
+    arun(bot.on_callback({"id": "1", "data": "best", "message": {"message_id": 1}}))
     assert not bot.awaiting_amount
 
 
 def test_awaiting_amount_reset_by_other_command():
     bot = Stub(p2p.Config())
     bot.awaiting_amount = True
-    asyncio.run(bot.handle("/best"))
+    arun(bot.handle("/best"))
     assert not bot.awaiting_amount
 
 
@@ -1288,7 +1288,7 @@ def test_account_view_hint_is_exchange_specific():
 
 def test_acc_add_sends_exchange_specific_hint():
     bot = Stub(p2p.Config())
-    asyncio.run(bot.on_callback({"id": "1", "data": "acc_add:mexc", "message": {"message_id": 1}}))
+    arun(bot.on_callback({"id": "1", "data": "acc_add:mexc", "message": {"message_id": 1}}))
     assert any("API Management" in p.get("text", "") for m, p in bot.out if m == "sendMessage")
 
 
@@ -1322,17 +1322,17 @@ def test_acc_add_kucoin_arms_awaiting_key_three_step_flow(tmp_path, monkeypatch)
     monkeypatch.setattr(B.accounts, "verify", fake_verify)
     monkeypatch.setattr(B.accounts, "key_permissions", _perms_readonly)
     bot = Stub(p2p.Config())
-    asyncio.run(bot.on_callback({"id": "1", "data": "acc_add:kucoin", "message": {"message_id": 1}}))
+    arun(bot.on_callback({"id": "1", "data": "acc_add:kucoin", "message": {"message_id": 1}}))
     assert bot.awaiting_key == {"ex": "kucoin", "step": "key"}
 
-    asyncio.run(bot.handle_key_input("APIKEY123", 55))
+    arun(bot.handle_key_input("APIKEY123", 55))
     assert bot.awaiting_key == {"ex": "kucoin", "step": "secret", "key": "APIKEY123"}
 
-    asyncio.run(bot.handle_key_input("SECRET456", 56))
+    arun(bot.handle_key_input("SECRET456", 56))
     assert bot.awaiting_key == {"ex": "kucoin", "step": "passphrase", "key": "APIKEY123", "secret": "SECRET456"}
     assert accounts.keys("kucoin") is None   # ещё не сохранён — ждём passphrase
 
-    asyncio.run(bot.handle_key_input("PASS789", 57))
+    arun(bot.handle_key_input("PASS789", 57))
     assert bot.awaiting_key is None
     assert accounts.keys("kucoin") == ("APIKEY123", "SECRET456")
     assert accounts.passphrase("kucoin") == "PASS789"
@@ -1347,7 +1347,7 @@ def test_settings_view_has_accounts_button():
 
 def test_acc_add_callback_arms_awaiting_key():
     bot = Stub(p2p.Config())
-    asyncio.run(bot.on_callback({"id": "1", "data": "acc_add:bybit", "message": {"message_id": 1}}))
+    arun(bot.on_callback({"id": "1", "data": "acc_add:bybit", "message": {"message_id": 1}}))
     assert bot.awaiting_key == {"ex": "bybit", "step": "key"}
     assert "API key" in texts(bot)[-1]
 
@@ -1362,11 +1362,11 @@ def test_handle_key_input_flow_saves_and_verifies(tmp_path, monkeypatch):
     monkeypatch.setattr(B.accounts, "key_permissions", _perms_readonly)
     bot = Stub(p2p.Config())
     bot.awaiting_key = {"ex": "bybit", "step": "key"}
-    asyncio.run(bot.handle_key_input("APIKEY123", 55))
+    arun(bot.handle_key_input("APIKEY123", 55))
     assert ("deleteMessage", {"chat_id": "1", "message_id": 55}) in bot.out
     assert bot.awaiting_key == {"ex": "bybit", "step": "secret", "key": "APIKEY123"}
 
-    asyncio.run(bot.handle_key_input("SECRET456", 56))
+    arun(bot.handle_key_input("SECRET456", 56))
     assert bot.awaiting_key is None
     assert accounts.keys("bybit") == ("APIKEY123", "SECRET456")
     assert any("✅ Подключено" in t for t in texts(bot))
@@ -1382,7 +1382,7 @@ def test_handle_key_input_reports_failed_verification(tmp_path, monkeypatch):
     monkeypatch.setattr(B.accounts, "key_permissions", _perms_readonly)
     bot = Stub(p2p.Config())
     bot.awaiting_key = {"ex": "bybit", "step": "secret", "key": "APIKEY123"}
-    asyncio.run(bot.handle_key_input("SECRET456", 56))
+    arun(bot.handle_key_input("SECRET456", 56))
     assert any("Invalid api_key" in t for t in texts(bot))
 
 
@@ -1390,7 +1390,7 @@ def test_on_update_routes_plain_text_to_key_input_when_awaiting():
     bot = Stub(p2p.Config())
     bot.chat_id = "1"
     bot.awaiting_key = {"ex": "bybit", "step": "key"}
-    asyncio.run(bot.on_update({"message": {"chat": {"id": 1, "type": "private"}, "from": {"id": 1}, "text": "APIKEY123",
+    arun(bot.on_update({"message": {"chat": {"id": 1, "type": "private"}, "from": {"id": 1}, "text": "APIKEY123",
                                            "message_id": 7}}))
     assert ("deleteMessage", {"chat_id": "1", "message_id": 7}) in bot.out
     assert bot.awaiting_key == {"ex": "bybit", "step": "secret", "key": "APIKEY123"}
@@ -1400,7 +1400,7 @@ def test_on_update_command_bypasses_key_input():
     bot = Stub(p2p.Config())
     bot.chat_id = "1"
     bot.awaiting_key = {"ex": "bybit", "step": "key"}
-    asyncio.run(bot.on_update({"message": {"chat": {"id": 1, "type": "private"}, "from": {"id": 1}, "text": "/best",
+    arun(bot.on_update({"message": {"chat": {"id": 1, "type": "private"}, "from": {"id": 1}, "text": "/best",
                                            "message_id": 7}}))
     assert not any(m == "deleteMessage" for m, _ in bot.out)
     assert bot.awaiting_key is None
@@ -1409,14 +1409,14 @@ def test_on_update_command_bypasses_key_input():
 def test_other_callback_resets_awaiting_key():
     bot = Stub(p2p.Config())
     bot.awaiting_key = {"ex": "bybit", "step": "key"}
-    asyncio.run(bot.on_callback({"id": "1", "data": "best", "message": {"message_id": 1}}))
+    arun(bot.on_callback({"id": "1", "data": "best", "message": {"message_id": 1}}))
     assert bot.awaiting_key is None
 
 
 def test_command_resets_awaiting_key():
     bot = Stub(p2p.Config())
     bot.awaiting_key = {"ex": "bybit", "step": "key"}
-    asyncio.run(bot.handle("/best"))
+    arun(bot.handle("/best"))
     assert bot.awaiting_key is None
 
 
@@ -1429,7 +1429,7 @@ def test_acc_check_callback_reports_status(tmp_path, monkeypatch):
     monkeypatch.setattr(B.accounts, "verify", fake_verify)
     monkeypatch.setattr(B.accounts, "key_permissions", _perms_readonly)
     bot = Stub(p2p.Config())
-    asyncio.run(bot.on_callback({"id": "1", "data": "acc_check:bybit", "message": {"message_id": 1}}))
+    arun(bot.on_callback({"id": "1", "data": "acc_check:bybit", "message": {"message_id": 1}}))
     assert "bad key" in texts(bot)[-1]
 
 
@@ -1439,7 +1439,7 @@ def test_acc_check_callback_escapes_error_html(monkeypatch):
 
     monkeypatch.setattr(B.accounts, "verify", fake_verify)
     bot = Stub(p2p.Config())
-    asyncio.run(bot.on_callback({"id": "1", "data": "acc_check:bybit", "message": {"message_id": 1}}))
+    arun(bot.on_callback({"id": "1", "data": "acc_check:bybit", "message": {"message_id": 1}}))
     assert "&lt;bad request&gt;" in texts(bot)[-1] and "<bad" not in texts(bot)[-1]
 
 
@@ -1452,7 +1452,7 @@ def test_handle_key_input_escapes_error_html(tmp_path, monkeypatch):
     monkeypatch.setattr(B.accounts, "verify", fake_verify)
     bot = Stub(p2p.Config())
     bot.awaiting_key = {"ex": "bybit", "step": "secret", "key": "APIKEY123"}
-    asyncio.run(bot.handle_key_input("SECRET456", 56))
+    arun(bot.handle_key_input("SECRET456", 56))
     assert any("&lt;bad request&gt;" in t for t in texts(bot))
     assert not any("<bad" in t for t in texts(bot))
 
@@ -1468,7 +1468,7 @@ def test_check_accounts_error_log_has_no_url_with_key(tmp_path, monkeypatch, cap
 
     monkeypatch.setattr(B.accounts, "account_history", fake_history)
     caplog.set_level(logging.WARNING)
-    asyncio.run(Stub(p2p.Config()).check_accounts())
+    arun(Stub(p2p.Config()).check_accounts())
     assert "HTTP 403" in caplog.text
     assert "AKID-TEST-KEY-1234" not in caplog.text and "Signature" not in caplog.text
 
@@ -1477,7 +1477,7 @@ def test_acc_del_callback_removes_key(tmp_path, monkeypatch):
     monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
     accounts.save_key("bybit", "k", "s")
     bot = Stub(p2p.Config())
-    asyncio.run(bot.on_callback({"id": "1", "data": "acc_del:bybit", "message": {"message_id": 1}}))
+    arun(bot.on_callback({"id": "1", "data": "acc_del:bybit", "message": {"message_id": 1}}))
     assert accounts.keys("bybit") is None
     assert any("удалён" in t for t in texts(bot))
 
@@ -1494,7 +1494,7 @@ def test_acc_del_callback_disables_env_key(tmp_path, monkeypatch):
     monkeypatch.setenv("BYBIT_API_KEY", "envkey")
     monkeypatch.setenv("BYBIT_API_SECRET", "envsecret")
     bot = Stub(p2p.Config())
-    asyncio.run(bot.on_callback({"id": "1", "data": "acc_del:bybit", "message": {"message_id": 1}}))
+    arun(bot.on_callback({"id": "1", "data": "acc_del:bybit", "message": {"message_id": 1}}))
     assert accounts.keys("bybit") is None
     out = texts(bot)
     assert any("удалён" in t and ".env" in t for t in out)
@@ -1507,7 +1507,7 @@ def test_acc_del_callback_without_key_says_not_connected(tmp_path, monkeypatch):
     monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
     _clear_env_keys(monkeypatch)
     bot = Stub(p2p.Config())
-    asyncio.run(bot.on_callback({"id": "1", "data": "acc_del:bybit", "message": {"message_id": 1}}))
+    arun(bot.on_callback({"id": "1", "data": "acc_del:bybit", "message": {"message_id": 1}}))
     out = texts(bot)
     assert "не был подключён" in out[0] and not any("удалён" in t for t in out)
 
@@ -1525,10 +1525,10 @@ def test_check_key_safety_disables_env_only_key(tmp_path, monkeypatch):
 
     monkeypatch.setattr(B.accounts, "api_permissions", fake_permissions)
     bot = Stub(p2p.Config())
-    asyncio.run(bot.check_key_safety())
+    arun(bot.check_key_safety())
     assert accounts.keys("bybit") is None
     assert len(texts(bot)) == 1 and ".env" in texts(bot)[0]
-    asyncio.run(bot.check_key_safety())   # следующий старт: ключ выключен, проверять и предупреждать нечего
+    arun(bot.check_key_safety())   # следующий старт: ключ выключен, проверять и предупреждать нечего
     assert calls == ["bybit"] and len(texts(bot)) == 1
 
 
@@ -1541,7 +1541,7 @@ def test_check_key_safety_removes_unsafe_key_and_warns(tmp_path, monkeypatch):
 
     monkeypatch.setattr(B.accounts, "api_permissions", fake_permissions)
     bot = Stub(p2p.Config())
-    asyncio.run(bot.check_key_safety())
+    arun(bot.check_key_safety())
     assert accounts.keys("bybit") is None
     warning = texts(bot)[-1]
     assert "торговля" in warning and "ТОЛЬКО для чтения" in warning
@@ -1556,7 +1556,7 @@ def test_check_key_safety_keeps_readonly_key_and_stays_silent(tmp_path, monkeypa
 
     monkeypatch.setattr(B.accounts, "api_permissions", fake_permissions)
     bot = Stub(p2p.Config())
-    asyncio.run(bot.check_key_safety())
+    arun(bot.check_key_safety())
     assert accounts.keys("mexc") == ("k", "s")
     assert texts(bot) == []
 
@@ -1571,7 +1571,7 @@ def test_check_key_safety_skips_exchanges_without_saved_key(tmp_path, monkeypatc
 
     monkeypatch.setattr(B.accounts, "api_permissions", fake_permissions)
     bot = Stub(p2p.Config())
-    asyncio.run(bot.check_key_safety())
+    arun(bot.check_key_safety())
     assert calls == []
 
 
@@ -1606,8 +1606,8 @@ def test_handle_key_input_drops_trade_key_and_never_says_readonly(tmp_path, monk
     monkeypatch.setattr(B.accounts, "verify", _verify_ok(calls))
     bot = Stub(p2p.Config())
     bot.awaiting_key = {"ex": "bybit", "step": "key"}
-    asyncio.run(bot.handle_key_input("APIKEY123", 55))
-    asyncio.run(bot.handle_key_input("SECRET456", 56))
+    arun(bot.handle_key_input("APIKEY123", 55))
+    arun(bot.handle_key_input("SECRET456", 56))
     assert accounts.keys("bybit") is None
     assert calls == ["perm"]                    # баланс торгового ключа даже не запрашивали
     assert any("больше, чем чтение" in t and "торговля" in t for t in texts(bot))
@@ -1622,7 +1622,7 @@ def test_handle_key_input_checks_permissions_before_verify(tmp_path, monkeypatch
     monkeypatch.setattr(B.accounts, "verify", _verify_ok(calls))
     bot = Stub(p2p.Config())
     bot.awaiting_key = {"ex": "bybit", "step": "secret", "key": "APIKEY123"}
-    asyncio.run(bot.handle_key_input("SECRET456", 56))
+    arun(bot.handle_key_input("SECRET456", 56))
     assert calls == ["perm", "verify"]
     assert accounts.keys("bybit") == ("APIKEY123", "SECRET456")
     assert "✅ Подключено (только чтение)" in texts(bot)
@@ -1635,7 +1635,7 @@ def test_handle_key_input_unverified_permissions_not_called_readonly(tmp_path, m
     monkeypatch.setattr(B.accounts, "verify", _verify_ok())
     bot = Stub(p2p.Config())
     bot.awaiting_key = {"ex": "bybit", "step": "secret", "key": "APIKEY123"}
-    asyncio.run(bot.handle_key_input("SECRET456", 56))
+    arun(bot.handle_key_input("SECRET456", 56))
     assert accounts.keys("bybit") == ("APIKEY123", "SECRET456")
     connected = [t for t in texts(bot) if t.startswith("✅ Подключено")]
     assert connected and "проверить не удалось" in connected[0]
@@ -1648,7 +1648,7 @@ def test_handle_key_input_remembers_confirmed_readonly_status(tmp_path, monkeypa
     monkeypatch.setattr(B.accounts, "verify", _verify_ok())
     bot = Stub(p2p.Config())
     bot.awaiting_key = {"ex": "bybit", "step": "secret", "key": "APIKEY123"}
-    asyncio.run(bot.handle_key_input("SECRET456", 56))
+    arun(bot.handle_key_input("SECRET456", 56))
     assert accounts.verify_status("bybit") == ("ok", "")
 
 
@@ -1659,7 +1659,7 @@ def test_handle_key_input_unverified_permissions_status_is_unknown_not_error(tmp
     monkeypatch.setattr(B.accounts, "verify", _verify_ok())
     bot = Stub(p2p.Config())
     bot.awaiting_key = {"ex": "bybit", "step": "secret", "key": "APIKEY123"}
-    asyncio.run(bot.handle_key_input("SECRET456", 56))
+    arun(bot.handle_key_input("SECRET456", 56))
     assert accounts.verify_status("bybit") == ("unknown", "")
 
 
@@ -1669,7 +1669,7 @@ def test_handle_key_input_verify_failure_remembers_error_status(tmp_path, monkey
     monkeypatch.setattr(B.accounts, "verify", _verify_fail("Invalid api_key"))
     bot = Stub(p2p.Config())
     bot.awaiting_key = {"ex": "bybit", "step": "secret", "key": "APIKEY123"}
-    asyncio.run(bot.handle_key_input("SECRET456", 56))
+    arun(bot.handle_key_input("SECRET456", 56))
     assert accounts.verify_status("bybit") == ("error", "Invalid api_key")
     text, kb = B.account_view("bybit")
     assert "⚠️ Ошибка последней проверки: Invalid api_key" in text
@@ -1682,10 +1682,10 @@ def test_acc_check_updates_status_from_ok_to_error(tmp_path, monkeypatch):
     monkeypatch.setattr(B.accounts, "key_permissions", _perms((True, "")))
     monkeypatch.setattr(B.accounts, "verify", _verify_ok())
     bot = Stub(p2p.Config())
-    asyncio.run(bot.on_callback({"id": "1", "data": "acc_check:bybit", "message": {"message_id": 1}}))
+    arun(bot.on_callback({"id": "1", "data": "acc_check:bybit", "message": {"message_id": 1}}))
     assert accounts.verify_status("bybit") == ("ok", "")
     monkeypatch.setattr(B.accounts, "verify", _verify_fail("network down"))
-    asyncio.run(bot.on_callback({"id": "2", "data": "acc_check:bybit", "message": {"message_id": 1}}))
+    arun(bot.on_callback({"id": "2", "data": "acc_check:bybit", "message": {"message_id": 1}}))
     assert accounts.verify_status("bybit") == ("error", "network down")
 
 
@@ -1696,7 +1696,7 @@ def test_acc_check_drops_trade_key(tmp_path, monkeypatch):
     monkeypatch.setattr(B.accounts, "key_permissions", _perms((False, "вывод"), calls))
     monkeypatch.setattr(B.accounts, "verify", _verify_ok(calls))
     bot = Stub(p2p.Config())
-    asyncio.run(bot.on_callback({"id": "1", "data": "acc_check:bybit", "message": {"message_id": 1}}))
+    arun(bot.on_callback({"id": "1", "data": "acc_check:bybit", "message": {"message_id": 1}}))
     assert accounts.keys("bybit") is None
     assert calls == ["perm"]
     assert any("больше, чем чтение" in t and "вывод" in t for t in texts(bot))
@@ -1709,7 +1709,7 @@ def test_acc_check_readonly_key_confirmed(tmp_path, monkeypatch):
     monkeypatch.setattr(B.accounts, "key_permissions", _perms((True, "")))
     monkeypatch.setattr(B.accounts, "verify", _verify_ok())
     bot = Stub(p2p.Config())
-    asyncio.run(bot.on_callback({"id": "1", "data": "acc_check:bybit", "message": {"message_id": 1}}))
+    arun(bot.on_callback({"id": "1", "data": "acc_check:bybit", "message": {"message_id": 1}}))
     assert accounts.keys("bybit") == ("k", "s")
     assert texts(bot)[-1] == "✅ Ключ рабочий (только чтение)"
 
@@ -1720,7 +1720,7 @@ def test_acc_check_unverified_permissions_not_called_readonly(tmp_path, monkeypa
     monkeypatch.setattr(B.accounts, "key_permissions", _perms((None, "")))
     monkeypatch.setattr(B.accounts, "verify", _verify_ok())
     bot = Stub(p2p.Config())
-    asyncio.run(bot.on_callback({"id": "1", "data": "acc_check:bybit", "message": {"message_id": 1}}))
+    arun(bot.on_callback({"id": "1", "data": "acc_check:bybit", "message": {"message_id": 1}}))
     assert accounts.keys("bybit") == ("k", "s")
     assert texts(bot)[-1].startswith("✅ Ключ рабочий") and "проверить не удалось" in texts(bot)[-1]
     assert "(только чтение)" not in texts(bot)[-1]
@@ -1734,9 +1734,9 @@ def test_unverified_key_never_claimed_readonly_in_any_message(tmp_path, monkeypa
     monkeypatch.setattr(B.accounts, "verify", _verify_ok())
     bot = Stub(p2p.Config())
     bot.awaiting_key = {"ex": "bybit", "step": "secret", "key": "APIKEY123"}
-    asyncio.run(bot.handle_key_input("SECRET456", 56))
-    asyncio.run(bot.on_callback({"id": "1", "data": "acc_check:bybit", "message": {"message_id": 1}}))
-    asyncio.run(bot.on_callback({"id": "2", "data": "acc:bybit", "message": {"message_id": 1}}))
+    arun(bot.handle_key_input("SECRET456", 56))
+    arun(bot.on_callback({"id": "1", "data": "acc_check:bybit", "message": {"message_id": 1}}))
+    arun(bot.on_callback({"id": "2", "data": "acc:bybit", "message": {"message_id": 1}}))
     assert accounts.keys("bybit") == ("APIKEY123", "SECRET456")
     assert len(texts(bot)) >= 4 and "Ключ подключён" in texts(bot)[-1]
     assert not any("только чтение" in t for t in texts(bot))
@@ -1777,8 +1777,8 @@ def test_connect_bybit_trade_key_via_api_is_dropped(tmp_path, monkeypatch):
     paths = _bybit_transport(monkeypatch, BYBIT_TRADE_KEY)
     bot = Stub(p2p.Config())
     bot.awaiting_key = {"ex": "bybit", "step": "key"}
-    asyncio.run(bot.handle_key_input("APIKEY123", 55))
-    asyncio.run(bot.handle_key_input("SECRET456", 56))
+    arun(bot.handle_key_input("APIKEY123", 55))
+    arun(bot.handle_key_input("SECRET456", 56))
     assert accounts.keys("bybit") is None
     assert paths == ["/v5/user/query-api"]
     assert not any("только чтение)" in t for t in texts(bot))
@@ -1790,7 +1790,7 @@ def test_connect_bybit_readonly_key_via_api_says_readonly(tmp_path, monkeypatch)
     paths = _bybit_transport(monkeypatch, BYBIT_READONLY_KEY)
     bot = Stub(p2p.Config())
     bot.awaiting_key = {"ex": "bybit", "step": "secret", "key": "APIKEY123"}
-    asyncio.run(bot.handle_key_input("SECRET456", 56))
+    arun(bot.handle_key_input("SECRET456", 56))
     assert paths == ["/v5/user/query-api", "/v5/account/wallet-balance"]
     assert accounts.keys("bybit") == ("APIKEY123", "SECRET456")
     assert "✅ Подключено (только чтение)" in texts(bot)
@@ -1801,7 +1801,7 @@ def test_connect_bybit_permissions_api_error_not_called_readonly(tmp_path, monke
     _bybit_transport(monkeypatch, {"retCode": 10005, "retMsg": "Permission denied"})
     bot = Stub(p2p.Config())
     bot.awaiting_key = {"ex": "bybit", "step": "secret", "key": "APIKEY123"}
-    asyncio.run(bot.handle_key_input("SECRET456", 56))
+    arun(bot.handle_key_input("SECRET456", 56))
     assert accounts.keys("bybit") == ("APIKEY123", "SECRET456")
     assert any(t.startswith("✅ Подключено") and "проверить не удалось" in t for t in texts(bot))
     assert not any("только чтение" in t for t in texts(bot))   # и в карточке биржи после «Подключено»
@@ -1812,7 +1812,7 @@ def test_acc_check_bybit_trade_key_via_api_is_dropped(tmp_path, monkeypatch):
     accounts.save_key("bybit", "APIKEY123", "SECRET456")
     _bybit_transport(monkeypatch, BYBIT_TRADE_KEY)
     bot = Stub(p2p.Config())
-    asyncio.run(bot.on_callback({"id": "1", "data": "acc_check:bybit", "message": {"message_id": 1}}))
+    arun(bot.on_callback({"id": "1", "data": "acc_check:bybit", "message": {"message_id": 1}}))
     assert accounts.keys("bybit") is None
     assert not any("✅ Ключ рабочий" in t for t in texts(bot))
 
@@ -1827,7 +1827,7 @@ def test_connect_mexc_trade_withdraw_key_via_api_is_dropped(tmp_path, monkeypatc
     monkeypatch.setattr(accounts, "mexc_get", fake_mexc_get)
     bot = Stub(p2p.Config())
     bot.awaiting_key = {"ex": "mexc", "step": "secret", "key": "k"}
-    asyncio.run(bot.handle_key_input("s", 56))
+    arun(bot.handle_key_input("s", 56))
     assert accounts.keys("mexc") is None
     assert any("больше, чем чтение" in t and "торговля, вывод" in t for t in texts(bot))
     assert not any("✅ Подключено" in t for t in texts(bot))
@@ -1855,7 +1855,7 @@ class RaisingDelete(Stub):
 def test_handle_key_input_warns_when_delete_refused(caplog):
     bot = RefusingDelete(p2p.Config())
     bot.awaiting_key = {"ex": "bybit", "step": "key"}
-    asyncio.run(bot.handle_key_input("APIKEY123", 55))
+    arun(bot.handle_key_input("APIKEY123", 55))
     assert ("deleteMessage", {"chat_id": "1", "message_id": 55}) in bot.out
     assert not any("удалено" in t for t in texts(bot))
     assert any("вручную" in t for t in texts(bot))
@@ -1866,7 +1866,7 @@ def test_handle_key_input_warns_when_delete_refused(caplog):
 def test_handle_key_input_warns_when_delete_raises():
     bot = RaisingDelete(p2p.Config())
     bot.awaiting_key = {"ex": "bybit", "step": "key"}
-    asyncio.run(bot.handle_key_input("APIKEY123", 55))     # исключение не вылетает наружу
+    arun(bot.handle_key_input("APIKEY123", 55))     # исключение не вылетает наружу
     assert not any("удалено" in t for t in texts(bot))
     assert any("вручную" in t for t in texts(bot))
     assert bot.awaiting_key == {"ex": "bybit", "step": "secret", "key": "APIKEY123"}
@@ -1879,7 +1879,7 @@ def test_handle_key_input_final_step_warns_when_delete_refused(tmp_path, monkeyp
     monkeypatch.setattr(B.accounts, "verify", _verify_ok(calls))
     bot = RefusingDelete(p2p.Config())
     bot.awaiting_key = {"ex": "bybit", "step": "secret", "key": "APIKEY123"}
-    asyncio.run(bot.handle_key_input("SECRET456", 56))
+    arun(bot.handle_key_input("SECRET456", 56))
     assert accounts.keys("bybit") == ("APIKEY123", "SECRET456")
     assert calls == ["perm", "verify"]
     assert any("вручную" in t for t in texts(bot))
@@ -1893,7 +1893,7 @@ def test_handle_key_input_kucoin_every_step_warns_when_delete_refused(tmp_path, 
     bot = RefusingDelete(p2p.Config())
     bot.awaiting_key = {"ex": "kucoin", "step": "key"}
     for n, (text, mid) in enumerate((("APIKEY123", 55), ("SECRET456", 56), ("PASS789", 57)), 1):
-        asyncio.run(bot.handle_key_input(text, mid))
+        arun(bot.handle_key_input(text, mid))
         assert sum("вручную" in t for t in texts(bot)) == n    # предупреждение на каждом шаге
     assert not any("удалено" in t for t in texts(bot))
     assert accounts.passphrase("kucoin") == "PASS789"
@@ -1902,14 +1902,14 @@ def test_handle_key_input_kucoin_every_step_warns_when_delete_refused(tmp_path, 
 def test_handle_key_input_delete_ok_still_says_deleted():
     bot = Stub(p2p.Config())
     bot.awaiting_key = {"ex": "bybit", "step": "key"}
-    asyncio.run(bot.handle_key_input("APIKEY123", 55))
+    arun(bot.handle_key_input("APIKEY123", 55))
     assert texts(bot) == ["Ключ получен, сообщение удалено. Теперь пришли <b>secret</b> для Bybit."]
 
 
 def test_handle_key_input_without_message_id_claims_nothing():
     bot = Stub(p2p.Config())
     bot.awaiting_key = {"ex": "bybit", "step": "key"}
-    asyncio.run(bot.handle_key_input("APIKEY123", None))
+    arun(bot.handle_key_input("APIKEY123", None))
     assert not any(m == "deleteMessage" for m, _ in bot.out)
     assert not any("удалено" in t or "вручную" in t for t in texts(bot))
 
@@ -2044,10 +2044,10 @@ def test_cmd_paper_on_off_writes_env(monkeypatch, tmp_path):
     env = tmp_path / ".env"
     monkeypatch.setattr(B, "save_env", functools.partial(B.save_env, path=str(env)))
     bot = Stub(p2p.Config())
-    asyncio.run(bot.cmd_paper("on"))
+    arun(bot.cmd_paper("on"))
     assert "PAPER=1" in env.read_text()
     assert "включён" in texts(bot)[-1]
-    asyncio.run(bot.cmd_paper("off"))
+    arun(bot.cmd_paper("off"))
     assert "PAPER=0" in env.read_text()
     assert "выключен" in texts(bot)[-1]
 
@@ -2069,7 +2069,7 @@ def test_check_paper_ladder_sends_up_suggestion_with_button(monkeypatch, tmp_pat
     _patch_paper_db(monkeypatch, db)
     _fill_ladder_cycles(db)   # 20 кругов, срывов 10%, факт == план — критерии выполнены
     bot = Stub(p2p.Config())
-    asyncio.run(bot.check_paper_ladder())
+    arun(bot.check_paper_ladder())
     msgs = [(t, p.get("reply_markup")) for m, p in bot.out if m == "sendMessage"
             for t in [p["text"]] if "20 000" in t]
     assert len(msgs) == 1
@@ -2086,7 +2086,7 @@ def test_check_paper_ladder_sends_down_suggestion(monkeypatch, tmp_path):
     now = time.time()
     _fill_ladder_cycles(db, done=2, failed=3, ts=now)   # неделя: 60% сорвалось > 40%
     bot = Stub(p2p.Config())
-    asyncio.run(bot.check_paper_ladder())
+    arun(bot.check_paper_ladder())
     msgs = [t for t in texts(bot) if "10 000" in t]
     assert len(msgs) == 1 and "срывов" in msgs[0]
 
@@ -2098,8 +2098,8 @@ def test_check_paper_ladder_respects_cooldown(monkeypatch, tmp_path):
     _patch_paper_db(monkeypatch, db)
     _fill_ladder_cycles(db)
     bot = Stub(p2p.Config())
-    asyncio.run(bot.check_paper_ladder())
-    asyncio.run(bot.check_paper_ladder())   # второй раз сразу — кулдаун не прошёл
+    arun(bot.check_paper_ladder())
+    arun(bot.check_paper_ladder())   # второй раз сразу — кулдаун не прошёл
     msgs = [t for t in texts(bot) if "20 000" in t]
     assert len(msgs) == 1
 
@@ -2110,7 +2110,7 @@ def test_check_paper_ladder_noop_when_off(monkeypatch, tmp_path):
     _patch_paper_db(monkeypatch, db)
     _fill_ladder_cycles(db)
     bot = Stub(p2p.Config())
-    asyncio.run(bot.check_paper_ladder())
+    arun(bot.check_paper_ladder())
     assert not bot.out
 
 
@@ -2122,7 +2122,7 @@ def test_check_paper_ladder_noop_without_chat_id(monkeypatch, tmp_path):
     _fill_ladder_cycles(db)
     bot = Stub(p2p.Config())
     bot.chat_id = None
-    asyncio.run(bot.check_paper_ladder())
+    arun(bot.check_paper_ladder())
     assert not bot.out
 
 
@@ -2130,7 +2130,7 @@ def test_paper_ladder_callback_saves_env_and_confirms(monkeypatch, tmp_path):
     env = tmp_path / ".env"
     monkeypatch.setattr(B, "save_env", functools.partial(B.save_env, path=str(env)))
     bot = Stub(p2p.Config())
-    asyncio.run(bot.on_callback({"id": "1", "data": "paper_ladder:20000", "message": {"message_id": 9}}))
+    arun(bot.on_callback({"id": "1", "data": "paper_ladder:20000", "message": {"message_id": 9}}))
     assert "PAPER_AMOUNT=20000" in env.read_text()
     assert "20 000" in texts(bot)[-1]
 
@@ -2139,14 +2139,14 @@ def test_cmd_paper_amount_writes_env(monkeypatch, tmp_path):
     env = tmp_path / ".env"
     monkeypatch.setattr(B, "save_env", functools.partial(B.save_env, path=str(env)))
     bot = Stub(p2p.Config())
-    asyncio.run(bot.cmd_paper("amount 20000"))
+    arun(bot.cmd_paper("amount 20000"))
     assert "PAPER_AMOUNT=20000" in env.read_text()
     assert "20 000" in texts(bot)[-1]
 
 
 def test_cmd_paper_amount_bad_value():
     bot = Stub(p2p.Config())
-    asyncio.run(bot.cmd_paper("amount не число"))
+    arun(bot.cmd_paper("amount не число"))
     assert "Не понял сумму" in texts(bot)[-1]
 
 
@@ -2154,7 +2154,7 @@ def test_cmd_paper_no_arg_shows_view(monkeypatch, tmp_path):
     monkeypatch.delenv("PAPER", raising=False)
     _patch_paper_db(monkeypatch, str(tmp_path / "paper.db"))
     bot = Stub(p2p.Config())
-    asyncio.run(bot.cmd_paper(""))
+    arun(bot.cmd_paper(""))
     assert "🧪 <b>Сухой прогон</b>" in texts(bot)[-1]
 
 
@@ -2162,14 +2162,14 @@ def test_dispatch_paper_routes_to_cmd_paper(monkeypatch, tmp_path):
     monkeypatch.delenv("PAPER", raising=False)
     _patch_paper_db(monkeypatch, str(tmp_path / "paper.db"))
     bot = Stub(p2p.Config())
-    asyncio.run(bot.dispatch("/paper", ""))
+    arun(bot.dispatch("/paper", ""))
     assert "🧪 <b>Сухой прогон</b>" in texts(bot)[-1]
 
 
 def test_cmd_paper_report_no_cycles_sends_text_only(monkeypatch, tmp_path):
     _patch_paper_db(monkeypatch, str(tmp_path / "paper.db"))
     bot = Stub(p2p.Config())
-    asyncio.run(bot.cmd_paper("report"))
+    arun(bot.cmd_paper("report"))
     assert "завершённых кругов ещё нет" in texts(bot)[-1]
     assert not [m for m in bot.out if m[0] == "sendDocument"]
 
@@ -2183,7 +2183,7 @@ def test_cmd_paper_report_sends_summary_and_csv(monkeypatch, tmp_path):
     cid = paper.start_cycle(10000, buy, sell, "route", 2.0, path=db)
     paper.finish_cycle(cid, "done", realized_pct=2.5, path=db)
     bot = Stub(p2p.Config())
-    asyncio.run(bot.cmd_paper("report"))
+    arun(bot.cmd_paper("report"))
     text = texts(bot)[-1]
     assert "Bybit→MEXC (USDT→USDT)" in text and "план +2.00%" in text and "факт +2.50%" in text
     docs = [m for m in bot.out if m[0] == "sendDocument"]
@@ -2228,13 +2228,13 @@ def test_maker_view_skips_venue_without_both_sides():
 def test_maker_command_requires_known_asset():
     bot = Stub(p2p.Config())
     bot.last = p2p.Snapshot(88.0, "test", {}, {}, [], {}, {}, {})
-    asyncio.run(bot.maker("DOGE"))
+    arun(bot.maker("DOGE"))
     assert "не отслеживается" in texts(bot)[-1]
 
 
 def test_maker_command_waits_for_first_scan():
     bot = Stub(p2p.Config())
-    asyncio.run(bot.maker("USDT"))
+    arun(bot.maker("USDT"))
     assert texts(bot)[-1] == B.WAIT
 
 
@@ -2242,7 +2242,7 @@ def test_maker_command_sends_quotes():
     g = _groups(make_ad("MEXC", "buy", 90.0), make_ad("MEXC", "sell", 92.0))
     bot = Stub(p2p.Config(exchanges=["mexc"]))
     bot.last = p2p.Snapshot(88.0, "test", {}, {}, [], {}, {}, {}, groups=g)
-    asyncio.run(bot.maker("usdt"))
+    arun(bot.maker("usdt"))
     assert "MEXC" in texts(bot)[-1]
 
 
@@ -2266,13 +2266,13 @@ def test_banks_view_no_ads_anywhere():
 def test_banks_command_requires_known_asset():
     bot = Stub(p2p.Config())
     bot.last = p2p.Snapshot(88.0, "test", {}, {}, [], {}, {}, {})
-    asyncio.run(bot.banks("DOGE"))
+    arun(bot.banks("DOGE"))
     assert "не отслеживается" in texts(bot)[-1]
 
 
 def test_banks_command_waits_for_first_scan():
     bot = Stub(p2p.Config())
-    asyncio.run(bot.banks("USDT"))
+    arun(bot.banks("USDT"))
     assert texts(bot)[-1] == B.WAIT
 
 
@@ -2280,7 +2280,7 @@ def test_banks_command_sends_liquidity():
     g = _groups(make_ad("MEXC", "buy", 90.0, pays=("T-Bank",), max_amt=50000, avail=1000))
     bot = Stub(p2p.Config(exchanges=["mexc"]))
     bot.last = p2p.Snapshot(88.0, "test", {}, {}, [], {}, {}, {}, groups=g)
-    asyncio.run(bot.banks("usdt"))
+    arun(bot.banks("usdt"))
     assert "T-Bank" in texts(bot)[-1]
 
 
@@ -2340,7 +2340,7 @@ def test_balance_before_first_scan_sends_text_without_card(monkeypatch):
     monkeypatch.setattr(B, "portfolio_card", boom)
     bot = Stub(p2p.Config())
     assert bot.last is None
-    asyncio.run(bot.handle("/balance"))
+    arun(bot.handle("/balance"))
     assert not photos(bot)
     (method, params), = bot.out
     assert method == "sendMessage" and "курс ещё не получен" in params["text"] and "≈ 100 ₽" not in params["text"]
@@ -2355,7 +2355,7 @@ def test_balance_command_sends_card_with_refresh_button(monkeypatch):
     monkeypatch.setattr(B, "portfolio_card", lambda rows, total: b"png")
     bot = Stub(p2p.Config())
     bot.last = p2p.Snapshot(88.0, "test", {"USDT": 88.0}, {}, [], {}, {}, {})
-    asyncio.run(bot.handle("/balance"))
+    arun(bot.handle("/balance"))
     pics = photos(bot)
     assert len(pics) == 1
     assert "MEXC" in pics[0][1]["caption"]
@@ -2373,7 +2373,7 @@ def test_balance_falls_back_to_text_when_card_render_fails(monkeypatch):
     monkeypatch.setattr(B, "portfolio_card", boom)
     bot = Stub(p2p.Config())
     bot.last = p2p.Snapshot(88.0, "test", {"USDT": 88.0}, {}, [], {}, {}, {})
-    asyncio.run(bot.handle("/balance"))
+    arun(bot.handle("/balance"))
     assert not photos(bot)
     assert any("MEXC" in t for t in texts(bot))
 
@@ -2384,7 +2384,7 @@ def test_balance_callback_refreshes(monkeypatch):
 
     monkeypatch.setattr(B.accounts, "portfolio", fake_portfolio)
     bot = Stub(p2p.Config())
-    asyncio.run(bot.on_callback({"id": "1", "data": "balance", "message": {"message_id": 1}}))
+    arun(bot.on_callback({"id": "1", "data": "balance", "message": {"message_id": 1}}))
     assert any("Баланс" in p.get("text", "") for m, p in bot.out if m == "sendMessage")
 
 
@@ -2416,15 +2416,15 @@ def test_check_accounts_first_poll_is_silent_then_new_items_notify(tmp_path, mon
 
     monkeypatch.setattr(B.accounts, "account_history", fake_history)
     bot = Stub(p2p.Config())
-    asyncio.run(bot.check_accounts())
+    arun(bot.check_accounts())
     assert texts(bot) == []          # первый опрос — только запоминаем
 
     hist.append({"kind": "withdraw", "asset": "USDT", "amount": 30.0, "ts": 2.0})
-    asyncio.run(bot.check_accounts())
+    arun(bot.check_accounts())
     msgs = texts(bot)
     assert len(msgs) == 1 and "исполнен вывод" in msgs[0]
 
-    asyncio.run(bot.check_accounts())
+    arun(bot.check_accounts())
     assert len(texts(bot)) == 1       # повтор той же истории не шлём
 
 
@@ -2444,21 +2444,21 @@ def _history_bot(tmp_path, monkeypatch, answers):
 def test_check_accounts_empty_history_then_first_deposit_notifies(tmp_path, monkeypatch):
     dep = {"kind": "deposit", "asset": "USDT", "amount": 100.0, "ts": 1.0}
     bot = _history_bot(tmp_path, monkeypatch, [[], [dep], [dep]])
-    asyncio.run(bot.check_accounts())
+    arun(bot.check_accounts())
     assert bot.acc_seen["mexc"] == set() and texts(bot) == []   # пустой успешный ответ — это первый опрос
-    asyncio.run(bot.check_accounts())
+    arun(bot.check_accounts())
     msgs = texts(bot)
     assert len(msgs) == 1 and "пришёл депозит" in msgs[0]
-    asyncio.run(bot.check_accounts())
+    arun(bot.check_accounts())
     assert len(texts(bot)) == 1
 
 
 def test_check_accounts_none_history_does_not_seed_baseline(tmp_path, monkeypatch):
     dep = {"kind": "deposit", "asset": "USDT", "amount": 100.0, "ts": 1.0}
     bot = _history_bot(tmp_path, monkeypatch, [None, [dep]])
-    asyncio.run(bot.check_accounts())
+    arun(bot.check_accounts())
     assert bot.acc_seen.get("mexc") is None                   # ошибка — не первый опрос
-    asyncio.run(bot.check_accounts())
+    arun(bot.check_accounts())
     assert texts(bot) == [] and bot.acc_seen["mexc"] == {B.hist_key(dep)}
 
 
@@ -2469,7 +2469,7 @@ def test_check_accounts_partial_failure_does_not_forget_items(tmp_path, monkeypa
     wd = {"kind": "withdraw", "asset": "USDT", "amount": 30.0, "ts": 2.0}
     bot = _history_bot(tmp_path, monkeypatch, [[wd, dep], [wd], [wd, dep]])
     for _ in range(3):
-        asyncio.run(bot.check_accounts())
+        arun(bot.check_accounts())
     assert texts(bot) == []
 
 
@@ -2500,13 +2500,13 @@ def test_show_steps_sends_message():
     bot = Stub(p2p.Config())
     d = deal(5.0)
     deal_id = bot.remember_deal(d, snap=snap([d]))
-    asyncio.run(bot.show_steps({"id": "1"}, deal_id))
+    arun(bot.show_steps({"id": "1"}, deal_id))
     assert "Шаги связки" in texts(bot)[-1]
 
 
 def test_show_steps_unknown_id_not_sent():
     bot = Stub(p2p.Config())
-    asyncio.run(bot.show_steps({"id": "1"}, 999))
+    arun(bot.show_steps({"id": "1"}, 999))
     method, params = bot.out[-1]
     assert method == "answerCallbackQuery" and "устарел" in params["text"]
 
@@ -2521,7 +2521,7 @@ def test_check_accounts_skips_exchanges_without_saved_key(tmp_path, monkeypatch)
 
     monkeypatch.setattr(B.accounts, "account_history", fake_history)
     bot = Stub(p2p.Config())
-    asyncio.run(bot.check_accounts())
+    arun(bot.check_accounts())
     assert calls == []
 
 
@@ -2569,7 +2569,7 @@ def test_quiet_hours_blocks_signal_and_stores_for_digest(monkeypatch):
     bot = Stub(p2p.Config(min_profit=2.0))
     bot.quiet_on = True
     d = deal(5, "MEXC")
-    asyncio.run(bot.quiet_and_pause_tick(snap([d])))
+    arun(bot.quiet_and_pause_tick(snap([d])))
     assert not bot.out                              # сигнал не отправлен
     assert list(bot.night_deals.values()) == [d]     # но накоплен для утреннего дайджеста
 
@@ -2579,7 +2579,7 @@ def test_night_digest_collects_after_low_deal(monkeypatch):
     monkeypatch.setattr(B.time, "time", lambda: msk_ts(2, 0))
     bot = Stub(p2p.Config(min_profit=2.0))
     bot.quiet_on = True
-    asyncio.run(bot.quiet_and_pause_tick(snap([deal(1.5, "MEXC"), deal(3, "KuCoin")])))
+    arun(bot.quiet_and_pause_tick(snap([deal(1.5, "MEXC"), deal(3, "KuCoin")])))
     assert not bot.out
     assert [d[0] for d in bot.night_deals.values()] == [3]
 
@@ -2590,7 +2590,7 @@ def test_quiet_hours_off_sends_signal_as_usual(monkeypatch):
     bot = Stub(p2p.Config(min_profit=2.0))
     bot.live_scans = 1   # тест про антидубль/паузу, не про живость
     d = deal(5, "MEXC")
-    asyncio.run(bot.quiet_and_pause_tick(snap([d])))
+    arun(bot.quiet_and_pause_tick(snap([d])))
     assert photos(bot)                               # тихие часы выключены — сигнал уходит как обычно
 
 
@@ -2600,20 +2600,20 @@ def test_night_digest_aggregates_across_scans_and_sends_top3_once(monkeypatch):
     bot.quiet_on = True
     a, bd, c = deal(5, "MEXC"), deal(4, "KuCoin"), deal(6, "HTX")
     monkeypatch.setattr(B.time, "time", lambda: msk_ts(2, 0))
-    asyncio.run(bot.quiet_and_pause_tick(snap([a, bd])))
+    arun(bot.quiet_and_pause_tick(snap([a, bd])))
     monkeypatch.setattr(B.time, "time", lambda: msk_ts(3, 0))
-    asyncio.run(bot.quiet_and_pause_tick(snap([c])))
+    arun(bot.quiet_and_pause_tick(snap([c])))
     assert not texts(bot)                            # всю ночь — тишина, дайджеста ещё нет
     assert len(bot.night_deals) == 3
 
     monkeypatch.setattr(B.time, "time", lambda: msk_ts(9, 0))     # тихие часы закончились
-    asyncio.run(bot.quiet_and_pause_tick(snap([])))
+    arun(bot.quiet_and_pause_tick(snap([])))
     msgs = texts(bot)
     assert len(msgs) == 1 and "Топ-3 связки за ночь" in msgs[0]
     assert msgs[0].index("+6.00%") < msgs[0].index("+5.00%") < msgs[0].index("+4.00%")  # по убыванию прибыли
     assert bot.night_deals == {}
 
-    asyncio.run(bot.quiet_and_pause_tick(snap([])))   # повторный тик после конца ночи — дайджест не дублируем
+    arun(bot.quiet_and_pause_tick(snap([])))   # повторный тик после конца ночи — дайджест не дублируем
     assert len(texts(bot)) == 1
 
 
@@ -2621,9 +2621,9 @@ def test_night_digest_empty_when_nothing_above_threshold(monkeypatch):
     bot = Stub(p2p.Config(min_profit=2.0))
     bot.quiet_on = True
     monkeypatch.setattr(B.time, "time", lambda: msk_ts(2, 0))
-    asyncio.run(bot.quiet_and_pause_tick(snap([])))
+    arun(bot.quiet_and_pause_tick(snap([])))
     monkeypatch.setattr(B.time, "time", lambda: msk_ts(9, 0))
-    asyncio.run(bot.quiet_and_pause_tick(snap([])))
+    arun(bot.quiet_and_pause_tick(snap([])))
     assert "связок выше порога не было" in texts(bot)[-1]
 
 
@@ -2639,9 +2639,9 @@ def test_night_digest_includes_paper_summary_when_on(monkeypatch, tmp_path):
     bot = Stub(p2p.Config(min_profit=2.0))
     bot.quiet_on = True
     monkeypatch.setattr(B.time, "time", lambda: msk_ts(2, 0))
-    asyncio.run(bot.quiet_and_pause_tick(snap([])))
+    arun(bot.quiet_and_pause_tick(snap([])))
     monkeypatch.setattr(B.time, "time", lambda: msk_ts(9, 0))
-    asyncio.run(bot.quiet_and_pause_tick(snap([])))
+    arun(bot.quiet_and_pause_tick(snap([])))
     msgs = texts(bot)
     assert any("Сухой прогон за сутки" in m for m in msgs)
 
@@ -2652,15 +2652,15 @@ def test_night_digest_skips_paper_summary_when_off(monkeypatch, tmp_path):
     bot = Stub(p2p.Config(min_profit=2.0))
     bot.quiet_on = True
     monkeypatch.setattr(B.time, "time", lambda: msk_ts(2, 0))
-    asyncio.run(bot.quiet_and_pause_tick(snap([])))
+    arun(bot.quiet_and_pause_tick(snap([])))
     monkeypatch.setattr(B.time, "time", lambda: msk_ts(9, 0))
-    asyncio.run(bot.quiet_and_pause_tick(snap([])))
+    arun(bot.quiet_and_pause_tick(snap([])))
     assert not any("Сухой прогон за сутки" in m for m in texts(bot))
 
 
 def test_pause_command_no_arg_is_indefinite():
     bot = Stub(p2p.Config())
-    asyncio.run(bot.handle("/pause"))
+    arun(bot.handle("/pause"))
     assert bot.paused and bot.pause_until == 0.0
     assert "паузе" in texts(bot)[-1]
 
@@ -2671,21 +2671,21 @@ def test_pause_1h_blocks_signals_and_expires(monkeypatch):
     monkeypatch.setattr(B.time, "time", lambda: now[0])
     bot = Stub(p2p.Config(min_profit=2.0))
     bot.live_scans = 1   # тест про антидубль/паузу, не про живость
-    asyncio.run(bot.handle("/pause 1h"))
+    arun(bot.handle("/pause 1h"))
     assert bot.pause_until == now[0] + 3600 and not bot.paused
 
     d = deal(5, "MEXC")
-    asyncio.run(bot.quiet_and_pause_tick(snap([d])))
+    arun(bot.quiet_and_pause_tick(snap([d])))
     assert not photos(bot)                 # сигналы блокированы на время паузы
 
     now[0] += 3601                          # час прошёл — пауза истекла сама, без /resume
-    asyncio.run(bot.quiet_and_pause_tick(snap([d])))
+    arun(bot.quiet_and_pause_tick(snap([d])))
     assert photos(bot)                      # сигналы снова идут
 
 
 def test_pause_bad_arg_reports_error():
     bot = Stub(p2p.Config())
-    asyncio.run(bot.handle("/pause ерунда"))
+    arun(bot.handle("/pause ерунда"))
     assert "срок" in texts(bot)[-1].lower()
     assert bot.pause_until == 0.0 and not bot.paused
 
@@ -2694,7 +2694,7 @@ def test_pause_until_morning_uses_quiet_hours_end(monkeypatch):
     ts = msk_ts(2, 0)
     monkeypatch.setattr(B.time, "time", lambda: ts)
     bot = Stub(p2p.Config())
-    asyncio.run(bot.handle("/pause до утра"))
+    arun(bot.handle("/pause до утра"))
     assert bot.pause_until == B.quiet_hours_end_ts(bot.quiet_hours, ts)
     assert "08:00" in texts(bot)[-1]
 
@@ -2702,7 +2702,7 @@ def test_pause_until_morning_uses_quiet_hours_end(monkeypatch):
 def test_pause_until_morning_without_quiet_hours_configured():
     bot = Stub(p2p.Config())
     bot.quiet_hours = ""
-    asyncio.run(bot.handle("/pause до утра"))
+    arun(bot.handle("/pause до утра"))
     assert bot.pause_until == 0.0
     assert "QUIET_HOURS" in texts(bot)[-1]
 
@@ -2711,7 +2711,7 @@ def test_resume_command_clears_manual_and_timed_pause():
     bot = Stub(p2p.Config())
     bot.paused = True
     bot.pause_until = time.time() + 999
-    asyncio.run(bot.handle("/resume"))
+    arun(bot.handle("/resume"))
     assert not bot.paused and bot.pause_until == 0.0
     assert "включены" in texts(bot)[-1].lower()
 
@@ -2851,7 +2851,7 @@ def test_flt_callback_rerenders_filters_view(tmp_path, monkeypatch):
     env.write_text("ASSETS=USDT,BTC\n", encoding="utf-8")
     monkeypatch.setattr(B, "save_env", functools.partial(B.save_env, path=str(env)))
     bot = Stub(p2p.Config(assets=["USDT", "BTC"]))
-    asyncio.run(bot.on_callback({"id": "1", "data": "flt_a:BTC", "message": {"message_id": 1}}))
+    arun(bot.on_callback({"id": "1", "data": "flt_a:BTC", "message": {"message_id": 1}}))
     method, params = bot.out[-1]
     assert method == "editMessageText" and "Фильтры" in params["text"]
 
@@ -2875,9 +2875,9 @@ def test_preset_save_flow_writes_current_filters(tmp_path, monkeypatch):
     monkeypatch.setattr(B.presets, "save_preset", functools.partial(B.presets.save_preset, path=str(pfile)))
     monkeypatch.setattr(B.presets, "list_custom", functools.partial(B.presets.list_custom, path=str(pfile)))
     bot = Stub(p2p.Config(assets=["USDT"], exchanges=["bybit"], min_profit=3.0, amount=70000))
-    asyncio.run(bot.on_callback({"id": "1", "data": "preset_save", "message": {"message_id": 1}}))
+    arun(bot.on_callback({"id": "1", "data": "preset_save", "message": {"message_id": 1}}))
     assert bot.awaiting_preset_name
-    asyncio.run(bot.handle("Мой набор"))
+    arun(bot.handle("Мой набор"))
     assert not bot.awaiting_preset_name
     saved = presets.list_custom(path=str(pfile))
     assert saved["Мой набор"]["assets"] == ["USDT"] and saved["Мой набор"]["amount"] == 70000
@@ -2889,7 +2889,7 @@ def test_preset_save_empty_name_not_saved(tmp_path, monkeypatch):
     monkeypatch.setattr(B.presets, "save_preset", functools.partial(B.presets.save_preset, path=str(pfile)))
     bot = Stub(p2p.Config())
     bot.awaiting_preset_name = True
-    asyncio.run(bot.handle("   "))
+    arun(bot.handle("   "))
     assert not pfile.exists()
     assert "не сохранён" in texts(bot)[-1].lower()
 
@@ -2959,7 +2959,7 @@ def test_preset_del_callback_removes_and_rerenders(tmp_path, monkeypatch):
     use_presets_file(monkeypatch, pfile)
     bot = Stub(p2p.Config())
     data = "preset_del:" + presets.preset_id("Старый")
-    asyncio.run(bot.on_callback({"id": "1", "data": data, "message": {"message_id": 1}}))
+    arun(bot.on_callback({"id": "1", "data": data, "message": {"message_id": 1}}))
     assert "Старый" not in presets.list_custom(path=str(pfile))
     method, params = bot.out[-1]
     assert method == "editMessageText" and "Пресеты" in params["text"]
@@ -2989,8 +2989,8 @@ def test_preset_long_cyrillic_name_save_apply_delete_via_buttons(tmp_path, monke
     env_file(tmp_path, monkeypatch)
     name = "Мои любимые банки и площадки на все дни"   # 39 букв: с префиксом по имени было 91 байт
     bot = Stub(p2p.Config(assets=["USDT"], exchanges=["bybit"], min_profit=3.0, amount=70000))
-    asyncio.run(bot.on_callback({"id": "1", "data": "preset_save", "message": {"message_id": 1}}))
-    asyncio.run(bot.handle(name))
+    arun(bot.on_callback({"id": "1", "data": "preset_save", "message": {"message_id": 1}}))
+    arun(bot.handle(name))
     method, params = bot.out[-1]
     assert method == "sendMessage" and "Пресеты" in params["text"]
     data = callbacks(params["reply_markup"])
@@ -2999,12 +2999,12 @@ def test_preset_long_cyrillic_name_save_apply_delete_via_buttons(tmp_path, monke
     del_btn = "preset_del:" + presets.preset_id(name)
     assert apply_btn in data and del_btn in data
     bot.cfg = p2p.Config(assets=["BTC"], exchanges=["mexc"], min_profit=1.0, amount=20000)
-    asyncio.run(bot.on_callback({"id": "2", "data": apply_btn, "message": {"message_id": 1}}))
+    arun(bot.on_callback({"id": "2", "data": apply_btn, "message": {"message_id": 1}}))
     assert bot.cfg.assets == ["USDT"] and bot.cfg.exchanges == ["bybit"]
     assert bot.cfg.min_profit == 3.0 and bot.cfg.amount == 70000
     toast = next(p["text"] for m, p in bot.out if m == "answerCallbackQuery" and p["callback_query_id"] == "2")
     assert name in toast
-    asyncio.run(bot.on_callback({"id": "3", "data": del_btn, "message": {"message_id": 1}}))
+    arun(bot.on_callback({"id": "3", "data": del_btn, "message": {"message_id": 1}}))
     assert name not in presets.list_custom(path=str(pfile))
 
 
@@ -3016,7 +3016,7 @@ def test_preset_name_is_html_escaped_in_messages(tmp_path, monkeypatch):
     name = "<b>Банки</b> & <i>x"
     bot = Stub(p2p.Config())
     bot.awaiting_preset_name = True
-    asyncio.run(bot.handle(name))
+    arun(bot.handle(name))
     saved_msg, view = texts(bot)[-2:]
     escaped = "&lt;b&gt;Банки&lt;/b&gt; &amp; &lt;i&gt;x"
     assert escaped in saved_msg and "<i>" not in saved_msg
@@ -3037,7 +3037,7 @@ def test_old_preset_buttons_with_name_still_work(tmp_path, monkeypatch):
     assert "Мой" in bot.apply("preset_apply:Мой") and bot.cfg.assets == ["USDT"]
     bot.apply("preset_apply:USDT без переводов")
     assert bot.cfg.same_venue_only is True
-    asyncio.run(bot.on_callback({"id": "1", "data": "preset_del:Мой", "message": {"message_id": 1}}))
+    arun(bot.on_callback({"id": "1", "data": "preset_del:Мой", "message": {"message_id": 1}}))
     assert "Мой" not in presets.list_custom(path=str(pfile))
 
 
@@ -3075,7 +3075,7 @@ def test_history_command_empty_sends_message_no_photos(tmp_path, monkeypatch):
     db = str(tmp_path / "history.db")
     monkeypatch.setattr(B.history, "is_empty", functools.partial(B.history.is_empty, path=db))
     bot = Stub(p2p.Config())
-    asyncio.run(bot.handle("/history"))
+    arun(bot.handle("/history"))
     assert "пуста" in texts(bot)[-1]
     assert not photos(bot)
 
@@ -3086,7 +3086,7 @@ def test_history_command_renders_two_photos(tmp_path, monkeypatch):
         monkeypatch.setattr(B.history, name, functools.partial(getattr(B.history, name), path=db))
     history._insert([(time.time(), "Bybit", "MEXC", "USDT", "USDT", 3.0, 88.0)], db)
     bot = Stub(p2p.Config())
-    asyncio.run(bot.handle("/history"))
+    arun(bot.handle("/history"))
     assert len(photos(bot)) == 2
 
 
@@ -3094,7 +3094,7 @@ def test_history_callback_routes_to_show_history(tmp_path, monkeypatch):
     db = str(tmp_path / "history.db")
     monkeypatch.setattr(B.history, "is_empty", functools.partial(B.history.is_empty, path=db))
     bot = Stub(p2p.Config())
-    asyncio.run(bot.on_callback({"id": "1", "data": "history", "message": {"message_id": 1}}))
+    arun(bot.on_callback({"id": "1", "data": "history", "message": {"message_id": 1}}))
     assert "пуста" in texts(bot)[-1]
 
 
@@ -3114,7 +3114,7 @@ def test_mark_done_offers_fact_quick_buttons(tmp_path, monkeypatch):
     monkeypatch.setattr(B.trades, "log_trade", functools.partial(B.trades.log_trade, path=db))
     bot = Stub(p2p.Config(amount=70000))
     deal_id = bot.remember_deal(deal(5.0))
-    asyncio.run(bot.mark_done({"id": "1", "message": {"message_id": 9}}, deal_id))
+    arun(bot.mark_done({"id": "1", "message": {"message_id": 9}}, deal_id))
     msg = next(p for m, p in bot.out if m == "sendMessage" and "факт" in p["text"].lower())
     buttons = [b for row in msg["reply_markup"]["inline_keyboard"] for b in row]
     modes = {b["callback_data"].rsplit(":", 1)[-1] for b in buttons}
@@ -3132,9 +3132,9 @@ def test_fact_button_calc_records_calc_profit(tmp_path, monkeypatch):
     monkeypatch.setattr(B.trades, "stats", functools.partial(B.trades.stats, path=db))
     bot = Stub(p2p.Config(amount=70000))
     deal_id = bot.remember_deal(deal(5.0))
-    asyncio.run(bot.mark_done({"id": "1", "message": {"message_id": 9}}, deal_id))
+    arun(bot.mark_done({"id": "1", "message": {"message_id": 9}}, deal_id))
     trade_id = _fact_prompt_trade_id(bot)
-    asyncio.run(bot.on_callback({"id": "2", "data": f"fact:{trade_id}:calc", "message": {"message_id": 10}}))
+    arun(bot.on_callback({"id": "2", "data": f"fact:{trade_id}:calc", "message": {"message_id": 10}}))
     assert "Факт: +5.00%" in texts(bot)[-1] and "в сравнение расчёт→факт не идёт" in texts(bot)[-1]
     view = bot.stats_view()                              # «как расчёт» — это расчёт: в сравнение не идёт
     assert "факт указан у" not in view and "«как расчёт»/±0.5 у 1" in view
@@ -3148,12 +3148,12 @@ def test_fact_button_plus_minus_offsets_calc(tmp_path, monkeypatch):
     monkeypatch.setattr(B.trades, "set_fact", functools.partial(B.trades.set_fact, path=db))
     bot = Stub(p2p.Config(amount=70000))
     deal_id = bot.remember_deal(deal(5.0))
-    asyncio.run(bot.mark_done({"id": "1", "message": {"message_id": 9}}, deal_id))
+    arun(bot.mark_done({"id": "1", "message": {"message_id": 9}}, deal_id))
     trade_id = _fact_prompt_trade_id(bot)
-    asyncio.run(bot.on_callback({"id": "2", "data": f"fact:{trade_id}:minus", "message": {"message_id": 10}}))
+    arun(bot.on_callback({"id": "2", "data": f"fact:{trade_id}:minus", "message": {"message_id": 10}}))
     assert "Факт: +4.50%" in texts(bot)[-1] and "в сравнение расчёт→факт не идёт" in texts(bot)[-1]
     assert _fact_source(db, trade_id) == "plan±"
-    asyncio.run(bot.on_callback({"id": "3", "data": f"fact:{trade_id}:plus", "message": {"message_id": 10}}))
+    arun(bot.on_callback({"id": "3", "data": f"fact:{trade_id}:plus", "message": {"message_id": 10}}))
     assert "Факт: +5.50%" in texts(bot)[-1]
     assert _fact_source(db, trade_id) == "plan±"
 
@@ -3165,11 +3165,11 @@ def test_fact_manual_button_arms_awaiting_then_parses_text(tmp_path, monkeypatch
     monkeypatch.setattr(B.trades, "set_fact", functools.partial(B.trades.set_fact, path=db))
     bot = Stub(p2p.Config(amount=70000))
     deal_id = bot.remember_deal(deal(5.0))
-    asyncio.run(bot.mark_done({"id": "1", "message": {"message_id": 9}}, deal_id))
+    arun(bot.mark_done({"id": "1", "message": {"message_id": 9}}, deal_id))
     trade_id = _fact_prompt_trade_id(bot)
-    asyncio.run(bot.on_callback({"id": "2", "data": f"fact:{trade_id}:manual", "message": {"message_id": 10}}))
+    arun(bot.on_callback({"id": "2", "data": f"fact:{trade_id}:manual", "message": {"message_id": 10}}))
     assert bot.awaiting_fact == trade_id
-    asyncio.run(bot.handle("650 ₽"))
+    arun(bot.handle("650 ₽"))
     assert bot.awaiting_fact is None
     assert "Факт:" in texts(bot)[-1] and "не идёт" not in texts(bot)[-1]
     assert _fact_source(db, trade_id) == "manual"
@@ -3181,10 +3181,10 @@ def test_fact_manual_garbage_reports_error_and_resets_awaiting(tmp_path, monkeyp
     monkeypatch.setattr(B.trades, "get_trade", functools.partial(B.trades.get_trade, path=db))
     bot = Stub(p2p.Config(amount=70000))
     deal_id = bot.remember_deal(deal(5.0))
-    asyncio.run(bot.mark_done({"id": "1", "message": {"message_id": 9}}, deal_id))
+    arun(bot.mark_done({"id": "1", "message": {"message_id": 9}}, deal_id))
     trade_id = _fact_prompt_trade_id(bot)
     bot.awaiting_fact = trade_id
-    asyncio.run(bot.handle("ерунда"))
+    arun(bot.handle("ерунда"))
     assert bot.awaiting_fact is None
     assert "не понял" in texts(bot)[-1].lower()
 
@@ -3192,14 +3192,14 @@ def test_fact_manual_garbage_reports_error_and_resets_awaiting(tmp_path, monkeyp
 def test_awaiting_fact_reset_by_other_button():
     bot = Stub(p2p.Config())
     bot.awaiting_fact = 42
-    asyncio.run(bot.on_callback({"id": "1", "data": "best", "message": {"message_id": 1}}))
+    arun(bot.on_callback({"id": "1", "data": "best", "message": {"message_id": 1}}))
     assert bot.awaiting_fact is None
 
 
 def test_awaiting_fact_reset_by_other_command():
     bot = Stub(p2p.Config())
     bot.awaiting_fact = 42
-    asyncio.run(bot.handle("/best"))
+    arun(bot.handle("/best"))
     assert bot.awaiting_fact is None
 
 
@@ -3209,7 +3209,7 @@ def test_backtest_command_reports_top_pairs_and_disclaimer(tmp_path, monkeypatch
     monkeypatch.setattr(B.history, "backtest", functools.partial(B.history.backtest, path=db))
     history._insert([(time.time(), "Bybit", "MEXC", "USDT", "USDT", 3.0, 88.0)], db)
     bot = Stub(p2p.Config(min_profit=2.0, amount=50000))
-    asyncio.run(bot.handle("/backtest"))
+    arun(bot.handle("/backtest"))
     text = texts(bot)[-1]
     assert "Bybit" in text and "MEXC" in text
     assert "прошлое — не прогноз" in text.lower()
@@ -3220,7 +3220,7 @@ def test_backtest_command_empty_history_message(tmp_path, monkeypatch):
     db = str(tmp_path / "history.db")
     monkeypatch.setattr(B.history, "is_empty", functools.partial(B.history.is_empty, path=db))
     bot = Stub(p2p.Config())
-    asyncio.run(bot.handle("/backtest"))
+    arun(bot.handle("/backtest"))
     assert "пуста" in texts(bot)[-1]
 
 
@@ -3228,7 +3228,7 @@ def test_backtest_callback_routes_same_as_command(tmp_path, monkeypatch):
     db = str(tmp_path / "history.db")
     monkeypatch.setattr(B.history, "is_empty", functools.partial(B.history.is_empty, path=db))
     bot = Stub(p2p.Config())
-    asyncio.run(bot.on_callback({"id": "1", "data": "backtest", "message": {"message_id": 1}}))
+    arun(bot.on_callback({"id": "1", "data": "backtest", "message": {"message_id": 1}}))
     assert "пуста" in texts(bot)[-1]
 
 
@@ -3281,14 +3281,14 @@ def test_status_no_errors_says_all_ok(tmp_path):
 def test_status_command_sends_status_view(monkeypatch):
     monkeypatch.setattr(B.Bot, "status_view", lambda self, status_path=B.DEV_STATUS: "STATUS TEXT")
     bot = Stub(p2p.Config())
-    asyncio.run(bot.handle("/status"))
+    arun(bot.handle("/status"))
     assert texts(bot)[-1] == "STATUS TEXT"
 
 
 def test_status_callback_sends_status_view(monkeypatch):
     monkeypatch.setattr(B.Bot, "status_view", lambda self, status_path=B.DEV_STATUS: "STATUS TEXT")
     bot = Stub(p2p.Config())
-    asyncio.run(bot.on_callback({"id": "1", "data": "status", "message": {"message_id": 1}}))
+    arun(bot.on_callback({"id": "1", "data": "status", "message": {"message_id": 1}}))
     assert texts(bot)[-1] == "STATUS TEXT"
 
 
@@ -3318,7 +3318,7 @@ def test_logs_command_sends_logs_view(tmp_path, monkeypatch):
     log.write_text("24.09 10:00:00 INFO bot: hello\n", encoding="utf-8")
     monkeypatch.setattr(B, "LOG_PATH", str(log))
     bot = Stub(p2p.Config())
-    asyncio.run(bot.handle("/logs"))
+    arun(bot.handle("/logs"))
     assert "hello" in texts(bot)[-1]
 
 
@@ -3336,7 +3336,7 @@ def test_scan_loop_records_last_scan_timestamp_and_duration(monkeypatch):
     bot = Stub(p2p.Config())
     bot.chat_id = ""   # без чата — не шлём алерты/дайджесты
     try:
-        asyncio.run(bot.scan_loop())
+        arun(bot.scan_loop())
     except asyncio.CancelledError:
         pass
     assert bot.last_scan_ts > 0 and bot.last_scan_duration >= 0

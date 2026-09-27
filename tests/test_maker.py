@@ -1,4 +1,3 @@
-import asyncio
 import html
 import re
 
@@ -6,7 +5,7 @@ import pytest
 
 import bot as B
 import p2p
-from helpers import make_ad
+from helpers import arun, make_ad
 
 
 def groups(*ads):
@@ -99,7 +98,7 @@ def _tg_len(text):
 
 def _offline_snap():
     cfg = p2p.Config(assets=["USDT"])
-    return cfg, asyncio.run(p2p.scan(None, cfg))
+    return cfg, arun(p2p.scan(None, cfg))
 
 
 def test_scan_keeps_whole_book_including_filtered_ads(offline):
@@ -193,8 +192,8 @@ def test_live_card_update_keeps_lean_snapshot(monkeypatch):
     ad = p2p.Ad("Bybit", "buy", 85.0, 1000, 500000, 1e4, ["SBP"], "m", 1000, 100.0)
     book = {("Bybit", "buy", "USDT"): [ad] * 20}
     snap = lambda ds: p2p.Snapshot(88.0, "t", {}, {}, ds, {}, {}, {}, book=book)
-    asyncio.run(bot.notify(snap([deal(5.0)])))
+    arun(bot.notify(snap([deal(5.0)])))
     for live in bot.live_msg.values():
         live["last_edit"] = time.time() - B.LIVE_EDIT_INTERVAL - 1
-    asyncio.run(bot.notify(snap([deal(5.1)])))
+    arun(bot.notify(snap([deal(5.1)])))
     assert all(entry[2].book == {} for entry in bot.deals_by_id.values())
