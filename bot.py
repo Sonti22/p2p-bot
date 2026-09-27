@@ -203,6 +203,8 @@ ACCOUNT_NAMES = dict(EXCHANGE_NAMES, bingx="BingX", cryptomus="Cryptomus")
 ACCOUNT_ONLY = tuple(ex for ex in ACCOUNT_NAMES if ex not in VENUE_NAMES)   # ("bingx", "cryptomus")
 ACCOUNT_POLL_INTERVAL_DEFAULT = 60  # опрос истории аккаунтов, сек — если не задано в .env
 LIVE_EDIT_INTERVAL = 30     # сек: не чаще обновляем карточку последнего сигнала вместо повторной отправки
+STALE_RETRY_BASE = 30       # сек: пометку «⌛ устарела» после 429/5xx/сбоя сети повторим не раньше (дальше ×2)
+STALE_RETRY_MAX = 600       # сек: потолок паузы между повторами пометки
 MARKET_STATUS_INTERVAL = 60  # сек: не чаще обновляем закреплённое сообщение «Статус рынка»
 MSK = timezone(timedelta(hours=3))                    # тихие часы и /pause считаем по МСК, не по времени ПК
 PAUSE_PRESETS = {"30m": 1800, "1h": 3600, "3h": 3 * 3600}  # аргументы /pause -> секунды
@@ -2818,21 +2820,32 @@ class Bot:
             self.deals_by_id[live["deal_id"]] = (d, copy.deepcopy(cfg), _lean(snap))
 
     async def mark_stale_deals(self, active):
-        """Связка пропала из топа — один раз пометить последний сигнал по ней «⌛ устарел»."""
+        """Связка пропала из топа — один раз пометить последний сигнал по ней «⌛ устарел». Помеченной считаем, только
+        когда Telegram принял правку: 429, 5xx и сбой сети — повтор на следующих сканах не раньше retry_after (нет его —
+        через STALE_RETRY_BASE, дальше ×2 до STALE_RETRY_MAX); сообщения уже нет (400/403) — повтор не поможет."""
+        now = time.time()
         for key, live in self.live_msg.items():
-            if key in active or live["stale"]:
+            if key in active or live["stale"] or now < live.get("stale_retry_at", 0.0):
                 continue
-            live["stale"] = True
             text = live["caption"] + STALE_MARK
             try:
                 if live["photo"]:
-                    await self.call("editMessageCaption", chat_id=self.chat_id, message_id=live["message_id"],
-                                    caption=text, parse_mode="HTML")
+                    r = await self.call("editMessageCaption", chat_id=self.chat_id, message_id=live["message_id"],
+                                        caption=text, parse_mode="HTML")
                 else:
-                    await self.call("editMessageText", chat_id=self.chat_id, message_id=live["message_id"],
-                                    text=text, parse_mode="HTML", disable_web_page_preview=True)
-            except Exception as e:
-                logger.warning("live card stale error: %s", e)
+                    r = await self.call("editMessageText", chat_id=self.chat_id, message_id=live["message_id"],
+                                        text=text, parse_mode="HTML", disable_web_page_preview=True)
+            except Exception as e:   # сеть/таймаут — повторим
+                logger.warning("live card stale error: %s", accounts.api_error_text(e))   # без URL с токеном бота
+                r = {}
+            if r and not r.get("ok"):
+                logger.warning("live card stale: %s", r.get("description"))
+            if delivery_final(r):
+                live["stale"] = True
+                continue
+            tries = live["stale_tries"] = live.get("stale_tries", 0) + 1
+            retry = (r.get("parameters") or {}).get("retry_after")
+            live["stale_retry_at"] = now + (retry or min(STALE_RETRY_BASE * 2 ** (tries - 1), STALE_RETRY_MAX))
 
     async def check_accounts(self):
         """Уведомление о новых движениях по подключённым биржам: депозит, вывод, спот-сделка, P2P-ордер.

@@ -136,3 +136,67 @@ def test_mexc_withdraw_processing_then_success_notifies_once(tmp_path, monkeypat
     asyncio.run(bot.check_accounts())
     done = [t for t in texts(bot) if "вывод" in t]
     assert len(done) == 1 and "исполнен вывод" in done[0] and "30 USDT" in done[0]
+
+
+# --- №14: пометка «⌛ устарела» — только после ответа ok, временные ошибки повторяем -------------------------------
+
+KEY = ("Bybit", "USDT", "MEXC", "USDT")
+
+
+def _stale_bot(monkeypatch, answers):
+    """Бот с живой карточкой по KEY; editMessageText отвечает по очереди из answers (исключение — бросает)."""
+    bot = Stub(p2p.Config())
+    bot.live_msg[KEY] = {"message_id": 7, "photo": False, "deal_id": None, "last_edit": 0.0, "caption": "c",
+                         "stale": False}
+    answers = list(answers)
+
+    async def call(method, **p):
+        bot.out.append((method, p))
+        r = answers.pop(0)
+        if isinstance(r, Exception):
+            raise r
+        return r
+    bot.call = call
+    now = [1_790_000_000.0]
+    monkeypatch.setattr(B.time, "time", lambda: now[0])
+    return bot, now
+
+
+def _edits(bot):
+    return [p for m, p in bot.out if m == "editMessageText"]
+
+
+def test_stale_mark_after_429_is_retried_after_retry_after(monkeypatch):
+    too_many = {"ok": False, "error_code": 429, "description": "Too Many Requests: retry after 5",
+                "parameters": {"retry_after": 5}}
+    bot, now = _stale_bot(monkeypatch, [too_many, {"ok": True}])
+    asyncio.run(bot.mark_stale_deals(set()))
+    assert len(_edits(bot)) == 1 and not bot.live_msg[KEY]["stale"]      # 429 — пометка не доставлена
+    now[0] += 2
+    asyncio.run(bot.mark_stale_deals(set()))
+    assert len(_edits(bot)) == 1                                          # retry_after ещё не прошёл
+    now[0] += 4
+    asyncio.run(bot.mark_stale_deals(set()))
+    assert len(_edits(bot)) == 2 and bot.live_msg[KEY]["stale"]          # вторая попытка — доставлено
+    assert _edits(bot)[-1]["text"].endswith("⌛ <i>связка устарела</i>")
+    asyncio.run(bot.mark_stale_deals(set()))
+    assert len(_edits(bot)) == 2                                          # после доставки — больше не правим
+
+
+def test_stale_mark_after_timeout_is_retried(monkeypatch):
+    bot, now = _stale_bot(monkeypatch, [asyncio.TimeoutError(), {"ok": True}])
+    asyncio.run(bot.mark_stale_deals(set()))
+    assert not bot.live_msg[KEY]["stale"]
+    now[0] += B.STALE_RETRY_BASE
+    asyncio.run(bot.mark_stale_deals(set()))
+    assert len(_edits(bot)) == 2 and bot.live_msg[KEY]["stale"]
+
+
+def test_stale_mark_on_missing_message_is_not_retried(monkeypatch):
+    """Сообщения больше нет (400) — повтор не поможет: помечаем и больше не пробуем."""
+    gone = {"ok": False, "error_code": 400, "description": "Bad Request: message to edit not found"}
+    bot, now = _stale_bot(monkeypatch, [gone])
+    asyncio.run(bot.mark_stale_deals(set()))
+    now[0] += B.STALE_RETRY_MAX
+    asyncio.run(bot.mark_stale_deals(set()))
+    assert len(_edits(bot)) == 1 and bot.live_msg[KEY]["stale"]
