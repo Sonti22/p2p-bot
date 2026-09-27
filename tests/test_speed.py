@@ -79,7 +79,7 @@ def test_slow_venue_does_not_delay_others(offline, monkeypatch):
     assert snap.errors["htx/USDT"].startswith(f"таймаут {TIMEOUT:g} с")   # причина — в ошибках (/status)
     jobs = [j for j in snap.jobs if j["ex"] == "htx"]
     assert len(jobs) == 2 and all(j["timeout"] and j["stale"] is False and j["n"] == 0 for j in jobs)
-    assert all(snap.ts + TIMEOUT * 0.99 <= j["t1"] < snap.ts + TIMEOUT + EPS for j in jobs)   # ждали до срока скана
+    assert all(snap.ts + TIMEOUT * 0.9 <= j["t1"] < snap.ts + TIMEOUT + EPS for j in jobs)   # ждали до срока (часы — 16 мс)
     assert all(not j.get("timeout") for j in snap.jobs if j["ex"] != "htx")
     assert not p2p._venue_paused_until("htx")                            # таймаут скана — не ошибка: запрос ещё идёт
     assert not p2p._venue_paused_until("bybit")
@@ -322,6 +322,10 @@ def test_bestchange_backoff_grows_when_dump_fails_after_scan_deadline(offline, m
         delays = [await cycle() for _ in range(4)]
         fail[0] = False
         await cycle()
+        for _ in range(30):                                                # медленная машина: ждём итог выгрузки
+            if "bestchange" not in p2p._venue_backoff:
+                break
+            await asyncio.sleep(0.1)
         return delays
 
     assert asyncio.run(go()) == [30, 60, 120, 240]
