@@ -735,17 +735,21 @@ def test_strings_see_concatenation_and_fstrings():
 
 # --- 3. Сеть в тестах заблокирована (tests/conftest.py) ---------------------------------------------------------------
 
+NOWHERE = "192.0.2.1"   # TEST-NET-1 (RFC 5737): не маршрутизируется, даже если блок бы не сработал
+LOOPBACK = "127.0.0.1"
+
+
 def test_socket_connect_outside_is_blocked(network_attempts):
     with pytest.raises(ConnectionRefusedError, match="сеть в тестах заблокирована"):
-        socket.create_connection(("192.0.2.1", 443), timeout=1)
+        socket.create_connection((NOWHERE, 443), timeout=1)
     with pytest.raises(OSError):
         socket.getaddrinfo("example.com", 443)
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         with pytest.raises(OSError):
-            s.sendto(b"x", ("192.0.2.1", 53))
+            s.sendto(b"x", (NOWHERE, 53))
         with pytest.raises(OSError):
-            s.connect_ex(("192.0.2.1", 53))
+            s.connect_ex((NOWHERE, 53))
     finally:
         s.close()
     assert len(network_attempts) == 4, network_attempts
@@ -765,14 +769,14 @@ def test_swallowed_attempt_still_recorded(network_attempts):
 def test_aiohttp_and_urllib_are_blocked(network_attempts):
     async def go():
         async with aiohttp.ClientSession() as s:
-            for url in ("http://192.0.2.1/", "https://api.bybit.com/v5/order/create"):
+            for url in (f"http://{NOWHERE}/", "https://api.bybit.com/v5/order/create"):
                 with pytest.raises(aiohttp.ClientError):
                     async with s.post(url, timeout=aiohttp.ClientTimeout(total=5)) as r:
                         await r.read()
     asyncio.run(go())
     direct = urllib.request.build_opener(urllib.request.ProxyHandler({}))   # без системного прокси ПК
     with pytest.raises(urllib.error.URLError):
-        direct.open("http://192.0.2.1/", timeout=1)
+        direct.open(f"http://{NOWHERE}/", timeout=1)
     assert len(network_attempts) == 3, network_attempts
     assert any("api.bybit.com" in a for a in network_attempts), network_attempts
     network_attempts.clear()
@@ -783,15 +787,15 @@ def test_foreign_loopback_port_is_blocked(network_attempts):
     loopback можно только с портами, которые открыл сам процесс тестов."""
     foreign = 10808   # не эфемерный порт: процесс тестов его сам не открывает
     with pytest.raises(ConnectionRefusedError, match="сеть в тестах заблокирована"):
-        socket.create_connection(("127.0.0.1", foreign), timeout=1)
-    via_proxy = urllib.request.build_opener(urllib.request.ProxyHandler({"http": f"http://127.0.0.1:{foreign}"}))
+        socket.create_connection((LOOPBACK, foreign), timeout=1)
+    via_proxy = urllib.request.build_opener(urllib.request.ProxyHandler({"http": f"http://{LOOPBACK}:{foreign}"}))
     with pytest.raises(urllib.error.URLError):
         via_proxy.open("http://api.bybit.com/v5/order/create", timeout=1)
 
     async def go():
         async with aiohttp.ClientSession() as s:
             with pytest.raises(aiohttp.ClientError):
-                async with s.get("http://api.bybit.com/", proxy=f"http://127.0.0.1:{foreign}") as r:
+                async with s.get("http://api.bybit.com/", proxy=f"http://{LOOPBACK}:{foreign}") as r:
                     await r.read()
     asyncio.run(go())
     assert len(network_attempts) == 3 and all(str(foreign) in a for a in network_attempts), network_attempts
@@ -804,9 +808,9 @@ def test_own_loopback_server_is_allowed(network_attempts):
             writer.write(await reader.readline())
             await writer.drain()
             writer.close()
-        server = await asyncio.start_server(echo, "127.0.0.1", 0)
+        server = await asyncio.start_server(echo, LOOPBACK, 0)
         port = server.sockets[0].getsockname()[1]
-        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        reader, writer = await asyncio.open_connection(LOOPBACK, port)
         writer.write(b"ping\n")
         await writer.drain()
         line = await reader.readline()
