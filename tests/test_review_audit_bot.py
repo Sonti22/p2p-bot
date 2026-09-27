@@ -104,3 +104,35 @@ def test_auto_match_does_not_write_fact_from_inr_order():
     assert texts(bot) == [] and trades.get_trade(trade_id) and trades.unmatched()[0]["id"] == trade_id
     asyncio.run(bot.auto_match_facts({"bybit": [_leg("buy", 90.0, "RUB", now), _leg("sell", 95.0, "RUB", now + 60)]}))
     assert len(texts(bot)) == 1 and trades.unmatched() == []
+
+
+# --- №8: вывод MEXC «исполнен» — только со статусом 7 (SUCCESS) ---------------------------------------------------
+
+WD = {"coin": "USDT", "amount": "30", "applyTime": "2026-09-27 10:00:00"}
+
+
+def test_mexc_history_keeps_only_completed_withdrawals():
+    session = _UrlJsonSession({"capital/deposit/hisrec": [], "capital/withdraw/history": [
+        dict(WD, status=4), dict(WD, status=8, amount="31"), dict(WD, status=9, amount="32"),
+        dict(WD, status=7, amount="33")]})
+    hist = asyncio.run(accounts.mexc_history(session, "k", "s"))
+    assert [(it["kind"], it["amount"]) for it in hist] == [("withdraw", 33.0)]
+
+
+def test_mexc_withdraw_processing_then_success_notifies_once(tmp_path, monkeypatch):
+    """4 (в обработке) → 8/9 не «исполнен вывод»; переход 4 → 7 — ровно одно уведомление о выводе."""
+    monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    accounts.save_key("mexc", "k", "s")
+    bodies = dict(MEXC_EMPTY)
+    bot = Stub(p2p.Config())
+    bot.s = _UrlJsonSession(bodies)
+    asyncio.run(bot.check_accounts())                                   # первый опрос — база
+    for status in (4, 8, 9, 4):
+        bodies["capital/withdraw/history"] = [dict(WD, status=status)]
+        asyncio.run(bot.check_accounts())
+    assert not [t for t in texts(bot) if "вывод" in t]
+    bodies["capital/withdraw/history"] = [dict(WD, status=7)]
+    asyncio.run(bot.check_accounts())
+    asyncio.run(bot.check_accounts())
+    done = [t for t in texts(bot) if "вывод" in t]
+    assert len(done) == 1 and "исполнен вывод" in done[0] and "30 USDT" in done[0]

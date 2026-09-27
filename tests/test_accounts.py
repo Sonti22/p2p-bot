@@ -748,7 +748,7 @@ def test_bybit_p2p_orders_returns_none_on_error():
 def test_mexc_history_merges_deposits_and_withdrawals_by_time():
     session = _UrlJsonSession({
         "capital/deposit/hisrec": [{"coin": "USDT", "amount": "100.5", "insertTime": 1700000000000}],
-        "capital/withdraw/history": [{"coin": "USDT", "amount": "9", "applyTime": "2023-11-16 00:00:00"}],
+        "capital/withdraw/history": [{"coin": "USDT", "amount": "9", "applyTime": "2023-11-16 00:00:00", "status": 7}],
     })
     hist = arun(accounts.mexc_history(session, "k", "s"))
     assert hist == [
@@ -761,7 +761,7 @@ def test_mexc_history_merges_deposits_and_withdrawals_by_time():
 def test_mexc_history_falls_back_to_withdrawals_when_no_deposits():
     session = _UrlJsonSession({
         "capital/deposit/hisrec": [],
-        "capital/withdraw/history": [{"coin": "USDT", "amount": "9", "applyTime": "2023-11-14 22:13:20"}],
+        "capital/withdraw/history": [{"coin": "USDT", "amount": "9", "applyTime": "2023-11-14 22:13:20", "status": 7}],
     })
     hist = arun(accounts.mexc_history(session, "k", "s"))
     assert hist == [{"kind": "withdraw", "asset": "USDT", "amount": 9.0,

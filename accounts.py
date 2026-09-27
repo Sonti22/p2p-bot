@@ -889,10 +889,14 @@ def _merge_hist(*sources, limit=20):
     return items[:limit]
 
 
+MEXC_WITHDRAW_SUCCESS = "7"   # статус вывода MEXC: 7 — исполнен; 4 — в обработке, 8 — не прошёл, 9 — отменён
+
+
 async def mexc_history(s, api_key, api_secret, limit=20):
     """История MEXC для автожурнала (нет отдельного P2P API, как у Bybit): депозиты и выводы
     объединяются в одну ленту по времени, а не берётся первый непустой источник — иначе старый
-    депозит скрывает более свежий вывод."""
+    депозит скрывает более свежий вывод. Вывод — только исполненный (MEXC_WITHDRAW_SUCCESS), как у BingX: запись
+    «в обработке» не выдаём за исполненную, а при переходе 4 → 7 она впервые появится в ленте — одно уведомление."""
     sources = []
     for kind, path, ts_field in (("deposit", "/api/v3/capital/deposit/hisrec", "insertTime"),
                                   ("withdraw", "/api/v3/capital/withdraw/history", "applyTime")):
@@ -903,6 +907,8 @@ async def mexc_history(s, api_key, api_secret, limit=20):
         if not isinstance(j, list):
             sources.append(None)   # не ответил — пустоту истории им не подтвердить
             continue
+        if kind == "withdraw":
+            j = [it for it in j if str(it.get("status")) == MEXC_WITHDRAW_SUCCESS]
         sources.append([it for it in (_hist_item(kind, it.get("coin"), it.get("amount"), it.get(ts_field))
                                        for it in j) if it])
     return _merge_hist(*sources, limit=limit)
