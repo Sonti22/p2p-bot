@@ -33,7 +33,7 @@ def _on(name, default):
 
 
 def settings():
-    f = lambda k, d: float(os.getenv(k, d))   # noqa: E731
+    f = perp.env_float   # опечатка в числе — значение по умолчанию, а не сбой тика и /funding
     return {"on": _on("SIM_FUNDING", "1"),
             "assets": [x.strip().upper() for x in os.getenv("FUND_ASSETS", "BTC,ETH,TON").split(",") if x.strip()],
             "notional": f("FUND_NOTIONAL", 1000), "entry_apr": f("FUND_ENTRY_APR", 20), "exit_apr": f("FUND_EXIT_APR", 5),
@@ -274,7 +274,7 @@ def view(path=DB_PATH, now=None):
                 f"{s['funding']:+.2f} − комиссии {s['fees']:.2f} ± базис")
         if s["apr"] is not None:
             line += f", {s['apr']:+.1f}% годовых на позицию"
-        lines.append(line)
+        lines.append(line + f"; при комиссиях ×2, как в бэктесте, — {s['pnl'] - s['fees']:+.2f} USDT")
     lines.append(f"Расчётов фандинга: {s['settlements']}" + (f" (оценочных {s['approx']})" if s["approx"] else "")
                  + f" · худший MTM {s['worst_mtm']:+.2f} USDT · данных {s['days']:.1f} дн.")
     market = candidates(now, cfg)

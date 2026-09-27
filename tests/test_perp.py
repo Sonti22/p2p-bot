@@ -1,6 +1,9 @@
 """perp.py: разбор публичных ответов Bybit/BingX, опрос с бэкоффом, стакан, лоты, точный учёт фандинга."""
 import asyncio
 import inspect
+import json
+import os
+import re
 
 import pytest
 
@@ -196,3 +199,135 @@ def test_settle_marks_stale_rate_as_approx():
     perp.settle(st, quote(rate=0.0001, mark=100.0, next_funding=t, ts=NOW), now=NOW)   # за час до расчёта
     ev = perp.settle(st, None, now=t + 5)
     assert ev == [(t, 0.0001, 100.0, True)]
+
+
+def test_settle_ignores_quote_fetched_after_its_settlement():
+    """Площадка ещё показывает прошедший расчёт, а ставка уже следующего периода — такой котировкой не списываем."""
+    t = NOW + 600
+    st = {}
+    perp.settle(st, quote(rate=0.0001, mark=100.0, next_funding=t, ts=t - 20), now=t - 20)
+    late = quote(rate=0.0009, mark=101.0, next_funding=t, ts=t + 5)   # получена после расчёта, время ещё старое
+    assert perp.settle(st, late, now=t + 5) == [(t, 0.0001, 100.0, False)]
+    assert st["next"] == t + 8 * 3600 and st["rate"] == 0.0001
+
+
+def test_settle_and_windows_are_bounded_on_bad_interval():
+    """Мусорный интервал (≤ 0 или доли часа) не крутит цикл: шаг — 8 ч."""
+    t = NOW + 60
+    for bad in (-1.0, 0.0001):
+        st = {}
+        perp.settle(st, quote(rate=0.0001, mark=100.0, next_funding=t, ts=NOW, interval_h=bad), now=NOW)
+        assert [e[0] for e in perp.settle(st, None, now=t + 17 * 3600)] == [t, t + 8 * 3600, t + 16 * 3600]
+        assert perp.funding_windows(quote(next_funding=NOW + 3600, interval_h=bad), NOW, 17) == 3
+    assert perp.funding_windows(quote(next_funding=1000.0), NOW, 8) == 1   # расчёт в далёком прошлом — без цикла
+    j = api()
+    j["bybit_ticker_BTCUSDT"]["result"]["list"][0]["fundingIntervalHour"] = "-8"
+    assert perp.parse_bybit_ticker(j["bybit_ticker_BTCUSDT"], "BTCUSDT")["interval_h"] is None
+
+
+def test_env_typos_fall_back_to_defaults(monkeypatch):
+    monkeypatch.setenv("PERP_INTERVAL", "30s")
+    monkeypatch.setenv("PERP_MAX_AGE", "nan")
+    monkeypatch.setenv("PERP_ASSETS", "BTC, eth&limit=1000,ton")
+    cfg = perp.settings()
+    assert cfg["interval"] == 30 and cfg["max_age"] == 90
+    assert cfg["assets"] == ["BTC", "TON"]   # в URL — только буквы и цифры
+    monkeypatch.setenv("X_TEST_NUM", "1,5")
+    assert perp.env_float("X_TEST_NUM", 2) == 1.5 and perp.env_float("X_TEST_MISSING", 2) == 2
+
+
+def test_get_requires_https_allowed_host_and_no_redirect():
+    for url in (perp.BYBIT.replace("https", "http") + "/v5/market/time",   # не https
+                perp.BYBIT + ":8443/v5/market/time",                        # чужой порт
+                perp.BYBIT.replace("://", "://x@") + "/v5/market/time"):    # userinfo
+        with pytest.raises(ValueError):
+            asyncio.run(perp._get(None, url))
+
+    seen = {}
+
+    class Resp:
+        status = 301
+
+        def raise_for_status(self):
+            pass
+
+        async def json(self, content_type=None):
+            return {}
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+    class Session:
+        def get(self, url, **kw):
+            seen.update(kw)
+            return Resp()
+
+    with pytest.raises(ValueError):   # 3xx: не идём по редиректу и не читаем тело как ответ
+        asyncio.run(perp._get(Session(), perp.BYBIT + "/v5/market/time"))
+    assert seen["allow_redirects"] is False and seen["timeout"].total == perp.REQUEST_TIMEOUT
+
+
+def test_time_sync_failure_keeps_quotes():
+    errors = asyncio.run(perp.refresh(None, make_get(fail=("/v5/market/time", "server/time")), now=NOW))
+    assert errors == {} and ("Bybit", "BTCUSDT") in perp._quotes and ("BingX", "BTCUSDT") in perp._quotes
+    assert not perp._backoff
+
+
+def test_bybit_empty_book_is_an_error_not_a_zero_quote():
+    j = api()
+    empty = dict(j["bybit_book_BTCUSDT"], result={"s": "BTCUSDT", "b": [], "a": []})
+    errors = asyncio.run(perp.refresh(None, make_get({"bybit_book_BTCUSDT": empty}), now=NOW))
+    assert "Bybit/BTCUSDT" in errors and ("Bybit", "BTCUSDT") not in perp._quotes
+    assert ("Bybit", "ETHUSDT") in perp._quotes
+
+
+def test_bingx_interval_inferred_from_roll_when_missing():
+    """Нет fundingIntervalHours в premiumIndex: интервал — сдвиг следующего расчёта между соседними опросами."""
+    j = api()
+    prem = j["bingx_premium_GRAMTON-USDT"]
+    prem["data"].pop("fundingIntervalHours")
+    asyncio.run(perp.refresh(None, make_get({"bingx_premium_GRAMTON-USDT": prem}), now=NOW))
+    assert perp._quotes[("BingX", "GRAMTONUSDT")].interval_h == 8   # пока не видно — по умолчанию
+    rolled = json_copy(prem)
+    rolled["data"]["nextFundingTime"] += 4 * 3600 * 1000
+    asyncio.run(perp.refresh(None, make_get({"bingx_premium_GRAMTON-USDT": rolled}), now=NOW + 30))
+    assert perp._quotes[("BingX", "GRAMTONUSDT")].interval_h == 4
+    asyncio.run(perp.refresh(None, make_get({"bingx_premium_GRAMTON-USDT": rolled}), now=NOW + 60))
+    assert perp._quotes[("BingX", "GRAMTONUSDT")].interval_h == 4   # держится до следующего сдвига
+
+
+def json_copy(x):
+    return json.loads(json.dumps(x))
+
+
+def test_klines_refetched_right_after_hour_close_and_timestamped():
+    edge = (NOW // 3600 + 1) * 3600   # ближайшее закрытие часа
+    no_time = ("/v5/market/time", "server/time")   # без сдвига часов: время сервера = локальное
+
+    def kline_calls(now):
+        calls = []
+        asyncio.run(perp.refresh(None, make_get(calls=calls, fail=no_time), now=now))
+        return [u for u in calls if "kline" in u and "BTCUSDT" in u]
+
+    assert kline_calls(edge - 10) and perp.kline_time("Bybit", "BTCUSDT") == edge - 10
+    assert kline_calls(edge + 5)            # 15 с спустя, но час закрылся — докачали сразу
+    assert perp.kline_time("Bybit", "BTCUSDT") == edge + 5
+    assert not kline_calls(edge + 20)       # этот час уже есть, KLINE_TTL не прошёл
+
+
+def test_every_setting_is_documented_in_env_example():
+    """Каждая настройка перпов и бумажных симуляций описана в .env.example."""
+    import simdirectional
+    import simfunding
+    import simperp
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with open(os.path.join(root, ".env.example"), encoding="utf-8") as f:
+        documented = set(re.findall(r"^([A-Z_]+)=", f.read(), re.M))
+    names = set()
+    for mod in (perp, simperp, simfunding, simdirectional):
+        names |= set(re.findall(r"(?:getenv|env_float|_on|f)\(\"([A-Z][A-Z_]+)\"", inspect.getsource(mod)))
+    assert {"PERPS", "PAPER_HEDGE", "SIM_FUNDING", "SIM_DIRECTIONAL", "FUND_SPOT_FEE", "DIR_STOP_SLIP"} <= names
+    assert names - documented == set()

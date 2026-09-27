@@ -1690,7 +1690,10 @@ class Bot:
                 if g["avg_realized_pct"] is not None:
                     line += f" / факт {g['avg_realized_pct']:+.2f}%"
                 lines.append(line)
-        lines += simperp.report_lines()
+        try:   # сбой отчёта бумажного хеджа не ломает /paper report
+            lines += simperp.report_lines()
+        except Exception as e:
+            logger.error("simperp: %s: %s", type(e).__name__, e)
         lines += ["", *self.paper_vs_real_lines(rows)]
         lines.append("")
         lines.append("📄 разбор по связкам — файлом CSV ниже.")
@@ -2432,15 +2435,12 @@ class Bot:
                     "snapshot_id": snapshots.scan_id(snap)}
         if measures["snapshot_id"] is not None:   # снимок этого скана запишется, даже если он не SNAPSHOT_EVERY-й
             self.snapshot_keep.add(measures["snapshot_id"])
-        # бумажный хедж (simperp): шорт перпа на монету круга; HEDGE_PLAN=1 — в плане стоимость хеджа вместо запаса
-        try:
-            hedge, hedge_note = simperp.choose(b.asset, qty or s.avail, settings["amount"], psnap.ref, b.price,
-                                               risk=self.cfg.risk_buffer.get(b.asset, 0.0))
-        except Exception as e:   # сбой симуляции хеджа не мешает кругу
-            logger.error("simperp: %s", e)
-            hedge, hedge_note = None, ""
-        if hedge and simperp.settings()["plan"]:
-            profit = simperp.hedged_plan(raw, hedge)
+        # бумажный хедж (simperp): шорт перпа на монету круга; HEDGE_PLAN=1 — в плане стоимость хеджа вместо запаса.
+        # Монета круга — выход маршрута, а без него купленное (не s.avail — это весь объём объявления продажи).
+        # for_cycle не бросает исключений: сбой хеджа не мешает ни кругу, ни сигналам после него
+        hedge, hedge_note, profit, hedge_line = simperp.for_cycle(
+            b.asset, qty or settings["amount"] / b.price, settings["amount"], psnap.ref, b.price, raw, profit,
+            risk=self.cfg.risk_buffer.get(b.asset, 0.0))
         # over — тот же, что в плане и qty: банк оплаты и комиссия СБП в круге совпадут с планом
         cycle = paper.get_cycle(paper.start_cycle(settings["amount"], b, s, route, profit, label=label,
                                                   sell_qty=qty or s.avail, pay_fee=self.cfg.pay_fee, over=over,
@@ -2456,7 +2456,6 @@ class Bot:
                 f" · оценка {rank:+.2f}")
         if reasons:
             text += "\n" + "\n".join(f"• {html.escape(r)}" for r in reasons)
-        hedge_line = simperp.card_line(hedge, hedge_note, b.asset)
         if hedge_line:
             text += "\n" + html.escape(hedge_line)
         await self.send(text, topic="signals")

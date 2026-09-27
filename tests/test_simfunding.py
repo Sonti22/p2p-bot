@@ -91,6 +91,8 @@ def test_open_settle_both_legs_and_close(tmp_path, monkeypatch):
     assert p["pnl"] == pytest.approx(legs + p["funding"] - p["fees"])
     assert p["fees"] == pytest.approx(0.00055 * (p["long_open"] + p["long_close"]) * qty
                                       + 0.0005 * (p["short_open"] + p["short_close"]) * qty)
+    # как в research/funding_bt.py (комиссии ×2) — отдельной цифрой рядом с фактом
+    assert f"при комиссиях ×2, как в бэктесте, — {p['pnl'] - p['fees']:+.2f} USDT" in SF.view(db, now=t + 60)
 
 
 def test_spot_perp_and_mtm_stop(tmp_path, monkeypatch):

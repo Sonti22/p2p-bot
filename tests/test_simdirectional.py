@@ -13,16 +13,20 @@ from perpfx import install, quote
 
 H = 3600
 L0 = 1790488800.0   # начало последней «ровной» свечи (кратно часу)
+REAL_KLINE_TIME = perp.kline_time
 
 
 @pytest.fixture(autouse=True)
 def _clean(monkeypatch):
     perp.reset()
     for k in ("SIM_DIRECTIONAL", "DIR_ASSETS", "DIR_RISK_USDT", "DIR_MAX_NOTIONAL", "DIR_ATR_MULT", "DIR_ENTRY_LAG",
-              "DIR_RANDOM_P", "DIR_RANDOM_HOLD_H", "DIR_STOP_SLIP", "PERP_MAX_AGE"):
+              "DIR_RANDOM_P", "DIR_RANDOM_HOLD_H", "DIR_STOP_SLIP", "DIR_FEE_MULT", "PERP_MAX_AGE"):
         monkeypatch.delenv(k, raising=False)
     monkeypatch.setenv("DIR_ASSETS", "BTC")
     monkeypatch.setenv("DIR_RANDOM_P", "0")
+    # свечи тесты кладут в perp._klines сами (без опроса) — считаем их загруженными «сейчас»; правило «свеча закрыта,
+    # только если загружена после закрытия» проверяет test_candle_fetched_before_close_is_not_closed
+    monkeypatch.setattr(perp, "kline_time", lambda venue, symbol: float("inf"))
     yield
     perp.reset()
 
@@ -72,7 +76,7 @@ def test_entry_on_live_cross_with_atr_stop_and_fixed_risk(tmp_path):
     assert p["stop"] == pytest.approx(110.05 - 2 * atr_v)
     assert p["qty"] == pytest.approx(int(2 / (2 * atr_v) / 0.001) * 0.001)
     assert p["risk"] == pytest.approx(p["qty"] * 2 * atr_v) and p["risk"] <= 2.0
-    assert p["fees"] == pytest.approx(0.00055 * 110.05 * p["qty"])
+    assert p["fees"] == pytest.approx(0.00055 * 110.05 * p["qty"] * 2)   # тейкер ×2, как в бэктесте
 
 
 def test_late_candle_is_not_entered(tmp_path):
@@ -202,6 +206,53 @@ def test_view_and_owner_only_command(tmp_path, monkeypatch):
     finally:
         B.REPLY_CHAT.reset(token)
     assert "только для владельца" in TB.texts(bot)[-1]
+
+
+def test_fees_x2_like_backtest_and_x1_reported(tmp_path, monkeypatch):
+    """Итог сделки — с комиссиями ×DIR_FEE_MULT (2, как research/directional_bt.py); /futures показывает и ×1.
+    Множитель запоминается на входе: смена настройки не пересчитывает открытую позицию."""
+    db = str(tmp_path / "d.db")
+    _, t = _enter_long(db)
+    monkeypatch.setenv("DIR_FEE_MULT", "1")   # после входа — на эту позицию не влияет
+    install(_q(100.0, t + 60))
+    c = SD.tick(now=t + 60, path=db)["closed"][0]
+    p = SD._dicts(SD._connect(db).execute("SELECT * FROM positions"))[0]
+    taker = 0.00055 * (p["px_open"] + p["px_close"]) * p["qty"]
+    assert p["fees"] == pytest.approx(2 * taker)
+    assert c["pnl"] == pytest.approx((p["px_close"] - p["px_open"]) * p["qty"] - 2 * taker + p["funding"])
+    assert SD.at_fees_x1(p)["pnl"] == pytest.approx(c["pnl"] + taker)
+    books, _, _, books_x1 = SD.stats(db)
+    assert books_x1["ema"]["pnl"] == pytest.approx(books["ema"]["pnl"] + taker)
+    assert "При комиссиях ×1: стратегия" in SD.view(db, now=t + 60)
+
+
+def test_candle_fetched_before_close_is_not_closed(tmp_path, monkeypatch):
+    """Свечи в кеше загружены до закрытия часа — последняя в них неполная: по ней не входим и её не «съедаем»
+    (last:BTC не сдвигается), вход — когда свечи загружены после закрытия."""
+    monkeypatch.setattr(perp, "kline_time", REAL_KLINE_TIME)
+    db = str(tmp_path / "d.db")
+    key = ("Bybit", "BTCUSDT")
+    perp._klines[key] = flat()
+    perp._kline_srv[key] = L0 + H + 30
+    SD.tick(now=L0 + H + 60, path=db)
+    perp._klines[key].append(candle(L0 + H, 110.0, prev=100.0))
+    t = L0 + 2 * H + 20
+    install(_q(110.0, t))
+    perp._kline_srv[key] = L0 + 2 * H - 30   # загрузка за 30 с до закрытия свечи
+    assert SD.tick(now=t, path=db)["opened"] == []
+    assert SD._get_state(SD._connect(db), "last:BTC") == L0
+    perp._kline_srv[key] = L0 + 2 * H + 10   # докачали после закрытия
+    assert SD.tick(now=t, path=db)["opened"] == [{"book": "ema", "asset": "BTC", "side": 1}]
+
+
+def test_position_of_removed_asset_is_still_managed(tmp_path, monkeypatch):
+    """Монету убрали из DIR_ASSETS при открытой позиции — стоп по ней работает, новых входов нет."""
+    db = str(tmp_path / "d.db")
+    _, t = _enter_long(db)
+    monkeypatch.setenv("DIR_ASSETS", "ETH")
+    install(_q(100.0, t + 60))
+    out = SD.tick(now=t + 60, path=db)
+    assert out["closed"] and out["closed"][0]["asset"] == "BTC" and out["closed"][0]["reason"] == "стоп"
 
 
 def test_switch_off(tmp_path, monkeypatch):

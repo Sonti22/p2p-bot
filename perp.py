@@ -20,9 +20,14 @@ PERP_MAX_AGE — сколько секунд котировка считаетс
 """
 import asyncio
 import logging
+import math
 import os
+import re
 import time
 from dataclasses import dataclass, field
+from urllib.parse import urlsplit
+
+import aiohttp
 
 logger = logging.getLogger(__name__)
 
@@ -44,15 +49,41 @@ KLINE_FULL = 1000     # первая загрузка свечей — хват�
 BACKOFF_BASE = 30
 BACKOFF_MAX = 600
 SETTLE_STALE = 600    # сек: ставка из котировки старше этого до расчёта — расчёт помечается оценочным
+REQUEST_TIMEOUT = 10  # сек на один публичный GET
+KLINE_GRACE = 3       # сек после закрытия часа: свечи, загруженные раньше, про эту свечу ещё неполные
+ROLL_GAP = 600        # сек: сдвиг следующего расчёта между опросами не дальше этого — это один интервал фандинга
 HEADERS = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
+_warned = set()
 
 
 def _on(name, default="1"):
     return os.getenv(name, default).strip().lower() in ("1", "true", "yes", "on")
 
 
+def env_float(name, default, lo=None, hi=None):
+    """Число из .env (и для симуляций): пусто — по умолчанию; опечатка — по умолчанию с предупреждением в лог (один
+    раз), а не исключение — ошибка в настройке бумаги не должна ронять опрос, скан P2P или сигналы. «1,5» = 1.5."""
+    raw = os.getenv(name, "").strip()
+    try:
+        v = float(raw.replace(",", ".")) if raw else float(default)
+        if not math.isfinite(v):
+            raise ValueError(raw)
+    except ValueError:
+        if (name, raw) not in _warned:
+            _warned.add((name, raw))
+            logger.warning("%s=%r — не число, беру %s", name, raw, default)
+        v = float(default)
+    if lo is not None:
+        v = max(lo, v)
+    if hi is not None:
+        v = min(hi, v)
+    return v
+
+
 def _assets(spec):
-    return [x.strip().upper() for x in spec.split(",") if x.strip()]
+    """Монеты через запятую; в URL идут только буквы/цифры (строка из .env не допишет параметры запроса)."""
+    out = [x.strip().upper() for x in spec.split(",") if x.strip()]
+    return [x for x in out if re.fullmatch(r"[A-Z0-9]{1,20}", x)]
 
 
 def settings():
@@ -66,9 +97,15 @@ def settings():
             explicit.add(k.strip())
         except ValueError:
             continue
-    return {"on": _on("PERPS"), "interval": max(10.0, float(os.getenv("PERP_INTERVAL", 30))),
+    return {"on": _on("PERPS"), "interval": env_float("PERP_INTERVAL", 30, lo=10.0),
             "assets": _assets(os.getenv("PERP_ASSETS", DEFAULT_ASSETS)),
-            "taker": fees, "taker_explicit": explicit, "max_age": float(os.getenv("PERP_MAX_AGE", 90))}
+            "taker": fees, "taker_explicit": explicit, "max_age": env_float("PERP_MAX_AGE", 90, lo=1.0)}
+
+
+def _hours(v):
+    """Интервал фандинга, ч: только правдоподобный (1–24), иначе None — берётся другой источник или 8 ч."""
+    h = _f(v)
+    return h if 1 <= h <= 24 else None
 
 
 def bingx_symbol(symbol):
@@ -138,6 +175,7 @@ _quotes = {}        # (площадка, символ) -> PerpQuote
 _spot = {}          # (площадка, символ) -> PerpQuote(kind="spot") — стакан спота Bybit для simfunding
 _instr = {}         # (площадка, символ) -> Instrument
 _klines = {}        # (площадка, символ) -> [(начало, o, h, l, c)] по возрастанию времени
+_kline_srv = {}     # (площадка, символ) -> время сервера, когда свечи загружены (свеча закрыта раньше — она полная)
 _skew = {}          # площадка -> сдвиг часов, сек
 _backoff = {}       # площадка -> {"delay", "until"}
 _meta = {"t": 0.0, "info_t": {}, "time_t": {}, "kline_t": {}, "errors": {}, "ok_t": {}}
@@ -145,7 +183,7 @@ _meta = {"t": 0.0, "info_t": {}, "time_t": {}, "kline_t": {}, "errors": {}, "ok_
 
 def reset():
     """Для тестов: забыть всё состояние модуля."""
-    for d in (_quotes, _spot, _instr, _klines, _skew, _backoff):
+    for d in (_quotes, _spot, _instr, _klines, _kline_srv, _skew, _backoff):
         d.clear()
     _meta.update(t=0.0, info_t={}, time_t={}, kline_t={}, errors={}, ok_t={})
 
@@ -189,7 +227,7 @@ def parse_bybit_instrument(j, symbol):
     return Instrument("Bybit", symbol, status == "Trading" and row.get("contractType") == "LinearPerpetual",
                       lot=_f(lot.get("qtyStep")), min_qty=_f(lot.get("minOrderQty")),
                       min_notional=_f(lot.get("minNotionalValue")),
-                      interval_h=_f(row.get("fundingInterval"), 480.0) / 60,
+                      interval_h=_hours(_f(row.get("fundingInterval")) / 60) or 8.0,
                       note="" if status == "Trading" else f"статус {status or '?'}")
 
 
@@ -205,7 +243,7 @@ def parse_bybit_ticker(j, symbol):
     return {"mark": _f(row.get("markPrice")), "index": _f(row.get("indexPrice")), "last": _f(row.get("lastPrice")),
             "bid": _f(row.get("bid1Price")), "ask": _f(row.get("ask1Price")),
             "funding_rate": _f(row.get("fundingRate")), "next_funding": _f(row.get("nextFundingTime")) / 1000,
-            "interval_h": _f(row.get("fundingIntervalHour"), 0.0) or None}
+            "interval_h": _hours(row.get("fundingIntervalHour"))}
 
 
 def parse_bybit_book(j):
@@ -256,7 +294,7 @@ def parse_bingx_premium(j):
         raise ValueError("BingX: пустой premiumIndex")
     return {"mark": _f(d.get("markPrice")), "index": _f(d.get("indexPrice")),
             "funding_rate": _f(d.get("lastFundingRate")), "next_funding": _f(d.get("nextFundingTime")) / 1000,
-            "interval_h": _f(d.get("fundingIntervalHours"), 0.0) or None}
+            "interval_h": _hours(d.get("fundingIntervalHours"))}
 
 
 def parse_bingx_depth(j):
@@ -311,17 +349,20 @@ def settle(st, q, now=None):
     о том же ближайшем расчёте (после расчёта у площадки уже новая ставка на следующий). Пропущенные расчёты
     (бот не работал) считаются по последней известной ставке, как и расчёт, до которого свежей котировки не было
     дольше SETTLE_STALE, — такие помечаются approx.
+    Котировка, полученная уже после своего «ближайшего» расчёта (площадка ещё не сдвинула время, а ставка могла
+    уже стать ставкой следующего периода) или с временем расчёта дальше суток, ставку не задаёт.
     Возвращает [(время расчёта, ставка, mark, approx)]; st меняется на месте."""
     now = time.time() if now is None else now
+    q = q if _ahead(q) else None   # только котировка «до расчёта»: остальное — как будто её нет
 
     def take(q):   # котировка о том же ближайшем расчёте — её ставка и спишется
-        if q is not None and q.next_funding and abs(q.next_funding - st["next"]) < 1:
+        if q is not None and abs(q.next_funding - st["next"]) < 1:
             st.update(rate=q.funding_rate, mark=q.mark, interval_h=q.interval_h or st.get("interval_h") or 8,
                       used=False, seen=q.ts - (q.skew or 0.0))
 
     if q is not None:
         st["skew"] = q.skew or 0.0
-        if q.next_funding and not st.get("next"):
+        if not st.get("next"):
             st["next"] = q.next_funding
     if st.get("next"):
         take(q)
@@ -332,26 +373,32 @@ def settle(st, q, now=None):
             stale = st["next"] - (st.get("seen") or st["next"]) > SETTLE_STALE
             out.append((st["next"], st["rate"], st["mark"], bool(st.get("used")) or stale))
         st["used"] = True   # следующий расчёт по этой же ставке — уже оценка
-        nxt = st["next"] + (st.get("interval_h") or 8) * 3600
-        if q is not None and q.next_funding and st["next"] < q.next_funding <= nxt + 1:
+        nxt = st["next"] + (_hours(st.get("interval_h")) or 8) * 3600   # шаг ≥ 1 ч: цикл конечен при любых данных
+        if q is not None and st["next"] < q.next_funding <= nxt + 1:
             nxt = q.next_funding   # площадка знает точное время (интервал мог смениться)
         st["next"] = nxt
         take(q)
     return out
 
 
+def _ahead(q):
+    """Котировка про будущий расчёт: получена (по часам сервера) раньше него и не больше чем за сутки."""
+    if q is None or not q.next_funding:
+        return False
+    ahead = q.next_funding - (q.ts - (q.skew or 0.0))
+    return 0 < ahead <= 25 * 3600
+
+
 def funding_windows(q, start, hours):
     """Сколько расчётов фандинга попадёт в окно [start, start + hours] (время сервера)."""
     if q is None or not q.next_funding:
         return 0
-    step = (q.interval_h or 8) * 3600
-    n, t = 0, q.next_funding
-    while t < start:
-        t += step
-    while t <= start + hours * 3600:
-        n += 1
-        t += step
-    return n
+    step = (_hours(q.interval_h) or 8) * 3600
+    t = q.next_funding
+    if t < start:   # расчёт в прошлом (котировка до него) — ближайший следующий, без цикла по шагам
+        t += math.ceil((start - t) / step) * step
+    end = start + hours * 3600
+    return 0 if t > end else int((end - t) // step) + 1
 
 
 # --- доступ к состоянию ---
@@ -400,6 +447,11 @@ def klines(venue, symbol):
     return list(_klines.get((venue, symbol)) or [])
 
 
+def kline_time(venue, symbol):
+    """Время сервера последней загрузки свечей (None — не загружались): свеча, закрывшаяся позже, в кеше неполная."""
+    return _kline_srv.get((venue, symbol))
+
+
 def status(now=None):
     """Для /funding и /futures: ошибки, паузы, время последнего ответа, неторгуемые символы."""
     now = time.time() if now is None else now
@@ -412,12 +464,16 @@ def status(now=None):
 # --- сеть ---
 
 async def _get(s, url):
-    """Публичный GET только на api.bybit.com / open-api.bingx.com, без редиректов."""
-    host = url.split("/")[2]
-    if host not in HOSTS:
-        raise ValueError(f"хост не разрешён: {host}")
-    async with s.get(url, headers=HEADERS, allow_redirects=False) as r:
+    """Публичный GET только по https на api.bybit.com / open-api.bingx.com (проверка до запроса), без редиректов,
+    со своим таймаутом."""
+    parts = urlsplit(url)
+    if parts.scheme != "https" or parts.hostname not in HOSTS or parts.port or parts.username or parts.password:
+        raise ValueError(f"адрес не разрешён: {parts.netloc or url[:40]}")
+    async with s.get(url, headers=HEADERS, allow_redirects=False,
+                     timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)) as r:
         r.raise_for_status()
+        if r.status != 200:   # 3xx: редирект не выполняем
+            raise ValueError(f"HTTP {r.status}")
         return await r.json(content_type=None)
 
 
@@ -435,10 +491,14 @@ async def _sync_time(s, get, venue, now):
     if not _due("time_t", venue, TIME_TTL, now):
         return
     t0 = time.time()
-    if venue == "Bybit":
-        srv = parse_bybit_time(await get(s, f"{BYBIT}/v5/market/time"))
-    else:
-        srv = parse_bingx_time(await get(s, f"{BINGX}/openApi/swap/v2/server/time"))
+    try:   # время сервера — только поправка часов: сбой не отменяет котировки, сдвиг остаётся прежним
+        if venue == "Bybit":
+            srv = parse_bybit_time(await get(s, f"{BYBIT}/v5/market/time"))
+        else:
+            srv = parse_bingx_time(await get(s, f"{BINGX}/openApi/swap/v2/server/time"))
+    except Exception as e:
+        logger.warning("перпы %s: время сервера не получено (%s)", venue, type(e).__name__)
+        return
     local = (t0 + time.time()) / 2
     _skew[venue] = local - srv if srv else 0.0
     _meta["time_t"][venue] = now
@@ -450,9 +510,11 @@ async def _bybit_symbol(s, get, sym, asset, cfg):
                                    get(s, f"{BYBIT}/v5/market/orderbook?category=linear&symbol={sym}&limit={DEPTH}"))
     d = parse_bybit_ticker(t, sym)
     bids, asks = parse_bybit_book(book)
+    if not bids or not asks:   # без стакана нет ни цены исполнения, ни mid — котировку не подменяем нулями
+        raise ValueError(f"Bybit: пустой стакан {sym}")
     _quotes[("Bybit", sym)] = PerpQuote(
-        "Bybit", sym, d["mark"], d["index"], d["last"], bids[0][0] if bids else d["bid"],
-        asks[0][0] if asks else d["ask"], d["funding_rate"], d["next_funding"], d["interval_h"] or inst.interval_h,
+        "Bybit", sym, d["mark"], d["index"], d["last"], bids[0][0], asks[0][0], d["funding_rate"],
+        d["next_funding"], d["interval_h"] or inst.interval_h,
         time.time(), _skew.get("Bybit", 0.0), bids, asks, inst.lot, inst.min_qty, inst.min_notional,
         _taker("Bybit", inst, cfg), asset=asset)
 
@@ -465,17 +527,26 @@ async def _bybit_spot(s, get, sym, asset):
                                           time.time(), _skew.get("Bybit", 0.0), bids, asks, kind="spot", asset=asset)
 
 
+def _new_hour(key, now):
+    """Час закрылся после последней загрузки свечей — докачать сразу, не дожидаясь KLINE_TTL."""
+    srv = now - _skew.get(key[0], 0.0)
+    edge = srv - srv % 3600 + KLINE_GRACE
+    return srv >= edge and _kline_srv.get(key, 0.0) < edge
+
+
 async def _bybit_klines(s, get, sym, now):
-    if not _due("kline_t", ("Bybit", sym), KLINE_TTL, now):
+    key = ("Bybit", sym)
+    if not (_due("kline_t", key, KLINE_TTL, now) or _new_hour(key, now)):
         return
-    have = _klines.get(("Bybit", sym)) or []
+    have = _klines.get(key) or []
     limit = 5 if len(have) >= 200 else KLINE_FULL
     rows = parse_bybit_klines(await get(s, f"{BYBIT}/v5/market/kline?category=linear&symbol={sym}&interval=60"
                                            f"&limit={limit}"))
     merged = {r[0]: r for r in have}
     merged.update({r[0]: r for r in rows})
-    _klines[("Bybit", sym)] = sorted(merged.values())[-KLINE_FULL:]
-    _meta["kline_t"][("Bybit", sym)] = now
+    _klines[key] = sorted(merged.values())[-KLINE_FULL:]
+    _meta["kline_t"][key] = now
+    _kline_srv[key] = now - _skew.get("Bybit", 0.0)   # момент запроса: всё, что закрылось раньше, пришло целиком
 
 
 def _live(venue, syms):
@@ -529,8 +600,22 @@ async def _bingx_symbol(s, get, sym, asset, cfg):
     mid = (bids[0][0] + asks[0][0]) / 2
     _quotes[("BingX", sym)] = PerpQuote(
         "BingX", sym, d["mark"], d["index"], mid, bids[0][0], asks[0][0], d["funding_rate"], d["next_funding"],
-        d["interval_h"] or inst.interval_h, time.time(), _skew.get("BingX", 0.0), bids, asks, inst.lot,
-        inst.min_qty, inst.min_notional, _taker("BingX", inst, cfg), asset=asset)
+        d["interval_h"] or _bingx_interval(sym, d["next_funding"]) or inst.interval_h, time.time(),
+        _skew.get("BingX", 0.0), bids, asks, inst.lot, inst.min_qty, inst.min_notional, _taker("BingX", inst, cfg),
+        asset=asset)
+
+
+def _bingx_interval(sym, next_funding):
+    """В premiumIndex нет fundingIntervalHours: интервал — на сколько сдвинулся следующий расчёт между соседними
+    опросами (не дальше ROLL_GAP — ровно один расчёт); сдвига ещё не было — прежний из котировки. None — неизвестно
+    (справочник BingX интервала не даёт — тогда 8 ч)."""
+    prev = _quotes.get(("BingX", sym))
+    if prev is None:
+        return None
+    step = next_funding - prev.next_funding
+    if step > 1 and time.time() - prev.ts <= ROLL_GAP:
+        return _hours(step / 3600) or prev.interval_h
+    return prev.interval_h
 
 
 async def _refresh_bingx(s, get, cfg, now):

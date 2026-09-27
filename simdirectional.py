@@ -9,12 +9,13 @@
 направление, те же объём, стоп и комиссии; выход по стопу или через столько часов, сколько в среднем держит
 стратегия (пока сделок нет — DIR_RANDOM_HOLD_H). Случайность детерминирована свечой (повторяемо). И «держать» —
 изменение цены с первой увиденной свечи.
-Исполнение — по стакану (тейкер на вход и выход), стоп внутри свечи — по котировке (бид/аск за стопом), пропущенный
+Исполнение — по стакану (тейкер на вход и выход, ×DIR_FEE_MULT — по умолчанию 2, как в research/directional_bt.py;
+/futures показывает и итог при ×1), стоп внутри свечи — по котировке (бид/аск за стопом), пропущенный
 (бот не работал) — по high/low закрытой свечи ценой стопа с проскальзыванием DIR_STOP_SLIP %. Фандинг — по
 фактическим расчётам (perp.settle): лонг платит ставку, шорт получает.
 
 Настройки .env: SIM_DIRECTIONAL (1), DIR_ASSETS, DIR_RISK_USDT (2), DIR_MAX_NOTIONAL (200), DIR_ATR_MULT (2),
-DIR_ENTRY_LAG (900), DIR_RANDOM_P (0.02), DIR_RANDOM_HOLD_H (48), DIR_STOP_SLIP (0.05).
+DIR_ENTRY_LAG (900), DIR_RANDOM_P (0.02), DIR_RANDOM_HOLD_H (48), DIR_STOP_SLIP (0.05), DIR_FEE_MULT (2).
 """
 import json
 import os
@@ -37,12 +38,13 @@ def _on(name, default):
 
 
 def settings():
-    f = lambda k, d: float(os.getenv(k, d))   # noqa: E731
+    f = perp.env_float   # опечатка в числе — значение по умолчанию, а не сбой тика и /futures
     return {"on": _on("SIM_DIRECTIONAL", "1"),
             "assets": [x.strip().upper() for x in os.getenv("DIR_ASSETS", "BTC,ETH").split(",") if x.strip()],
             "risk": f("DIR_RISK_USDT", 2), "max_notional": f("DIR_MAX_NOTIONAL", 200), "atr_mult": f("DIR_ATR_MULT", 2),
             "entry_lag": f("DIR_ENTRY_LAG", 900), "random_p": f("DIR_RANDOM_P", 0.02),
-            "random_hold_h": f("DIR_RANDOM_HOLD_H", 48), "stop_slip": f("DIR_STOP_SLIP", 0.05)}
+            "random_hold_h": f("DIR_RANDOM_HOLD_H", 48), "stop_slip": f("DIR_STOP_SLIP", 0.05),
+            "fee_mult": f("DIR_FEE_MULT", 2, lo=0.0)}
 
 
 # --- индикаторы (чистые функции) ---
@@ -126,16 +128,18 @@ def _open(con, book, asset, q, side, atr_value, cfg, now, reason):
     fund = {}
     perp.settle(fund, q, now)
     stop = px - side * dist
+    mult = cfg["fee_mult"]   # комиссии ×2, как в research/directional_bt.py — сравнение с бэктестом на равных
     cur = con.execute("INSERT INTO positions (book, asset, symbol, side, qty, ts_open, px_open, stop, risk, fees, "
                       "reason_open, state) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                      (book, asset, q.symbol, side, qty, now, px, stop, qty * dist, q.taker_fee / 100 * px * qty,
-                       reason, json.dumps({"fund": fund, "taker": q.taker_fee})))
+                      (book, asset, q.symbol, side, qty, now, px, stop, qty * dist, q.taker_fee / 100 * px * qty * mult,
+                       reason, json.dumps({"fund": fund, "taker": q.taker_fee, "fee_mult": mult})))
     return cur.lastrowid
 
 
 def _close(con, p, px, now, reason, taker=None):
-    taker = json.loads(p["state"] or "{}").get("taker", 0.055) if taker is None else taker
-    fees = (p["fees"] or 0.0) + taker / 100 * px * p["qty"]
+    st = json.loads(p["state"] or "{}")
+    taker = st.get("taker", 0.055) if taker is None else taker
+    fees = (p["fees"] or 0.0) + taker / 100 * px * p["qty"] * st.get("fee_mult", 1.0)   # множитель — со входа
     pnl = (px - p["px_open"]) * p["side"] * p["qty"] - fees + (p["funding"] or 0.0)
     con.execute("UPDATE positions SET ts_close = ?, px_close = ?, fees = ?, pnl = ?, reason_close = ? WHERE id = ?",
                 (now, px, fees, pnl, reason, p["id"]))
@@ -177,7 +181,10 @@ def tick(now=None, path=DB_PATH):
     now = time.time() if now is None else now
     con = _connect(path)
     with con:
-        for asset in cfg["assets"]:
+        # монету убрали из DIR_ASSETS, а позиция по ней открыта — ведём её до выхода (стоп, разворот), новых входов нет
+        held = [r[0] for r in con.execute("SELECT DISTINCT asset FROM positions WHERE ts_close IS NULL")]
+        for asset in cfg["assets"] + [a for a in held if a not in cfg["assets"]]:
+            entries = asset in cfg["assets"]
             sym = perp.venue_symbol(VENUE, asset)
             q = perp.quote_for(VENUE, asset, now)
             last = perp.last_for(VENUE, asset)
@@ -196,7 +203,10 @@ def tick(now=None, path=DB_PATH):
                     out["closed"].append(_close(con, p, px, now, reason, q.taker_fee))
             candles = perp.klines(VENUE, sym)
             server_now = now - (last.skew if last else 0.0)
-            closed = [k for k in candles if k[0] + HOUR <= server_now]
+            # закрытая свеча — только если свечи загружены после её закрытия: иначе в кеше её неполная версия
+            # (докачка раз в минуту), а решение по ней не пересматривается
+            seen = min(server_now, perp.kline_time(VENUE, sym) or 0.0) - perp.KLINE_GRACE
+            closed = [k for k in candles if k[0] + HOUR <= seen]
             if len(closed) < SLOW + 1:
                 continue
             key = f"last:{asset}"
@@ -205,6 +215,8 @@ def tick(now=None, path=DB_PATH):
                 _set_state(con, key, closed[-1][0])
                 _set_state(con, f"hold:{asset}", closed[-1][4])
                 continue
+            if closed[-1][0] <= last_ts:
+                continue   # новых закрытых свечей нет — индикаторы не пересчитываем
             closes = [k[4] for k in closed]
             cross, atrs = crosses(closes), atr(closed)
             for i, k in enumerate(closed):
@@ -229,14 +241,14 @@ def tick(now=None, path=DB_PATH):
                             st = json.loads(p["state"] or "{}")
                             st["exit"] = "разворот тренда"
                             con.execute("UPDATE positions SET state = ? WHERE id = ?", (json.dumps(st), p["id"]))
-                    if live and not _open_positions(con, "ema"):
+                    if live and entries and not _open_positions(con, "ema"):
                         side = "лонг" if cross[i] > 0 else "шорт"
                         pid = _open(con, "ema", asset, q, cross[i], atrs[i], cfg, now,
                                     f"EMA{FAST} {'выше' if cross[i] > 0 else 'ниже'} EMA{SLOW} — {side}")
                         if pid:
                             out["opened"].append({"book": "ema", "asset": asset, "side": cross[i]})
                 rng = random.Random(f"{asset}:{int(start)}")
-                if live and rng.random() < cfg["random_p"] and not _open_positions(con, "random"):
+                if live and entries and rng.random() < cfg["random_p"] and not _open_positions(con, "random"):
                     side = rng.choice((1, -1))
                     if _open(con, "random", asset, q, side, atrs[i], cfg, now, "случайный вход"):
                         out["opened"].append({"book": "random", "asset": asset, "side": side})
@@ -263,15 +275,24 @@ def book_stats(rows):
             "max_dd": dd, "avg_r": sum(rs) / len(rs) if rs else None}
 
 
+def at_fees_x1(r):
+    """Сделка при комиссиях ×1 (реальный тейкер, без запаса): хранится с множителем DIR_FEE_MULT со входа."""
+    mult = json.loads(r.get("state") or "{}").get("fee_mult", 1.0) or 1.0
+    return dict(r, pnl=r["pnl"] + (r["fees"] or 0.0) * (1 - 1 / mult))
+
+
 def stats(path=DB_PATH):
+    """(итоги по книгам с комиссиями ×DIR_FEE_MULT, открытые позиции, старт «держать», итоги при комиссиях ×1)."""
     if not os.path.exists(path):
-        return {b: book_stats([]) for b in BOOKS}, [], {}
+        empty = {b: book_stats([]) for b in BOOKS}
+        return empty, [], {}, dict(empty)
     con = _connect(path)
     closed = _dicts(con.execute("SELECT * FROM positions WHERE ts_close IS NOT NULL ORDER BY ts_close"))
     opened = _open_positions(con)
     hold = {k[5:]: json.loads(v) for k, v in con.execute("SELECT key, value FROM state WHERE key LIKE 'hold:%'")}
     con.close()
-    return {b: book_stats([r for r in closed if r["book"] == b]) for b in BOOKS}, opened, hold
+    return ({b: book_stats([r for r in closed if r["book"] == b]) for b in BOOKS}, opened, hold,
+            {b: book_stats([at_fees_x1(r) for r in closed if r["book"] == b]) for b in BOOKS})
 
 
 def _fmt_book(name, s):
@@ -287,11 +308,11 @@ def view(path=DB_PATH, now=None):
     """Текст /futures (только владельцу)."""
     now = time.time() if now is None else now
     cfg = settings()
-    books, opened, hold = stats(path)
+    books, opened, hold, books_x1 = stats(path)
     lines = ["📈 <b>Направленная стратегия — бумага</b> (ордеров нет)",
              f"Статус: {'🟢 включена' if cfg['on'] else '⚪ выключена'} · EMA{FAST}/{SLOW} 1ч Bybit · стоп ATR{ATR_N}"
              f"×{cfg['atr_mult']:g} · риск {cfg['risk']:g} USDT на сделку, до {cfg['max_notional']:g} USDT · "
-             f"{', '.join(cfg['assets'])}", ""]
+             f"комиссии тейкера ×{cfg['fee_mult']:g} (как в бэктесте) · {', '.join(cfg['assets'])}", ""]
     for p in opened:
         q = perp.quote_for(VENUE, p["asset"], now)
         upnl = ""
@@ -307,6 +328,9 @@ def view(path=DB_PATH, now=None):
     e, r = books["ema"], books["random"]
     if e["trades"] and r["trades"]:
         lines.append(f"Стратегия vs случайные: итог {e['pnl'] - r['pnl']:+.2f} USDT")
+    e1, r1 = books_x1["ema"], books_x1["random"]
+    if e1["trades"] or r1["trades"]:
+        lines.append(f"При комиссиях ×1: стратегия {e1['pnl']:+.2f} USDT, случайные {r1['pnl']:+.2f} USDT")
     for asset, start in sorted(hold.items()):
         q = perp.quote_for(VENUE, asset, now)
         if q is not None and start:

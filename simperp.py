@@ -16,6 +16,7 @@ hedge_* (USDT), сравнение «с хеджем / без» — в /paper re
 в среднем идёт круг, для оценки фандинга), HEDGE_ASSETS (BTC,ETH,TON).
 """
 import json
+import logging
 import os
 import statistics
 import time
@@ -23,6 +24,7 @@ import time
 import paper
 import perp
 
+logger = logging.getLogger(__name__)
 STALE_CLOSE = 1800   # сек: пора закрывать, а свежей котировки нет дольше — закрываем по последней (с пометкой)
 
 
@@ -31,10 +33,13 @@ def _on(name, default):
 
 
 def settings():
+    """Опечатка в числе — значение по умолчанию (perp.env_float), не исключение: хедж считается при старте круга,
+    перед отправкой сигналов."""
+    f = perp.env_float
     return {"on": _on("PAPER_HEDGE", "1"), "plan": _on("HEDGE_PLAN", "0"),
-            "ratio": float(os.getenv("HEDGE_RATIO", 1.0)), "band": float(os.getenv("HEDGE_RATIO_BAND", 0.1)),
-            "max_hours": float(os.getenv("HEDGE_MAX_HOURS", 6)), "residual": float(os.getenv("HEDGE_RESIDUAL", 0.1)),
-            "hold_min": float(os.getenv("HEDGE_HOLD_MINUTES", 40)),
+            "ratio": f("HEDGE_RATIO", 1.0, lo=0.0), "band": f("HEDGE_RATIO_BAND", 0.1, lo=0.0),
+            "max_hours": f("HEDGE_MAX_HOURS", 6, lo=0.0), "residual": f("HEDGE_RESIDUAL", 0.1, lo=0.0),
+            "hold_min": f("HEDGE_HOLD_MINUTES", 40, lo=0.0),
             "assets": [a.strip().upper() for a in os.getenv("HEDGE_ASSETS", "BTC,ETH,TON").split(",") if a.strip()]}
 
 
@@ -56,8 +61,8 @@ def choose(asset, coin_qty, amount, ref, coin_rub, risk=0.0, now=None):
     ref — ₽ за USDT (snap.ref; 0 — оценка по цене покупки coin_rub и mid перпа), risk — запас на курс монеты, %."""
     st = settings()
     asset = (asset or "").upper()
-    if not st["on"] or asset not in st["assets"] or coin_qty <= 0 or amount <= 0:
-        return None, ""
+    if not st["on"] or not perp.settings()["on"] or asset not in st["assets"] or coin_qty <= 0 or amount <= 0:
+        return None, ""   # PERPS=0 — котировок не будет: не хеджируем и не пишем «нет котировки» в каждый круг
     now = time.time() if now is None else now
     plans, notes = [], []
     for venue in perp.VENUES:
@@ -84,7 +89,7 @@ def choose(asset, coin_qty, amount, ref, coin_rub, risk=0.0, now=None):
         if not rub:
             notes.append(f"{venue}: нет курса ₽/USDT")
             continue
-        plans.append(dict(e, venue=venue, symbol=sym, qty=qty, ratio=ratio, coin_qty=coin_qty, ref=rub,
+        plans.append(dict(e, venue=venue, symbol=sym, qty=qty, ratio=ratio, coin_qty=coin_qty, ref=rub, mid=q.mid,
                           cost_pct=e["cost"] * rub / amount * 100, taker=q.taker_fee, rate=q.funding_rate,
                           residual_pct=st["residual"] + abs(1 - ratio) * risk))
     if not plans:
@@ -98,6 +103,19 @@ def choose(asset, coin_qty, amount, ref, coin_rub, risk=0.0, now=None):
 def hedged_plan(raw_pct, plan):
     """План круга с хеджем: план без запаса на курс − ожидаемая стоимость хеджа − остаточный запас."""
     return raw_pct - plan["cost_pct"] - plan["residual_pct"]
+
+
+def for_cycle(asset, coin_qty, amount, ref, coin_rub, raw_pct, plan_pct, risk=0.0):
+    """Всё про хедж при старте круга одним вызовом, который не бросает исключений (он стоит перед отправкой
+    сигналов): (план хеджа или None, причина без хеджа, план круга — при HEDGE_PLAN=1 с хеджем, строка карточки).
+    Сбой — (None, "", plan_pct, "") и запись в лог: круг и сигналы идут как без хеджа."""
+    try:
+        hedge, note = choose(asset, coin_qty, amount, ref, coin_rub, risk=risk)
+        pct = hedged_plan(raw_pct, hedge) if hedge and settings()["plan"] else plan_pct
+        return hedge, note, pct, card_line(hedge, note, asset)
+    except Exception as e:
+        logger.error("simperp: %s: %s", type(e).__name__, e)
+        return None, "", plan_pct, ""
 
 
 def card_line(plan, note, asset):
@@ -128,6 +146,7 @@ def open_hedge(cycle_id, plan, note="", now=None, path=paper.DB_PATH):
             fund = {}
             perp.settle(fund, perp._quotes.get((plan["venue"], plan["symbol"])), now)   # ближайший расчёт и ставка
             state = {"status": "open", "symbol": plan["symbol"], "ts_open": now, "ratio": plan["ratio"],
+                     "mid_open": plan.get("mid"),   # для факта стоимости: спред входа = mid − цена по бидам
                      "coin_qty": plan["coin_qty"], "exp_cost_usdt": plan["cost"], "exp_cost_pct": plan["cost_pct"],
                      "residual_pct": plan["residual_pct"], "ref_open": plan["ref"], "alt": plan["alt"],
                      "fund": fund, "fundings": [], "note": note}
@@ -155,45 +174,58 @@ def tick(ref=0.0, now=None, path=paper.DB_PATH):
     max_hours = settings()["max_hours"]
     closed = []
     for c in _rows("SELECT * FROM cycles WHERE hedge_qty > 0 AND hedge_close IS NULL", path=path):
-        st = json.loads(c.get("hedge_state") or "{}")
-        if st.get("status") != "open":
+        try:   # одна битая запись не останавливает учёт и закрытие остальных хеджей
+            done = _tick_one(c, ref, now, max_hours, path)
+        except Exception as e:
+            logger.error("simperp: круг #%s: %s: %s", c.get("id"), type(e).__name__, e)
             continue
-        venue, qty = c["hedge_venue"], c["hedge_qty"]
-        last = perp._quotes.get((venue, st["symbol"]))
-        funding = c.get("hedge_funding") or 0.0
-        for ts, rate, mark, approx in perp.settle(st["fund"], last, now):
-            amt = rate * mark * qty   # шорт: ставка > 0 — получает, < 0 — платит
-            funding += amt
-            st["fundings"].append([ts, rate, mark, amt, approx])
-        fields = {"hedge_funding": funding}
-        reason = ""
-        if c.get("result"):
-            reason = "круг исполнен" if c["result"] == "done" else f"круг сорван ({c['result']})"
-        elif now - st["ts_open"] >= max_hours * 3600:
-            reason = f"таймаут {max_hours:g} ч"
-        q = None
-        if reason:
-            st.setdefault("due", now)
-            q = perp.quote(venue, st["symbol"], now)
-            if q is None and last is not None and now - st["due"] >= STALE_CLOSE:
-                q, st["stale"] = last, True
-        if q is not None:
-            px = perp.walk(q.asks, qty)
-            if px is None:   # глубины стакана не хватило — худший уровень с запасом 0.1%
-                px, st["thin"] = (q.asks[-1][0] if q.asks else q.ask) * 1.001, True
-            fees = (c.get("hedge_fees") or 0.0) + q.taker_fee / 100 * px * qty
-            pnl = (c["hedge_open"] - px) * qty - fees + funding
-            rub = ref if ref and ref > 0 else st.get("ref_open") or 0.0
-            st.update(status="closed", ts_close=now, reason=reason, ref_close=rub,
-                      pnl_pct=pnl * rub / c["amount"] * 100 if rub and c.get("amount") else None)
-            fields.update(hedge_close=px, hedge_fees=fees, hedge_pnl=pnl)
-            closed.append({"id": c["id"], "venue": venue, "pnl": pnl, "pnl_pct": st["pnl_pct"], "reason": reason})
-        fields["hedge_state"] = json.dumps(st, ensure_ascii=False)
-        con = paper._connect(path)
-        with con:
-            _update(con, c["id"], fields)
-        con.close()
+        if done:
+            closed.append(done)
     return closed
+
+
+def _tick_one(c, ref, now, max_hours, path):
+    st = json.loads(c.get("hedge_state") or "{}")
+    if st.get("status") != "open":
+        return None
+    venue, qty = c["hedge_venue"], c["hedge_qty"]
+    last = perp._quotes.get((venue, st["symbol"]))
+    funding = c.get("hedge_funding") or 0.0
+    for ts, rate, mark, approx in perp.settle(st["fund"], last, now):
+        amt = rate * mark * qty   # шорт: ставка > 0 — получает, < 0 — платит
+        funding += amt
+        st["fundings"].append([ts, rate, mark, amt, approx])
+    fields = {"hedge_funding": funding}
+    reason, done = "", None
+    if c.get("result"):
+        reason = "круг исполнен" if c["result"] == "done" else f"круг сорван ({c['result']})"
+    elif now - st["ts_open"] >= max_hours * 3600:
+        reason = f"таймаут {max_hours:g} ч"
+    q = None
+    if reason:
+        st.setdefault("due", now)
+        q = perp.quote(venue, st["symbol"], now)
+        if q is None and last is not None and now - st["due"] >= STALE_CLOSE:
+            q, st["stale"] = last, True
+    if q is not None:
+        px = perp.walk(q.asks, qty)
+        if px is None:   # глубины стакана не хватило — худший уровень с запасом 0.1%
+            px, st["thin"] = (q.asks[-1][0] if q.asks else q.ask) * 1.001, True
+        fees = (c.get("hedge_fees") or 0.0) + q.taker_fee / 100 * px * qty
+        pnl = (c["hedge_open"] - px) * qty - fees + funding
+        rub = ref if ref and ref > 0 else st.get("ref_open") or 0.0
+        # спред и проскальзывание обеих сторон относительно mid — часть стоимости хеджа (в плане он тоже есть)
+        spread = ((st["mid_open"] - c["hedge_open"]) + (px - q.mid)) * qty if st.get("mid_open") else None
+        st.update(status="closed", ts_close=now, reason=reason, ref_close=rub, mid_close=q.mid, spread_usdt=spread,
+                  pnl_pct=pnl * rub / c["amount"] * 100 if rub and c.get("amount") else None)
+        fields.update(hedge_close=px, hedge_fees=fees, hedge_pnl=pnl)
+        done = {"id": c["id"], "venue": venue, "pnl": pnl, "pnl_pct": st["pnl_pct"], "reason": reason}
+    fields["hedge_state"] = json.dumps(st, ensure_ascii=False)
+    con = paper._connect(path)
+    with con:
+        _update(con, c["id"], fields)
+    con.close()
+    return done
 
 
 def report(path=paper.DB_PATH):
@@ -206,7 +238,10 @@ def report(path=paper.DB_PATH):
     diffs_u, diffs_h, exp_cost, fact_cost, ratios = [], [], [], [], []
     band = settings()["band"]
     for r in rows:
-        st = json.loads(r["hedge_state"] or "{}")
+        try:
+            st = json.loads(r["hedge_state"] or "{}")
+        except ValueError:   # битая запись — не повод ломать /paper report
+            continue
         status = st.get("status")
         if status == "none":
             key = st.get("note") or "?"
@@ -218,9 +253,10 @@ def report(path=paper.DB_PATH):
         if status != "closed" or st.get("pnl_pct") is None:
             continue
         rub, amount = st.get("ref_close") or st.get("ref_open") or 0.0, r["amount"] or 0.0
-        if rub and amount:
+        if rub and amount:   # как в плане: комиссии + спред/проскальзывание − фандинг (у старых записей спреда нет)
             exp_cost.append(st.get("exp_cost_pct") or 0.0)
-            fact_cost.append(((r["hedge_fees"] or 0.0) - (r["hedge_funding"] or 0.0)) * rub / amount * 100)
+            fact = (r["hedge_fees"] or 0.0) + (st.get("spread_usdt") or 0.0) - (r["hedge_funding"] or 0.0)
+            fact_cost.append(fact * rub / amount * 100)
         if r["result"] == "done" and r["plan"] is not None and r["realized_pct"] is not None:
             diffs_u.append(r["realized_pct"] - r["plan"])
             diffs_h.append(r["realized_pct"] + st["pnl_pct"] - (r["plan"] - (st.get("exp_cost_pct") or 0.0)))
@@ -248,8 +284,8 @@ def report_lines(path=paper.DB_PATH):
     elif r["pairs"]:
         lines.append(f"σ(факт − план): исполненных кругов с хеджем пока {r['pairs']} — мало для сравнения")
     if r["exp_cost"] is not None:
-        lines.append(f"стоимость хеджа (комиссии − фандинг): ожидалась {r['exp_cost']:.2f}%, факт {r['fact_cost']:.2f}% "
-                     "суммы круга")
+        lines.append(f"стоимость хеджа (комиссии + спред − фандинг): ожидалась {r['exp_cost']:.2f}%, факт "
+                     f"{r['fact_cost']:.2f}% суммы круга")
     if r["ratio_ok"] is not None:
         lines.append(f"коэффициент хеджа в полосе 1 ± {settings()['band']:g}: {r['ratio_ok'] * 100:.0f}% кругов")
     for note, n in sorted(r["none"].items(), key=lambda kv: -kv[1])[:3]:

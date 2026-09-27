@@ -169,6 +169,46 @@ def test_paper_migration_and_rows_by_name(tmp_path):
     assert c["amount"] == 10000 and paper.open_cycles(path=db)[0]["buy_asset"] == "BTC"
 
 
+def test_every_paper_reader_is_name_based_whatever_the_alter_order(tmp_path):
+    """Живая data/paper.db могла получить колонки в другом порядке (ветки мигрируют по-разному): здесь hedge_* и
+    чужая колонка стоят ДО bank/label/…/planned_raw/route_hops. Все чтения paper.py, calibration и simperp берут
+    значения по именам — ни одно поле не съезжает."""
+    import calibration
+    db = str(tmp_path / "paper.db")
+    con = sqlite3.connect(db)
+    con.execute("CREATE TABLE cycles (id INTEGER PRIMARY KEY AUTOINCREMENT, ts_start REAL, amount REAL, buy_ex TEXT, "
+                "buy_asset TEXT, buy_price REAL, buy_nick TEXT, sell_ex TEXT, sell_asset TEXT, sell_price REAL, "
+                "sell_nick TEXT, route TEXT, planned_pct REAL, stage TEXT, ts_stage REAL, realized_pct REAL DEFAULT NULL, "
+                "result TEXT DEFAULT NULL, note TEXT DEFAULT '')")
+    for col, ddl in (*paper.HEDGE_COLUMNS, ("other_branch_col", "TEXT DEFAULT 'x'")):
+        con.execute(f"ALTER TABLE cycles ADD COLUMN {col} {ddl}")
+    con.commit()
+    con.close()
+    cid = _cycle(db)   # _connect допишет bank, label, …, planned_raw, route_hops — в конец, после хеджа
+    names = [r[1] for r in sqlite3.connect(db).execute("PRAGMA table_info(cycles)")]
+    assert names.index("hedge_state") < names.index("other_branch_col") < names.index("planned_raw")
+    c = paper.get_cycle(cid, path=db)
+    assert (c["amount"], c["buy_asset"], c["planned_pct"], c["planned_raw"], c["sell_qty"], c["stage"]) == \
+        (10000.0, "BTC", 0.5, 0.6, 0.0013, "buy")
+    assert (c["hedge_venue"], c["hedge_qty"], c["other_branch_col"]) == ("", None, "x")
+    assert paper.open_cycles(path=db)[0]["planned_raw"] == 0.6
+    _btc_quotes(rate_bingx=0.0)
+    plan, _ = simperp.choose("BTC", 0.0013, 10000, RUB, 84000 * RUB, now=NOW)
+    simperp.open_hedge(cid, plan, "", now=NOW, path=db)
+    paper.finish_cycle(cid, "done", 0.8, path=db, ts=NOW + 600)
+    assert simperp.tick(RUB, now=NOW + 60, path=db)[0]["id"] == cid
+    assert paper.stats(path=db, now=NOW + 600)["all"]["avg_diff"] == pytest.approx(0.8 - 0.6)
+    row = paper.report_rows(path=db)[0]
+    assert (row["buy_asset"], row["avg_planned_pct"], row["avg_realized_pct"]) == ("BTC", 0.6, 0.8)
+    assert row["avg_duration_min"] == pytest.approx(10.0)
+    assert paper.balance_change(path=db) == pytest.approx(10000 * 0.8 / 100)
+    assert paper.first_start(path=db) == NOW
+    s = calibration.paper_samples(db)[0]
+    assert s.done and s.buy_asset == "BTC" and s.diff == pytest.approx(0.2) and s.duration == pytest.approx(600)
+    r = simperp.report(db)
+    assert r["closed"] == 1 and r["pairs"] == 1
+
+
 def _patch(monkeypatch, db):
     TB._patch_paper_db(monkeypatch, db)
     monkeypatch.setattr(B.paper, "get_cycle", functools.partial(B.paper.get_cycle, path=db))
@@ -217,6 +257,114 @@ def test_bot_hedge_failure_does_not_block_cycle(monkeypatch, tmp_path):
     d = _btc_deal()
     asyncio.run(bot.maybe_start_paper_cycle([d], TB.snap_groups([d])))
     assert len(paper.open_cycles(path=db)) == 1
+
+
+def test_bot_hedge_error_after_choose_does_not_block_cycle_or_signal(monkeypatch, tmp_path):
+    """Сбой где угодно в хедже (здесь — строка карточки) не прерывает maybe_start_paper_cycle: он стоит в notify
+    перед отправкой сигналов. План круга — без хеджа."""
+    db = str(tmp_path / "paper.db")
+    _patch(monkeypatch, db)
+    monkeypatch.setattr(B, "deal_card", lambda d, c, a=None, r=None, breakdown=None: b"png")
+    monkeypatch.setattr(simperp.time, "time", lambda: NOW)
+    for k, v in (("PAPER", "1"), ("PAPER_AMOUNT", "10000"), ("HEDGE_PLAN", "1")):
+        monkeypatch.setenv(k, v)
+    _btc_quotes()
+
+    def boom(*a, **k):
+        raise RuntimeError("x")
+    monkeypatch.setattr(B.simperp, "card_line", boom)
+    bot = TB.Stub(p2p.Config(min_profit=2.0))
+    bot.live_scans = 1
+    d = _btc_deal()
+    snap = TB.snap_groups([d])
+    snap.ref = RUB
+    asyncio.run(bot.maybe_start_paper_cycle([d], snap))
+    c = paper.open_cycles(path=db)[0]
+    assert c["hedge_state"] == "" and any("Сухой прогон" in t for t in TB.texts(bot))
+
+
+def test_settings_typos_fall_back_and_perps_off_means_no_hedge(monkeypatch):
+    monkeypatch.setenv("HEDGE_RATIO", "1,0")
+    monkeypatch.setenv("HEDGE_MAX_HOURS", "six")
+    st = simperp.settings()
+    assert st["ratio"] == 1.0 and st["max_hours"] == 6
+    _btc_quotes()
+    monkeypatch.setenv("PERPS", "0")   # перпы не опрашиваются — без хеджа и без «нет котировки» в каждом круге
+    assert simperp.choose("BTC", 0.0013, 10000, RUB, 84000 * RUB, now=NOW) == (None, "")
+
+
+def test_bot_hedges_bought_coins_when_route_qty_missing(monkeypatch, tmp_path):
+    """Нет выхода маршрута — хеджируем купленную монету (сумма / цена), а не весь объём объявления продажи."""
+    db = str(tmp_path / "paper.db")
+    _patch(monkeypatch, db)
+    monkeypatch.setattr(B, "deal_card", lambda d, c, a=None, r=None, breakdown=None: b"png")
+    monkeypatch.setattr(simperp.time, "time", lambda: NOW)
+    monkeypatch.setattr(B, "_route_qty", lambda *a, **k: None)
+    for k, v in (("PAPER", "1"), ("PAPER_AMOUNT", "10000")):
+        monkeypatch.setenv(k, v)
+    _btc_quotes()
+    bot = TB.Stub(p2p.Config(min_profit=2.0))
+    bot.live_scans = 1
+    d = _btc_deal()
+    snap = TB.snap_groups([d])
+    snap.ref = RUB
+    asyncio.run(bot.maybe_start_paper_cycle([d], snap))
+    c = paper.open_cycles(path=db)[0]
+    st = json.loads(c["hedge_state"])
+    assert st["coin_qty"] == pytest.approx(10000 / 7_000_000.0) and c["hedge_qty"] == pytest.approx(0.0014)
+
+
+def test_tick_skips_broken_row_and_closes_others(tmp_path):
+    db = str(tmp_path / "paper.db")
+    _btc_quotes(rate_bingx=0.0)
+    ids = []
+    for _ in range(2):
+        cid = _cycle(db)
+        plan, _ = simperp.choose("BTC", 0.0013, 10000, RUB, 84000 * RUB, now=NOW)
+        simperp.open_hedge(cid, plan, "", now=NOW, path=db)
+        paper.finish_cycle(cid, "done", 0.2, path=db, ts=NOW + 60)
+        ids.append(cid)
+    con = sqlite3.connect(db)
+    con.execute("UPDATE cycles SET hedge_state = '{broken' WHERE id = ?", (ids[0],))
+    con.commit()
+    con.close()
+    closed = simperp.tick(RUB, now=NOW + 60, path=db)
+    assert [c["id"] for c in closed] == [ids[1]]
+    assert simperp.report(db)["closed"] == 1   # битую запись отчёт пропускает
+
+
+def test_fact_cost_counts_spread_like_the_plan(tmp_path):
+    """Цена не двигалась, ставка 0: факт стоимости (комиссии + спред − фандинг) совпадает с ожидаемой."""
+    db = str(tmp_path / "paper.db")
+    _btc_quotes(rate_bingx=0.0)
+    cid = _cycle(db)
+    plan, _ = simperp.choose("BTC", 0.0013, 10000, RUB, 84000 * RUB, now=NOW)
+    simperp.open_hedge(cid, plan, "", now=NOW, path=db)
+    paper.finish_cycle(cid, "done", 0.2, path=db, ts=NOW + 60)
+    simperp.tick(RUB, now=NOW + 60, path=db)
+    r = simperp.report(db)
+    assert r["fact_cost"] == pytest.approx(r["exp_cost"]) and r["exp_cost"] == pytest.approx(plan["cost_pct"])
+
+
+def test_cost_model_matches_hedge_backtest():
+    """Сверка с research/hedge_bt.py на одинаковых входах: без движения цены и фандинга стоимость хеджа simperp
+    (тейкер на входе и выходе + пересечение спреда по стакану) = фиксированная стоимость бэктеста при комиссиях ×1 и
+    проскальзывании = полспреда на сторону. «0.8 запаса» из бэктеста BTC — это комиссии ×2 и 0.02%/сторону."""
+    from research import hedge_bt
+    mid, spread, taker = 84000.0, 16.8, 0.05            # спред 0.02% — по 0.01% на сторону
+    install(quote("BingX", "BTCUSDT", mid=mid, spread=spread, size=1.0, rate=0.0, lot=0.0001, min_qty=0.0001,
+                  fee=taker, ts=NOW),
+            quote("Bybit", "BTCUSDT", mid=mid, spread=spread, size=1.0, rate=0.0, lot=0.0001, min_qty=0.0001,
+                  fee=taker, ts=NOW))
+    qty = 0.01
+    amount = qty * mid * RUB                             # коэффициент хеджа 1: сумма круга = номинал шорта
+    plan, _ = simperp.choose("BTC", qty, amount, RUB, mid * RUB, now=NOW)
+    half = spread / 2 / mid * 100                         # % на сторону
+    zero = [(0, 0.0, 0.0, 0.0)] * 3                       # окна без движения цены и без фандинга
+    bt = hedge_bt.evaluate_window(zero, zero, 60, "BTC", hedge_bt.Params(fee_mult=1.0, slippage={"BTC": half}), taker)
+    assert plan["cost_pct"] == pytest.approx(bt["cost_mean_pct"], abs=1e-4)
+    stress = hedge_bt.evaluate_window(zero, zero, 60, "BTC", hedge_bt.Params(), 0.05)   # ×2 и 0.02%/сторону
+    assert stress["cost_mean_pct"] == pytest.approx(0.24) and stress["cost_to_buffer"] == pytest.approx(0.8)
 
 
 def test_ton_hedges_with_per_venue_symbols():
