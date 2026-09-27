@@ -35,11 +35,12 @@ def snap(ads, hidden=(), ref=REF):
                         books(*ads, *hidden))
 
 
-def market(b1=1000.0, b2=500.0, b3=800.0, s1=1000.0, s2=600.0, drop_s2=False):
+def market(b1=1000.0, b2=500.0, b3=800.0, s1=1000.0, s2=600.0, drop_s2=False, drop_b3=False):
     """Синтетический стакан Bybit USDT: покупатели монеты (очередь своего объявления на покупку) 89.50/89.40/89.00,
     продавцы (очередь объявления на продажу) 90.50/90.60. Цены мейкера: купить 89.51, продать 90.49."""
-    ads = [ad("sell", 89.50, "B1", b1), ad("sell", 89.40, "B2", b2), ad("sell", 89.00, "B3", b3),
-           ad("buy", 90.50, "S1", s1)]
+    ads = [ad("sell", 89.50, "B1", b1), ad("sell", 89.40, "B2", b2), ad("buy", 90.50, "S1", s1)]
+    if not drop_b3:
+        ads.append(ad("sell", 89.00, "B3", b3))
     if not drop_s2:
         ads.append(ad("buy", 90.60, "S2", s2))
     return ads
@@ -169,6 +170,15 @@ def test_flow_ignores_topups_duplicates_and_caps_vanished_ad():
     assert S.flow(prev, cur, "buy_ad", 89.5) == (0.0, 0.0)   # долив не поток; дубль ника и безымянный — пропуск
     prev = [["Z", 89.0, 1000.0, 8900.0]]                      # верх лимита 8900 ₽ = 100 монет за раз
     assert S.flow(prev, [], "buy_ad", 89.5) == (0.0, pytest.approx(100.0))
+    assert S.flow(prev, [], "buy_ad", 89.5, cap_rub=4450) == (0.0, pytest.approx(50.0))   # не больше своего лота
+
+
+def test_flow_skips_vanished_tail_of_full_page():
+    page = [[f"N{i}", 89.4 - i * 0.01, 10.0, 500000] for i in range(S.PAGE_FULL)]
+    cur = [r for i, r in enumerate(page) if i not in (5, S.PAGE_FULL - 1)]   # пропали 6-й и последний
+    assert S.flow(page, cur, "buy_ad", 89.5) == (0.0, pytest.approx(10.0))   # последнего могли вытеснить со страницы
+    short = page[:5]
+    assert S.flow(short, short[:4], "buy_ad", 89.5) == (0.0, pytest.approx(10.0))   # неполная страница — считаем
 
 
 def test_fill_share_depends_on_place_and_is_capped():
@@ -190,10 +200,11 @@ def test_synthetic_sequence_fills_buy_then_sell_into_round(monkeypatch):
     assert fills[1]["wait_s"] == pytest.approx(20)   # очередь считается заново после первого исполнения
     assert S.position(st["lots"]) == pytest.approx(100) and not rounds
     assert "buy_ad" not in st["ads"] and st["paused"]["buy_ad"] == {"limit": 2}   # лимит позиции 1 лот
-    # продажа: S2 (90.60 ≥ 90.49) пропал — остаток 600 → половина, но не больше позиции
-    st2, fills2, rounds2 = run(seq[:3] + [snap(market(b2=430, b3=500, drop_s2=True))], s)
+    # продажа: у S1 (90.50 ≥ 90.49) убыло 150, S2 пропал (засчитан один лот 9000 ₽) → половина, но не больше позиции
+    st2, fills2, rounds2 = run(seq[:3] + [snap(market(b2=430, b3=500, s1=850, drop_s2=True))], s)
     assert fills2[-1]["side"] == "sell_ad" and fills2[-1]["qty"] == pytest.approx(100)
-    assert fills2[-1]["flow_gone"] == pytest.approx(600) and fills2[-1]["fee"] == 0
+    assert fills2[-1]["flow_drop"] == pytest.approx(150) and fills2[-1]["flow_gone"] == pytest.approx(9000 / 90.6)
+    assert fills2[-1]["fee"] == 0
     assert len(rounds2) == 2 and S.position(st2["lots"]) == pytest.approx(0)
     pnl = sum(r["pnl"] for r in rounds2)
     assert pnl == pytest.approx(100 * (90.49 - 89.51) - 100 * 89.51 * FEE / 100)
@@ -246,15 +257,23 @@ def test_open_qty_limits_position_both_ways():
 def test_on_scan_persists_and_report_is_labelled_weak(monkeypatch, tmp_path):
     cfg_env(monkeypatch, SIM_MAKER_MAX_GAP="7200")
     db = str(tmp_path / "sim_maker.db")
-    for i, sn in enumerate([snap(market()), snap(market(b2=300)), snap(market(b2=300, drop_s2=True))]):
+    seq = [snap(market()),
+           snap(market(b2=300)),                                    # купили лот (ждали 60 мин)
+           snap(market(b2=300, s1=0, drop_s2=True)),                # продали лот (продажа стоит с 1-го скана: 120 мин)
+           snap(market(b2=300, s1=0, drop_s2=True, drop_b3=True))]  # B3 пропал: купили полкруга только по пропаже
+    for i, sn in enumerate(seq):
         S.on_scan(sn, p2p.Config(), path=db, now=1000.0 + i * 3600)
     rows_ = S.stats(db)
     assert len(rows_) == 1
     r = rows_[0]
-    assert (r["ex"], r["asset"], r["fills"], r["rounds"], r["fills_gone"]) == ("Bybit", "USDT", 2, 1, 1)
-    assert r["total"] == pytest.approx(100 * (90.49 - 89.51) - 100 * 89.51 * FEE / 100)
-    assert r["wait_min"] == pytest.approx(90)   # покупка ждала 60 мин, продажа — 120 (стоит с первого скана)
-    assert r["fills_per_day"] == pytest.approx(2 / (7200 / 86400))
+    assert (r["ex"], r["asset"], r["fills"], r["rounds"], r["fills_gone"]) == ("Bybit", "USDT", 3, 1, 1)
+    q = 0.5 * 9000 / 89.0   # пропажа B3 засчитана одним лотом
+    assert r["pos"] == pytest.approx(q)
+    assert r["realized"] == pytest.approx(100 * (90.49 - 89.51) - 100 * 89.51 * FEE / 100)
+    assert r["unreal"] == pytest.approx(q * (REF - 89.51)) and r["open_fees"] == pytest.approx(q * 89.51 * FEE / 100)
+    assert r["total"] == pytest.approx(r["realized"] + r["unreal"] - r["open_fees"])
+    assert r["wait_min"] == pytest.approx(60)   # 60, 120, 60
+    assert r["fills_per_day"] == pytest.approx(3 / (3 * 3600 / 86400))
     text = S.report_view(p2p.Config(), path=db)
     assert "слабый прокси" in text and "Bybit USDT" in text and "Кругов: 1" in text
     assert "≥ 30 дней" in text and "реальных объявлений и сделок нет" in text
