@@ -88,6 +88,8 @@ def track_signals(rows, ts, open_ids, amount=None, min_profit=None, path=DB_PATH
     скан, максимум прибыли, сигнал; причина — последняя, у связки с сигналом — пусто), новой — новая строка; ключ,
     которого в rows нет, выпал из-под порога — эпизод закрыт. Возвращает open_ids для следующего скана."""
     out = {}
+    if not rows:   # выше порога никого — все эпизоды закрыты, писать нечего
+        return out
     con = _connect(path)
     try:
         with con:

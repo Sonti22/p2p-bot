@@ -1194,6 +1194,7 @@ class Bot:
         self.payout_task = None       # фоновая отправка подтверждённой выплаты: command_loop тем временем принимает «⛔ Стоп»
         self.onboarding = None   # {"step": "amount"/"banks"/"min", "banks": set()} — мастер первого /start
         self.sent = {}
+        self.signal_rows = {}   # (ex,asset,ex,asset) -> id открытого эпизода в history.signals (связка выше порога)
         self.live_msg = {}   # (ex,asset,ex,asset) -> последнее сообщение сигнала для «живой карточки» (editMessage)
         self.live = {}                                            # (ex,asset,ex,asset) -> {"first": ts, "streak": n}
         self.live_scans = int(os.getenv("LIVE_SCANS", 2))        # сигнал, только если связка держится ≥ N сканов
@@ -2210,8 +2211,52 @@ class Bot:
             await self.send_paper_digest()
         self._was_quiet = quiet
         paused = self.paused or (self.pause_until and time.time() < self.pause_until)
+        since = time.time()   # отправленное notify в этом скане отмечено в self.sent не раньше
         if not quiet and not paused:
             await self.notify(snap)
+        await self.record_signals(snap, since, quiet, bool(paused))
+
+    def signal_reasons(self, snap, since, quiet=False, paused=False):
+        """Связки выше порога и почему по каждой не ушёл сигнал в этом скане: [(ключ, связка, причина)], причина
+        None — сигнал ушёл (антидубль отмечен не раньше since). Иначе — первая преграда в порядке notify: quiet /
+        paused → trap (🪤 не шлём, SIGNAL_TRAPS=0) → max_signals (вне топ-N и не ⭐ избранная) → unconfirmed
+        (держится меньше LIVE_SCANS сканов) → cooldown (антидубль) → unsent (не доставлено)."""
+        top = {self._deal_key(d) for d in self._signal_deals(snap)}
+        favs, fav_min = favorites.keys(), favorites.fav_min_profit()
+        traps = signal_traps()
+        out = []
+        for d in snap.deals:
+            if d[0] < self.cfg.min_profit:
+                continue
+            key = self._deal_key(d)
+            prev = self.sent.get(key)
+            if prev and prev[0] >= since:
+                reason = None
+            elif quiet or paused:
+                reason = "quiet" if quiet else "paused"
+            elif not traps and reliability(d, self.cfg, snap)[0] == TRAP:
+                reason = "trap"
+            elif key not in top and not (favorites.key_str(key) in favs and d[0] >= fav_min):
+                reason = "max_signals"
+            elif not self.is_confirmed(d):
+                reason = "unconfirmed"
+            elif prev and since - prev[0] < self.cooldown and d[0] < prev[1] + self.repeat_step:
+                reason = "cooldown"
+            else:
+                reason = "unsent"
+            out.append((key, d, reason))
+        return out
+
+    async def record_signals(self, snap, since, quiet=False, paused=False):
+        """Эпизоды связок выше порога в history.signals (этап 1 «измерения»): был ли сигнал и почему нет — для доли
+        пропущенных связок (history.signal_stats). Пишем в отдельном потоке; ошибка — строка в логе, сигналы не ломает."""
+        try:
+            rows = [(key, d[0], reason is None, reason)
+                    for key, d, reason in self.signal_reasons(snap, since, quiet, paused)]
+            self.signal_rows = await asyncio.to_thread(history.track_signals, rows, snap.ts or since, self.signal_rows,
+                                                       self.cfg.amount, self.cfg.min_profit)
+        except Exception as e:
+            logger.warning("signals: %s", e)
 
     async def cmd_pause(self, arg):
         """/pause [30m|1h|3h|до утра] — пауза сигналов; без аргумента — бессрочно, как кнопка «⏸ Пауза»."""
