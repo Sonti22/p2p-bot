@@ -378,7 +378,7 @@ def test_group_as_tg_chat_id_gets_no_owner_actions(monkeypatch, ctype):
     for data in ("pay_to:w1", "pay_ok:x", "pay_stop", "pay_hist", "settings", "acc_add:bybit", "paper_set:on"):
         run(bot.on_update(_cb(-1001, data, uid=5, ctype=ctype)))
     got = _texts(bot)
-    assert got and all("личном чате" in t and "TG_CHAT_ID" in t for t in got)
+    assert len(got) == 1 and "личном чате" in got[0] and "TG_CHAT_ID" in got[0]   # отказ — раз в 10 минут на чат
     assert _answers(bot) and all("личном чате" in t for t in _answers(bot))
     assert saved == [] and payouts.enabled() and bot.awaiting_payout is None and bot.awaiting_key is None
     assert bot.guests == set() and not bot.s.calls
@@ -422,11 +422,40 @@ def test_owner_private_chat_keeps_working_end_to_end():
     assert not payouts.enabled()
 
 
-def test_owner_pressing_in_another_group_is_not_owner():
-    """Сам владелец (from.id == TG_CHAT_ID) жмёт кнопку в чужой группе — это не его личный чат: ничего."""
+def test_owner_pressing_in_another_group_or_unsigned_press_is_not_owner():
+    """Сам владелец (from.id == TG_CHAT_ID) жмёт кнопку в чужой группе — это не его личный чат: ничего. Нажатие в чате
+    владельца без from (кто нажал — неизвестно) или с чатом без типа — отказ."""
     bot = owner()
+    token = to_preview(bot)
     run(bot.on_update(_cb(-5, "pay_stop", uid=1, ctype="supergroup")))
-    assert payouts.enabled()
+    unsigned = _cb(1, f"pay_ok:{token}")
+    del unsigned["callback_query"]["from"]
+    untyped = _cb(1, "pay_stop")
+    del untyped["callback_query"]["message"]["chat"]["type"]
+    for u in (unsigned, untyped):
+        run(bot.on_update(u))
+        run(bot.payout_callback(u["callback_query"], u["callback_query"]["data"]))
+    assert payouts.enabled() and not bot.s.posts() and bot.payout_preview["token"] == token
+
+
+def test_stop_while_send_waits_for_lock_blocks_post_even_if_switch_flips_back(monkeypatch):
+    """«✅ Отправить» ждёт замок (идёт опрос или другая отправка), тут «⛔ Стоп», а потом PAYOUTS снова 1 — эта отправка
+    всё равно отказ: счётчик Стопа берётся до замка."""
+    s = Session(routes())
+    q = quote(s)
+
+    async def go():
+        lock = payouts._send_lock()
+        await lock.acquire()
+        task = asyncio.create_task(payouts.send(s, entry("w1"), Decimal("25"), q))
+        for _ in range(10):
+            await asyncio.sleep(0)
+        payouts.disable()
+        monkeypatch.setenv("PAYOUTS", "1")
+        lock.release()
+        return await asyncio.wait_for(task, 5)
+    res = run(go())
+    assert res["state"] == "refused" and not s.posts() and payouts.history() == []
 
 
 def test_send_refreshes_rate_and_refuses_over_limit_at_new_price():

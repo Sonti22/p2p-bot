@@ -1188,6 +1188,7 @@ class Bot:
         self.guests = {g for g in entries if not g.startswith("@")}          # id чатов гостей
         self.pending = {g.lower() for g in entries if g.startswith("@")}   # @ники: доступ откроется с первого сообщения
         self.asked = set()        # чужие чаты, которым уже ответили «бот приватный» (раз за запуск)
+        self.refused_at = {}      # чат TG_CHAT_ID не личный -> когда последний раз ответили «команды — только в личке»
         self.username = ""       # @ник бота из getMe — для подсказок
         self.repeat_step = float(os.getenv("REPEAT_STEP", 0.3))  # п.п. роста профита для досрочного повтора
         self.max_signals = int(os.getenv("MAX_SIGNALS", 3))      # сигналим только из топ-N
@@ -2828,7 +2829,10 @@ class Bot:
             text = (msg.get("text") or "").strip()
             logger.warning("команда владельца не из его личного чата (чат %s, %s, от %s) — отказ",
                            chat, msg.get("chat", {}).get("type"), (msg.get("from") or {}).get("id"))
-            if text.startswith("/") or text in BUTTONS:   # на обычную болтовню в группе не отвечаем
+            # на болтовню в группе не отвечаем, на команды — не чаще раза в 10 минут на чат (любой участник группы
+            # иначе заставил бы бота слать отказ за отказом и тратить общий с сигналами лимит Telegram)
+            if (text.startswith("/") or text in BUTTONS) and time.time() - self.refused_at.get(chat, 0) > 600:
+                self.refused_at[chat] = time.time()
                 private = msg.get("chat", {}).get("type") == "private"
                 await self.send("🔒 Это только для владельца бота." if private else OWNER_ONLY_PRIVATE, chat_id=chat)
         elif who == "guest":
