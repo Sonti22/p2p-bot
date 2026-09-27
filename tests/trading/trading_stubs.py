@@ -1,18 +1,68 @@
 """Заглушки для тестов торгового ядра: сеть — только эта «сессия» (ответ по методу и пути), ключи — фиктивные.
 
 Запрос не к api.bybit.com / open-api.bingx.com или без заготовленного ответа — ошибка теста: настоящих запросов нет.
+Корутины тестов идут на ОДНОМ цикле событий на весь прогон (`run`), а не asyncio.run на каждый тест: на Windows каждый
+новый цикл — пара loopback-сокетов, тысячи тестов исчерпывали буфер сокетов (WinError 10055) при полном прогоне на ПК
+владельца. Цикл закрывается при выходе (atexit); задачи, оставленные тестом, отменяются после каждого run.
 """
 import asyncio
+import atexit
 import json
 from decimal import Decimal
 
 from yarl import URL
 
 import accounts
+from trading import journal, keys
 
 KEY, SECRET = "FAKEKEY0000", "FAKESECRET0000000000"
 CREDS = (KEY, SECRET)
 HOSTS = {accounts.BYBIT_BASE: "bybit", accounts.BINGX_BASE: "bingx"}
+D = Decimal
+
+_LOOP = {"loop": None}
+
+
+def loop():
+    """Общий цикл событий тестов ядра (создаётся один раз)."""
+    lp = _LOOP["loop"]
+    if lp is None or lp.is_closed():
+        lp = _LOOP["loop"] = asyncio.new_event_loop()
+    return lp
+
+
+def run(coro):
+    """Выполнить корутину на общем цикле; задачи, которые тест оставил, — отменить и дождаться."""
+    lp = loop()
+    try:
+        return lp.run_until_complete(coro)
+    finally:
+        left = [t for t in asyncio.all_tasks(lp) if not t.done()]
+        for t in left:
+            t.cancel()
+        if left:
+            lp.run_until_complete(asyncio.gather(*left, return_exceptions=True))
+
+
+def close_loop():
+    lp = _LOOP["loop"]
+    if lp is not None and not lp.is_closed():
+        lp.run_until_complete(lp.shutdown_asyncgens())
+        lp.close()
+
+
+atexit.register(close_loop)
+
+
+def fresh_journal(monkeypatch, tmp_path):
+    """Журнал в tmp, свежие замки, без идущих отправок, торговые ключи CREDS проверены (итог — в tmp)."""
+    monkeypatch.setattr(journal, "DB_PATH", str(tmp_path / "trading.db"))
+    monkeypatch.setattr(journal, "RETRY_DELAY", 0)
+    monkeypatch.setattr(journal, "_locks", {"loop": None, "state": None, "symbols": {}})
+    monkeypatch.setattr(journal, "_inflight", set())
+    monkeypatch.setattr(keys, "CHECK_PATH", str(tmp_path / "trading_keycheck.json"))
+    for venue in ("bybit", "bingx"):
+        keys.save_check(venue, CREDS, keys.KeyCheck(True, "ok", "", True))
 
 
 class Resp:
@@ -46,17 +96,18 @@ class Gated(Resp):
 
 class Session:
     """Ответ по (метод, путь): Resp, список Resp (по очереди, последний повторяется) или функция от записанного
-    запроса. Каждый запрос записывается: метод, URL как отправлен, путь, query (раскодированный), заголовки, тело."""
+    запроса. Каждый запрос записывается: метод, URL как отправлен, путь, query (раскодированный), заголовки, тело,
+    таймаут."""
     def __init__(self, routes=None):
         self.routes, self.calls = dict(routes or {}), []
 
-    def _answer(self, method, url, headers=None, data=None, allow_redirects=True):
+    def _answer(self, method, url, headers=None, data=None, allow_redirects=True, timeout=None):
         raw = str(url)
         base = next((b for b in HOSTS if raw.startswith(b + "/")), None)
         assert base is not None, f"запрос не к бирже ядра: {raw}"
         u = URL(raw, encoded=True)
         call = {"method": method, "url": raw, "venue": HOSTS[base], "path": u.path, "query": dict(u.query),
-                "headers": dict(headers or {}), "data": data, "redirects": allow_redirects}
+                "headers": dict(headers or {}), "data": data, "redirects": allow_redirects, "timeout": timeout}
         self.calls.append(call)
         r = self.routes.get((method, call["path"]))
         if r is None:
@@ -65,21 +116,17 @@ class Session:
             r = r.pop(0) if len(r) > 1 else r[0]
         return r(call) if callable(r) else r
 
-    def get(self, url, headers=None, allow_redirects=True):
-        return self._answer("GET", url, headers, allow_redirects=allow_redirects)
+    def get(self, url, headers=None, allow_redirects=True, timeout=None):
+        return self._answer("GET", url, headers, allow_redirects=allow_redirects, timeout=timeout)
 
-    def post(self, url, headers=None, data=None, allow_redirects=True):
-        return self._answer("POST", url, headers, data, allow_redirects)
+    def post(self, url, headers=None, data=None, allow_redirects=True, timeout=None):
+        return self._answer("POST", url, headers, data, allow_redirects, timeout)
 
-    def delete(self, url, headers=None, allow_redirects=True):
-        return self._answer("DELETE", url, headers, allow_redirects=allow_redirects)
+    def delete(self, url, headers=None, allow_redirects=True, timeout=None):
+        return self._answer("DELETE", url, headers, allow_redirects=allow_redirects, timeout=timeout)
 
     def sent(self, method, path):
         return [c for c in self.calls if c["method"] == method and c["path"] == path]
-
-
-def run(coro):
-    return asyncio.run(coro)
 
 
 def body(call):
@@ -108,11 +155,39 @@ def bingx_err(code, msg="error"):
     return Resp(200, {"code": code, "msg": msg, "data": {}})
 
 
+# шаги инструментов «биржи» заглушки: (qty_step, min_qty, tick, min_notional)
+BYBIT_INST = {("linear", "BTCUSDT"): ("0.001", "0.001", "0.1", "5"), ("linear", "ETHUSDT"): ("0.01", "0.01", "0.01", "5"),
+              ("linear", "GRAMUSDT"): ("0.1", "0.1", "0.0001", "5"),
+              ("spot", "BTCUSDT"): ("0.000001", "0.000048", "0.01", "1"),
+              ("spot", "ETHUSDT"): ("0.0001", "0.0001", "0.01", "1"), ("spot", "GRAMUSDT"): ("0.01", "0.1", "0.0001", "1")}
+BINGX_INST = {"BTC-USDT": (4, 1, "0.0001", "2"), "ETH-USDT": (2, 2, "0.01", "2"), "GRAMTON-USDT": (1, 4, "1", "2")}
+MARKS = {"BTCUSDT": "65000", "ETHUSDT": "3000", "GRAMUSDT": "3", "BTC-USDT": "65000", "ETH-USDT": "3000",
+         "GRAMTON-USDT": "3"}
+_BYBIT_OPEN = ("New", "PartiallyFilled", "Untriggered")
+_BINGX_OPEN = ("NEW", "PARTIALLY_FILLED", "PENDING")
+
+
 class Book:
-    """«Биржа» с ордерами по клиентскому id: ответ создания и ответы на запросы статуса по id."""
+    """«Биржа»: ордера по клиентскому id (ответ создания и запросы статуса по id), список открытых ордеров символа
+    (наши и ордера владельца — foreign), позиции (исполнение ордера двигает позицию), плечо, режим маржи, тикер и
+    шаги инструмента."""
     def __init__(self):
-        self.orders = {}   # client_id -> вид для ответа
+        self.orders = {}          # client_id -> вид для ответа
         self.next_id = 1321003749386327552
+        self.foreign = []         # открытые ордера владельца / стопы позиции: виды биржи
+        self.position = {}        # символ биржи -> знаковый размер (Decimal)
+        self.other = []           # ненулевые позиции других монет аккаунта: (символ биржи, знаковый размер)
+        self.leverage = "2"
+        self.margin = {"bybit": "ISOLATED_MARGIN", "bingx": "ISOLATED"}
+        self.marks = dict(MARKS)
+        self.liq = {}             # символ биржи -> цена ликвидации (строка)
+
+    def _move(self, sym, side, qty, reduce_only):
+        signed = D(qty) if side.lower() == "buy" else -D(qty)
+        cur = self.position.get(sym, D(0))
+        if reduce_only and (cur == 0 or (cur > 0) == (signed > 0)):
+            return
+        self.position[sym] = cur + signed
 
     # --- Bybit ---
     def bybit_create(self, status="New", filled="0", **over):
@@ -122,20 +197,54 @@ class Book:
             if cid in self.orders:   # как биржа: id уже был — второй ордер не создаётся
                 return bybit_err(110072, "OrderLinkedID is duplicate")
             self.next_id += 1
+            done = b["qty"] if status == "Filled" else filled
             self.orders[cid] = dict({"orderId": str(self.next_id), "orderLinkId": cid, "symbol": b["symbol"],
                                      "side": b["side"], "orderType": b["orderType"], "qty": b["qty"],
-                                     "price": b.get("price", "0"), "orderStatus": status, "cumExecQty": filled,
+                                     "price": b.get("price", "0"), "orderStatus": status, "cumExecQty": done,
                                      "avgPrice": "", "reduceOnly": b.get("reduceOnly", False)}, **over)
+            if b["category"] != "spot" and D(done):
+                self._move(b["symbol"], b["side"], done, b.get("reduceOnly", False))
             return bybit_ok({"orderId": str(self.next_id), "orderLinkId": cid})
         return answer
 
     def bybit_query(self, call):
-        cid = call["query"].get("orderLinkId")
-        o = self.orders.get(cid)
-        return bybit_ok({"category": call["query"].get("category"), "list": [o] if o else [], "nextPageCursor": ""})
+        q = call["query"]
+        cid = q.get("orderLinkId")
+        if cid is not None or q.get("openOnly") == "1":
+            o = self.orders.get(cid)
+            return bybit_ok({"category": q.get("category"), "list": [o] if o else [], "nextPageCursor": ""})
+        sym = q.get("symbol")
+        mine = [o for o in self.orders.values() if o.get("symbol") == sym and o.get("orderStatus") in _BYBIT_OPEN]
+        theirs = [o for o in self.foreign if o.get("symbol") == sym]
+        return bybit_ok({"category": q.get("category"), "list": mine + theirs, "nextPageCursor": ""})
 
     def bybit_store(self, cid, **fields):
         self.orders.setdefault(cid, {"orderLinkId": cid}).update(fields)
+
+    def _bybit_row(self, sym, size):
+        return {"symbol": sym, "positionIdx": 0, "side": "Buy" if size > 0 else "Sell" if size < 0 else "",
+                "size": str(abs(size)), "avgPrice": self.marks.get(sym, "1"), "markPrice": self.marks.get(sym, "1"),
+                "liqPrice": self.liq.get(sym, ""), "leverage": self.leverage}
+
+    def bybit_positions(self, call):
+        sym = call["query"].get("symbol")
+        if sym:
+            return bybit_ok({"list": [self._bybit_row(sym, self.position.get(sym, D(0)))], "nextPageCursor": ""})
+        rows = [self._bybit_row(s, v) for s, v in list(self.position.items()) + self.other if v]
+        return bybit_ok({"list": rows, "nextPageCursor": ""})
+
+    def bybit_ticker(self, call):
+        sym = call["query"]["symbol"]
+        return bybit_ok({"list": [{"symbol": sym, "markPrice": self.marks[sym], "lastPrice": self.marks[sym]}]})
+
+    def bybit_instrument(self, call):
+        cat, sym = call["query"]["category"], call["query"]["symbol"]
+        step, mn, tick, notional = BYBIT_INST[(cat, sym)]
+        lot = ({"basePrecision": step, "minOrderQty": mn, "maxOrderQty": "1000", "minOrderAmt": notional}
+               if cat == "spot" else {"qtyStep": step, "minOrderQty": mn, "maxOrderQty": "1000",
+                                      "minNotionalValue": notional})
+        return bybit_ok({"list": [{"symbol": sym, "status": "Trading", "lotSizeFilter": lot,
+                                   "priceFilter": {"tickSize": tick}}]})
 
     # --- BingX ---
     def bingx_create(self, status="NEW", **over):
@@ -145,11 +254,14 @@ class Book:
             if cid in self.orders:
                 return bingx_err(101481, "clientOrderID has already been used")
             self.next_id += 1
+            done = q["quantity"] if status == "FILLED" else "0"
             order = dict({"symbol": q["symbol"], "orderId": self.next_id, "side": q["side"],
                           "positionSide": q["positionSide"], "type": q["type"], "origQty": q["quantity"],
-                          "price": q.get("price", "0"), "executedQty": "0", "status": status,
+                          "price": q.get("price", "0"), "executedQty": done, "status": status,
                           "clientOrderId": cid}, **over)
             self.orders[cid] = order
+            if D(done):
+                self._move(q["symbol"], q["side"], done, q.get("reduceOnly") == "true")
             return bingx_ok({"order": order})
         return answer
 
@@ -158,5 +270,51 @@ class Book:
         o = self.orders.get(cid)
         return bingx_ok({"order": o}) if o else bingx_err(109421, "order not exist")
 
+    def bingx_open(self, call):
+        sym = call["query"].get("symbol")
+        mine = [o for o in self.orders.values() if o.get("symbol") == sym and o.get("status") in _BINGX_OPEN]
+        return bingx_ok({"orders": mine + [o for o in self.foreign if o.get("symbol") == sym]})
 
-D = Decimal
+    def _bingx_row(self, sym, size):
+        return {"symbol": sym, "positionSide": "BOTH", "positionAmt": str(size), "avgPrice": self.marks.get(sym, "1"),
+                "markPrice": self.marks.get(sym, "1"), "liquidationPrice": self.liq.get(sym, "0"),
+                "leverage": int(self.leverage), "isolated": self.margin["bingx"] == "ISOLATED"}
+
+    def bingx_positions(self, call):
+        sym = call["query"].get("symbol")
+        items = [(sym, self.position.get(sym, D(0)))] if sym else list(self.position.items()) + self.other
+        return bingx_ok([self._bingx_row(s, v) for s, v in items if v])
+
+    def bingx_ticker(self, call):
+        sym = call["query"]["symbol"]
+        return bingx_ok({"symbol": sym, "lastPrice": self.marks[sym]})
+
+    def bingx_contracts(self, call):
+        sym = call["query"]["symbol"]
+        qp, pp, mn, notional = BINGX_INST[sym]
+        return bingx_ok([{"symbol": sym, "quantityPrecision": qp, "pricePrecision": pp, "tradeMinQuantity": mn,
+                          "tradeMinUSDT": notional, "status": 1, "apiStateOpen": "true", "currency": "USDT"}])
+
+    def routes(self, venue, **over):
+        """Все пути «биржи» для заглушки Session; over — подмена отдельных (ключ — «POST /v5/order/create» и т. п.)."""
+        if venue == "bybit":
+            r = {("POST", "/v5/order/create"): self.bybit_create(), ("GET", "/v5/order/realtime"): self.bybit_query,
+                 ("GET", "/v5/order/history"): bybit_ok({"list": []}),
+                 ("GET", "/v5/position/list"): self.bybit_positions,
+                 ("GET", "/v5/account/info"): lambda c: bybit_ok({"marginMode": self.margin["bybit"]}),
+                 ("GET", "/v5/market/tickers"): self.bybit_ticker,
+                 ("GET", "/v5/market/instruments-info"): self.bybit_instrument}
+        else:
+            r = {("POST", "/openApi/swap/v2/trade/order"): self.bingx_create(),
+                 ("GET", "/openApi/swap/v2/trade/order"): self.bingx_query,
+                 ("GET", "/openApi/swap/v2/trade/openOrders"): self.bingx_open,
+                 ("GET", "/openApi/swap/v2/user/positions"): self.bingx_positions,
+                 ("GET", "/openApi/swap/v2/trade/leverage"): lambda c: bingx_ok(
+                     {"longLeverage": int(self.leverage), "shortLeverage": int(self.leverage)}),
+                 ("GET", "/openApi/swap/v2/trade/marginType"): lambda c: bingx_ok({"marginType": self.margin["bingx"]}),
+                 ("GET", "/openApi/swap/v2/quote/ticker"): self.bingx_ticker,
+                 ("GET", "/openApi/swap/v2/quote/contracts"): self.bingx_contracts}
+        for k, v in over.items():
+            method, path = k.split(" ", 1)
+            r[(method, path)] = v
+        return r

@@ -11,10 +11,15 @@
 - подпись по точным байтам: Bybit GET — accounts.bybit_headers (query — urlencode тех же параметров), Bybit POST —
   accounts.bybit_post_headers (подписывается ровно отправляемая строка тела), BingX — accounts.bingx_signed_query
   (параметры в query у всех методов, тело пустое; значения с «[»/«{» в URL кодируются, подпись — по сырой строке);
-- URL не перекодируется (yarl encoded=True), за редиректом не идём (allow_redirects=False);
+- URL не перекодируется (yarl encoded=True), за редиректом не идём (allow_redirects=False), у каждого запроса свой
+  таймаут aiohttp.ClientTimeout(total=REQUEST_TIMEOUT);
 - ответ — (HTTP-статус, JSON или None); `outcome()` раскладывает его на ok / rejected / duplicate / notfound /
   ambiguous; тексты ошибок — через accounts._scrub и accounts.api_error_text (без ключа, подписи и URL).
-Публичные справочники (PUBLIC, `public_get`) — без ключа: проверка, какой символ биржи сейчас торгуется (TON → GRAM).
+Публичные справочники (PUBLIC, `public_get`) — без ключа: проверка, какой символ биржи сейчас торгуется (TON → GRAM),
+шаги количества и цены (`instrument`), цена для оценки номинала (`mark_price`).
+Чтение по одному символу для проверки «чьё это» (trading/ownership.py): `symbol_positions` (строго: чужой символ,
+режим хеджа позиций или битое поле — ошибка, а не «пусто»), `open_orders`, `symbol_leverage`, `margin_mode`;
+по всему аккаунту — `account_positions` (кросс-маржа).
 
 Источники: документация Bybit v5 (bybit-exchange.github.io/docs/v5: guide, order/create-order, order/cancel-order,
 order/open-order, position, position/trading-stop, position/leverage, account/account-info, user/apikey-info, error,
@@ -28,6 +33,7 @@ from collections import namedtuple
 from decimal import Decimal, InvalidOperation
 from urllib.parse import quote, urlencode
 
+import aiohttp
 from yarl import URL
 
 import accounts
@@ -53,6 +59,9 @@ RESOLVE_TTL = 6 * 3600                                 # сек: столько 
 MIN_TURNOVER_24H = Decimal(1_000_000)                  # USDT оборота за сутки — «ликвидный» контракт
 HARD_MAX_LEVERAGE = 3                                  # потолок плана (хедж/фандинг 3×); risk.py режет ниже
 RECV_WINDOW = "5000"                                   # мс; у BingX это и максимум
+REQUEST_TIMEOUT = 10                                   # сек на весь запрос (ClientTimeout total) — у каждого запроса
+LIST_LIMIT = 50                                        # столько открытых ордеров Bybit за запрос; ровно столько — «не все»
+BYBIT_LEVERAGE_UNCHANGED = 110043                      # set-leverage: «плечо не изменилось» — для этого вызова успех
 CLIENT_ID_RE = re.compile(r"t\d{12}[0-9a-f]{8}")       # наш id, 21 символ: Bybit ≤ 36 [A-Za-z0-9_-], BingX 1–40
                                                        # (BingX переводит id в нижний регистр — у нас он уже такой)
 _DEC_RE = re.compile(r"\d{1,12}(?:\.\d{1,12})?")      # без знака, экспоненты и пробелов
@@ -208,7 +217,7 @@ ALLOWED = {
             "category": _LINEAR, "symbol": _BY_SYM, "tpslMode": _enum("Full"), "positionIdx": _oneway_idx,
             "stopLoss": _positive_dec, "slTriggerBy": _enum("MarkPrice", "LastPrice"),
         }, ("category", "symbol", "tpslMode", "positionIdx", "stopLoss"), _none),
-        # TODO(api): 110043 «плечо не изменилось» — для этого вызова по сути успех (сейчас — rejected)
+        # 110043 «плечо не изменилось» — для этого вызова успех (leverage_outcome)
         ("POST", "/v5/position/set-leverage"): Spec("write", {
             "category": _LINEAR, "symbol": _BY_SYM, "buyLeverage": _leverage, "sellLeverage": _leverage,
         }, ("category", "symbol", "buyLeverage", "sellLeverage"), _same_leverage),
@@ -351,10 +360,11 @@ def prepare(venue, method, path, params, creds, timestamp=None):
 
 
 async def _send(s, req):
-    """Отправить подготовленный запрос: (HTTP-статус, JSON или None). Без редиректов, URL — как есть. Числа с точкой —
-    Decimal (id ордеров BingX больше 2^53 — целые Python и так точные)."""
+    """Отправить подготовленный запрос: (HTTP-статус, JSON или None). Без редиректов, URL — как есть, свой таймаут
+    REQUEST_TIMEOUT на весь запрос (зависший ответ не держит ни отправку, ни сверку). Числа с точкой — Decimal (id
+    ордеров BingX больше 2^53 — целые Python и так точные)."""
     url = URL(req.url, encoded=True)
-    kw = {"headers": req.headers, "allow_redirects": False}
+    kw = {"headers": req.headers, "allow_redirects": False, "timeout": aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)}
     if req.method == "GET":
         ctx = s.get(url, **kw)
     elif req.method == "POST":
@@ -428,6 +438,14 @@ def outcome(venue, status, j, creds=()):
                     else (BINGX_DUPLICATE, BINGX_NOT_FOUND, BINGX_REJECT))
     kind = "duplicate" if code in dup else "notfound" if code in nf else "rejected" if code in rej else "ambiguous"
     return kind, None, code, text
+
+
+def leverage_outcome(venue, status, j, creds=()):
+    """outcome() для смены плеча: у Bybit код 110043 («плечо не изменилось», HTTP 200) — это успех: плечо уже такое."""
+    kind, data, code, text = outcome(venue, status, j, creds)
+    if venue == BYBIT and status == 200 and code == BYBIT_LEVERAGE_UNCHANGED:
+        return "ok", data, code, text
+    return kind, data, code, text
 
 
 # --- символы ---
@@ -675,9 +693,11 @@ def _bybit_fee(item, symbol):
 
 
 def order_view(venue, item):
-    """Ордер из ответа биржи (создание или запрос) в виде ядра: {client_id, order_id, symbol, side, type, qty, price,
-    filled, avg_price, fee, reduce_only, status, state} или None, если это не ордер. state: open / filled / closed /
-    rejected (закрыт без исполнения по отказу биржи). Незнакомый статус — state None (журнал оставит unknown)."""
+    """Ордер из ответа биржи (создание или запрос) в виде ядра: {client_id, order_id, symbol, raw_symbol, side, type,
+    qty, price, filled, avg_price, fee, reduce_only, status, state} или None, если это не ордер. symbol — канонический
+    (None — не наша монета, в т. ч. «GRAM-USDT» BingX), raw_symbol — как прислала биржа (журнал сверяет его с символом
+    из параметров создания: чужой или пустой — несовпадение). state: open / filled / closed / rejected (закрыт без
+    исполнения по отказу биржи). Незнакомый статус — state None (журнал оставит unknown)."""
     if venue == BINGX and isinstance(item, dict) and isinstance(item.get("order"), dict):
         item = item["order"]   # BingX заворачивает ордер в data.order
     if not isinstance(item, dict):
@@ -700,7 +720,8 @@ def order_view(venue, item):
     if isinstance(reduce_only, str) and reduce_only.lower() in ("true", "false"):
         reduce_only = reduce_only.lower() == "true"
     return {"client_id": str(cid or "").lower() if venue == BINGX else str(cid or ""), "order_id": str(oid or ""),
-            "symbol": canonical_symbol(venue, item.get("symbol")), "side": str(item.get("side") or "").lower(),
+            "symbol": canonical_symbol(venue, item.get("symbol")), "raw_symbol": str(item.get("symbol") or ""),
+            "side": str(item.get("side") or "").lower(),
             "type": typ, "qty": dec(_first(item, "qty", "origQty", "quantity")), "price": dec(item.get("price")),
             "filled": filled, "avg_price": dec(item.get("avgPrice")), "fee": fee,
             "reduce_only": reduce_only if isinstance(reduce_only, bool) else None, "status": status, "state": state}
@@ -768,7 +789,8 @@ def position_view(venue, item):
 
 
 async def positions(s, venue, creds):
-    """Открытые позиции по нашим монетам: (список видов, None) или (None, текст ошибки)."""
+    """Открытые позиции по нашим монетам: (список видов, None) или (None, текст ошибки). Это ВСЕ позиции аккаунта по
+    этим монетам — и ручные владельца: что из них бота, решает journal.own_positions (ownership.annotate)."""
     if venue == BYBIT:
         path, params = "/v5/position/list", {"category": "linear", "settleCoin": "USDT", "limit": "200"}
     else:
@@ -784,6 +806,287 @@ async def positions(s, venue, creds):
     if not isinstance(rows, list):
         return None, "неожиданная форма ответа"
     return [v for v in (position_view(venue, it) for it in rows) if v], None
+
+
+# --- чтение по одному символу: чьё это (trading/ownership.py) ---
+
+async def _read(s, venue, path, params, creds):
+    """GET с ключом → (данные, "") или (None, причина). Любая ошибка — причина, не исключение."""
+    try:
+        status, j = await call(s, venue, "GET", path, params, creds)
+    except Exception as e:   # сеть, таймаут, ошибка правил
+        return None, accounts.api_error_text(e)
+    kind, data, _, msg = outcome(venue, status, j, creds)
+    if kind != "ok":
+        return None, msg or f"ответ {kind}"
+    return data, ""
+
+
+def _same_symbol(raw, venue_sym):
+    return isinstance(raw, str) and raw.upper() == venue_sym.upper()
+
+
+def _signed_size(venue, item):
+    """Знаковый размер строки позиции (long > 0, short < 0) или ValueError — битая строка."""
+    if venue == BYBIT:
+        size, side = dec(item.get("size")), str(item.get("side") or "")
+        if size is None or size < 0:
+            raise ValueError(f"битое количество позиции {item.get('size')!r}")
+        if size == 0:
+            return Decimal(0)
+        if side not in ("Buy", "Sell"):
+            raise ValueError(f"сторона позиции {side!r}")
+        return size if side == "Buy" else -size
+    amt = dec(item.get("positionAmt"))
+    if amt is None:
+        raise ValueError(f"битое количество позиции {item.get('positionAmt')!r}")
+    ps = str(item.get("positionSide") or "").upper()
+    if ps == "LONG":
+        return abs(amt)
+    if ps == "SHORT":
+        return -abs(amt)
+    if ps in ("BOTH", ""):
+        return amt   # TODO(api): в одностороннем режиме BingX знак positionAmt — направление (как в position_view)
+    raise ValueError(f"positionSide {ps!r}")
+
+
+async def symbol_positions(s, venue, venue_sym, creds):
+    """Позиция одного перп-символа, строго: ({"net": знаковый размер, "rows": [...], "leverage": плечо или None}, "")
+    или (None, причина). Строка чужого символа, битое количество, незнакомая сторона, больше одной ненулевой строки
+    (режим хеджа позиций) или ненулевая строка Bybit с positionIdx ≠ 0 — ошибка, а не «пусто»: бот не угадывает.
+    Плечо — Bybit: из строки positionIdx 0 (биржа отдаёт её и при нулевой позиции); BingX — symbol_leverage."""
+    if venue == BYBIT:
+        path, params = "/v5/position/list", {"category": "linear", "symbol": venue_sym}
+    else:
+        path, params = "/openApi/swap/v2/user/positions", {"symbol": venue_sym}
+    data, why = await _read(s, venue, path, params, creds)
+    if why:
+        return None, why
+    rows = _bybit_list(data) if venue == BYBIT else data
+    if not isinstance(rows, list):
+        return None, "неожиданная форма ответа (позиции)"
+    out, lev, net = [], None, Decimal(0)
+    for it in rows:
+        if not isinstance(it, dict) or not _same_symbol(it.get("symbol"), venue_sym):
+            got = it.get("symbol") if isinstance(it, dict) else it
+            return None, f"в ответе позиция не по символу {venue_sym}: {str(got)[:40]!r}"
+        try:
+            signed = _signed_size(venue, it)
+        except ValueError as e:
+            return None, str(e)
+        idx = it.get("positionIdx", 0) if venue == BYBIT else 0
+        if signed and idx != 0:
+            return None, "позиция в режиме хеджа (positionIdx ≠ 0) — ядро работает только в одностороннем режиме"
+        if venue == BYBIT and idx == 0:
+            lev = dec(it.get("leverage"))
+        if signed:
+            out.append({"signed": signed, "entry": dec(it.get("avgPrice")), "mark": dec(it.get("markPrice")),
+                        "liq": dec(it.get("liqPrice" if venue == BYBIT else "liquidationPrice")) or None,
+                        "leverage": dec(it.get("leverage"))})
+            net += signed
+    if len(out) > 1:
+        return None, "по символу больше одной позиции (режим хеджа позиций?) — бот не угадывает"
+    return {"net": net, "rows": out, "leverage": lev if lev and lev > 0 else None}, ""
+
+
+async def symbol_leverage(s, venue_sym, creds):
+    """Плечо символа BingX (GET /openApi/swap/v2/trade/leverage): большее из long/short — (Decimal, "") или
+    (None, причина). У Bybit плечо — в symbol_positions."""
+    data, why = await _read(s, BINGX, "/openApi/swap/v2/trade/leverage", {"symbol": venue_sym}, creds)
+    if why:
+        return None, why
+    vals = [dec(data.get(k)) for k in ("longLeverage", "shortLeverage")] if isinstance(data, dict) else [None]
+    if None in vals or any(v <= 0 for v in vals):
+        return None, "плечо символа не прочитано"
+    return max(vals), ""
+
+
+_BYBIT_STOP_TYPES = frozenset({"StopLoss", "TakeProfit", "TrailingStop", "PartialStopLoss", "PartialTakeProfit",
+                               "Stop", "tpslOrder"})
+_BINGX_STOP_TYPES = frozenset({"STOP_MARKET", "STOP", "TAKE_PROFIT_MARKET", "TAKE_PROFIT", "TRAILING_STOP_MARKET",
+                               "TRIGGER_MARKET", "TRIGGER_LIMIT", "TRAILING_TP_SL"})
+
+
+def open_order_view(venue, item):
+    """Открытый ордер из списка биржи → {client_id, order_id, raw_symbol, side, type, qty, price, trigger, stop_type,
+    reduce_only} или None (не словарь). stop_type — вид условного ордера (Bybit stopOrderType, BingX type STOP_MARKET…),
+    "" — обычный. Стоп позиции (tpslMode=Full у Bybit, stopLoss у BingX) биржа показывает условным ордером без нашего
+    клиентского id — его ownership сверяет с ценой стопа из журнала."""
+    if not isinstance(item, dict):
+        return None
+    if venue == BYBIT:
+        stop_type, cid = str(item.get("stopOrderType") or ""), str(item.get("orderLinkId") or "")
+        trigger, typ = dec(item.get("triggerPrice")), str(item.get("orderType") or "").lower()
+        reduce = item.get("reduceOnly") is True or item.get("closeOnTrigger") is True
+    else:
+        t = str(item.get("type") or "").upper()
+        stop_type, typ = (t if t in _BINGX_STOP_TYPES else ""), t.lower()
+        cid = str(item.get("clientOrderId") or item.get("clientOrderID") or "").lower()
+        trigger = dec(item.get("stopPrice"))
+        reduce = any(item.get(k) is True or str(item.get(k)).lower() == "true" for k in ("reduceOnly", "closePosition"))
+    return {"client_id": cid, "order_id": str(_first(item, "orderId", "orderID") or ""),
+            "raw_symbol": str(item.get("symbol") or ""), "side": str(item.get("side") or "").lower(), "type": typ,
+            "qty": dec(_first(item, "qty", "origQty", "quantity")), "price": dec(item.get("price")),
+            "trigger": trigger or None, "stop_type": stop_type, "reduce_only": reduce}
+
+
+async def open_orders(s, venue, category, venue_sym, creds):
+    """Все открытые ордера символа — наши, владельца, условные: (список open_order_view, "") или (None, причина).
+    Строго: не та форма ответа, ордер чужого символа, у Bybit LIST_LIMIT строк и больше (могли прочитать не все) —
+    ошибка."""
+    if venue == BYBIT:
+        path, params = "/v5/order/realtime", {"category": category, "symbol": venue_sym, "limit": str(LIST_LIMIT)}
+    else:
+        path, params = "/openApi/swap/v2/trade/openOrders", {"symbol": venue_sym}
+    data, why = await _read(s, venue, path, params, creds)
+    if why:
+        return None, why
+    rows = _bybit_list(data) if venue == BYBIT else data.get("orders") if isinstance(data, dict) else None
+    if not isinstance(rows, list):   # TODO(api): BingX без ордеров — "orders": [] (null считаем ошибкой)
+        return None, "неожиданная форма ответа (ордера)"
+    if venue == BYBIT and len(rows) >= LIST_LIMIT:
+        return None, f"открытых ордеров {LIST_LIMIT} и больше — прочитаны не все"
+    out = []
+    for it in rows:
+        view = open_order_view(venue, it)
+        if view is None or not _same_symbol(view["raw_symbol"], venue_sym):
+            return None, f"в ответе ордер не по символу {venue_sym}"
+        out.append(view)
+    return out, ""
+
+
+async def account_positions(s, venue, creds):
+    """Все ненулевые USDT-перп позиции аккаунта, любые монеты (для кросс-маржи — у неё общий залог):
+    ([{raw_symbol, symbol (канонический или None), signed}], "") или (None, причина). Битая строка — ошибка."""
+    if venue == BYBIT:
+        path, params = "/v5/position/list", {"category": "linear", "settleCoin": "USDT", "limit": "200"}
+    else:
+        path, params = "/openApi/swap/v2/user/positions", {}
+    data, why = await _read(s, venue, path, params, creds)
+    if why:
+        return None, why
+    rows = _bybit_list(data) if venue == BYBIT else data
+    if not isinstance(rows, list):
+        return None, "неожиданная форма ответа (позиции аккаунта)"
+    if venue == BYBIT and len(rows) >= 200:
+        return None, "позиций 200 и больше — прочитаны не все"
+    out = []
+    for it in rows:
+        if not isinstance(it, dict) or not isinstance(it.get("symbol"), str):
+            return None, "битая строка позиции"
+        try:
+            signed = _signed_size(venue, it)
+        except ValueError as e:
+            return None, str(e)
+        if signed:
+            out.append({"raw_symbol": it["symbol"], "symbol": canonical_symbol(venue, it["symbol"]), "signed": signed})
+    return out, ""
+
+
+# --- публичные справочники: шаги инструмента и цена ---
+
+Instrument = namedtuple("Instrument", "qty_step min_qty max_qty tick min_notional")
+
+
+def _positive(*vals):
+    return all(v is not None and v > 0 for v in vals)
+
+
+def instrument_view(venue, category, item):
+    """Строка справочника → Instrument (шаг количества, мин./макс. количество, шаг цены, мин. номинал USDT) или None —
+    чего-то нет или не положительное (тогда ордер не собирается)."""
+    if not isinstance(item, dict):
+        return None
+    if venue == BYBIT:
+        lot, pf = item.get("lotSizeFilter"), item.get("priceFilter")
+        if not isinstance(lot, dict) or not isinstance(pf, dict):
+            return None
+        step = dec(lot.get("basePrecision" if category == "spot" else "qtyStep"))
+        min_qty, max_qty = dec(lot.get("minOrderQty")), dec(lot.get("maxOrderQty")) or None
+        tick = dec(pf.get("tickSize"))
+        min_notional = dec(lot.get("minOrderAmt" if category == "spot" else "minNotionalValue"))
+        if min_notional is None:
+            min_notional = Decimal(0) if category != "spot" else None   # старые контракты без minNotionalValue
+    else:
+        qp, pp = item.get("quantityPrecision"), item.get("pricePrecision")
+        if type(qp) is not int or type(pp) is not int or not (0 <= qp <= 12 and 0 <= pp <= 12):
+            return None
+        step, tick = Decimal(1).scaleb(-qp), Decimal(1).scaleb(-pp)
+        min_qty, max_qty, min_notional = dec(item.get("tradeMinQuantity")), None, dec(item.get("tradeMinUSDT"))
+    if not _positive(step, min_qty, tick) or min_notional is None or min_notional < 0 \
+            or (max_qty is not None and max_qty < min_qty):
+        return None
+    return Instrument(step, min_qty, max_qty, tick, min_notional)
+
+
+async def instrument(s, venue, category, venue_sym):
+    """Шаги инструмента из публичного справочника: (Instrument, "") или (None, причина)."""
+    try:
+        if venue == BYBIT:
+            status, j = await public_get(s, venue, "/v5/market/instruments-info",
+                                         {"category": category, "symbol": venue_sym})
+        else:
+            status, j = await public_get(s, venue, "/openApi/swap/v2/quote/contracts", {"symbol": venue_sym})
+    except Exception as e:
+        return None, accounts.api_error_text(e)
+    kind, data, _, msg = outcome(venue, status, j)
+    if kind != "ok":
+        return None, msg or "справочник не прочитан"
+    rows = _bybit_list(data) if venue == BYBIT else data if isinstance(data, list) else [data]
+    row = next((r for r in rows or () if isinstance(r, dict) and r.get("symbol") == venue_sym), None)
+    inst = instrument_view(venue, category, row)
+    return (inst, "") if inst else (None, f"{venue_sym}: нет шагов инструмента в справочнике")
+
+
+async def mark_price(s, venue, category, venue_sym):
+    """Цена для оценки номинала: Bybit linear — markPrice, спот — lastPrice; BingX — lastPrice. (Decimal, "") или
+    (None, причина)."""
+    try:
+        if venue == BYBIT:
+            status, j = await public_get(s, venue, "/v5/market/tickers", {"category": category, "symbol": venue_sym})
+        else:
+            status, j = await public_get(s, venue, "/openApi/swap/v2/quote/ticker", {"symbol": venue_sym})
+    except Exception as e:
+        return None, accounts.api_error_text(e)
+    kind, data, _, msg = outcome(venue, status, j)
+    if kind != "ok":
+        return None, msg or "тикер не прочитан"
+    if venue == BYBIT:
+        row = next((r for r in _bybit_list(data) or () if isinstance(r, dict) and r.get("symbol") == venue_sym), None)
+        px = dec((row or {}).get("markPrice" if category == "linear" else "lastPrice"))
+    else:
+        row = data[0] if isinstance(data, list) and data else data
+        px = dec(row.get("lastPrice")) if isinstance(row, dict) and row.get("symbol") == venue_sym else None
+    return (px, "") if px and px > 0 else (None, f"{venue_sym}: нет цены в тикере")
+
+
+# --- вызовы настроек символа (их отправляет journal после проверки «чьё это») ---
+
+def leverage_call(venue, venue_sym, leverage):
+    """(метод, путь, параметры) смены плеча: целое 1..HARD_MAX_LEVERAGE, односторонний режим."""
+    lev = str(leverage)
+    if venue == BYBIT:
+        c = ("POST", "/v5/position/set-leverage", {"category": "linear", "symbol": venue_sym, "buyLeverage": lev,
+                                                   "sellLeverage": lev})
+    else:
+        c = ("POST", "/openApi/swap/v2/trade/leverage", {"symbol": venue_sym, "side": "BOTH", "leverage": lev})
+    validate(venue, *c)
+    return c
+
+
+def margin_isolated_call(venue_sym):
+    """BingX: изолированная маржа символа (у Bybit UTA режим маржи — на весь аккаунт, ядро его не меняет)."""
+    c = ("POST", "/openApi/swap/v2/trade/marginType", {"symbol": venue_sym, "marginType": "ISOLATED"})
+    validate(BINGX, *c)
+    return c
+
+
+def stop_call(venue_sym, stop):
+    """Bybit: стоп всей позиции символа (tpslMode=Full, по mark) — трогать можно, только если вся позиция — бота."""
+    c = ("POST", "/v5/position/trading-stop", {"category": "linear", "symbol": venue_sym, "tpslMode": "Full",
+                                               "positionIdx": 0, "stopLoss": fmt(stop), "slTriggerBy": "MarkPrice"})
+    validate(BYBIT, *c)
+    return c
 
 
 MARGIN_MODES = {"ISOLATED_MARGIN": "isolated", "REGULAR_MARGIN": "cross", "PORTFOLIO_MARGIN": "portfolio",

@@ -2,6 +2,7 @@
 без редиректов, разбор ответов, символы (TON → GRAM, ловушка BingX GRAM-USDT), режим маржи. Сеть — заглушка;
 ключи — фиктивные."""
 import ast
+import asyncio
 import hashlib
 import hmac
 import inspect
@@ -16,8 +17,8 @@ import pytest
 
 import accounts
 from test_payout_pins import _senders
-from trading import gates, journal, keys, risk, switch, venues
-from trading_stubs import CREDS, KEY, SECRET, Resp, Session, bingx_err, bingx_ok, bybit_err, bybit_ok, run
+from trading import gates, journal, keys, ownership, risk, switch, venues
+from trading_stubs import CREDS, KEY, SECRET, Book, Resp, Session, bingx_err, bingx_ok, bybit_err, bybit_ok, loop, run
 
 CID = "t260927013512a1b2c3d4"
 TS = "1700000000000"
@@ -564,7 +565,7 @@ def test_margin_mode_read_from_exchange(venue, answer, mode):
 
 # --- кто вообще может слать запросы ---
 
-TRADING_MODULES = (venues, journal, risk, switch, gates, keys)
+TRADING_MODULES = (venues, journal, risk, switch, gates, keys, ownership)
 
 
 def test_only_venues_send_requests():
@@ -601,3 +602,200 @@ def test_resolve_needs_exactly_one_good_candidate_and_no_errors(monkeypatch):
                                                                          "turnover24h": "9e9"}]})}
     mapping, why = run(venues.resolve_symbols(Session(both), "bybit", "linear"))
     assert mapping == {"TONUSDT": None} and "несколько" in why["TONUSDT"]
+
+
+# --- таймаут у каждого запроса, общий цикл тестов ---
+
+def test_every_request_has_its_own_client_timeout():
+    s = Session({("GET", "/v5/order/realtime"): bybit_ok({"list": []}),
+                 ("GET", "/openApi/swap/v2/quote/ticker"): bingx_ok({"symbol": "ETH-USDT", "lastPrice": "3000"})})
+    run(venues.call(s, "bybit", "GET", "/v5/order/realtime", {"category": "linear", "symbol": "BTCUSDT"}, CREDS))
+    run(venues.public_get(s, "bingx", "/openApi/swap/v2/quote/ticker", {"symbol": "ETH-USDT"}))
+    assert [c["timeout"].total for c in s.calls] == [venues.REQUEST_TIMEOUT] * 2 and venues.REQUEST_TIMEOUT == 10
+
+
+def test_tests_share_one_event_loop():
+    """Заглушки гоняют корутины на одном цикле (не asyncio.run на каждый тест — WinError 10055 на ПК владельца)."""
+    async def which():
+        return asyncio.get_running_loop()
+    first = run(which())
+    assert run(which()) is first is loop() and not first.is_closed()
+
+
+# --- разбор ответов: мутации кода, конверта, таблиц статусов ---
+
+@pytest.mark.parametrize("venue,j,kind,data", [
+    ("bybit", {"retCode": 0, "result": {"a": 1}, "data": {"b": 2}}, "ok", {"a": 1}),        # конверт Bybit — result
+    ("bingx", {"code": 0, "result": {"a": 1}, "data": {"b": 2}}, "ok", {"b": 2}),           # конверт BingX — data
+    ("bybit", {"code": 0, "result": {"a": 1}}, "ambiguous", None),                           # код BingX у Bybit
+    ("bingx", {"retCode": 0, "data": {"b": 2}}, "ambiguous", None),                          # код Bybit у BingX
+    ("bybit", {"retCode": "0", "result": {}}, "ok", {}), ("bybit", {"retCode": "0.0"}, "ambiguous", None),
+    ("bybit", {"retCode": None, "result": {}}, "ambiguous", None),
+    ("bingx", {"code": 1, "data": {}}, "ambiguous", None), ("bybit", {"retCode": -1}, "ambiguous", None),
+])
+def test_outcome_code_and_envelope(venue, j, kind, data):
+    got = venues.outcome(venue, 200, j)
+    assert got[0] == kind and got[1] == data
+
+
+def test_outcome_code_sets_are_disjoint_and_messages_by_venue():
+    for dup, nf, rej in ((venues.BYBIT_DUPLICATE, venues.BYBIT_NOT_FOUND, venues.BYBIT_REJECT),
+                         (venues.BINGX_DUPLICATE, venues.BINGX_NOT_FOUND, venues.BINGX_REJECT)):
+        assert not (dup & nf) and not (dup & rej) and not (nf & rej) and 0 not in dup | nf | rej
+    assert venues.outcome("bybit", 200, {"retCode": 10001, "retMsg": "a", "msg": "b"})[3] == "код 10001: a"
+    assert venues.outcome("bingx", 200, {"code": 100001, "retMsg": "a", "msg": "b"})[3] == "код 100001: b"
+    assert venues.outcome("bybit", 200, {"retCode": 10001})[3] == "код 10001"
+
+
+def test_status_tables_exact():
+    assert venues._BYBIT_STATES == {"New": "open", "PartiallyFilled": "open", "Untriggered": "open", "Active": "open",
+                                    "Filled": "filled", "Cancelled": "closed", "PartiallyFilledCanceled": "closed",
+                                    "Deactivated": "closed", "Rejected": "closed"}
+    assert venues._BINGX_STATES == {"NEW": "open", "PARTIALLY_FILLED": "open", "PARTIALLYFILLED": "open",
+                                    "PENDING": "open", "FILLED": "filled", "CANCELED": "closed",
+                                    "CANCELLED": "closed", "EXPIRED": "closed", "FAILED": "closed"}
+    for status, state in venues._BYBIT_STATES.items():
+        want = "rejected" if status == "Rejected" else state
+        assert venues.order_view("bybit", {"orderStatus": status, "cumExecQty": "0"})["state"] == want
+    assert venues.order_view("bybit", {"orderStatus": "Rejected", "cumExecQty": "0.5"})["state"] == "closed"
+    assert venues.order_view("bingx", {"status": "failed", "executedQty": "0"})["state"] == "rejected"   # регистр
+    assert venues.order_view("bybit", {"orderStatus": "filled"})["state"] is None           # у Bybit регистр важен
+    assert venues.order_view("bingx", {"status": "CANCELED", "executedQty": "0.1"})["state"] == "closed"
+
+
+def test_order_view_envelopes_and_fields():
+    flat = {"symbol": "ETH-USDT", "orderId": 7, "side": "SELL", "type": "MARKET", "origQty": "0.01", "status": "NEW",
+            "clientOrderId": CID}
+    assert venues.order_view("bingx", {"order": flat}) == venues.order_view("bingx", flat)
+    by = venues.order_view("bybit", {"order": {"orderLinkId": CID}})                       # Bybit не разворачивает
+    assert by["client_id"] == "" and by["state"] is None
+    v = venues.order_view("bingx", flat)
+    assert (v["raw_symbol"], v["symbol"], v["qty"], v["order_id"]) == ("ETH-USDT", "ETHUSDT", Decimal("0.01"), "7")
+    assert venues.order_view("bingx", dict(flat, symbol="GRAM-USDT"))["symbol"] is None     # другой токен
+    assert venues.order_view("bybit", {"orderLinkId": CID, "qty": "1", "origQty": "2"})["qty"] == Decimal("1")
+    assert venues.order_view("bingx", {"clientOrderID": CID.upper(), "clientOrderId": ""})["client_id"] == CID
+    assert venues.order_view("bybit", {"reduceOnly": "true"})["reduce_only"] is True
+    assert venues.order_view("bybit", {"reduceOnly": "yes"})["reduce_only"] is None
+    assert venues.order_view("bybit", "x") is None and venues.order_view("bingx", None) is None
+    junk = venues.order_view("bingx", {"order": "x"})                    # не ордер: ни id, ни статуса — несовпадение
+    assert junk["client_id"] == "" and junk["state"] is None and junk["raw_symbol"] == ""
+
+
+# --- чтение по символу: строго ---
+
+def test_open_orders_listing_strict():
+    book = Book()
+    book.foreign.append({"orderId": "9", "orderLinkId": "", "symbol": "BTCUSDT", "side": "Buy", "orderType": "Market",
+                         "qty": "0", "stopOrderType": "StopLoss", "triggerPrice": "60000", "closeOnTrigger": True})
+    s = Session(book.routes("bybit"))
+    rows, why = run(venues.open_orders(s, "bybit", "linear", "BTCUSDT", CREDS))
+    assert why == "" and rows == [{"client_id": "", "order_id": "9", "raw_symbol": "BTCUSDT", "side": "buy",
+                                   "type": "market", "qty": Decimal("0"), "price": None,
+                                   "trigger": Decimal("60000"), "stop_type": "StopLoss", "reduce_only": True}]
+    assert s.calls[0]["query"] == {"category": "linear", "symbol": "BTCUSDT", "limit": "50"}
+    for answer in (bybit_ok({"list": [{"symbol": "ETHUSDT"}]}), bybit_ok({"list": [{"symbol": "BTCUSDT"}] * 50}),
+                   bybit_ok({"nolist": []}), bybit_ok({"list": ["x"]}), Resp(500, b""), Resp(exc=TimeoutError())):
+        s = Session({("GET", "/v5/order/realtime"): answer})
+        assert run(venues.open_orders(s, "bybit", "linear", "BTCUSDT", CREDS))[0] is None
+    bx = Session({("GET", "/openApi/swap/v2/trade/openOrders"): bingx_ok({"orders": [
+        {"symbol": "ETH-USDT", "orderId": 1, "type": "STOP_MARKET", "side": "BUY", "stopPrice": "3500",
+         "clientOrderId": "", "reduceOnly": "true"}]})})
+    rows, _ = run(venues.open_orders(bx, "bingx", "swap", "ETH-USDT", CREDS))
+    assert rows[0]["stop_type"] == "STOP_MARKET" and rows[0]["trigger"] == Decimal("3500") and rows[0]["reduce_only"]
+    for data in ({"orders": None}, [], {"orders": [{"symbol": "GRAM-USDT"}]}):
+        bx = Session({("GET", "/openApi/swap/v2/trade/openOrders"): bingx_ok(data)})
+        assert run(venues.open_orders(bx, "bingx", "swap", "ETH-USDT", CREDS))[0] is None
+
+
+@pytest.mark.parametrize("rows,net,lev,ok", [
+    ([{"symbol": "BTCUSDT", "positionIdx": 0, "side": "", "size": "0", "leverage": "2"}], 0, 2, True),
+    ([{"symbol": "BTCUSDT", "positionIdx": 0, "side": "None", "size": "0", "leverage": "3"}], 0, 3, True),
+    ([{"symbol": "BTCUSDT", "positionIdx": 0, "side": "Sell", "size": "0.01", "leverage": "2"}], "-0.01", 2, True),
+    ([{"symbol": "BTCUSDT", "positionIdx": 0, "side": "Buy", "size": "0.01", "leverage": ""}], "0.01", None, True),
+    ([{"symbol": "BTCUSDT", "positionIdx": 1, "side": "Buy", "size": "0", "leverage": "2"},
+      {"symbol": "BTCUSDT", "positionIdx": 2, "side": "Sell", "size": "0", "leverage": "2"}], 0, None, True),
+    ([{"symbol": "BTCUSDT", "positionIdx": 1, "side": "Buy", "size": "0.1", "leverage": "2"}], None, None, False),
+    ([{"symbol": "BTCUSDT", "positionIdx": 0, "side": "Buy", "size": "-1"}], None, None, False),
+    ([{"symbol": "BTCUSDT", "positionIdx": 0, "side": "Up", "size": "1"}], None, None, False),
+    ([{"symbol": "BTCUSDT", "positionIdx": 0, "side": "Buy", "size": ""}], None, None, False),
+    ([{"symbol": "ETHUSDT", "positionIdx": 0, "side": "", "size": "0"}], None, None, False),
+    ([{"symbol": "BTCUSDT", "positionIdx": 0, "side": "Buy", "size": "1"},
+      {"symbol": "BTCUSDT", "positionIdx": 0, "side": "Sell", "size": "1"}], None, None, False),
+    ("x", None, None, False),
+])
+def test_symbol_positions_bybit_strict(rows, net, lev, ok):
+    s = Session({("GET", "/v5/position/list"): bybit_ok({"list": rows} if rows != "x" else "x")})
+    got, why = run(venues.symbol_positions(s, "bybit", "BTCUSDT", CREDS))
+    assert (got is not None) is ok, why
+    if ok:
+        assert got["net"] == Decimal(net) and got["leverage"] == (None if lev is None else Decimal(lev))
+    assert s.calls[0]["query"] == {"category": "linear", "symbol": "BTCUSDT"}
+
+
+def test_symbol_positions_bingx_sides_and_leverage():
+    def pos(amt, side="BOTH"):
+        s = Session({("GET", "/openApi/swap/v2/user/positions"): bingx_ok([{"symbol": "ETH-USDT", "positionAmt": amt,
+                                                                            "positionSide": side}])})
+        return run(venues.symbol_positions(s, "bingx", "ETH-USDT", CREDS))
+    assert pos("-0.5")[0]["net"] == Decimal("-0.5") and pos("0.5", "SHORT")[0]["net"] == Decimal("-0.5")
+    assert pos("0.5", "LONG")[0]["net"] == Decimal("0.5") and pos("0")[0]["net"] == 0
+    assert pos("0.5", "WEIRD")[0] is None and pos("x")[0] is None
+    for data, want in (({"longLeverage": 2, "shortLeverage": 3}, Decimal(3)), ({"longLeverage": 2}, None),
+                       ({"longLeverage": 0, "shortLeverage": 2}, None), ("x", None)):
+        s = Session({("GET", "/openApi/swap/v2/trade/leverage"): bingx_ok(data)})
+        assert run(venues.symbol_leverage(s, "ETH-USDT", CREDS))[0] == want
+
+
+def test_account_positions_include_other_coins():
+    book = Book()
+    book.position["BTCUSDT"] = Decimal("-0.01")
+    book.other.append(("DOGEUSDT", Decimal("100")))
+    s = Session(book.routes("bybit"))
+    rows, why = run(venues.account_positions(s, "bybit", CREDS))
+    assert why == "" and rows == [{"raw_symbol": "BTCUSDT", "symbol": "BTCUSDT", "signed": Decimal("-0.01")},
+                                  {"raw_symbol": "DOGEUSDT", "symbol": None, "signed": Decimal("100")}]
+    assert s.calls[0]["query"] == {"category": "linear", "settleCoin": "USDT", "limit": "200"}
+    bad = Session({("GET", "/v5/position/list"): bybit_ok({"list": [{"symbol": "X", "side": "Buy", "size": "?"}]})})
+    assert run(venues.account_positions(bad, "bybit", CREDS))[0] is None
+
+
+def test_instrument_and_mark_price():
+    book = Book()
+    s = Session(book.routes("bybit") | book.routes("bingx"))
+    inst, _ = run(venues.instrument(s, "bybit", "linear", "BTCUSDT"))
+    assert inst == venues.Instrument(Decimal("0.001"), Decimal("0.001"), Decimal("1000"), Decimal("0.1"), Decimal("5"))
+    spot, _ = run(venues.instrument(s, "bybit", "spot", "ETHUSDT"))
+    assert spot.qty_step == Decimal("0.0001") and spot.min_notional == Decimal("1")
+    bx, _ = run(venues.instrument(s, "bingx", "swap", "ETH-USDT"))
+    assert bx == venues.Instrument(Decimal("0.01"), Decimal("0.01"), None, Decimal("0.01"), Decimal("2"))
+    assert run(venues.mark_price(s, "bybit", "linear", "BTCUSDT")) == (Decimal("65000"), "")
+    assert run(venues.mark_price(s, "bingx", "swap", "ETH-USDT")) == (Decimal("3000"), "")
+    assert all(c["headers"] == {} for c in s.calls)                                  # публичное — без ключа
+    lot = {"qtyStep": "0.001", "minOrderQty": "0.001", "maxOrderQty": "10", "minNotionalValue": "5"}
+    assert venues.instrument_view("bybit", "linear", {"lotSizeFilter": lot, "priceFilter": {"tickSize": "0.1"}})
+    for broken in ({"lotSizeFilter": dict(lot, qtyStep="0"), "priceFilter": {"tickSize": "0.1"}},
+                   {"lotSizeFilter": dict(lot, minOrderQty=""), "priceFilter": {"tickSize": "0.1"}},
+                   {"lotSizeFilter": lot, "priceFilter": {}}, {"lotSizeFilter": lot},
+                   {"lotSizeFilter": dict(lot, maxOrderQty="0.0001"), "priceFilter": {"tickSize": "0.1"}}):
+        assert venues.instrument_view("bybit", "linear", broken) is None
+    assert venues.instrument_view("bingx", "swap", {"quantityPrecision": "2", "pricePrecision": 2,
+                                                    "tradeMinQuantity": "1", "tradeMinUSDT": "2"}) is None
+    assert venues.instrument_view("bingx", "swap", {"quantityPrecision": True, "pricePrecision": 2,
+                                                    "tradeMinQuantity": "1", "tradeMinUSDT": "2"}) is None
+    s = Session({("GET", "/v5/market/tickers"): bybit_ok({"list": [{"symbol": "ETHUSDT", "markPrice": "1"}]})})
+    assert run(venues.mark_price(s, "bybit", "linear", "BTCUSDT"))[0] is None           # не тот символ
+
+
+def test_setting_call_builders():
+    assert venues.leverage_call("bybit", "BTCUSDT", 2) == ("POST", "/v5/position/set-leverage", {
+        "category": "linear", "symbol": "BTCUSDT", "buyLeverage": "2", "sellLeverage": "2"})
+    assert venues.leverage_call("bingx", "ETH-USDT", 3)[2] == {"symbol": "ETH-USDT", "side": "BOTH", "leverage": "3"}
+    for bad in (4, 0, "2.5", -1):
+        with pytest.raises(ValueError):
+            venues.leverage_call("bybit", "BTCUSDT", bad)
+    assert venues.margin_isolated_call("ETH-USDT")[2] == {"symbol": "ETH-USDT", "marginType": "ISOLATED"}
+    assert venues.stop_call("BTCUSDT", Decimal("70000.50"))[2]["stopLoss"] == "70000.5"
+    with pytest.raises(ValueError):
+        venues.stop_call("BTCUSDT", Decimal("0"))
+    with pytest.raises(ValueError):
+        venues.stop_call("DOGEUSDT", Decimal("1"))
