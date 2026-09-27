@@ -29,10 +29,13 @@ def cfg_of(scan):
     return p2p.Config(**{k: v for k, v in (scan.get("cfg") or {}).items() if k in names})
 
 
+DICT_PARSERS = {"merchant_min": p2p.parse_merchant_min}   # поля Config со своим разбором (без getattr по имени)
+
+
 def _dict_value(name, text):
-    """Словарь из строки: у поля свой разбор p2p.parse_<поле> (MERCHANT_MIN «Bybit:100/97,HTX:300/96») — им, иначе
+    """Словарь из строки: у поля свой разбор из DICT_PARSERS (MERCHANT_MIN «Bybit:100/97,HTX:300/96») — им, иначе
     «A:1,B:2» (p2p._fees). Часть не разобралась — ValueError с форматом, а не молча пустой или неполный словарь."""
-    parse = getattr(p2p, f"parse_{name}", None)
+    parse = DICT_PARSERS.get(name)
     parts = [p for p in text.split(",") if p.strip()]
     try:
         got = parse(text) if callable(parse) else p2p._fees(text, upper=name != "spot_fees")
