@@ -101,11 +101,11 @@ def _sendto_addr(sock, data, *rest):
     return _local_addr(rest[-1] if rest else None), (rest[-1] if rest else None)
 
 
-def _loop_host(loop, factory, host=None, port=None, **kwargs):
+def _loop_host(loop, protocol_factory, host=None, port=None, **kwargs):
     return _local_host(host), (host, port)
 
 
-def _loop_remote(loop, factory, local_addr=None, remote_addr=None, **kwargs):
+def _loop_remote(loop, protocol_factory, local_addr=None, remote_addr=None, **kwargs):
     return remote_addr is None or _local_addr(remote_addr), remote_addr
 
 
