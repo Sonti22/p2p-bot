@@ -135,29 +135,73 @@ def track_signals(rows, ts, open_ids, amount=None, min_profit=None, path=DB_PATH
     return out
 
 
-def signal_stats(path=DB_PATH, days=7, now=None, min_minutes=3):
+# причины, по которым связка без сигнала — не пропуск: тишина и пауза — выбор владельца, cooldown — сигнал по ней
+# уже был недавно (антидубль), trap — ловушки не шлём по настройке (причина бывает только при SIGNAL_TRAPS=0)
+NOT_MISSED = ("quiet", "paused", "cooldown", "trap")
+
+
+def _cooldown():
+    """COOLDOWN бота (сек антидубля, по умолчанию 600) — как Bot.cooldown."""
+    try:
+        return float(os.getenv("COOLDOWN", 600))
+    except ValueError:
+        return 600.0
+
+
+def _merged_episodes(rows, gap):
+    """Эпизоды одной связки, разделённые перерывом короче gap сек (связка на скан-другой ушла под порог и вернулась),
+    — один эпизод: первый/последний скан, сигнал — был ли хоть в одной части, причина — последней части.
+    rows — (ключ, first_seen, last_seen, signalled, reason) в порядке ключа и first_seen."""
+    out = []
+    for key, first, last, signalled, reason in rows:
+        ep = out[-1] if out else None
+        if ep and ep["key"] == key and first - ep["last"] < gap:
+            if last >= ep["last"]:
+                ep["last"], ep["reason"] = last, reason
+            ep["signalled"] = ep["signalled"] or bool(signalled)
+        else:
+            out.append({"key": key, "first": first, "last": last, "signalled": bool(signalled), "reason": reason})
+    return out
+
+
+def signal_stats(path=DB_PATH, days=7, now=None, min_minutes=3, cooldown=None):
     """Сводка эпизодов signals за `days` дней: всего, с сигналом, «долгие» (держались ≥ min_minutes от первого до
     последнего скана) и сколько из них прошло без сигнала — доля пропущенных связок (цель этапа 2 — ≤ 10%), и
-    причины пропуска. Эпизод, который ещё идёт, считается по уже увиденным сканам."""
+    причины пропуска. Эпизоды одной связки с перерывом короче cooldown (по умолчанию COOLDOWN) — один эпизод:
+    связка просела на скан и вернулась — это та же возможность. Долгие без сигнала по причинам NOT_MISSED (тишина,
+    пауза, антидубль, выключенные ловушки) — не пропуск: они в "excluded" и не входят в долю. Доля — пропущенные
+    из долгих без исключённых; таких нет — None. Эпизод, который ещё идёт, считается по уже увиденным сканам."""
     now = time.time() if now is None else now
-    out = {"episodes": 0, "signalled": 0, "long": 0, "missed": 0, "missed_share": None, "reasons": {}}
+    gap = _cooldown() if cooldown is None else cooldown
+    out = {"episodes": 0, "signalled": 0, "long": 0, "missed": 0, "missed_share": None, "reasons": {},
+           "excluded": 0, "excluded_reasons": {}}
     if not os.path.exists(path):
         return out
     con = _connect(path)
-    rows = con.execute("SELECT first_seen, last_seen, signalled, reason_not_signalled FROM signals "
-                       "WHERE last_seen >= ?", (now - days * 86400,)).fetchall()
+    rows = con.execute("SELECT buy_ex, buy_asset, sell_ex, sell_asset, first_seen, last_seen, signalled, "
+                       "reason_not_signalled FROM signals WHERE last_seen >= ? "
+                       "ORDER BY buy_ex, buy_asset, sell_ex, sell_asset, first_seen, id",
+                       (now - days * 86400,)).fetchall()
     con.close()
-    for first, last, signalled, reason in rows:
+    for ep in _merged_episodes([(r[:4], *r[4:]) for r in rows], gap):
         out["episodes"] += 1
-        out["signalled"] += 1 if signalled else 0
-        if last - first < min_minutes * 60:
+        out["signalled"] += 1 if ep["signalled"] else 0
+        if ep["last"] - ep["first"] < min_minutes * 60:
             continue
         out["long"] += 1
-        if not signalled:
+        if ep["signalled"]:
+            continue
+        reason = ep["reason"] or "?"
+        if reason in NOT_MISSED:
+            out["excluded"] += 1
+            counts = out["excluded_reasons"]
+        else:
             out["missed"] += 1
-            out["reasons"][reason or "?"] = out["reasons"].get(reason or "?", 0) + 1
-    if out["long"]:
-        out["missed_share"] = out["missed"] / out["long"]
+            counts = out["reasons"]
+        counts[reason] = counts.get(reason, 0) + 1
+    eligible = out["long"] - out["excluded"]
+    if eligible:
+        out["missed_share"] = out["missed"] / eligible
     return out
 
 

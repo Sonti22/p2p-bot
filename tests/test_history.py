@@ -172,18 +172,67 @@ def test_signal_stats_missed_share(tmp_path):
     db = str(tmp_path / "history.db")
     now = BASE
     ids = {}
-    # K1: 5 минут выше порога, сигнал был; K2: 5 минут без сигнала (кулдаун) — пропуск; k3: минута — не в счёт
-    k3 = ("KuCoin", "USDT", "MEXC", "USDT")
+    # K1: 5 минут выше порога, сигнал был; K2: 5 минут вне топ-N — пропуск; k3: минута — не в счёт;
+    # k4: 5 минут под антидублем (сигнал по ней был раньше, за окном) — не пропуск
+    k3, k4 = ("KuCoin", "USDT", "MEXC", "USDT"), ("MEXC", "USDT", "HTX", "USDT")
     ids = history.track_signals([(K1, 1.5, False, "unconfirmed"), (K2, 2.0, False, "unconfirmed"),
-                                 (k3, 1.2, False, "unconfirmed")], now - 300, ids, path=db)
-    ids = history.track_signals([(K1, 1.6, True, None), (K2, 2.0, False, "cooldown"), (k3, 1.2, False, "unconfirmed")],
-                                now - 240, ids, path=db)
-    ids = history.track_signals([(K1, 1.6, False, "cooldown"), (K2, 2.1, False, "cooldown")], now, ids, path=db)
+                                 (k3, 1.2, False, "unconfirmed"), (k4, 1.1, False, "cooldown")], now - 300, ids, path=db)
+    ids = history.track_signals([(K1, 1.6, True, None), (K2, 2.0, False, "max_signals"),
+                                 (k3, 1.2, False, "unconfirmed"), (k4, 1.1, False, "cooldown")], now - 240, ids, path=db)
+    ids = history.track_signals([(K1, 1.6, False, "cooldown"), (K2, 2.1, False, "max_signals"),
+                                 (k4, 1.1, False, "cooldown")], now, ids, path=db)
     st = history.signal_stats(path=db, now=now)
-    assert st == {"episodes": 3, "signalled": 1, "long": 2, "missed": 1, "missed_share": 0.5,
-                  "reasons": {"cooldown": 1}}
+    assert st == {"episodes": 4, "signalled": 1, "long": 3, "missed": 1, "missed_share": 0.5,
+                  "reasons": {"max_signals": 1}, "excluded": 1, "excluded_reasons": {"cooldown": 1}}
     empty = history.signal_stats(path=str(tmp_path / "none.db"), now=now)
     assert empty["episodes"] == 0 and empty["missed_share"] is None
+
+
+def _scans(db, key, ts_list, reason_at, ids=None):
+    """Связка key выше порога на сканах ts_list; reason_at(ts) — (сигнал ушёл, причина) на скане."""
+    ids = dict(ids or {})
+    for ts in ts_list:
+        sent, reason = reason_at(ts)
+        ids = history.track_signals([(key, 1.5, sent, reason)], ts, ids, path=db)
+    return ids
+
+
+def test_signal_stats_dip_during_cooldown_is_not_missed(tmp_path):
+    """Сигнал ушёл, связка на один скан ушла под порог и вернулась под антидублем — это та же возможность: не пропуск
+    (раньше — два эпизода и доля пропущенных 0.5)."""
+    db = str(tmp_path / "history.db")
+    t0 = BASE
+    _scans(db, K1, [t0 + 20 * i for i in range(16)], lambda ts: (ts == t0 + 20, None if ts == t0 + 20 else "cooldown"))
+    history.track_signals([], t0 + 320, {}, path=db)                                 # скан без неё — эпизод закрыт
+    _scans(db, K1, [t0 + 340 + 20 * i for i in range(14)], lambda ts: (False, "cooldown"))
+    assert len(_signals(db)) == 2
+    st = history.signal_stats(path=db, now=t0 + 700, cooldown=600)
+    assert (st["episodes"], st["long"], st["signalled"], st["missed"], st["missed_share"]) == (1, 1, 1, 0, 0.0)
+    # вернулась и держится вне топ-N (последняя причина — не антидубль): всё равно один эпизод с сигналом
+    db2 = str(tmp_path / "history2.db")
+    _scans(db2, K1, [t0 + 20 * i for i in range(16)], lambda ts: (ts == t0 + 20, None if ts == t0 + 20 else "cooldown"))
+    _scans(db2, K1, [t0 + 340 + 20 * i for i in range(14)], lambda ts: (False, "max_signals"))
+    assert history.signal_stats(path=db2, now=t0 + 700, cooldown=600)["missed_share"] == 0.0
+    assert history.signal_stats(path=db2, now=t0 + 700, cooldown=0)["missed_share"] == 0.5   # без склейки — пропуск
+
+
+def test_signal_stats_quiet_hours_not_missed(tmp_path):
+    """7 часов тихих часов: связка держится, сигналов нет по выбору владельца — не пропуск (раньше доля была 1.0)."""
+    db = str(tmp_path / "history.db")
+    t0 = BASE
+    _scans(db, K1, [t0 + 600 * i for i in range(43)], lambda ts: (False, "quiet"))   # 7 ч, скан раз в 10 минут
+    st = history.signal_stats(path=db, now=t0 + 7 * 3600)
+    assert (st["long"], st["missed"], st["excluded"], st["missed_share"]) == (1, 0, 1, None)
+    assert st["excluded_reasons"] == {"quiet": 1} and st["reasons"] == {}
+    _scans(db, K2, [t0 + 60 * i for i in range(6)], lambda ts: (ts == t0, None if ts == t0 else "cooldown"))
+    st = history.signal_stats(path=db, now=t0 + 7 * 3600)
+    assert (st["long"], st["missed"], st["missed_share"]) == (2, 0, 0.0)
+    # ловушки при SIGNAL_TRAPS=0 и пауза — тоже не пропуск
+    for key, why in ((("KuCoin", "USDT", "MEXC", "USDT"), "trap"), (("MEXC", "USDT", "HTX", "USDT"), "paused")):
+        _scans(db, key, [t0 + 60 * i for i in range(6)], lambda ts, why=why: (False, why))
+    st = history.signal_stats(path=db, now=t0 + 7 * 3600)
+    assert (st["missed"], st["excluded"], st["missed_share"]) == (0, 3, 0.0)
+    assert st["excluded_reasons"] == {"quiet": 1, "trap": 1, "paused": 1}
 
 
 def test_record_stores_amount_next_to_profit(tmp_path, monkeypatch):
