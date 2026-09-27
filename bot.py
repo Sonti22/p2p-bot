@@ -39,6 +39,7 @@ from p2p import ALL_EXCHANGES, AMOUNT_MAX, AMOUNT_MIN, DEFAULT_ASSETS, ENV_PATH,
     deal_for_amount, deal_fresh, fmt_ad, fmt_breakeven, fmt_deal, fmt_top, load_env, maker_neighbors, maker_place, maker_quote, \
     maker_round_fee, parse_amount, parse_min_profit, profit_breakdown, reliability, reliability_index, route_hops, scan, \
     score, setup_logging, spot_url, traps_log, venue_url
+from p2p import depth_for_deal, depth_settings
 
 logger = logging.getLogger(__name__)
 
@@ -1389,7 +1390,9 @@ class Bot:
         snap = snap if snap is not None else self.last
         guest = self.is_guest(self.chat_for(chat_id))
         deal_id = None if guest else self.remember_deal(d, cfg, snap)   # у гостя нет «✅ Сделал»/«📝 Инструкция»/«🚫»
-        amounts = deal_amounts(d, cfg, snap) if snap else None
+        # фишки сумм: площадки, которые сами отбирают выдачу под сумму запроса, опрашиваются под каждую сумму — только
+        # для связки, которая уходит карточкой (кэш, бэкофф и лимит доп. запросов на скан — в depth_for_deal)
+        amounts = deal_amounts(d, cfg, await self.chip_depth(d, cfg, snap)) if snap else None
         rel = (*reliability(d, cfg, snap), reliability_index(d, cfg, snap)) if snap else None
         caption = prefix + fmt_signal(d, cfg, snap)
         r, is_photo = await self.photo_or_text(lambda: deal_card(d, cfg, amounts, rel), caption,
@@ -1401,6 +1404,14 @@ class Bot:
             self.live_msg[key] = {"message_id": message_id, "photo": is_photo, "deal_id": deal_id,
                                   "last_edit": time.time(), "caption": caption, "stale": False}
         return r
+
+    async def chip_depth(self, d, cfg, snap):
+        """Снимок со стаканом связки под фишки сумм карточки (p2p.depth_for_deal); сбой запроса — стакан скана как есть."""
+        try:
+            return await depth_for_deal(self.s, cfg, snap, d)
+        except Exception as e:
+            logger.warning("глубина под суммы: %s: %s", type(e).__name__, e)
+            return snap
 
     async def show_steps(self, cq, deal_id):
         """Кнопка «📝 Инструкция»: отдельным сообщением пошаговый чек-лист маршрута."""
@@ -2184,6 +2195,9 @@ class Bot:
             return "\n".join(lines)
         above = sum(1 for d in snap.deals if d[0] >= self.cfg.min_profit)
         lines.append(f"Связок выше порога {self.cfg.min_profit:g}%: {above}")
+        extra = snap.extra
+        lines.append(f"Доп. запросы глубины в скане: вторые страницы {extra.get('page2', 0)}, под суммы "
+                     f"{extra.get('amounts', 0)} (лимит {depth_settings()['extra_max']})")
         if snap.errors:
             lines += ["", "<b>Ошибки площадок:</b>"]
             lines += [f"• {html.escape(k)}: {html.escape(e)}" for k, e in snap.errors.items()]

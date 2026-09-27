@@ -186,7 +186,8 @@ def collect(snap, cfg, live=None):
             "spot": {v: {a: list(p) for a, p in q.items()} for v, q in snap.spot.items()},
             "errors": dict(snap.errors), "dropped": dict(snap.dropped), "jobs": [dict(j) for j in snap.jobs],
             "over_banks": sorted(snap.over_banks), "blocked": sorted(list(x) for x in snap.blocked),
-            "deals": deals, "perps": [_perp_row(q) for _key, q in sorted(snap.perps.items())]}
+            "deals": deals, "perps": [_perp_row(q) for _key, q in sorted(snap.perps.items())],
+            "extra": dict(snap.extra)}   # доп. запросы глубины скана (вторые страницы, под фишки сумм)
     net = [[v, a, nets] for (v, a), nets in sorted(netstatus.STATUS.items(), key=lambda kv: (kv[0][0], str(kv[0][1])))]
     return {"id": int(ts * 1000), "ts": ts, "scan": scan, "groups": _groups(snap.ads), "net": net}
 

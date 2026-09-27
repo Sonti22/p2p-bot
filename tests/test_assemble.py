@@ -66,7 +66,7 @@ def test_assemble_blocked_and_over_banks():
 def test_scan_is_collect_plus_assemble(monkeypatch):
     raw = _raw(ts=2000.0)
 
-    async def fake_collect(s, cfg, force_alt=False):
+    async def fake_collect(s, cfg, force_alt=False, blocked=frozenset()):
         return dict(raw)
     monkeypatch.setattr(p2p, "collect", fake_collect)
     monkeypatch.setattr(p2p.blacklist, "blocked", lambda: frozenset())

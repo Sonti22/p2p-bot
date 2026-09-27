@@ -1,0 +1,48 @@
+{
+ "result": {
+  "items": [
+   {
+    "price": "85.00",
+    "minAmount": "1000.00",
+    "maxAmount": "90000.00",
+    "lastQuantity": "1847.0038",
+    "payments": [
+     "18",
+     "40",
+     "90",
+     "14"
+    ],
+    "nickName": "VaSa",
+    "recentOrderNum": 384,
+    "recentExecuteRate": 100,
+    "remark": "⚡️БЫСТРАЯ СДЕЛКА ПО РЕКВИЗИТАМ СЧЕТА БЕЗ БЛОКИРОВОК БАНКА И РИСКА⚡️\n\n🛡️БЕЗОПАСНО:\n    🏆4000+ положительных отзывов | 0 плохих за всё время работы!\n    🏦ИП | соо"
+   },
+   {
+    "price": "85.20",
+    "minAmount": "1000.00",
+    "maxAmount": "100000.00",
+    "lastQuantity": "1500",
+    "payments": [
+     "14"
+    ],
+    "nickName": "KursPlus",
+    "recentOrderNum": 450,
+    "recentExecuteRate": 99,
+    "remark": "Оплата по реквизитам банка, одним платежом"
+   },
+   {
+    "price": "85.35",
+    "minAmount": "5000.00",
+    "maxAmount": "60000.00",
+    "lastQuantity": "900",
+    "payments": [
+     "14"
+    ],
+    "nickName": "NovyKurs",
+    "recentOrderNum": 150,
+    "recentExecuteRate": 98,
+    "remark": ""
+   }
+  ]
+ }
+}
