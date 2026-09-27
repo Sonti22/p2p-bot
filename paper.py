@@ -206,14 +206,21 @@ def _row_to_dict(row):
     return dict(zip(_COLUMNS, row))
 
 
+def _dicts(cur):
+    """Строки SELECT * — словари по именам колонок из курсора: порядок колонок в базе зависит от порядка миграций
+    (у каждой ветки свои ALTER TABLE) и не обязан совпадать с _COLUMNS."""
+    names = [d[0] for d in cur.description]
+    return [dict(zip(names, r)) for r in cur.fetchall()]
+
+
 def get_cycle(cycle_id, path=DB_PATH):
     """Круг по id — словарь со всеми колонками, None — не найден."""
     if not os.path.exists(path):
         return None
     con = _connect(path)
-    row = con.execute("SELECT * FROM cycles WHERE id = ?", (cycle_id,)).fetchone()
+    rows = _dicts(con.execute("SELECT * FROM cycles WHERE id = ?", (cycle_id,)))
     con.close()
-    return _row_to_dict(row) if row else None
+    return rows[0] if rows else None
 
 
 def open_cycles(path=DB_PATH):
@@ -222,9 +229,9 @@ def open_cycles(path=DB_PATH):
     if not os.path.exists(path):
         return []
     con = _connect(path)
-    rows = con.execute("SELECT * FROM cycles WHERE result IS NULL ORDER BY id").fetchall()
+    rows = _dicts(con.execute("SELECT * FROM cycles WHERE result IS NULL ORDER BY id"))
     con.close()
-    return [_row_to_dict(r) for r in rows]
+    return rows
 
 
 def set_stage(cycle_id, stage, path=DB_PATH, ts=None):

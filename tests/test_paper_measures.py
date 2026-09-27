@@ -64,6 +64,28 @@ def test_new_and_migrated_db_have_same_column_order(tmp_path):
     assert g["avg_depth_margin"] is None and g["failed_by_reason"] == {}
 
 
+def test_cycles_read_by_column_name_not_position(tmp_path):
+    """База, где другая ветка добавила свою колонку раньше наших миграций: порядок колонок не совпадает с _COLUMNS —
+    get_cycle/open_cycles всё равно берут значения по именам."""
+    db = str(tmp_path / "other.db")
+    con = sqlite3.connect(db)
+    con.execute("CREATE TABLE cycles (id INTEGER PRIMARY KEY AUTOINCREMENT, ts_start REAL, amount REAL, "
+                "buy_ex TEXT, buy_asset TEXT, buy_price REAL, buy_nick TEXT, sell_ex TEXT, sell_asset TEXT, "
+                "sell_price REAL, sell_nick TEXT, route TEXT, planned_pct REAL, stage TEXT, ts_stage REAL, "
+                "realized_pct REAL DEFAULT NULL, result TEXT DEFAULT NULL, note TEXT DEFAULT '', "
+                "hedge_venue TEXT DEFAULT 'none')")
+    con.commit()
+    con.close()
+    buy, sell = _ads()
+    cid = paper.start_cycle(10000, buy, sell, "r", 2.0, path=db, ts=1000.0, index=7, depth=3.25, snapshot_id=1000123)
+    assert tuple(_cols(db)) != paper._COLUMNS
+    c = paper.get_cycle(cid, path=db)
+    assert (c["snapshot_id"], c["index_start"], c["depth_margin"], c["hedge_venue"]) == (1000123, 7, 3.25, "none")
+    assert c["buy_ex"] == "Bybit" and c["stage"] == "buy" and c["buy_orders"] == 300
+    (o,) = paper.open_cycles(path=db)
+    assert o == c
+
+
 def test_start_cycle_stores_start_measures():
     buy, sell = _ads()
     cid = paper.start_cycle(10000, buy, sell, "r", 2.0, ts=1000.0, index=7, reasons=["мерчант у порога"],
