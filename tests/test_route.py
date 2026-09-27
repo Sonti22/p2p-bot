@@ -157,6 +157,58 @@ def test_route_hops_none_when_route_impossible():
     assert p2p.route_hops(b, s, cfg(), spot) is None
 
 
+BTC_ETH_SPOT = {"Bybit": {"USDT": (1.0, 1.0), "BTC": (70000.0, 70010.0), "ETH": (2500.0, 2501.0)},
+                "MEXC": {"USDT": (1.0, 1.0), "ETH": (2499.0, 2500.0)}}
+TWO_VENUE_SPOT = {"Bybit": {"USDT": (1.0, 1.0), "BTC": (70000.0, 70010.0)},
+                  "MEXC": {"USDT": (1.0, 1.0), "ETH": (2499.0, 2500.0)}}
+
+
+@pytest.mark.parametrize("b, s, spot, venues", [
+    (make_ad("MEXC", "buy", 88.0), make_ad("Bybit", "sell", 90.0), SPOT, []),                       # одна монета
+    (make_ad("HTX", "buy", 88.0), make_ad("MEXC", "sell", 245000.0, asset="ETH"), SPOT, ["MEXC"]),  # USDT → ETH
+    (make_ad("Bybit", "buy", 7_000_000.0, asset="BTC"), make_ad("MEXC", "sell", 245000.0, asset="ETH"),
+     BTC_ETH_SPOT, ["Bybit"]),                                                                      # BTC → USDT → ETH
+    (make_ad("Bybit", "buy", 7_000_000.0, asset="BTC"), make_ad("MEXC", "sell", 245000.0, asset="ETH"),
+     TWO_VENUE_SPOT, ["Bybit", "MEXC"]),                                                            # две площадки
+])
+def test_hops_qty_matches_route_qty_on_unchanged_spot(b, s, spot, venues):
+    """Сохранённые хопы + тот же курс — тот же выход, что у _route_qty: формулы и порядок операций совпадают."""
+    c = cfg()
+    saved = p2p.route_hops(b, s, c, spot)
+    assert saved["venues"] == venues
+    assert p2p.hops_qty(saved, b.asset, s.asset, c.amount / b.price, c, spot) == pytest.approx(
+        p2p._route_qty(b, s, c, spot))
+
+
+def test_hops_qty_none_when_saved_venue_ticker_gone_or_hops_missing():
+    b, s = make_ad("Bybit", "buy", 7_000_000.0, asset="BTC"), make_ad("MEXC", "sell", 245000.0, asset="ETH")
+    c = cfg()
+    saved = p2p.route_hops(b, s, c, TWO_VENUE_SPOT)
+    qty = c.amount / b.price
+    no_eth = {"Bybit": TWO_VENUE_SPOT["Bybit"], "MEXC": {"USDT": (1.0, 1.0)}}
+    assert p2p.hops_qty(saved, "BTC", "ETH", qty, c, no_eth) is None
+    assert p2p.hops_qty({"venues": saved["venues"], "hops": saved["hops"][:2]}, "BTC", "ETH", qty, c,
+                        TWO_VENUE_SPOT) is None
+
+
+def test_hop_open_checks_saved_network_only():
+    """Хоп проверяется в той сети, по которой считали комиссию: она закрылась — хоп закрыт, даже если другая открыта."""
+    import netstatus
+    hop = p2p.route_hops(make_ad("MEXC", "buy", 88.0), make_ad("Bybit", "sell", 90.0), cfg(), SPOT)["hops"][0]
+    assert hop["to_net"] == "BEP20" and p2p.hop_open(cfg(), hop)
+    netstatus._apply("MEXC", "USDT", {"BEP20": {"dep": True, "wd": False, "fee": 0.01},
+                                      "TRC20": {"dep": True, "wd": True, "fee": 1.0}})
+    assert not p2p.hop_open(cfg(), hop)
+    netstatus._apply("Bybit", "USDT", {"BEP20": {"dep": False, "wd": True, "fee": 0.2}})
+    netstatus._apply("MEXC", "USDT", {"BEP20": {"dep": True, "wd": True, "fee": 0.01}})
+    assert not p2p.hop_open(cfg(), hop)                                  # ввод у получателя в этой сети закрыт
+    same = {"frm": "Bybit", "frm_net": "", "to": "Bybit", "to_net": "", "asset": "USDT", "fee": 0.0, "parts": 1}
+    assert p2p.hop_open(cfg(), same)                                     # внутри биржи перевода нет
+    from_exchanger = {"frm": "BestChange", "frm_net": "BEP20", "to": "Bybit", "to_net": "BEP20", "asset": "USDT",
+                      "fee": 0.0, "parts": 1}
+    assert not p2p.hop_open(cfg(), from_exchanger)                       # обменник шлёт в сеть, где ввод закрыт
+
+
 def test_pay_fee_applied():
     profit, route = p2p._route(make_ad("MEXC", "buy", 88.0), make_ad("MEXC", "sell", 88.0), cfg(pay_fee=0.5), SPOT)
     assert profit == pytest.approx(-0.5) and "банка" in route

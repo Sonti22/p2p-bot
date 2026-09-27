@@ -238,6 +238,98 @@ def test_cross_asset_sell_waits_when_saved_venue_ticker_missing():
     assert paper.recompute_sell_qty(c, cfg, back_spot) == pytest.approx(qty_start)
 
 
+def _cross_cycle(b, s, spot, cfg, stage):
+    """Межмонетный круг с хопами, сохранёнными при старте (как пишет Bot.maybe_start_paper_cycle), на стадии stage."""
+    route_cfg = dataclasses.replace(cfg, amount=10000)
+    qty = p2p._route_qty(b, s, route_cfg, spot, disable=frozenset({"risk"}))
+    cid = paper.start_cycle(10000, b, s, "спот", 1.0, ts=time.time() - 400, sell_qty=qty, pay_fee=0.0,
+                            hops=p2p.route_hops(b, s, route_cfg, spot))
+    paper.set_stage(cid, stage, ts=time.time() - 400)
+    return paper.get_cycle(cid), qty
+
+
+def _close(venue, asset, nets, fee=0.2, min_wd=None):
+    import netstatus
+    netstatus._apply(venue, asset, {n: {"dep": True, "wd": False, "fee": fee, "min": min_wd} for n in nets})
+
+
+def test_cross_asset_sell_keeps_saved_hop_fees_when_network_closes_after_transfer():
+    """П.3: купили BTC на Bybit, поменяли там в USDT и перевели на MEXC. На стадии sell вывод USDT с Bybit уже закрыт
+    (и минимум вывода вырос) — перевод прошёл раньше, продажа всё равно идёт; комиссия — сохранённая, курс — свежий."""
+    b = ad("Bybit", "buy", 6_000_000.0, asset="BTC")
+    s = ad("MEXC", "sell", 105.0, asset="USDT", avail=1_000_000)
+    cfg = p2p.Config(min_profit=2.0, pay_fee=0.0)
+    start_spot = {"Bybit": {"BTC": (60000.0, 60100.0)}}
+    c, qty_start = _cross_cycle(b, s, start_spot, cfg, "sell")
+    fee = paper.cycle_hops(c)["hops"][1]["fee"]
+    assert paper.cycle_hops(c)["venues"] == ["Bybit"] and fee > 0
+    _close("Bybit", "USDT", ("TRC20", "BEP20", "ERC20", "TON"), min_wd=1e9)
+    assert p2p._route_qty(b, s, dataclasses.replace(cfg, amount=10000), start_spot) is None   # подбор заново — срыв
+    action, note, price = paper.check_sell_stage(c, snap({("MEXC", "sell", "USDT"): [s]}, spot=start_spot), cfg=cfg)
+    assert action == "advance" and price == 105.0
+    assert paper.recompute_sell_qty(c, cfg, start_spot) == pytest.approx(qty_start)
+    up_spot = {"Bybit": {"BTC": (66000.0, 66100.0)}}      # курс вырос — пересчитывается только он
+    sf = p2p._spot_fee(cfg, "Bybit")
+    expected = 10000 / 6_000_000.0 * 66000.0 * (1 - sf / 100) - fee
+    assert paper.recompute_sell_qty(c, cfg, up_spot) == pytest.approx(expected)
+
+
+def test_bot_finishes_cross_asset_cycle_after_network_closed(monkeypatch):
+    b = ad("Bybit", "buy", 6_000_000.0, asset="BTC")
+    s = ad("MEXC", "sell", 105.0, asset="USDT", avail=1_000_000)
+    cfg = p2p.Config(min_profit=2.0, pay_fee=0.0)
+    spot = {"Bybit": {"BTC": (60000.0, 60100.0)}}
+    c, qty_start = _cross_cycle(b, s, spot, cfg, "sell")
+    _close("Bybit", "USDT", ("TRC20", "BEP20", "ERC20", "TON"))
+    asyncio.run(Stub(cfg).process_paper_cycles(snap({("MEXC", "sell", "USDT"): [s]}, spot=spot)))
+    done = paper.get_cycle(c["id"])
+    assert done["result"] == "done"
+    assert done["realized_pct"] == pytest.approx((qty_start * 105.0 / 10000 - 1) * 100)
+
+
+def test_transfer_stage_checks_the_coin_actually_transferred():
+    """П.4: BTC куплен на Bybit и там же поменян в USDT — переводится USDT, а не BTC. Закрыт вывод USDT, открыт
+    BTC — срыв; наоборот — проходит."""
+    b = ad("Bybit", "buy", 6_000_000.0, asset="BTC")
+    s = ad("MEXC", "sell", 105.0, asset="USDT", avail=1_000_000)
+    cfg = p2p.Config(min_profit=2.0, pay_fee=0.0)
+    c, _ = _cross_cycle(b, s, {"Bybit": {"BTC": (60000.0, 60100.0)}}, cfg, "transfer")
+    assert [(h["frm"], h["to"], h["asset"]) for h in paper.cycle_hops(c)["hops"]] == \
+        [("Bybit", "Bybit", "BTC"), ("Bybit", "MEXC", "USDT")]
+    import netstatus
+    _close("Bybit", "USDT", ("TRC20", "BEP20", "ERC20", "TON"))
+    netstatus._apply("Bybit", "BTC", {"BTC": {"dep": True, "wd": True, "fee": 0.0002}})
+    action, note = paper.check_transfer_stage(c, cfg, transfer_minutes=3)
+    assert action == "fail" and "USDT" in note and "MEXC" in note
+    netstatus.reset()
+    _close("Bybit", "BTC", ("BTC",), fee=0.0002)
+    assert paper.check_transfer_stage(c, cfg, transfer_minutes=3) == ("advance", "")
+
+
+def test_transfer_stage_checks_both_hops_when_conversion_is_on_a_third_exchange():
+    """П.4: купили и продаём на HTX, но BTC/USDT на споте HTX нет — конвертация на Bybit: два перевода (BTC HTX → Bybit,
+    USDT Bybit → HTX), хотя buy_ex == sell_ex. Закрыт любой из них — срыв."""
+    import netstatus
+    netstatus._apply("HTX", "BTC", {"BTC": {"dep": True, "wd": True, "fee": 0.0001}})
+    b = ad("HTX", "buy", 6_000_000.0, asset="BTC")
+    s = ad("HTX", "sell", 105.0, asset="USDT", avail=1_000_000)
+    cfg = p2p.Config(min_profit=2.0, pay_fee=0.0)
+    c, _ = _cross_cycle(b, s, {"Bybit": {"BTC": (60000.0, 60100.0)}}, cfg, "transfer")
+    hops = paper.cycle_hops(c)
+    assert hops["venues"] == ["Bybit"]
+    assert [(h["frm"], h["to"], h["asset"], h["to_net"]) for h in hops["hops"]] == \
+        [("HTX", "Bybit", "BTC", "BTC"), ("Bybit", "HTX", "USDT", "BEP20")]
+    assert paper.check_transfer_stage(c, cfg, transfer_minutes=3) == ("advance", "")
+    _close("HTX", "BTC", ("BTC",), fee=0.0001)
+    action, note = paper.check_transfer_stage(c, cfg, transfer_minutes=3)
+    assert action == "fail" and "BTC" in note and "HTX" in note
+    netstatus.reset()             # закрыта именно сеть, по которой считали комиссию (BEP20), TRC20 открыт
+    netstatus._apply("Bybit", "USDT", {"BEP20": {"dep": True, "wd": False, "fee": 0.2},
+                                       "TRC20": {"dep": True, "wd": True, "fee": 1.0}})
+    action, note = paper.check_transfer_stage(c, cfg, transfer_minutes=3)
+    assert action == "fail" and "USDT" in note and "BEP20" in note
+
+
 def test_virtually_exhausted_sbp_limit_puts_fee_into_plan_and_volume(monkeypatch):
     """Виртуальный оборот прогона исчерпал бесплатный лимит СБП всех своих банков — комиссия 0,5% в плане и объёме."""
     monkeypatch.setattr(B, "deal_card", lambda d, c, a=None, r=None, breakdown=None: b"png")

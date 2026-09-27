@@ -1162,9 +1162,9 @@ def _route(b, s, cfg, spot, over_banks=frozenset()):
 
 def route_hops(b, s, cfg, spot, over_banks=frozenset()):
     """Площадки конвертации и сеть+комиссия каждого хопа маршрута — для сухого прогона (paper.start_cycle
-    сохраняет в круге при старте, ROADМАP «межмонетные, часть 2»: стадии transfer/sell смогут проверять
-    реальные хопы вместо повторного подбора площадки/сети). То же ветвление и тот же qty на каждом шаге,
-    что в _route_qty (без disable — реальный расчёт при старте круга), чтобы _hop_detail выбрал ту же сеть.
+    сохраняет в круге при старте, ROADМАP «межмонетные, часть 2»: стадии transfer/sell проверяют
+    реальные хопы вместо повторного подбора площадки/сети — hop_open, hops_qty). То же ветвление и тот же qty
+    на каждом шаге, что в _route_qty (без disable — реальный расчёт при старте круга), чтобы _hop_detail выбрал ту же сеть.
     None — маршрут невозможен. Возвращает {"venues": [...], "hops": [{"frm", "frm_net", "to", "to_net",
     "asset", "fee", "parts"}, ...]}: venues — 0, 1 или 2 площадки конвертации на споте (пусто — одна монета,
     конвертации нет)."""
@@ -1257,6 +1257,53 @@ def spot_venues_ready(spot, venues, b_asset, s_asset):
         return b_asset in spot.get(v, {}) and s_asset in spot.get(v, {})
     v1, v2 = venues
     return b_asset in spot.get(v1, {}) and s_asset in spot.get(v2, {})
+
+
+def hop_open(cfg, hop):
+    """Хоп маршрута, сохранённый при старте круга (route_hops), ещё проходит в той же сети — для стадии transfer
+    сухого прогона: те же проверки, что в _hop_detail (вывод у отправителя, ввод у получателя; обменник шлёт сам —
+    только ввод у получателя в его сети), но сеть не переподбираем: комиссия круга посчитана по ней. Минимум
+    вывода не проверяем (как withdraw_open): сумма та же, что при старте. Внутри одной биржи перевода нет."""
+    frm, to, asset = hop["frm"], hop["to"], hop["asset"]
+    if frm == to and frm != "BestChange":
+        return True
+    if frm == "BestChange" and to == "BestChange":   # обменник → твой кошелёк на Bybit → другой обменник
+        if netstatus.deposit_ok("Bybit", asset, hop["frm_net"]) is False:
+            return False
+        return _withdraw(cfg, "Bybit", asset, hop["to_net"]) is not None
+    if frm == "BestChange":
+        return netstatus.deposit_ok(to, asset, hop["frm_net"]) is not False
+    return _withdraw(cfg, frm, asset, hop["to_net"], to) is not None
+
+
+def hops_qty(saved, b_asset, s_asset, qty, cfg, spot):
+    """Выход маршрута в монете продажи по хопам, сохранённым при старте круга (route_hops), и свежему курсу
+    спота — для стадии sell сухого прогона: переводы уже прошли, поэтому их комиссии — сохранённые, а сети,
+    приём у получателя и минимум вывода заново не проверяем; пересчитывается только конвертация на тех же
+    площадках (bid/ask и комиссия спота, те же формулы и порядок, что в _route_qty). qty — сколько монеты
+    покупки куплено (сумма круга после комиссии банка / цена покупки). Запаса на курс нет. None — тикера
+    сохранённой площадки в spot нет или хопов меньше, чем нужно маршруту."""
+    venues, fees = saved.get("venues") or [], [h["fee"] for h in saved.get("hops") or []]
+    if len(fees) != len(venues) + 1 or not spot_venues_ready(spot, venues, b_asset, s_asset):
+        return None
+    qty -= fees[0]
+    if not venues:
+        return qty
+    if len(venues) == 1:
+        v = venues[0]
+        sf = _spot_fee(cfg, v)
+        if "USDT" in (b_asset, s_asset):
+            bid, ask = spot[v][s_asset if b_asset == "USDT" else b_asset]
+            qty = (qty / ask if b_asset == "USDT" else qty * bid) * (1 - sf / 100)
+        else:
+            qty = qty * spot[v][b_asset][0] * (1 - sf / 100)     # b_asset → USDT
+            qty = (qty / spot[v][s_asset][1]) * (1 - sf / 100)   # USDT → s_asset
+        return qty - fees[1]
+    v1, v2 = venues
+    qty = qty * spot[v1][b_asset][0] * (1 - _spot_fee(cfg, v1) / 100)          # b_asset → USDT на v1
+    qty -= fees[1]                                                             # перевод USDT v1 → v2
+    qty = (qty / spot[v2][s_asset][1]) * (1 - _spot_fee(cfg, v2) / 100)        # USDT → s_asset на v2
+    return qty - fees[2]
 
 
 def _match(b, sell_ads, cfg, spot, over_banks=frozenset()):

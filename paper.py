@@ -180,8 +180,8 @@ def start_cycle(amount, buy, sell, route, planned_pct, path=DB_PATH, ts=None, la
     банк оплаты и pay_fee_used берём по ним же, иначе комиссия в круге разошлась бы с планом; не передан —
     только виртуальный оборот прогона. planned_raw — план без запаса на курс (для сравнения с фактом).
     hops — p2p.route_hops(buy, sell, ...) (площадки конвертации и сеть/комиссия каждого хопа маршрута на
-    момент старта) — не передан, пишем пустой маршрут; для стадий transfer/sell позже (ROADMAP «межмонетные,
-    часть 2») — в этой задаче только сохраняем, не используем.
+    момент старта) — не передан, пишем пустой маршрут; по ним стадия transfer проверяет реальные хопы в их сетях
+    (check_transfer_stage), а sell берёт их комиссии и пересчитывает только курс (recompute_sell_qty).
     Для разбора: index/reasons — индекс и причины надёжности связки на старте (p2p.reliability_index/reliability),
     streak — сколько сканов подряд она держалась (Bot.live), depth — запас глубины (depth_margin), snapshot_id —
     id снимка скана (snapshots.scan_id); сделки/% успешных мерчантов берём из buy/sell.
@@ -328,17 +328,28 @@ def check_buy_stage(cycle, snap, pay_minutes, now=None, stale_minutes=30.0):
 
 
 def check_transfer_stage(cycle, cfg, transfer_minutes, now=None):
-    """Проверка стадии transfer по свежему справочнику (только чтение fees.json/netstatus через
-    p2p.withdraw_open, без сети и без записи в БД). Раньше PAPER_TRANSFER_MINUTES с начала стадии
-    не ждём. После — проверяем, что вывод buy_asset с buy_ex на sell_ex всё ещё возможен (известна комиссия,
-    сеть открыта, получатель принимает) — иначе перевод сорвался бы в реальности. Внутри одной площадки перевода
-    нет; монету от обменника (buy_ex=BestChange) шлёт сам обменник — сведений о его выводе нет, не проверяем.
+    """Проверка стадии transfer по свежему справочнику (только чтение fees.json/netstatus, без сети и без
+    записи в БД). Раньше PAPER_TRANSFER_MINUTES с начала стадии не ждём. После — проверяем каждый хоп маршрута,
+    сохранённый при старте (cycle_hops: buy_ex → площадка конвертации в buy_asset, площадка → (вторая площадка в
+    USDT) → sell_ex в sell_asset), в его монете и сохранённой сети (p2p.hop_open) — закрыт хоть один, перевод
+    сорвался бы в реальности. При buy_ex == sell_ex и конвертации на третьей бирже это тоже два перевода.
+    Внутри одной площадки перевода нет; монету от обменника шлёт сам обменник — проверяем только ввод у получателя.
+    Круг без сохранённых хопов (старая версия) — как раньше: вывод buy_asset с buy_ex на sell_ex в любой открытой
+    сети (p2p.withdraw_open), монету от обменника (buy_ex=BestChange) не проверяем.
 
     Возвращает (action, note) как check_buy_stage: "wait"/"advance"/"fail" (result станет
     failed_transfer)."""
     now = now if now is not None else time.time()
     if now - cycle["ts_stage"] < transfer_minutes * 60:
         return "wait", ""
+    hops = cycle_hops(cycle)["hops"]
+    if hops:
+        for h in hops:
+            if not p2p.hop_open(cfg, h):
+                net = h["to_net"] or h["frm_net"]
+                return "fail", (f"перевод {h['asset']} с {h['frm']} на {h['to']}" + (f" ({net})" if net else "")
+                                + " закрыт")
+        return "advance", ""
     if cycle["buy_ex"] == cycle["sell_ex"] or cycle["buy_ex"] == "BestChange":
         return "advance", ""
     if not p2p.withdraw_open(cfg, cycle["buy_ex"], cycle["buy_asset"], receiver=cycle["sell_ex"]):
@@ -382,15 +393,20 @@ def recompute_sell_qty(cycle, cfg, spot):
 
     Комиссия банка (и решение о том, какой банк исчерпал лимит СБП) уже приняты на старте и сохранены
     как pay_fee_used — здесь не пересчитываем их заново с чужим over_banks, а просто уменьшаем сумму
-    круга на эту долю и отключаем банковскую комиссию в _route_qty (disable={"bank"}), пересчитывая
-    только шаги перевода/спота монеты. None — маршрут (нужная спот-пара) сейчас недоступен."""
+    круга на эту долю. Хопы маршрута сохранены при старте (cycle_hops) — переводы к стадии sell уже прошли:
+    комиссии берём сохранённые, сети, приём у получателя и минимум вывода заново не проверяем, пересчитываем
+    только курс на сохранённых площадках (p2p.hops_qty). Круг без хопов (старая версия) — как раньше: заново
+    _route_qty без банковской комиссии (disable={"bank"}). None — маршрут (нужная спот-пара) сейчас недоступен."""
     if cycle["buy_asset"] == cycle["sell_asset"]:
         return sell_qty(cycle)
+    net_amount = cycle["amount"] * (1 - (cycle.get("pay_fee_used") or 0.0) / 100)
+    saved = cycle_hops(cycle)
+    if saved["hops"]:
+        return p2p.hops_qty(saved, cycle["buy_asset"], cycle["sell_asset"], net_amount / cycle["buy_price"], cfg, spot)
     b = p2p.Ad(cycle["buy_ex"], "buy", cycle["buy_price"], 0, 0, 0, json.loads(cycle.get("buy_pays") or "[]"),
                cycle["buy_nick"], 0, 0, asset=cycle["buy_asset"], net=cycle.get("buy_net") or "")
     s = p2p.Ad(cycle["sell_ex"], "sell", cycle["sell_price"], 0, 0, 0, [], cycle["sell_nick"], 0, 0,
                asset=cycle["sell_asset"], net=cycle.get("sell_net") or "", parts=cycle.get("sell_parts") or 1)
-    net_amount = cycle["amount"] * (1 - (cycle.get("pay_fee_used") or 0.0) / 100)
     route_cfg = dataclasses.replace(cfg, amount=net_amount)
     return p2p._route_qty(b, s, route_cfg, spot, disable=frozenset({"bank", "risk"}))
 

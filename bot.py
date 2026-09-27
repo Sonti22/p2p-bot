@@ -2435,9 +2435,9 @@ class Bot:
         route_cfg = dataclasses.replace(self.cfg, amount=settings["amount"])
         qty = _route_qty(b, s, route_cfg, psnap.spot, over, disable=frozenset({"risk"}))
         raw = (qty * s.price / settings["amount"] - 1) * 100 if qty else profit
-        # площадки конвертации и сеть/комиссия каждого хопа на момент старта — для стадий transfer/sell
-        # межмонетных связок позже (ROADMAP «межмонетные, часть 2»); сейчас связка простая (paper.simple_route)
-        # — venues пусто, один хоп, но сохраняем и для неё, чтобы данные были у всех кругов подряд
+        # площадки конвертации и сеть/комиссия каждого хопа на момент старта: transfer проверяет эти хопы в их сетях,
+        # sell берёт их комиссии и пересчитывает только курс; сейчас связка простая (paper.simple_route) — venues
+        # пусто, один хоп
         hops = route_hops(b, s, route_cfg, psnap.spot, over)
         # для разбора (этап 1 «измерения»): индекс и причины надёжности, серия «живости», запас глубины и id снимка
         # скана — снимок пишется после сигналов, но id (время начала скана) известен уже сейчас
