@@ -1,11 +1,12 @@
 """⭐ Избранные маршруты: кнопка на карточке, сигнал от FAV_MIN_PROFIT вне порога и топа, /fav, гостям — нет."""
+from helpers import arun
+import asyncio
 
 import bot as B
 import favorites
 import p2p
 from test_bot import Stub, texts
 from test_guests import Stub as GuestStub, msg
-from helpers import arun
 
 
 def ad(ex, side, price, asset="USDT"):
@@ -88,9 +89,12 @@ def test_fav_list_and_remove(monkeypatch):
     favorites.toggle(("HTX", "USDT", "KuCoin", "USDT"))
     text, kb = bot.favorites_view()
     assert "Bybit USDT → MEXC USDT" in text and "HTX USDT → KuCoin USDT" in text
-    arun(bot.on_callback({"id": "1", "data": "favdel:1", "message": {"message_id": 4}}))
+    first = kb["inline_keyboard"][0][0]
+    assert first["text"] == "✖ 1. Bybit USDT → MEXC USDT"
+    arun(bot.on_callback({"id": "1", "data": first["callback_data"], "message": {"message_id": 4}}))
     assert favorites.keys() == {"HTX|USDT|KuCoin|USDT"}
-    arun(bot.on_callback({"id": "1", "data": "favdel:99", "message": {"message_id": 4}}))   # мимо — не падаем
+    for data in ("favdel:1", "favdel:99"):   # кнопки с номером (до этой правки) и мимо — не удаляют, не падаем
+        arun(bot.on_callback({"id": "1", "data": data, "message": {"message_id": 4}}))
     assert favorites.keys() == {"HTX|USDT|KuCoin|USDT"}
 
 

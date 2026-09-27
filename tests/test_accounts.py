@@ -747,8 +747,8 @@ def test_bybit_p2p_orders_returns_none_on_error():
 
 def test_mexc_history_merges_deposits_and_withdrawals_by_time():
     session = _UrlJsonSession({
-        "capital/deposit/hisrec": [{"coin": "USDT", "amount": "100.5", "insertTime": 1700000000000}],
-        "capital/withdraw/history": [{"coin": "USDT", "amount": "9", "applyTime": "2023-11-16 00:00:00"}],
+        "capital/deposit/hisrec": [{"coin": "USDT", "amount": "100.5", "insertTime": 1700000000000, "status": 5}],
+        "capital/withdraw/history": [{"coin": "USDT", "amount": "9", "applyTime": "2023-11-16 00:00:00", "status": 7}],
     })
     hist = arun(accounts.mexc_history(session, "k", "s"))
     assert hist == [
@@ -761,7 +761,7 @@ def test_mexc_history_merges_deposits_and_withdrawals_by_time():
 def test_mexc_history_falls_back_to_withdrawals_when_no_deposits():
     session = _UrlJsonSession({
         "capital/deposit/hisrec": [],
-        "capital/withdraw/history": [{"coin": "USDT", "amount": "9", "applyTime": "2023-11-14 22:13:20"}],
+        "capital/withdraw/history": [{"coin": "USDT", "amount": "9", "applyTime": "2023-11-14 22:13:20", "status": 7}],
     })
     hist = arun(accounts.mexc_history(session, "k", "s"))
     assert hist == [{"kind": "withdraw", "asset": "USDT", "amount": 9.0,
@@ -782,8 +782,8 @@ def test_mexc_history_returns_none_when_a_source_fails():
 
 def test_htx_history_merges_deposits_and_withdrawals_by_time():
     session = _UrlJsonSession({
-        "type=deposit": {"status": "ok", "data": [{"currency": "usdt", "amount": 50, "created-at": 1700000000000}]},
-        "type=withdraw": {"status": "ok", "data": [{"currency": "usdt", "amount": 5, "created-at": 1700000009000}]},
+        "type=deposit": {"status": "ok", "data": [{"currency": "usdt", "amount": 50, "created-at": 1700000000000, "state": "safe"}]},
+        "type=withdraw": {"status": "ok", "data": [{"currency": "usdt", "amount": 5, "created-at": 1700000009000, "state": "confirmed"}]},
     })
     hist = arun(accounts.htx_history(session, "k", "s"))
     assert hist == [
@@ -814,7 +814,7 @@ def test_htx_history_returns_none_on_error_status():
 def test_kucoin_history_reads_paginated_items():
     session = _UrlJsonSession({
         "api/v1/deposits": {"code": "200000", "data": {"items": [
-            {"currency": "USDT", "amount": "30", "createdAt": 1700000000000}]}},
+            {"currency": "USDT", "amount": "30", "createdAt": 1700000000000, "status": "SUCCESS"}]}},
         "api/v1/withdrawals": {"code": "200000", "data": {"items": []}},
     })
     hist = arun(accounts.kucoin_history(session, "k", "s", "pp"))
@@ -824,9 +824,9 @@ def test_kucoin_history_reads_paginated_items():
 def test_kucoin_history_merges_deposits_and_withdrawals_by_time():
     session = _UrlJsonSession({
         "api/v1/deposits": {"code": "200000", "data": {"items": [
-            {"currency": "USDT", "amount": "30", "createdAt": 1700000000000}]}},
+            {"currency": "USDT", "amount": "30", "createdAt": 1700000000000, "status": "SUCCESS"}]}},
         "api/v1/withdrawals": {"code": "200000", "data": {"items": [
-            {"currency": "USDT", "amount": "12", "createdAt": 1700000005000}]}},
+            {"currency": "USDT", "amount": "12", "createdAt": 1700000005000, "status": "SUCCESS"}]}},
     })
     hist = arun(accounts.kucoin_history(session, "k", "s", "pp"))
     assert hist == [
@@ -918,7 +918,7 @@ def test_account_history_mexc_does_not_hide_fresh_trade_behind_old_deposit(tmp_p
     monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
     accounts.save_key("mexc", "k", "s")
     session = _UrlJsonSession({
-        "capital/deposit/hisrec": [{"coin": "USDT", "amount": "100.5", "insertTime": 1700000000000}],
+        "capital/deposit/hisrec": [{"coin": "USDT", "amount": "100.5", "insertTime": 1700000000000, "status": 5}],
         "capital/withdraw/history": [],
         "symbol=USDCUSDT": [],
         "symbol=BTCUSDT": [{"isBuyer": True, "qty": "0.001", "price": "60000", "time": 1700000009000}],
@@ -937,7 +937,7 @@ def test_account_history_kucoin_does_not_hide_fresh_trade_behind_old_deposit(tmp
     accounts.save_key("kucoin", "k", "s", passphrase="pp")
     session = _UrlJsonSession({
         "api/v1/deposits": {"code": "200000", "data": {"items": [
-            {"currency": "USDT", "amount": "30", "createdAt": 1700000000000}]}},
+            {"currency": "USDT", "amount": "30", "createdAt": 1700000000000, "status": "SUCCESS"}]}},
         "api/v1/withdrawals": {"code": "200000", "data": {"items": []}},
         "api/v1/fills": {"code": "200000", "data": {"items": [
             {"symbol": "TON-USDT", "side": "sell", "size": "3", "price": "5.2", "createdAt": 1700000009000}]}},
