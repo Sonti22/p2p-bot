@@ -2,7 +2,9 @@
 
 Ключ и секрет запрашиваются через getpass (на экран не выводятся), пишутся в data/keys.json папки бота зашифрованными
 Windows DPAPI (accounts.save_key) и никогда не проходят через Telegram, логи или git. Ключ — «только торговля»:
-без вывода и переводов, по возможности с привязкой к IP. После ввода можно сразу проверить права ключа у биржи.
+без вывода и переводов, по возможности с привязкой к IP. Торговать ключом бот станет только после проверки прав у биржи
+(`check` здесь или проверка при старте бота): итог хранится в data/trading_keycheck.json папки бота (отпечаток ключа,
+без ключа и секрета); новый ключ до проверки не используется.
 Запуск: python scripts/trading_keys.py [set|check|delete] bybit|bingx [--bot-dir ПАПКА_БОТА]
 """
 import argparse
@@ -47,6 +49,7 @@ def cmd_set(venue, ask=getpass.getpass, confirm=input):
     print(f"Сохранено: {trade_keys.KEY_NAMES[venue]} {accounts.mask(key)} (data/keys.json, DPAPI).")
     if confirm("Проверить права ключа у биржи сейчас? [y/N] ").strip().lower() in YES:
         return cmd_check(venue)
+    print("Торговать этим ключом бот начнёт только после проверки прав (check или проверка при старте бота).")
     return 0
 
 
@@ -70,6 +73,7 @@ def main(argv=None, ask=getpass.getpass, confirm=input, run=None):
     p.add_argument("--bot-dir", default=DEFAULT_BOT_DIR)
     a = p.parse_args(argv)
     accounts.KEYS_PATH = os.path.join(a.bot_dir, "data", "keys.json")   # ключи — в папку бота, а не в текущую
+    trade_keys.CHECK_PATH = os.path.join(a.bot_dir, "data", "trading_keycheck.json")   # итог проверки — рядом
     if a.cmd == "set":
         if ask is getpass.getpass and not sys.stdin.isatty():
             print("Нужна интерактивная консоль владельца (ввод ключа через getpass).")

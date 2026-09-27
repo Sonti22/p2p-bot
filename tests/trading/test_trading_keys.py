@@ -32,6 +32,7 @@ def bybit_result(**over):
 @pytest.fixture(autouse=True)
 def _keys_env(tmp_path, monkeypatch):
     monkeypatch.setattr(accounts, "KEYS_PATH", str(tmp_path / "keys.json"))
+    monkeypatch.setattr(keys, "CHECK_PATH", str(tmp_path / "trading_keycheck.json"))
     for name in ("BYBIT_TRADE_API_KEY", "BYBIT_TRADE_API_SECRET", "BINGX_TRADE_API_KEY", "BINGX_TRADE_API_SECRET"):
         monkeypatch.delenv(name, raising=False)
 
@@ -43,8 +44,29 @@ def test_key_names_not_connectable_from_telegram(monkeypatch):
     assert keys.credentials("bybit") is None
     monkeypatch.setenv("BYBIT_TRADE_API_KEY", KEY)
     monkeypatch.setenv("BYBIT_TRADE_API_SECRET", SECRET)
-    assert keys.credentials("bybit") == CREDS and keys.credentials("bingx") is None
+    assert keys.raw_credentials("bybit") == CREDS and keys.raw_credentials("bingx") is None
+    assert keys.credentials("bybit") is None                                  # права ещё не проверены
     assert accounts.keys("bybit") is None                                     # read-only ключ — отдельно
+
+
+def test_credentials_only_after_passed_fresh_check_of_this_key(monkeypatch, tmp_path):
+    monkeypatch.setenv("BYBIT_TRADE_API_KEY", KEY)
+    monkeypatch.setenv("BYBIT_TRADE_API_SECRET", SECRET)
+    now = 1_800_000_000
+    assert "не проверены" in keys.check_status("bybit", CREDS, now)[0]
+    keys.save_check("bybit", CREDS, keys.KeyCheck(False, "unsafe", "у ключа лишние права: вывод", True), now=now)
+    assert keys.credentials("bybit", now) is None and "не пройдена" in keys.check_status("bybit", CREDS, now)[0]
+    keys.save_check("bybit", CREDS, keys.KeyCheck(True, "ok", "", True), now=now)
+    assert keys.credentials("bybit", now) == CREDS and keys.approved("bybit", CREDS, now)
+    assert keys.credentials("bybit", now + keys.CHECK_TTL + 1) is None           # проверка устарела
+    assert keys.credentials("bybit", now - 10) is None                           # время проверки из будущего
+    monkeypatch.setenv("BYBIT_TRADE_API_KEY", "OTHERKEY000")                     # ключ заменили после проверки
+    assert keys.credentials("bybit", now) is None and "заменён" in keys.check_status("bybit", ("OTHERKEY000", SECRET),
+                                                                                       now)[0]
+    saved = open(keys.CHECK_PATH, encoding="utf-8").read()
+    assert KEY not in saved and SECRET not in saved and keys.fingerprint(CREDS) in saved
+    assert keys.check_status("bybit", None)[0] == "торговый ключ не сохранён"
+    assert not keys.approved("bingx", CREDS, now)
 
 
 def test_bybit_trade_only_key_ok():
@@ -137,6 +159,7 @@ def test_check_asks_exchange_and_fails_closed(venue, answer, ok, state):
     k = run(keys.check(s, venue, CREDS))
     assert (k.ok, k.state) == (ok, state)
     assert [(c["method"], c["path"]) for c in s.calls] == [("GET", path)] and s.calls[0]["redirects"] is False
+    assert keys.approved(venue, CREDS) is ok                                  # итог проверки сохранён с ключом
 
 
 def test_check_without_key_makes_no_request():
@@ -158,7 +181,9 @@ def test_script_set_saves_encrypted_in_bot_dir_and_never_prints_secret(tmp_path,
     path = bot / "data" / "keys.json"
     saved = json.loads(path.read_text(encoding="utf-8"))["bybit_trade"]
     assert SECRET not in path.read_text(encoding="utf-8") or sys.platform != "win32"   # DPAPI на Windows
-    assert accounts.KEYS_PATH == str(path) and keys.credentials("bybit") == CREDS
+    assert accounts.KEYS_PATH == str(path) and keys.raw_credentials("bybit") == CREDS
+    assert keys.credentials("bybit") is None and "после проверки прав" in out   # до проверки прав ключ не в ходу
+    assert keys.CHECK_PATH == str(bot / "data" / "trading_keycheck.json")
     assert set(saved) == {"key", "secret"}
 
 
