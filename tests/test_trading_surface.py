@@ -67,13 +67,22 @@ def _is_trading(path):
     return "trading" in path.lower()
 
 
-def _modules():
-    """{имя модуля: путь} — весь код бота, кроме тестов."""
+RESEARCH = "research"   # офлайн-бэктесты: CLI, который запускает владелец; бот его не импортирует (проверено ниже)
+
+
+def _is_research(mod_name):
+    return mod_name == RESEARCH or mod_name.startswith(RESEARCH + ".")
+
+
+def _modules(research=False):
+    """{имя модуля: путь} — весь код бота, кроме тестов; research/ — отдельно (research=True — только он)."""
     out = {}
     for f in _tracked():
         if f.split("/")[0] == "tests" or not f.endswith(".py"):
             continue
-        out[f[:-3].replace("/", ".").removesuffix(".__init__")] = f
+        name = f[:-3].replace("/", ".").removesuffix(".__init__")
+        if _is_research(name) == research:
+            out[name] = f
     return out
 
 
@@ -147,10 +156,16 @@ def test_guard_trading_code_ignores(line):
     assert not re.search(guard.TRADING_CODE, line), line
 
 
-def test_guard_trading_code_silent_on_current_code():
-    """Весь нынешний код вне тестов (accounts.py, bot.py, paper.py, .env.example…), как если бы каждая его строка была
-    добавлена: ни одного срабатывания — иначе каждая правка рядом уходила бы в ручную проверку зря."""
-    hits, seen = [], 0
+# Строки торгового кода вне trading/ (как их видит guard), которые владелец проверил и принял: {путь: [строка без
+# отступов, …]} — сейчас ни одной. Guard не пускает такие строки в автомерж, а этот пин держит их и на ПК: новая строка
+# TRADING/trd_*/import trading… в bot.py или accounts.py без записи здесь — красный тест, значит и смоук launcher, и
+# обновление не встанет, пока владелец не впишет её сюда (защищённый файл — на ПК только с --approve), даже если CI обойдён.
+TRADING_LINES_APPROVED = {}
+
+
+def current_trading_lines():
+    """{путь: [строки]} — весь код вне тестов, .md и защищённых путей, как если бы каждая его строка была добавлена."""
+    found, seen = {}, 0
     for f in _tracked("*"):
         if f.split("/")[0] == "tests" or f.endswith(".md") or guard.protected(f):
             continue
@@ -159,10 +174,21 @@ def test_guard_trading_code_silent_on_current_code():
         except UnicodeDecodeError:   # картинки
             continue
         seen += 1
-        for n, line in enumerate(text.splitlines(), 1):
+        for line in text.splitlines():
             if re.search(guard.TRADING_CODE, line):
-                hits.append(f"{f}:{n}: {line.strip()[:100]}")
-    assert seen >= 10 and not hits, hits
+                found.setdefault(f, []).append(line.strip())
+    assert seen >= 10, "код бота не найден"
+    return found
+
+
+def test_trading_lines_outside_trading_are_pinned():
+    """Срабатывания guard на нынешнем коде вне trading/ (accounts.py, bot.py, paper.py, .env.example…) — ровно
+    TRADING_LINES_APPROVED. Сейчас их нет: ложных срабатываний на обычном коде тоже нет."""
+    now = current_trading_lines()
+    assert now == TRADING_LINES_APPROVED, (
+        "Строки торгового кода вне trading/ изменились. Проверить и вписать их в TRADING_LINES_APPROVED в "
+        "tests/test_trading_surface.py может только владелец (защищённый файл). Сейчас:\n"
+        + "\n".join(f"{f}: {line[:120]}" for f, lines in now.items() for line in lines))
 
 
 def _repo(tmp_path, monkeypatch):
@@ -262,9 +288,10 @@ ALLOWED_SENDERS = {
     ("bot", "Bot.call"): "Telegram Bot API",
     ("bot", "Bot._post_photo"): "Telegram sendPhoto",
     ("bot", "Bot.send_document"): "Telegram sendDocument",
-    ("bot", "Bot.payout_send"): "payouts.send — выплата через защищённый payouts.py (запинено)",
     ("launcher", "notify"): "уведомление владельцу в Telegram (urllib, защищённый launcher.py)",
 }
+# вызов функции своего модуля (payouts.send, self.send в классе со своим send) — не отправитель: тело этой функции
+# проверяется само, и отправитель внутри неё уже в списке выше (payouts.send → payout_call)
 # сетевой модуль, импортированный целиком: (модуль, сетевой модуль) → какие его атрибуты можно трогать
 ALLOWED_NET_IMPORTS = {
     ("p2p", "socket"): ("gethostbyname_ex", "gethostname"),       # локальные адреса ПК: BestChange в обход VPN
@@ -314,13 +341,36 @@ def _dotted(node):
     return None
 
 
-def _surface(mod_name, src):
+def _top_defs(src):
+    """Имена функций и классов верхнего уровня модуля."""
+    return {n.name for n in ast.parse(src).body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))}
+
+
+def _local_imports(tree, local_defs):
+    """{имя в модуле: модуль бота}: import payouts, import payouts as p, from research import metrics."""
+    out = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                if a.name in local_defs and (a.asname or "." not in a.name):
+                    out[a.asname or a.name] = a.name
+        elif isinstance(node, ast.ImportFrom) and not node.level and node.module:
+            for a in node.names:
+                if f"{node.module}.{a.name}" in local_defs:
+                    out[a.asname or a.name] = f"{node.module}.{a.name}"
+    return out
+
+
+def _surface(mod_name, src, local_defs=None):
     """→ (отправители {(модуль, функция): [что]}, динамика {(модуль, функция, код)}, нарушения сетевых импортов [..]).
-    Функция — полное имя: «Класс.метод», «внешняя.внутренняя», «<module>», «….<lambda>»."""
+    Функция — полное имя: «Класс.метод», «внешняя.внутренняя», «<module>», «….<lambda>». local_defs — {модуль бота:
+    имена его функций}: вызов своей функции другого модуля (payouts.send) — не отправитель, её тело проверяется само."""
     tree = ast.parse(src)
     senders, dynamic, net_bad = {}, set(), []
     parents = {c: p for p in ast.walk(tree) for c in ast.iter_child_nodes(p)}
     allowed_imports = {net: attrs for (m, net), attrs in ALLOWED_NET_IMPORTS.items() if m == mod_name}
+    local_defs = local_defs or {}
+    local_mods = _local_imports(tree, local_defs)
 
     def is_net(name):
         return name in NET_MODULES or name.split(".")[0] in NET_MODULES
@@ -336,8 +386,10 @@ def _surface(mod_name, src):
         elif isinstance(node, ast.Lambda):
             where = f"{where}.<lambda>"
         if isinstance(node, ast.Attribute) and node.attr in SEND_METHODS:
-            own = isinstance(node.value, ast.Name) and node.value.id == "self" and node.attr in own_methods
-            if not own:   # self.send в классе со своим send — вызов своего метода; его тело проверяется отдельно
+            base = node.value.id if isinstance(node.value, ast.Name) else None
+            own = (base == "self" and node.attr in own_methods          # self.send в классе со своим send
+                   or node.attr in local_defs.get(local_mods.get(base), ()))   # payouts.send — функция модуля бота
+            if not own:
                 add(where, f"{ast.unparse(node)} (стр. {node.lineno})")
         if isinstance(node, ast.Call):
             func = node.func
@@ -387,15 +439,17 @@ def _surface(mod_name, src):
 
 
 def _scan():
-    senders, dynamic, net_bad, strings = {}, set(), [], {}
-    for mod_name, path in _modules().items():
-        src = _source(path)
-        s, d, n = _surface(mod_name, src)
+    """Код бота (без research/): отправители, динамика, сетевые импорты; исходники — и research/ (для строк)."""
+    runtime, research = _modules(), _modules(research=True)
+    sources = {m: (p, _source(p)) for m, p in {**runtime, **research}.items()}
+    local_defs = {m: _top_defs(src) for m, (_, src) in sources.items()}
+    senders, dynamic, net_bad = {}, set(), []
+    for mod_name in runtime:
+        s, d, n = _surface(mod_name, sources[mod_name][1], local_defs)
         senders.update(s)
         dynamic |= d
         net_bad += n
-        strings[mod_name] = (path, src)
-    return senders, dynamic, net_bad, strings
+    return senders, dynamic, net_bad, sources
 
 
 @pytest.fixture(scope="module")
@@ -407,7 +461,7 @@ def test_modules_found():
     """Сканируется весь код бота: без главных модулей проверка молча ничего бы не проверяла."""
     mods = _modules()
     assert {"accounts", "bot", "p2p", "payouts", "paper", "launcher", "scripts.guard"} <= set(mods), sorted(mods)
-    assert not [m for m in mods if m.startswith("tests")]
+    assert not [m for m in mods if m.startswith("tests") or _is_research(m)]
 
 
 def test_only_known_senders(scan):
@@ -464,6 +518,75 @@ def test_no_withdrawals_transfers_or_p2p_release_anywhere(scan):
             if mod_name not in PAYOUT_MODULES and re.search(PAYOUT_ENDPOINT, s, re.I):
                 bad.append(f"{path}:{line}: выплата Cryptomus вне payouts.py: {s[:80]!r}")
     assert not bad, HOW_TO_UPDATE + "\n" + "\n".join(bad)
+
+
+# research/ — офлайн-бэктесты, которые запускает владелец (публичные свечи и фандинг Bybit/BingX через urllib GET). Он
+# вне списка отправителей, поэтому: бот его не импортирует, а сам он только читает и не трогает ключи, деньги и торговлю.
+RESEARCH_NO_IMPORT = ("accounts", "payouts", "bot", "launcher", "trading", "scripts")
+RESEARCH_WRITE = ("post", "put", "delete", "patch", "_request", "send", "sendall", "sendto", "ws_connect",
+                  "open_connection", "create_connection")
+
+
+def _imported(node):
+    """Имена модулей, которые импортирует узел (import, from … import, import_module/__import__ со строкой)."""
+    if isinstance(node, ast.Import):
+        return [a.name for a in node.names]
+    if isinstance(node, ast.ImportFrom) and not node.level:
+        return [node.module or ""]
+    if isinstance(node, ast.Call) and (_dotted(node.func) or "").split(".")[-1] in DYNAMIC_IMPORT and node.args \
+            and isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str):
+        return [node.args[0].value]
+    return []
+
+
+def _research_problems(path, src):
+    bad = []
+    tree = ast.parse(src)
+    for node in ast.walk(tree):
+        line = getattr(node, "lineno", 0)
+        if isinstance(node, ast.Attribute) and node.attr in RESEARCH_WRITE:
+            bad.append(f"{path}:{line}: {ast.unparse(node)} — research только читает")
+        if isinstance(node, ast.Call) and (_dotted(node.func) or "").split(".")[-1] == "Request" \
+                and (len(node.args) > 1 or any(k.arg in ("data", "method") for k in node.keywords)):
+            bad.append(f"{path}:{line}: {ast.unparse(node)[:80]} — запрос с телом/методом, research только GET")
+        for name in _imported(node):
+            if name.split(".")[0] in RESEARCH_NO_IMPORT:
+                bad.append(f"{path}:{line}: import {name} — ключи, деньги и торговля research недоступны")
+    for s, line in _strings(tree):
+        for p in _hits(TRADING_ENDPOINTS, s) + ([TRADE_KEY_STR] if re.search(TRADE_KEY_STR, s, re.I) else []):
+            bad.append(f"{path}:{line}: /{p}/ в {s[:80]!r}")
+    return bad
+
+
+def test_bot_never_imports_research():
+    """Ни один модуль бота (bot.py, p2p.py, paper.py, accounts.py, launcher.py, scripts/…) не импортирует research."""
+    bad = [f"{path}:{node.lineno}: {name}" for path in _modules().values()
+           for node in ast.walk(ast.parse(_source(path))) for name in _imported(node) if _is_research(name)]
+    assert not bad, HOW_TO_UPDATE + "\n" + "\n".join(bad)
+
+
+def test_research_only_reads_public_market_data():
+    bad = [p for path in _modules(research=True).values() for p in _research_problems(path, _source(path))]
+    assert not bad, HOW_TO_UPDATE + "\n" + "\n".join(bad)
+
+
+def test_research_checks_catch():
+    ok = ("import urllib.request\nfrom research import metrics\n"
+          "def get(u):\n    req = urllib.request.Request(u, headers={'User-Agent': 'x'})\n"
+          "    return urllib.request.build_opener().open(req, timeout=5).read()\n"
+          "URL = 'https://api.bybit.com/v5/market/kline?category=linear'\n")
+    assert _research_problems("research/data.py", ok) == []
+    for body in ("def f(s):\n    return s.post('u')\n",
+                 "import urllib.request\ndef f(u):\n    return urllib.request.Request(u, data=b'x')\n",
+                 "import urllib.request\ndef f(u):\n    return urllib.request.Request(u, b'x')\n",
+                 "import urllib.request\ndef f(u):\n    return urllib.request.Request(u, method='POST')\n",
+                 "import accounts\n", "from trading import venues\n", "import importlib\nimportlib.import_module('bot')\n",
+                 "P = '/v5/order/create'\n", "K = 'bybit_trade'\n"):
+        assert _research_problems("research/x.py", body), body
+    tree = ast.parse("import research.data\nfrom research import metrics\nimport importlib\n"
+                     "m = importlib.import_module('research.x')\n")
+    assert [n for node in ast.walk(tree) for n in _imported(node) if _is_research(n)] == \
+        ["research.data", "research", "research.x"]
 
 
 @pytest.mark.parametrize("path", [
@@ -550,6 +673,17 @@ def test_surface_qualified_names_and_own_methods():
             "def outer():\n    def inner(s):\n        return s.patch('u')\n    return inner\n")
     senders, _, _ = _fake_surface(body)
     assert senders == {"Bot.call", "Bot.hello.<lambda>", "outer.inner"}
+
+
+def test_surface_skips_calls_into_bot_modules():
+    """payouts.send(...) — вызов функции модуля бота (её тело проверяется само); s.send(...) рядом — отправитель."""
+    local = {"payouts": {"send"}, "research.metrics": {"post"}}
+    body = ("import payouts\nimport payouts as pay\nfrom research import metrics\n"
+            "async def f(s):\n    await payouts.send(s)\n    await pay.send(s)\n    metrics.post(1)\n"
+            "    return s.send(1)\n")
+    senders, _, _ = _surface("bot", body, local)
+    assert senders == {("bot", "f"): ["s.send (стр. 8)"]}
+    assert set(_surface("bot", body)[0][("bot", "f")]) > {"s.send (стр. 8)"}   # без знания модулей — всё подряд
 
 
 def test_surface_ignores_plain_reads():
