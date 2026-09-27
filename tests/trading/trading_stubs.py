@@ -119,6 +119,8 @@ class Book:
         def answer(call):
             b = body(call)
             cid = b["orderLinkId"]
+            if cid in self.orders:   # как биржа: id уже был — второй ордер не создаётся
+                return bybit_err(110072, "OrderLinkedID is duplicate")
             self.next_id += 1
             self.orders[cid] = dict({"orderId": str(self.next_id), "orderLinkId": cid, "symbol": b["symbol"],
                                      "side": b["side"], "orderType": b["orderType"], "qty": b["qty"],
@@ -140,6 +142,8 @@ class Book:
         def answer(call):
             q = call["query"]
             cid = q["clientOrderId"]
+            if cid in self.orders:
+                return bingx_err(101481, "clientOrderID has already been used")
             self.next_id += 1
             order = dict({"symbol": q["symbol"], "orderId": self.next_id, "side": q["side"],
                           "positionSide": q["positionSide"], "type": q["type"], "origQty": q["quantity"],

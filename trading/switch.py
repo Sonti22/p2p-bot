@@ -56,6 +56,33 @@ def lower(new):
     return True
 
 
+def stop_and_persist(save_env):
+    """«⛔ Стоп» для бота (как bot.payout_stop): сначала выключить в процессе (stop — сразу, даже если .env не
+    запишется), затем TRADING=0 и TRADING_MODE=paper в .env через save_env бота. None — записано; иначе имя ошибки
+    записи (владельцу: остановлено только до перезапуска)."""
+    stop()
+    try:
+        save_env("TRADING", "0")
+        save_env("TRADING_MODE", "paper")
+    except Exception as e:   # .env только для чтения, занят редактором и т. п.
+        return type(e).__name__
+    finally:
+        stop()   # save_env пишет и в окружение — на случай чужой реализации ещё раз «0»
+    return None
+
+
+def lower_and_persist(new, save_env):
+    """Понизить режим из Telegram и записать в .env: (True, None) — понижен и записан; (True, ошибка) — понижен
+    только в процессе; (False, None) — повысить нельзя, ничего не менялось."""
+    if not lower(new):
+        return False, None
+    try:
+        save_env("TRADING_MODE", mode())
+    except Exception as e:
+        return True, type(e).__name__
+    return True, None
+
+
 def _file_values(path):
     """{имя в верхнем регистре: [значения]} для TRADING и TRADING_MODE из .env — разбор как у payouts.switch_from_file
     (пустые и # строки — мимо, значение — до « #»). Файл не прочитать — пусто."""

@@ -125,3 +125,45 @@ def test_launcher_money_keys_match():
     import launcher
     assert "TRADING" in launcher.MONEY_KEYS
     assert os.path.basename(switch.STATE_PATH) == "trading_state.json"
+
+
+def test_stop_and_persist_writes_env_via_bot_save_env(tmp_path, monkeypatch):
+    """«⛔ Стоп» как у выплат: сначала процесс, затем .env через save_env бота (настоящий bot.save_env во временный
+    .env); после перезапуска switch_from_file не включит торговлю."""
+    import bot as B
+    path = env_file(tmp_path, "TRADING=1\nTRADING_MODE=auto\nOTHER=x\n")
+    monkeypatch.setenv("TRADING", "1")
+    monkeypatch.setenv("TRADING_MODE", "auto")
+    assert switch.stop_and_persist(lambda k, v: B.save_env(k, v, path)) is None
+    assert not switch.enabled() and switch.mode() == "paper"
+    assert open(path, encoding="utf-8").read().splitlines() == ["TRADING=0", "TRADING_MODE=paper", "OTHER=x"]
+    monkeypatch.setenv("TRADING", "1")                                      # окружение не вернёт торговлю
+    assert switch.switch_from_file(path) == (False, "paper")
+
+
+def test_stop_and_persist_env_write_failure_still_stops(monkeypatch):
+    monkeypatch.setenv("TRADING", "1")
+    monkeypatch.setenv("TRADING_MODE", "confirm")
+    written = []
+
+    def broken(k, v):
+        os.environ[k] = "1"                                                 # «чужая» реализация пишет не то
+        written.append(k)
+        raise PermissionError("файл занят")
+    assert switch.stop_and_persist(broken) == "PermissionError"
+    assert not switch.enabled() and switch.mode() == "paper" and written == ["TRADING"]
+
+
+def test_lower_and_persist(tmp_path, monkeypatch):
+    import bot as B
+    path = env_file(tmp_path, "TRADING=1\nTRADING_MODE=confirm\n")
+    monkeypatch.setenv("TRADING", "1")
+    monkeypatch.setenv("TRADING_MODE", "confirm")
+    assert switch.lower_and_persist("auto", lambda k, v: B.save_env(k, v, path)) == (False, None)
+    assert open(path, encoding="utf-8").read().splitlines() == ["TRADING=1", "TRADING_MODE=confirm"]
+    assert switch.lower_and_persist("minlot", lambda k, v: B.save_env(k, v, path)) == (True, None)
+    assert switch.mode() == "minlot" and "TRADING_MODE=minlot" in open(path, encoding="utf-8").read()
+
+    def broken(k, v):
+        raise OSError("нет доступа")
+    assert switch.lower_and_persist("paper", broken) == (True, "OSError") and switch.mode() == "paper"
