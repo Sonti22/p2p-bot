@@ -39,7 +39,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(HERE, "data", "snapshots.db")
 VERSION = 2
 TOP_N = 20              # объявлений на группу — лучшие по цене для бота
-DEALS_MAX = 100         # связок в снимке не больше — в порядке сканера (прибыль × надёжность)
+DEALS_MAX = 100         # связок в снимке не больше — в порядке сканера (p2p.score, при EV_RANK=1 — по EV)
 DEALS_MIN = 0.0         # связки от этой прибыли, % (или от порога сигнала, если он ниже): ниже не нужны
 RETENTION = 14 * 86400
 PRUNE_EVERY = 600       # сек: удаление по сроку — не чаще
@@ -165,9 +165,13 @@ def _deal(d, cfg, snap, live):
     profit, b, s, route = d
     label, reasons = p2p.reliability(d, cfg, snap)
     rec = (live or {}).get((b.ex, b.asset, s.ex, s.asset)) or {}
-    return {"profit": profit, "buy": _side(b), "sell": _side(s), "route": route, "label": label,
-            "index": p2p.reliability_index(d, cfg, snap), "reasons": reasons,
-            "streak": rec.get("streak", 0), "first": rec.get("first")}
+    out = {"profit": profit, "buy": _side(b), "sell": _side(s), "route": route, "label": label,
+           "index": p2p.reliability_index(d, cfg, snap), "reasons": reasons,
+           "streak": rec.get("streak", 0), "first": rec.get("first")}
+    ev = p2p.ev_of(d, snap)
+    if ev:   # EV_RANK=1: EV и p, с которыми связка стояла в этом порядке (без EV_RANK ключа нет — снимок прежний)
+        out["ev"] = list(ev)
+    return out
 
 
 def collect(snap, cfg, live=None):

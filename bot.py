@@ -1205,6 +1205,8 @@ class Bot:
         self.signal_rows = {}   # (ex,asset,ex,asset) -> id открытого эпизода в history.signals (связка выше порога)
         self.snapshot_scans = 0      # сканов с запуска — снимок пишется каждый SNAPSHOT_EVERY-й
         self.snapshot_keep = set()   # id сканов, на которых стартовал круг сухого прогона: их снимок пишется всегда
+        self.cal = None              # EV_RANK=1: калибровка (calibration.build) и когда собрана — пересборка раз в
+        self.cal_ts = 0.0            # calibration.REFRESH сек, в отдельном потоке
         self.live_msg = {}   # (ex,asset,ex,asset) -> последнее сообщение сигнала для «живой карточки» (editMessage)
         self.live = {}                                            # (ex,asset,ex,asset) -> {"first": ts, "streak": n}
         self.live_scans = int(os.getenv("LIVE_SCANS", 2))        # сигнал, только если связка держится ≥ N сканов
@@ -1857,7 +1859,7 @@ class Bot:
                             f"(от {_money(AMOUNT_MIN)} до {_money(AMOUNT_MAX)} ₽).")
             return
         calc_cfg = dataclasses.replace(self.cfg, amount=amount)
-        snap = await scan(self.s, calc_cfg, force_alt=True)
+        snap = await self.fresh_scan(calc_cfg, force_alt=True)
         await self.show_top(snap, calc_cfg)
         await self.show_best(snap, calc_cfg)
         if snap.deals:
@@ -1949,7 +1951,7 @@ class Bot:
             return
         self.cfg.amount = amount
         save_env("AMOUNT", f"{amount:.0f}")
-        snap = await scan(self.s, self.cfg, force_alt=True)
+        snap = await self.fresh_scan(force_alt=True)
         self.last = snap
         await self.show_top(snap)
         await self.show_best(snap)
@@ -2071,12 +2073,36 @@ class Bot:
             return self.apply_preset(data[len("preset_apply:"):])
         return ""
 
+    async def ev_rank(self, snap, cfg=None):
+        """EV_RANK=1 (Config.ev_rank): связки снимка по убыванию ожидаемой прибыли (calibration.rank_snapshot) — от
+        этого порядка /top, /best, топ-N сигналов и «EV … (p=…)» в карточке. Калибровку по базам прогона и журнала
+        собираем не чаще calibration.REFRESH; чтение баз и ранжирование — в отдельном потоке. EV_RANK=0 — снимок как
+        есть, базы не читаем. Сбой — снимок как есть и строка в логе: сигналы не ломаются."""
+        cfg = cfg or self.cfg
+        if snap is None or not cfg.ev_rank:
+            return snap
+        try:
+            now = time.time()
+            if self.cal is None or now - self.cal_ts >= calibration.REFRESH:
+                self.cal = await asyncio.to_thread(calibration.build)
+                self.cal_ts = now
+            await asyncio.to_thread(calibration.rank_snapshot, self.cal, snap, cfg)
+        except Exception as e:
+            logger.warning("ev rank: %s", e)
+        return snap
+
+    async def fresh_scan(self, cfg=None, force_alt=False):
+        """Скан (p2p.scan) и, при EV_RANK=1, порядок по EV (ev_rank) — до того, как снимок увидят команды и сигналы."""
+        cfg = cfg or self.cfg
+        snap = await (scan(self.s, cfg, force_alt=True) if force_alt else scan(self.s, cfg))
+        return await self.ev_rank(snap, cfg)
+
     async def scan_loop(self):
         while True:
             snap = None
             try:
                 t0 = time.time()
-                snap = self.last = await scan(self.s, self.cfg)
+                snap = self.last = await self.fresh_scan()
                 self.last_scan_ts, self.last_scan_duration = time.time(), time.time() - t0
                 self.track_liveness(self.last)
                 if history.record(self.last, self.cfg.amount):   # не чаще раза в 5 минут, независимо от чата
@@ -2350,7 +2376,7 @@ class Bot:
         return (b.ex, b.asset, s.ex, s.asset)
 
     def _signal_deals(self, snap, traps=None):
-        """Связки выше порога в порядке сканера (p2p.score), не больше MAX_SIGNALS.
+        """Связки выше порога в порядке сканера (p2p.score; EV_RANK=1 — по EV, Bot.ev_rank), не больше MAX_SIGNALS.
         Сначала порог и отсев «🪤 ловушек», потом топ-N: надёжная связка ниже порога или ловушка, стоящая выше
         в списке, не должна закрывать связки за ней. traps — брать и ловушки (None — по SIGNAL_TRAPS)."""
         traps = signal_traps() if traps is None else traps
@@ -3188,9 +3214,11 @@ class Bot:
             await self.send(self.stats_view())
         elif cmd == "/paper":
             await self.cmd_paper(arg)
-        # план 2.6: отчёт калибровки — только владельцу (не в GUEST_CMDS), за флагом CALIBRATION=1 (по умолчанию выкл.)
+        # план 2.6: отчёт калибровки — только владельцу (не в GUEST_CMDS), за флагом CALIBRATION=1 (по умолчанию выкл.);
+        # базы (прогон, журнал, снимки, история) читает в отдельном потоке
         elif cmd == "/calibration" and calibration.enabled():
-            await self.send(calibration.report_text())
+            snap, ev_rank = self.last, self.cfg.ev_rank
+            await self.send(await asyncio.to_thread(lambda: calibration.report_text(ev_rank=ev_rank, snap=snap)))
         elif cmd == "/funding":
             await self.send(simfunding.view())
         elif cmd == "/futures":   # и «/futures paper» — пока есть только бумага

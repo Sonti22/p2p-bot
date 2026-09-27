@@ -267,6 +267,9 @@ class Config:
     merchant_min: dict = field(default_factory=dict)   # MERCHANT_MIN: {Ad.ex: (сделок|None, %|None)}
     merchant_offline: str = "reason"   # MERCHANT_OFFLINE: skip — объявления мерчантов офлайн не берём, reason — причина
     merchant_offline_min: float = MERCHANT_OFFLINE_MIN_DEFAULT   # MERCHANT_OFFLINE_MIN: мин с last_seen до «офлайн»
+    # EV_RANK: связки скана по убыванию ожидаемой прибыли (calibration.rank_snapshot — бот после скана, replay.py для
+    # B), в карточке «EV … (p=…)»; False — порядок по score(), как раньше
+    ev_rank: bool = False
 
     def merchant_thresholds(self, ex):
         """(мин. сделок, мин. %) мерчанта площадки ex (как в Ad.ex): из MERCHANT_MIN, иначе MIN_ORDERS/MIN_RATE."""
@@ -301,6 +304,7 @@ class Config:
             merchant_min=parse_merchant_min(os.getenv("MERCHANT_MIN", "")),
             merchant_offline=_offline_mode_env(),
             merchant_offline_min=_env_parsed("MERCHANT_OFFLINE_MIN", parse_offline_min, MERCHANT_OFFLINE_MIN_DEFAULT),
+            ev_rank=os.getenv("EV_RANK", "0").strip().lower() in ("1", "true", "yes", "on"),
         )
 
 
@@ -1439,6 +1443,9 @@ class Snapshot:
     blocked: frozenset = field(default_factory=frozenset)   # блэклист (ex, nick), с которым собран снимок
     traps: list = field(default_factory=list)       # ловушки, отсеянные в этом скане (_trap_entry)
     perps: dict = field(default_factory=dict)       # (площадка, символ) -> perp.PerpQuote: последние котировки перпов
+    # EV_RANK=1: (ex покупки, монета, ex продажи, монета) -> (EV п.п., p исполнения) — calibration.rank_snapshot;
+    # пусто — EV в карточке не показываем
+    ev: dict = field(default_factory=dict)
 
 
 # key — (монеты, площадки, сумма круга), под которые собран кэш; jobs — замеры запросов, которыми он собран
@@ -1847,6 +1854,20 @@ def fmt_reliability(label, reasons, index=None, rank=None):
     return head if not reasons else f"{head} ({'; '.join(reasons)})"
 
 
+def ev_of(d, snap):
+    """(EV п.п., p) связки из snap.ev (EV_RANK=1, calibration.rank_snapshot); нет снимка или EV — None."""
+    if snap is None or not snap.ev:
+        return None
+    _, b, s, _ = d
+    return snap.ev.get((b.ex, b.asset, s.ex, s.asset))
+
+
+def fmt_ev(ev):
+    """«EV +0.85% (p=0.92)» — ожидаемая прибыль с учётом вероятности исполнения и поправки факта (calibration)."""
+    value, p = ev
+    return f"EV {value:+.2f}% (p={p:.2f})"
+
+
 def _money(x):
     return f"{x:,.0f}".replace(",", " ")
 
@@ -1878,6 +1899,9 @@ def fmt_deal(d, cfg, snap=None):
     if snap is not None:
         text += html.escape(fmt_reliability(*reliability(d, cfg, snap), reliability_index(d, cfg, snap),
                                             score(d, cfg, snap))) + "\n"
+        ev = ev_of(d, snap)
+        if ev:
+            text += "📐 " + fmt_ev(ev) + "\n"
         prem = premium_line(b, s, snap)
         if prem:
             text += html.escape(prem) + "\n"
@@ -1925,12 +1949,15 @@ def fmt_signal(d, cfg, snap=None, limit=SIGNAL_MAX):
     acts, costs = route_actions(route)
     cur = "₽" if cfg.fiat == "RUB" else cfg.fiat
     label, reasons = reliability(d, cfg, snap) if snap is not None else (None, [])
+    ev = ev_of(d, snap)
 
     def build(tail=True, why=True, terms=True):
         lines = [f"<b>{profit:+.2f}% чистыми</b> на {_money(cfg.amount)} {cur}: {b.ex} → {s.ex}"]
         if label:
             lines.append(f"{label} · надёжность {reliability_index(d, cfg, snap)}/10 · оценка {score(d, cfg, snap):+.2f}")
             lines += [f"  – {html.escape(r)}" for r in reasons[:2]] if why else []
+        if ev:   # EV_RANK=1 и калибровка активна
+            lines.append("📐 " + fmt_ev(ev))
         lines += ["", f"<b>{KEYCAPS[0]} Купить {b.asset} на {b.ex}</b> по {_price(b.price)} ₽"]
         lines += _signal_ad(b, "Продавец", "Оплатить через", terms)
         for i, st in enumerate(acts, 1):
