@@ -14,6 +14,7 @@ from datetime import datetime, timedelta, timezone
 import aiohttp
 
 import accounts
+import calibration
 import favorites
 import alerts
 import blacklist
@@ -2833,6 +2834,9 @@ class Bot:
             await self.send(self.stats_view())
         elif cmd == "/paper":
             await self.cmd_paper(arg)
+        # план 2.6: отчёт калибровки — только владельцу (не в GUEST_CMDS), за флагом CALIBRATION=1 (по умолчанию выкл.)
+        elif cmd == "/calibration" and calibration.enabled():
+            await self.send(calibration.report_text())
         elif cmd == "/fav":
             text, kb = self.favorites_view()
             await self.send(text, markup=kb)
