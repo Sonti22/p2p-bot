@@ -83,13 +83,15 @@ def test_routing_by_topic_and_reply_thread(monkeypatch):
     asyncio.run(bot.send("plain"))
     assert [p.get("message_thread_id") for p in sent(bot)] == [11, 12, None]
     # команда из топика «Настройки» — ответ туда же; следующая из общего чата — без топика
-    upd = {"message": {"chat": {"id": 1}, "text": "/help", "message_thread_id": 13}}
+    own = {"chat": {"id": 1, "type": "private"}, "from": {"id": 1}}   # личный чат владельца (топики — в личке)
+    upd = {"message": dict(own, text="/help", message_thread_id=13)}
     asyncio.run(bot.on_update(upd))
     assert sent(bot)[-1]["message_thread_id"] == 13
-    asyncio.run(bot.on_update({"message": {"chat": {"id": 1}, "text": "/help"}}))
+    asyncio.run(bot.on_update({"message": dict(own, text="/help")}))
     assert "message_thread_id" not in sent(bot)[-1]
     # кнопка, нажатая в топике, — ответ туда же
-    cq = {"id": "1", "data": "history", "message": {"chat": {"id": 1}, "message_id": 5, "message_thread_id": 14}}
+    cq = {"id": "1", "data": "history", "from": {"id": 1},
+          "message": {"chat": {"id": 1, "type": "private"}, "message_id": 5, "message_thread_id": 14}}
     asyncio.run(bot.on_update({"callback_query": cq}))
     assert bot.cur_thread == 14
     # сигнал скана — всегда в «Сигналы», даже если последняя команда была из другого топика
@@ -105,6 +107,6 @@ def test_first_chat_sets_up_topics(tmp_path, monkeypatch):
     monkeypatch.setattr(B, "save_env", lambda *a, **k: None)
     bot = Stub(p2p.Config())
     bot.chat_id = ""
-    asyncio.run(bot.on_update({"message": {"chat": {"id": 42}, "text": "/start"}}))
+    asyncio.run(bot.on_update({"message": {"chat": {"id": 42, "type": "private"}, "from": {"id": 42}, "text": "/start"}}))
     assert bot.chat_id == "42" and bot.topics["signals"] == 11
     assert sent(bot)[-1]["text"].startswith("👋") and "message_thread_id" not in sent(bot)[-1]

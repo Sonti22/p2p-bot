@@ -621,7 +621,9 @@ def owner(session=None):
 
 
 def cq(data, mid=77, chat=1):
-    return {"id": "cb", "data": data, "message": {"message_id": mid, "chat": {"id": chat}}}
+    """Нажатие кнопки в личном чате chat его хозяином (from.id == chat.id)."""
+    return {"id": "cb", "data": data, "from": {"id": chat},
+            "message": {"message_id": mid, "chat": {"id": chat, "type": "private"}}}
 
 
 def texts(bot):
@@ -1036,8 +1038,7 @@ def test_stop_during_inflight_send_prevents_resends():
     token = to_preview(bot)
 
     def update(data):
-        return {"update_id": 1, "callback_query": {"id": "c", "data": data,
-                                                   "message": {"message_id": 5, "chat": {"id": 1}}}}
+        return {"update_id": 1, "callback_query": cq(data, mid=5)}
 
     async def go():
         gate = asyncio.Event()

@@ -10,8 +10,10 @@
 - адреса — только из белого списка data/payout_whitelist.json; бот его не пишет, правит владелец на ПК
   (scripts/payout_whitelist.py); записи с ошибкой в адресе/сети пропускаются;
 - лимиты PAYOUT_MAX_ONE и PAYOUT_DAILY_LIMIT в USDT (календарный день МСК, списание = сумма + комиссия) — при
-  предпросмотре и ещё раз перед отправкой; нет курса — отказ;
-- выключатель: выплаты идут только при PAYOUTS=1 (.env на ПК); из Telegram их можно только выключить;
+  предпросмотре и ещё раз перед отправкой по свежему курсу; курс сдвинулся больше PAYOUT_RATE_DRIFT — отказ,
+  подтвердить заново; нет курса — отказ;
+- выключатель: выплаты идут только при PAYOUTS=1 (.env на ПК); из Telegram их можно только выключить. «⛔ Стоп»
+  проверяется сразу перед каждым POST создания (после каждого await) и будит отправку, спящую перед повтором;
 - журнал data/payouts.db: намерение с новым order_id пишется до любого запроса. Неясный исход (таймаут, 5xx) — не
   новый order_id, а /v1/payout/info и повтор с тем же order_id и теми же байтами (не больше MAX_RESEND раз).
 """
@@ -71,11 +73,13 @@ RETRY_DELAY = 5      # сек × номер попытки: пауза посл�
 POLL_INTERVAL = 30   # сек между опросами незавершённых выплат
 POLL_DAYS = 7        # незавершённые выплаты старше — не опрашиваем (в /payout history они остаются)
 DEFAULT_LIMIT = "2000"
+DEFAULT_DRIFT = "2"  # %: PAYOUT_RATE_DRIFT — допустимый сдвиг курса монеты к USDT между предпросмотром и отправкой
 QUANT = Decimal("0.00000001")
 CENT = Decimal("0.01")
 OFF = "выплаты выключены (PAYOUTS≠1): включить можно только на ПК — PAYOUTS=1 в .env и перезапуск бота"
 
 _lock = {"loop": None, "lock": None}
+_stop = {"n": 0, "wake": set()}   # «⛔ Стоп»: сколько раз нажат и (цикл, событие) отправок, спящих перед повтором
 
 
 def _send_lock():
@@ -92,8 +96,45 @@ def enabled():
 
 
 def disable():
-    """«⛔ Стоп»: выплаты выключаются в этом процессе сразу, ещё до записи .env (та может и не удаться)."""
+    """«⛔ Стоп»: выплаты выключаются в этом процессе сразу, ещё до записи .env (та может и не удаться). Отправка, которая
+    уже идёт, после Стопа не шлёт ни одного POST, даже если PAYOUTS снова станет 1, а спящую перед /info или повтором
+    Стоп будит сразу."""
     os.environ["PAYOUTS"] = "0"
+    _stop["n"] += 1
+    try:
+        running = asyncio.get_running_loop()
+    except RuntimeError:
+        running = None
+    for loop, event in list(_stop["wake"]):
+        if loop is running:
+            event.set()
+        else:
+            try:
+                loop.call_soon_threadsafe(event.set)
+            except RuntimeError:   # цикл уже закрыт — будить некого
+                pass
+
+
+def _halted(gen):
+    """Отправке, начатой при счётчике Стопа gen, больше ничего не слать: выплаты выключены или с тех пор был Стоп."""
+    return not enabled() or _stop["n"] != gen
+
+
+async def _pause(seconds, gen):
+    """Пауза отправки перед /info или повтором, которую «⛔ Стоп» прерывает сразу. True — дальше ничего не слать
+    (_halted) — проверено и до паузы, и сразу после неё."""
+    if _halted(gen) or seconds <= 0:
+        return _halted(gen)
+    event = asyncio.Event()
+    waker = (asyncio.get_running_loop(), event)
+    _stop["wake"].add(waker)
+    try:
+        await asyncio.wait_for(event.wait(), seconds)
+    except asyncio.TimeoutError:
+        pass
+    finally:
+        _stop["wake"].discard(waker)
+    return _halted(gen)
 
 
 def switch_from_file(path):
@@ -132,6 +173,16 @@ def _limit(name):
 def limits():
     """(лимит одной выплаты, лимит дня) в USDT из .env."""
     return _limit("PAYOUT_MAX_ONE"), _limit("PAYOUT_DAILY_LIMIT")
+
+
+def rate_drift():
+    """Допустимый сдвиг курса монеты к USDT между предпросмотром и отправкой — доля (PAYOUT_RATE_DRIFT в %, по
+    умолчанию 2 %). Мусор или отрицательное в .env — 0: любой сдвиг курса — отказ (стейблкоинов не касается: курс 1)."""
+    try:
+        v = Decimal(os.getenv("PAYOUT_RATE_DRIFT", DEFAULT_DRIFT).strip())
+    except (InvalidOperation, AttributeError):
+        return Decimal(0)
+    return v / 100 if v.is_finite() and v >= 0 else Decimal(0)
 
 
 def fmt(d):
@@ -729,19 +780,49 @@ def _result(state, row=None, reason="", event=None):
     return {"state": state, "row": row, "reason": reason, "event": event}
 
 
+def _fresh_value(entry, amount, fee, rate, q):
+    """USDT-оценка выплаты по свежему курсу перед самой отправкой: (оценка для лимитов и журнала, None) или (None,
+    причина отказа). Лимиты — по бо́льшей из оценок (предпросмотр или свежая), с учётом всех выплат дня; курс сдвинулся
+    больше PAYOUT_RATE_DRIFT против предпросмотра — отказ: владелец подтверждал другую сумму в USDT."""
+    cur, again = entry["currency"], "проверь выплату заново с новой оценкой: /payout"
+    if rate is None:
+        return None, f"нет курса {cur}→USDT у Cryptomus — без него лимит не проверить, {again}"
+    now = ((amount + fee) * rate).quantize(CENT, rounding=ROUND_UP)
+    usdt = max(q["usdt"], now)
+    why = check_limits(usdt)
+    if why:
+        return None, f"{why} (по курсу на момент отправки) — {again}"
+    was, drift = q.get("rate"), rate_drift()
+    if not isinstance(was, Decimal) or was <= 0 or abs(rate - was) > was * drift:
+        return None, (f"курс {cur}→USDT сдвинулся с предпросмотра: {fmt(was) if isinstance(was, Decimal) else '?'} → "
+                      f"{fmt(rate)} (допуск PAYOUT_RATE_DRIFT={fmt(drift * 100)}%), выплата теперь ≈{now} USDT — {again}")
+    return usdt, None
+
+
+def _stopped(order_id, msg):
+    """«⛔ Стоп» во время разбора неясного исхода: больше ничего не шлём; выплата — "unknown" (в лимите), разберёт poll."""
+    row = _update(order_id, note=f"{msg}; выплаты выключены — повтор не отправлен, статус выяснит опрос")
+    logger.warning("выплата %s: выплаты выключены — повтор не отправлен", order_id)
+    return _result("unknown", row, row["note"])
+
+
 async def send(s, entry, amount, q, creds=None):
     """Отправить выплату, подтверждённую владельцем. Один вызов — не больше одного нового order_id.
 
     Перед отправкой (под общим замком) заново: сервис Cryptomus доступен, сумма в его мин/макс, комиссия не выросла
-    против предпросмотра; затем без пауз до самого POST — выключатель, запись белого списка та же, лимиты с учётом всех
-    выплат дня. Намерение — в журнал (prepared), потом POST /v1/payout (sending):
+    против предпросмотра, свежий курс монеты к USDT; затем без пауз до самого POST — выключатель и Стоп, запись белого
+    списка та же, лимиты по свежему курсу с учётом всех выплат дня, курс не ушёл дальше PAYOUT_RATE_DRIFT. Намерение —
+    в журнал (prepared), потом POST /v1/payout (sending):
     - HTTP 200, state 0, ответ совпал с заявкой — "sent" (или сразу итог); не совпал — "unknown" + тревога;
     - отказ — /v1/payout/info по order_id: «не найдено» — "rejected" (в лимит не идёт), нашлась — принимаем;
     - неясный исход — "unknown", пауза, /v1/payout/info: нашлась — принимаем; «не найдено» — повтор с тем же order_id
-      и теми же байтами (не больше MAX_RESEND раз и только пока PAYOUTS=1); иначе "unknown" (в лимите), разберёт poll.
+      и теми же байтами (не больше MAX_RESEND раз); иначе "unknown" (в лимите), разберёт poll.
+    «⛔ Стоп» (disable) с начала вызова — ни одного POST больше: выключатель и счётчик Стопа проверяются после каждого
+    await и сразу перед каждым POST, а паузу перед /info и повтором Стоп прерывает; выплата остаётся "unknown".
     Возвращает {"state": refused|rejected|sent|unknown|final_paid|final_failed, "row", "reason", "event"}."""
+    gen = _stop["n"]   # Стоп после этой точки — даже пока ждём замок — останавливает и эту отправку
     async with _send_lock():
-        if not enabled():
+        if _halted(gen):
             return _result("refused", reason=OFF)
         creds = creds or credentials()
         if not creds:
@@ -753,15 +834,16 @@ async def send(s, entry, amount, q, creds=None):
         if fee > q["fee"]:
             return _result("refused", reason=f"комиссия Cryptomus выросла: {fmt(q['fee'])} → {fmt(fee)} "
                                              f"{entry['currency']}, проверь выплату заново")
-        # дальше до POST — без await: выключатель, белый список и лимиты проверены прямо перед отправкой
-        if not enabled():
+        rate = await usdt_rate(s, entry["currency"])   # оценка предпросмотра могла устареть: курс — заново
+        # дальше до POST — без await: выключатель, белый список, курс и лимиты проверены прямо перед отправкой
+        if _halted(gen):
             return _result("refused", reason=OFF)
         if whitelist_entry(entry["id"]) != entry:
             return _result("refused", reason="запись белого списка изменилась или удалена")
-        why = check_limits(q["usdt"])
+        usdt, why = _fresh_value(entry, amount, fee, rate, q)
         if why:
             return _result("refused", reason=why)
-        row = _insert_intent(entry, amount, q)
+        row = _insert_intent(entry, amount, dict(q, usdt=usdt))
         order_id = row["order_id"]
         body = payout_body(create_payload(row))
         _update(order_id, state="sending")
@@ -776,8 +858,9 @@ async def send(s, entry, amount, q, creds=None):
             ambiguous = ambiguous or kind == "ambiguous"
             _update(order_id, state="unknown", note=msg, create_kind="ambiguous" if ambiguous else "error")
             logger.warning("выплата %s: %s (%s)", order_id, "исход неясен" if kind == "ambiguous" else "отказ", msg)
-            if kind == "ambiguous":
-                await asyncio.sleep(RETRY_DELAY * posts)   # первый запрос точно закончился; даём Cryptomus время
+            # первый запрос точно закончился; после неясного исхода даём Cryptomus время. Стоп — больше ничего не шлём
+            if await _pause(RETRY_DELAY * posts if kind == "ambiguous" else 0, gen):
+                return _stopped(order_id, msg)
             ikind, ires, imsg = await _info(s, creds, order_id)
             if ikind == "ok":
                 kind, res = "ok", ires
@@ -789,10 +872,8 @@ async def send(s, entry, amount, q, creds=None):
             if ikind != "notfound" or kind == "error" or posts > MAX_RESEND:
                 row = get(order_id)   # отказ после неясного исхода не доказывает, что первая попытка не прошла
                 return _result("unknown", row, row["note"])
-            if not enabled():
-                row = _update(order_id, note=f"{msg}; выплаты выключены — повтор не отправлен")
-                return _result("unknown", row, row["note"])
-            await asyncio.sleep(RETRY_DELAY * posts)
+            if await _pause(RETRY_DELAY * posts, gen):   # выключатель — до паузы и сразу после неё, перед самым POST
+                return _stopped(order_id, msg)
             kind, res, msg = await _create(s, creds, body)   # тот же order_id, те же байты
             posts += 1
 

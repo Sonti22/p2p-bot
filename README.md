@@ -13,7 +13,8 @@
 pip install -r requirements.txt
 cp .env.example .env        # вписать TG_TOKEN от @BotFather
 python p2p.py               # разовый срез в консоль
-python bot.py               # бот (или run.bat); напиши ему /start — chat_id запишется в .env сам
+python bot.py               # бот (или run.bat); напиши ему /start в личку — chat_id запишется в .env сам
+                            # (владелец — только личный чат: группа или канал владельцем не станут)
 ```
 
 ## Команды бота

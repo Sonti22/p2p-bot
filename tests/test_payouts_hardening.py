@@ -1,14 +1,17 @@
 """Выплаты Cryptomus, финальная проверка: «⛔ Стоп» во время перезапроса сервисов, «не найдено» при известном uuid,
 база первой версии без create_kind, разделители строк в .env, поддельные кнопки мастера первого запуска."""
 import asyncio
+import os
 import sqlite3
+from decimal import Decimal
 
 import pytest
 
 import bot as B
 import payouts
-from test_payouts import (INFO, SERVICE_LIST, SERVICES, Resp, Session, _payout_env, _sent_row, info_for,  # noqa: F401
-                          owner, routes, run, to_preview)
+from test_payouts import (ENTRIES, INFO, PAY, SERVICE_LIST, SERVICES, TRON2, Resp, Session,  # noqa: F401
+                          _payout_env, _sent_row, echo, entry, info_for, owner, quote, rate, routes, run, to_preview,
+                          write_whitelist)
 
 
 class GatedOK(Resp):
@@ -23,7 +26,9 @@ class GatedOK(Resp):
 
 
 def _update(data):
-    return {"update_id": 1, "callback_query": {"id": "c", "data": data, "message": {"message_id": 5, "chat": {"id": 1}}}}
+    """Кнопка владельца в его личном чате (type private, from.id == chat.id == TG_CHAT_ID)."""
+    return {"update_id": 1, "callback_query": {"id": "c", "data": data, "from": {"id": 1},
+                                               "message": {"message_id": 5, "chat": {"id": 1, "type": "private"}}}}
 
 
 def test_stop_during_services_recheck_sends_no_post():
@@ -197,8 +202,7 @@ def test_payout_handlers_refuse_non_owner_even_past_routing():
         run(bot.cmd_payout(""))
         run(bot.cmd_payout("history"))
         run(bot.payout_amount("w1", "25"))
-        run(bot.payout_callback({"id": "g", "data": "pay_hist", "message": {"message_id": 3, "chat": {"id": 1}}},
-                                "pay_hist"))
+        run(bot.payout_callback(_update("pay_hist")["callback_query"], "pay_hist"))
     finally:
         B.REPLY_CHAT.reset(guest)
     new = bot.out[out:]
@@ -206,7 +210,7 @@ def test_payout_handlers_refuse_non_owner_even_past_routing():
     assert [p.get("text") for m, p in new if m == "answerCallbackQuery"] == ["Только для владельца бота"]
     assert bot.payout_preview["token"] == token and len(bot.s.posts()) == posts
     async def owner_press():
-        await bot.on_callback({"id": "o", "data": f"pay_ok:{token}", "message": {"message_id": 5, "chat": {"id": 1}}})
+        await bot.on_callback(_update(f"pay_ok:{token}")["callback_query"])
         await bot.payout_task
     run(owner_press())
     assert len(bot.s.posts()) == posts + 1                         # владелец отправляет как обычно
@@ -240,3 +244,260 @@ def test_forged_onboarding_bank_callback_is_ignored():
     run(bot.on_callback({"id": "c", "data": f"onb_bank:{B.ONBOARD_BANKS[0]}",
                          "message": {"message_id": 5, "chat": {"id": 1}}, "from": {"id": 1}}))
     assert bot.onboarding["banks"] == {B.ONBOARD_BANKS[0]}           # настоящая кнопка работает
+
+
+# --- ревью 2026-09-27: «⛔ Стоп» в паузе повтора, владелец — личный чат, свежий курс перед отправкой ---
+
+RATE_BTC = ("GET", "/v1/exchange-rate/BTC/list")
+
+
+def _msg(chat, text, uid=None, ctype="private"):
+    """Сообщение Telegram: чат с типом и отправитель (в личном чате id отправителя = id чата)."""
+    return {"message": {"message_id": 9, "chat": {"id": chat, "type": ctype}, "text": text,
+                        "from": {"id": chat if uid is None else uid, "first_name": "Вася"}}}
+
+
+def _cb(chat, data, uid=None, ctype="private"):
+    """Нажатие кнопки: from — кто нажал, message.chat — где сообщение с кнопкой."""
+    return {"callback_query": {"id": "c", "data": data, "from": {"id": chat if uid is None else uid},
+                               "message": {"message_id": 5, "chat": {"id": chat, "type": ctype}}}}
+
+
+def _texts(bot):
+    return [p["text"] for m, p in bot.out if m == "sendMessage"]
+
+
+def test_stop_during_resend_delay_sends_no_second_post(monkeypatch):
+    """Неясный исход → /info «не найдено» → пауза перед повтором. «⛔ Стоп» в этой паузе — повтор не уходит:
+    выключатель проверяется сразу перед каждым POST, после каждого await (раньше — только до паузы)."""
+    monkeypatch.setattr(payouts, "RETRY_DELAY", 0.2)
+    s = Session(routes({PAY: [Resp(exc=asyncio.TimeoutError()), echo()], INFO: info_for({})}))
+    q = quote(s)
+
+    async def go():
+        task = asyncio.create_task(payouts.send(s, entry("w1"), Decimal("25"), q))
+        while not s.posts("/v1/payout/info"):
+            await asyncio.sleep(0.01)
+        await asyncio.sleep(0.03)                                   # send уже в паузе перед повтором
+        payouts.disable()
+        return await asyncio.wait_for(task, 5)
+    res = run(go())
+    assert len(s.posts()) == 1                                      # без исправления — 2 (повтор после Стопа)
+    assert res["state"] == "unknown" and "повтор не отправлен" in res["reason"]
+    assert payouts.used_today() == q["usdt"]                        # исход неясен — в лимите
+
+
+def test_stop_is_sticky_for_inflight_send_even_if_switch_flips_back(monkeypatch):
+    """Стоп во время паузы, а потом PAYOUTS снова 1 (чем угодно в процессе) — эта отправка всё равно больше ничего не
+    шлёт: кроме выключателя проверяется счётчик Стопа. Следующая выплата — уже по новому подтверждению — идёт."""
+    monkeypatch.setattr(payouts, "RETRY_DELAY", 0.2)
+    s = Session(routes({PAY: [Resp(exc=asyncio.TimeoutError()), echo()], INFO: info_for({})}))
+    q = quote(s)
+
+    async def go():
+        task = asyncio.create_task(payouts.send(s, entry("w1"), Decimal("25"), q))
+        while not s.posts("/v1/payout/info"):
+            await asyncio.sleep(0.01)
+        payouts.disable()
+        monkeypatch.setenv("PAYOUTS", "1")
+        return await asyncio.wait_for(task, 5)
+    res = run(go())
+    assert len(s.posts()) == 1 and res["state"] == "unknown" and "повтор не отправлен" in res["reason"]
+    assert run(payouts.send(s, entry("w1"), Decimal("25"), quote(s)))["state"] == "sent"
+
+
+def test_stop_interrupts_sleeping_resend_at_once(monkeypatch):
+    """Пауза перед /info и повтором длинная (RETRY_DELAY × попытка) — «⛔ Стоп» будит её сразу: отправка кончается
+    за доли секунды, без /info и без повтора; исход выяснит опрос (poll)."""
+    monkeypatch.setattr(payouts, "RETRY_DELAY", 30)
+    s = Session(routes({PAY: [Resp(exc=asyncio.TimeoutError()), echo()], INFO: info_for({})}))
+    q = quote(s)
+
+    async def go():
+        task = asyncio.create_task(payouts.send(s, entry("w1"), Decimal("25"), q))
+        while not s.posts():
+            await asyncio.sleep(0.01)
+        await asyncio.sleep(0.03)
+        payouts.disable()
+        return await asyncio.wait_for(task, 5)                      # без пробуждения — 30 с и таймаут теста
+    res = run(go())
+    assert len(s.posts()) == 1 and not s.posts("/v1/payout/info")
+    assert res["state"] == "unknown" and "повтор не отправлен" in res["reason"]
+    assert payouts.history()[0]["state"] == "unknown"
+
+
+def test_stop_button_interrupts_background_resend(monkeypatch):
+    """Через бота: «✅ Отправить» ушла фоном, первый POST — таймаут, отправка спит перед разбором; «⛔ Стоп» из
+    command_loop будит её — ровно один POST, владельцу — «исход неясен»."""
+    monkeypatch.setattr(payouts, "RETRY_DELAY", 30)
+    s = Session(routes({PAY: [Resp(exc=asyncio.TimeoutError()), echo()], INFO: info_for({})}))
+    bot = owner(s)
+    token = to_preview(bot)
+
+    async def go():
+        await asyncio.wait_for(bot.on_update(_cb(1, f"pay_ok:{token}")), 5)
+        while not s.posts():
+            await asyncio.sleep(0.01)
+        await asyncio.sleep(0.03)
+        await bot.on_update(_cb(1, "pay_stop"))
+        await asyncio.wait_for(bot.payout_task, 5)
+    run(go())
+    assert len(s.posts()) == 1 and not payouts.enabled()
+    assert "неясен" in _texts(bot)[-1]
+
+
+@pytest.mark.parametrize("ctype,chat,uid", [("group", -5, 7), ("supergroup", -1001, 7), ("channel", -1002, 7),
+                                            ("private", 7, 8)])
+def test_new_install_binds_owner_only_from_private_chat(monkeypatch, caplog, ctype, chat, uid):
+    """TG_CHAT_ID пуст: владельцем становится только личный чат (type private, from.id == chat.id). Группа,
+    супергруппа, канал (и чужой отправитель) — не привязываются, это пишется в лог; потом личный чат — как раньше."""
+    saved = []
+    monkeypatch.setattr(B, "save_env", lambda k, v, path=None: saved.append((k, v)))
+    bot = owner()
+    bot.chat_id = ""
+    run(bot.on_update(_msg(chat, "/start", uid=uid, ctype=ctype)))
+    run(bot.on_update({"channel_post": {"message_id": 1, "chat": {"id": chat, "type": "channel"}, "text": "/start"}}))
+    assert bot.chat_id == "" and saved == [] and bot.onboarding is None
+    assert "TG_CHAT_ID" in caplog.text
+    run(bot.on_update(_msg(7, "/start")))                           # личный чат — мастер первого запуска
+    assert bot.chat_id == "7" and saved == [("TG_CHAT_ID", "7")]
+    assert bot.onboarding == {"step": "amount", "banks": set()}
+
+
+@pytest.mark.parametrize("ctype", ["group", "supergroup", "channel"])
+def test_group_as_tg_chat_id_gets_no_owner_actions(monkeypatch, ctype):
+    """TG_CHAT_ID — группа (или канал): ни один её участник, включая самого владельца, не получает команд и кнопок
+    владельца — настроек, ключей, выплат, «⛔ Стоп»; на команду — понятный отказ, на кнопку — всплывающий отказ."""
+    saved = []
+    monkeypatch.setattr(B, "save_env", lambda k, v, path=None: saved.append((k, v)))
+    bot = owner()
+    bot.chat_id = "-1001"
+    for uid in (5, 6):
+        for text in ("/payout", "/settings", "⚙️ Настройки", "/status", "/allow 42"):
+            run(bot.on_update(_msg(-1001, text, uid=uid, ctype=ctype)))
+    for data in ("pay_to:w1", "pay_ok:x", "pay_stop", "pay_hist", "settings", "acc_add:bybit", "paper_set:on"):
+        run(bot.on_update(_cb(-1001, data, uid=5, ctype=ctype)))
+    got = _texts(bot)
+    assert got and all("личном чате" in t and "TG_CHAT_ID" in t for t in got)
+    assert _answers(bot) and all("личном чате" in t for t in _answers(bot))
+    assert saved == [] and payouts.enabled() and bot.awaiting_payout is None and bot.awaiting_key is None
+    assert bot.guests == set() and not bot.s.calls
+
+
+def test_callback_or_message_from_another_user_in_owner_chat_refused():
+    """Кнопку нажал не владелец (callback.from.id ≠ TG_CHAT_ID), хотя сообщение с кнопкой — в чате владельца: отказ и
+    в маршрутизации, и в самом обработчике выплат. Владелец после этого отправляет как обычно."""
+    bot = owner()
+    token = to_preview(bot)
+    for data in (f"pay_ok:{token}", "pay_stop", "paper_set:on", "settings"):
+        run(bot.on_update(_cb(1, data, uid=2)))
+    run(bot.payout_callback(_cb(1, f"pay_ok:{token}", uid=2)["callback_query"], f"pay_ok:{token}"))
+    run(bot.on_update(_msg(1, "/payout", uid=2)))
+    assert not bot.s.posts() and payouts.enabled() and bot.payout_preview["token"] == token
+    assert len(_answers(bot)) >= 5 and all("владельц" in t for t in _answers(bot)[-5:])
+
+    async def owner_press():
+        await bot.on_update(_cb(1, f"pay_ok:{token}"))
+        await bot.payout_task
+    run(owner_press())
+    assert len(bot.s.posts()) == 1
+
+
+def test_owner_private_chat_keeps_working_end_to_end():
+    """Владелец в личном чате (type private, from.id == chat.id == TG_CHAT_ID): /payout → получатель → сумма →
+    «✅ Отправить» → ровно один POST; «⛔ Стоп» выключает выплаты."""
+    s = Session(routes())
+    bot = owner(s)
+
+    async def go():
+        await bot.on_update(_msg(1, "/payout"))
+        await bot.on_update(_cb(1, "pay_to:w1"))
+        await bot.on_update(_msg(1, "25"))
+        token = bot.payout_preview["token"]
+        await bot.on_update(_cb(1, f"pay_ok:{token}"))
+        await bot.payout_task
+        await bot.on_update(_cb(1, "pay_stop"))
+    run(go())
+    assert len(s.posts()) == 1 and "Cryptomus принял выплату 25 USDT" in " ".join(_texts(bot))
+    assert not payouts.enabled()
+
+
+def test_owner_pressing_in_another_group_is_not_owner():
+    """Сам владелец (from.id == TG_CHAT_ID) жмёт кнопку в чужой группе — это не его личный чат: ничего."""
+    bot = owner()
+    run(bot.on_update(_cb(-5, "pay_stop", uid=1, ctype="supergroup")))
+    assert payouts.enabled()
+
+
+def test_send_refreshes_rate_and_refuses_over_limit_at_new_price():
+    """Предпросмотр по старому курсу: 0.03 BTC + 0.0001 комиссии ≈ 1806 USDT (лимит 2000). К отправке BTC подорожал —
+    та же выплата уже ≈2107 USDT: отказ до POST с новой оценкой и просьбой подтвердить заново."""
+    s = Session(routes())
+    q = quote(s, "w2", "0.03")
+    assert q["usdt"] == Decimal("1806.00")
+    s.routes[RATE_BTC] = rate("BTC", "70000")
+    res = run(payouts.send(s, entry("w2"), Decimal("0.03"), q))
+    assert res["state"] == "refused" and "2107" in res["reason"] and "/payout" in res["reason"]
+    assert not s.posts() and payouts.history() == []
+
+
+def test_send_refuses_rate_drift_and_allows_small_drift(monkeypatch):
+    """Курс сдвинулся больше PAYOUT_RATE_DRIFT (по умолчанию 2 %) — отказ, даже в пределах лимитов; небольшой сдвиг —
+    отправка, в журнал и лимит — бо́льшая из оценок (предпросмотр или свежая)."""
+    s = Session(routes())
+    q = quote(s, "w2", "0.01")                                      # 0.0101 × 60000 = 606.00
+    s.routes[RATE_BTC] = rate("BTC", "63000")                       # +5 %
+    res = run(payouts.send(s, entry("w2"), Decimal("0.01"), q))
+    assert res["state"] == "refused" and "курс" in res["reason"] and "/payout" in res["reason"] and not s.posts()
+    s.routes[RATE_BTC] = rate("BTC", "60600")                       # +1 %
+    res = run(payouts.send(s, entry("w2"), Decimal("0.01"), q))
+    assert res["state"] == "sent" and res["row"]["usdt_value"] == "612.06" and len(s.posts()) == 1
+    s.routes[RATE_BTC] = rate("BTC", "59400")                       # −1 %: в лимит — оценка предпросмотра
+    res = run(payouts.send(s, entry("w2"), Decimal("0.01"), q))
+    assert res["state"] == "sent" and res["row"]["usdt_value"] == "606.00"
+    monkeypatch.setenv("PAYOUT_RATE_DRIFT", "10")
+    s.routes[RATE_BTC] = rate("BTC", "63000")
+    assert run(payouts.send(s, entry("w2"), Decimal("0.01"), q))["state"] == "sent"
+
+
+def test_rate_drift_garbage_fails_closed_and_is_documented(monkeypatch):
+    s = Session(routes())
+    q = quote(s, "w2", "0.01")
+    monkeypatch.setenv("PAYOUT_RATE_DRIFT", "много")                # мусор — допуск 0: любой сдвиг курса — отказ
+    s.routes[RATE_BTC] = rate("BTC", "60001")
+    assert run(payouts.send(s, entry("w2"), Decimal("0.01"), q))["state"] == "refused"
+    s.routes[RATE_BTC] = rate("BTC", "60000")
+    assert run(payouts.send(s, entry("w2"), Decimal("0.01"), q))["state"] == "sent"
+    with open(os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env.example"), encoding="utf-8") as f:
+        assert "PAYOUT_RATE_DRIFT=2" in f.read().splitlines()
+
+
+def test_send_refuses_when_rate_unavailable_at_send():
+    s = Session(routes())
+    q = quote(s, "w2", "0.01")
+    s.routes[RATE_BTC] = Resp(500, {"message": "Server error"})
+    res = run(payouts.send(s, entry("w2"), Decimal("0.01"), q))
+    assert res["state"] == "refused" and "нет курса" in res["reason"] and not s.posts()
+
+
+@pytest.mark.parametrize("change", ["stop", "whitelist"])
+def test_everything_rechecked_after_rate_refresh(change):
+    """Свежий курс — ещё один await перед POST: «⛔ Стоп» или правка белого списка, пока он идёт, — POST не уходит."""
+    s = Session(routes())
+    q = quote(s, "w2", "0.01")
+    body = {"state": 0, "result": [{"from": "BTC", "to": "USDT", "course": "60000"}]}
+
+    async def go():
+        gate = asyncio.Event()
+        s.routes[RATE_BTC] = lambda call: GatedOK(gate, 200, body)
+        task = asyncio.create_task(payouts.send(s, entry("w2"), Decimal("0.01"), q))
+        for _ in range(50):
+            await asyncio.sleep(0)
+        if change == "stop":
+            payouts.disable()
+        else:
+            write_whitelist([dict(x, name="Другой BTC") if x["id"] == "w2" else x for x in ENTRIES])
+        gate.set()
+        return await asyncio.wait_for(task, 5)
+    res = run(go())
+    assert res["state"] == "refused" and not s.posts() and payouts.history() == []

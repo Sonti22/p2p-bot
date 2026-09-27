@@ -86,6 +86,12 @@ GUEST_WELCOME = ("👋 <b>Владелец открыл тебе доступ.</
                  "Настройки, ключи бирж и журнал сделок — только у владельца.")
 ACCESS_HINT = ("🔒 Бот приватный. Твой id: <code>{chat}</code> — попроси владельца выполнить "
                "<code>/allow {chat}</code>, и я начну отвечать.")
+# владелец — только личный чат: чат TG_CHAT_ID оказался группой/каналом (или пишет не владелец)
+OWNER_ONLY_PRIVATE = ("🔒 Команды владельца (настройки, ключи, выплаты) работают только в личном чате с ботом. "
+                      "Сейчас TG_CHAT_ID в .env — группа или канал: впиши туда id своего личного чата с ботом (он "
+                      "равен твоему Telegram user id) и перезапусти бота.")
+OWNER_ONLY_TOAST = "Кнопки владельца — только в личном чате владельца с ботом"
+FIRST_CHAT_PRIVATE = "🔒 Владельцем бота становится только личный чат: напиши мне /start в личные сообщения."
 COMMANDS = [{"command": "best", "description": "Лучшая связка сейчас"},
             {"command": "top", "description": "Топ связок графиком"},
             {"command": "history", "description": "История спредов: время суток, дни недели, BestChange"},
@@ -2753,24 +2759,41 @@ class Bot:
                 except Exception as e:
                     logger.error("update error: %s", e)
 
-    def _owner_gate(self, chat):
-        """Кто пишет боту: "owner" — чат владельца (TG_CHAT_ID): ему всё, в том числе настройки, ключи и выплаты;
-        "guest" — гость из /allow: только GUEST_CMDS/GUEST_CALLBACKS; None — чужой. Защищённая функция (пин в
-        tests/test_payout_pins.py): от неё зависит, кто может нажимать кнопки выплат."""
-        if chat == self.chat_id:
-            return "owner"
-        if self.is_guest(chat):
+    def _owner_gate(self, u):
+        """Кто прислал u — сообщение (message) или нажатие кнопки (callback_query) Telegram:
+        "owner" — владелец в своём личном чате: chat.type == "private" и from.id == chat.id == TG_CHAT_ID (у личного
+        чата id равен id пользователя; у кнопки from — тот, кто нажал, chat — где сообщение с кнопкой): ему всё, в том
+        числе настройки, ключи, выплаты и их подтверждение; "refuse" — чат TG_CHAT_ID, но не личный (группа,
+        супергруппа, канал) или пишет/нажал не владелец: команды и кнопки владельца — отказ; "bind" — TG_CHAT_ID пуст и
+        пишет человек в личном чате с ботом: этот чат станет чатом владельца (группа или канал — никогда);
+        "guest" — гость из /allow: только GUEST_CMDS/GUEST_CALLBACKS; None — чужой.
+        Защищённая функция (пин в tests/test_payout_pins.py): от неё зависит, кто может нажимать кнопки выплат."""
+        u = u if isinstance(u, dict) else {}
+        m = u if "chat" in u else u.get("message")   # у кнопки чат — у сообщения, к которому она приложена
+        chat = (m.get("chat") if isinstance(m, dict) else None) or {}
+        cid = str(chat.get("id", "")) if isinstance(chat, dict) else ""
+        sender = u.get("from") if isinstance(u.get("from"), dict) else {}
+        private = bool(cid) and chat.get("type") == "private" and str(sender.get("id", "")) == cid
+        if self.chat_id and cid == self.chat_id:
+            return "owner" if private else "refuse"
+        if not self.chat_id and private and m is u:
+            return "bind"
+        if cid and self.is_guest(cid):
             return "guest"
         return None
 
     async def on_update(self, u):
         cq = u.get("callback_query")
         if cq:
-            chat = str(cq.get("message", {}).get("chat", {}).get("id", ""))
-            who = self._owner_gate(chat)
+            chat = str(((cq.get("message") or {}).get("chat") or {}).get("id", ""))
+            who = self._owner_gate(cq)
             if who == "owner":
                 self.cur_thread = cq["message"].get("message_thread_id")   # ответ — в тот же топик
                 await self.on_callback(cq)
+            elif who == "refuse":
+                logger.warning("кнопка владельца не из его личного чата (чат %s, нажал %s) — отказ",
+                               chat, (cq.get("from") or {}).get("id"))
+                await self.call("answerCallbackQuery", callback_query_id=cq["id"], text=OWNER_ONLY_TOAST)
             elif who == "guest":
                 await self.on_guest_callback(cq, chat)
             return
@@ -2779,21 +2802,35 @@ class Bot:
         if not chat:
             return
         self.cur_thread = msg.get("message_thread_id")
-        if not self.chat_id:
-            # первый написавший чат становится получателем сигналов
+        who = self._owner_gate(msg)
+        if who == "bind":
+            # первый, кто написал боту в личку, становится владельцем и получателем сигналов
             self.chat_id = chat
             save_env("TG_CHAT_ID", chat)
             logger.info("chat_id сохранён в .env: %s", chat)
             await self.setup_topics()
             await self.start_onboarding()
             return
-        who = self._owner_gate(chat)
+        if not self.chat_id:
+            if chat not in self.asked:   # группа, канал или чужой отправитель: владельцем не делаем, отвечаем раз
+                self.asked.add(chat)
+                logger.warning("TG_CHAT_ID пуст: чат %s (%s) не личный — владельцем не назначен, жду /start в личке",
+                               chat, msg.get("chat", {}).get("type"))
+                await self.send(FIRST_CHAT_PRIVATE, chat_id=chat)
+            return
         if who == "owner":
             text = (msg.get("text") or "").strip()
             if self.awaiting_key and text and text not in BUTTONS and not text.startswith("/"):
                 await self.handle_key_input(text, msg.get("message_id"))
             else:
                 await self.handle(text)
+        elif who == "refuse":
+            text = (msg.get("text") or "").strip()
+            logger.warning("команда владельца не из его личного чата (чат %s, %s, от %s) — отказ",
+                           chat, msg.get("chat", {}).get("type"), (msg.get("from") or {}).get("id"))
+            if text.startswith("/") or text in BUTTONS:   # на обычную болтовню в группе не отвечаем
+                private = msg.get("chat", {}).get("type") == "private"
+                await self.send("🔒 Это только для владельца бота." if private else OWNER_ONLY_PRIVATE, chat_id=chat)
         elif who == "guest":
             await self.handle_guest(chat, (msg.get("text") or "").strip())
         else:
@@ -3288,10 +3325,9 @@ class Bot:
 
     async def payout_callback(self, cq, data):
         """Кнопки выплат: pay_to:<id> — получатель из белого списка, pay_ok/pay_no:<токен> — кнопки предпросмотра,
-        pay_hist — история, pay_stop — выключить выплаты. Только чат владельца (_owner_gate) и не в контексте гостя —
-        проверка здесь же, а не только в маршрутизации on_update."""
-        chat = str((cq.get("message") or {}).get("chat", {}).get("id", ""))
-        if REPLY_CHAT.get() is not None or self._owner_gate(chat) != "owner":
+        pay_hist — история, pay_stop — выключить выплаты. Только сам владелец в своём личном чате (_owner_gate: тип чата,
+        кто нажал) и не в контексте гостя — проверка здесь же, а не только в маршрутизации on_update."""
+        if REPLY_CHAT.get() is not None or self._owner_gate(cq) != "owner":
             await self.call("answerCallbackQuery", callback_query_id=cq["id"], text="Только для владельца бота")
             return
         kind, _, arg = data.partition(":")

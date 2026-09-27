@@ -1379,7 +1379,8 @@ def test_on_update_routes_plain_text_to_key_input_when_awaiting():
     bot = Stub(p2p.Config())
     bot.chat_id = "1"
     bot.awaiting_key = {"ex": "bybit", "step": "key"}
-    asyncio.run(bot.on_update({"message": {"chat": {"id": 1}, "text": "APIKEY123", "message_id": 7}}))
+    asyncio.run(bot.on_update({"message": {"chat": {"id": 1, "type": "private"}, "from": {"id": 1}, "text": "APIKEY123",
+                                           "message_id": 7}}))
     assert ("deleteMessage", {"chat_id": "1", "message_id": 7}) in bot.out
     assert bot.awaiting_key == {"ex": "bybit", "step": "secret", "key": "APIKEY123"}
 
@@ -1388,7 +1389,8 @@ def test_on_update_command_bypasses_key_input():
     bot = Stub(p2p.Config())
     bot.chat_id = "1"
     bot.awaiting_key = {"ex": "bybit", "step": "key"}
-    asyncio.run(bot.on_update({"message": {"chat": {"id": 1}, "text": "/best", "message_id": 7}}))
+    asyncio.run(bot.on_update({"message": {"chat": {"id": 1, "type": "private"}, "from": {"id": 1}, "text": "/best",
+                                           "message_id": 7}}))
     assert not any(m == "deleteMessage" for m, _ in bot.out)
     assert bot.awaiting_key is None
 
