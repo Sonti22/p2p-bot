@@ -46,21 +46,14 @@ guard = _load_guard()
 
 def _tracked(pattern="*.py"):
     """Файлы, которые отслеживает git (в CI и в папке бота на ПК это checkout; посторонние файлы ПК не в счёт).
-    Без git — обход папки (без .git, виртуальных окружений, data/ и logs/)."""
+    git не ответил — красный тест, а не обход папки: иначе проверка молча смотрела бы не на то (или ни на что)."""
     try:
         out = guard.git("-C", ROOT, "-c", "core.quotepath=false", "ls-files", "-z", "--", pattern)
-        files = [f for f in out.split("\0") if f]
-    except Exception:
-        files = []
-    if files:
-        return files
-    skip = {".git", "__pycache__", ".venv", "venv", "env", "data", "logs", ".pytest_cache", "node_modules"}
-    for top, dirs, names in os.walk(ROOT):
-        dirs[:] = [d for d in dirs if d not in skip]
-        for n in names:
-            if n.endswith(pattern.lstrip("*")):
-                files.append(os.path.relpath(os.path.join(top, n), ROOT).replace(os.sep, "/"))
-    return files
+    except Exception as e:
+        pytest.fail(f"git ls-files не сработал ({type(e).__name__}: {str(e)[:200]}) — без списка файлов из git "
+                    f"поверхность вне trading/ не проверить. Тесты запускаются в checkout репозитория (CI, папка бота "
+                    f"на ПК) с git в PATH.", pytrace=False)
+    return [f for f in out.split("\0") if f]
 
 
 def _is_trading(path):
@@ -123,6 +116,20 @@ TRADING_LINES = [
     "    key = accounts.keys().get('bybit_trade')",
     "BINGX_TRADE_KEY=",
     "def bingx_trade_key():",
+    # режимы маржи и позиций, поля позиций (фьючерсы — только trading/)
+    "    '/v5/account/set-margin-mode',",
+    "    '/v5/spot-margin-trade/switch-mode',",
+    "    body['positionIdx'] = 0",
+    "    params = {'positionSide': 'LONG'}",
+    # вывод и переводы — путь с ведущей «/» (нигде, и в trading/ тоже; см. MONEY_OUT ниже)
+    "    '/v5/asset/withdraw/create',",
+    "    url = f'{BINGX_BASE}/openApi/wallets/v1/capital/withdraw/apply'",
+    "    '/v5/asset/transfer/inter-transfer',",
+    "    '/v5/asset/transfer/universal-transfer',",
+    "    '/api/v3/capital/sub-account/universalTransfer',",
+    "    '/openApi/wallets/v1/capital/innerTransfer/apply',",
+    "    '/openApi/api/v3/post/asset/transfer',",
+    "    PATH = '/v1/transfer/to-personal'",
 ]
 
 NOT_TRADING_LINES = [
@@ -144,6 +151,16 @@ NOT_TRADING_LINES = [
     "    '/v5/p2p/order/payments',",
     "# paper_trading.py и trading-заметки в комментарии",
     "    'trade': 'сделка',",
+    # чтение истории и слова без пути — не вывод и не перевод
+    "        trade_id = row['trade_id']",
+    "    '/api/v3/capital/withdraw/history',",
+    "    '/openApi/api/v3/capital/withdraw/history',",
+    "    '/v5/asset/transfer/query-inter-transfer-list',",
+    "    '/api/v1/withdrawals',",
+    "    '/v1/query/deposit-withdraw',",
+    "    'permitsUniversalTransfer': 'переводы между своими счетами',",
+    "    (status 6). Вывод с transferType 2 — перевод другому пользователю BingX (innerTransfer, право Withdraw), а",
+    "    positions = [], position_side = None",
 ]
 
 
@@ -233,6 +250,27 @@ def test_guard_blocks_trading_lines_and_trading_paths(tmp_path, monkeypatch):
     assert guard.check("main") == ["bot.py: изменён торговый код (1 стр.) — только ручная проверка"]
 
 
+def test_guard_skips_trading_lines_in_tests_but_not_payout_lines(tmp_path, monkeypatch):
+    """В tests/ строки торгового кода guard не считает (списки запретных путей там нарочно, как в этом файле;
+    tests/trading/ и tests/conftest.py защищены путём), а строки выплат — считает, как раньше."""
+    g = _repo(tmp_path, monkeypatch)
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_x.py").write_text("P = '/v5/order/create'\nT = 'TRADING=1'\nimport trading\n",
+                                                  encoding="utf-8")
+    g("add", "-A")
+    g("commit", "-q", "-m", "tests")
+    assert guard.check("main") == []
+    (tmp_path / "tests" / "test_y.py").write_text("X = 'pay_ok'\n", encoding="utf-8")
+    (tmp_path / "tests" / "trading").mkdir()
+    (tmp_path / "tests" / "trading" / "test_z.py").write_text("X = 1\n", encoding="utf-8")
+    g("add", "-A")
+    g("commit", "-q", "-m", "more")
+    found = guard.check("main")
+    assert len(found) == 2 and set(found) == {
+        "изменён защищённый файл: tests/trading/test_z.py",
+        "tests/test_y.py: изменён код выплат (1 стр.) — только ручная проверка владельца"}, found
+
+
 def test_guard_protects_trading_paths():
     for path in ("trading/venues.py", "trading/__init__.py", "tests/trading/test_risk.py", "scripts/trading_keys.py",
                  "tests/test_trading_surface.py", "Trading/Risk.py", "tests/conftest.py"):
@@ -271,37 +309,97 @@ PAYOUT_MODULES = ("payouts",)
 TRADE_KEY_STR = r"^[\w{}]*_trade(?:_[\w{}]*)?$"   # строка-ключ: bybit_trade, BYBIT_TRADE_KEY, f"{ex}_trade"…
 TRADE_KEY_NAME = r"(?:bybit|bingx|mexc|htx|kucoin|lbank|bitpapa|cryptomus)_trade(?![a-z0-9])"
 
-SEND_METHODS = ("post", "put", "delete", "patch", "request", "_request", "send", "urlopen", "ws_connect",
-                "open_connection", "create_connection", "sendall", "sendto", "sock_sendall", "sock_connect")
+# Отправитель — обращение к методу запроса на объекте, который может быть сетевым клиентом:
+# - STATE_METHODS (.post/.put/.delete/.patch/.request/.send/.urlopen/.ws_connect…) — отправитель, если объект не
+#   заведомо свой: не очередь/словарь/хранилище, созданные тут же (asyncio.Queue(), {}, deque()…), не экземпляр своего
+#   класса бота, не свой метод (self.send в классе со своим send; bot.send / self.bot.send, когда у класса Bot свой send),
+#   не функция своего модуля (payouts.send), не объект с именем очереди/хранилища (q, queue, store, cache, db…);
+# - READ_METHODS (.get/.head/.options/.open) — отправитель, только если объект — сетевой клиент: создан как клиент
+#   (aiohttp.ClientSession(), urllib.request.build_opener()…), параметр или self-атрибут с именем сессии (s, session…)
+#   или с аннотацией клиента, — или вызов похож на HTTP (URL первым аргументом, headers=/params=/allow_redirects=…);
+#   dict.get('ключ') — не отправитель;
+# - модуль: requests.get, aiohttp.request, urllib.request.urlopen, socket.create_connection, asyncio.open_connection…
+STATE_METHODS = ("post", "put", "delete", "patch", "request", "_request", "send", "urlopen", "ws_connect",
+                 "open_connection", "create_connection", "sendall", "sendto", "sock_sendall", "sock_connect")
+READ_METHODS = ("get", "head", "options", "open")
+SEND_METHODS = STATE_METHODS + READ_METHODS
 DYNAMIC_LOOKUP = ("getattr", "__getattribute__", "attrgetter", "methodcaller")
 DYNAMIC_IMPORT = ("__import__", "import_module")
 NET_MODULES = ("requests", "httpx", "urllib3", "urllib.request", "http.client", "http", "socket", "ssl",
                "asyncio.streams", "websockets", "websocket", "ftplib", "smtplib", "telnetlib", "xmlrpc", "pycurl",
                "curl_cffi", "grpc")
 AIOHTTP_SENDERS = ("request", "ClientSession", "ClientRequest", "TCPConnector", "Session", "client", "connector")
+NET_ROOTS = frozenset({m.split(".")[0] for m in NET_MODULES} | {"aiohttp"})   # модуль-получатель: requests.get…
+ASYNC_NET = ("open_connection", "create_connection", "sock_connect", "sock_sendall")   # asyncio.<это> — соединение
+# вызовы (и аннотации), которые дают сетевой клиент: его .get/.post/.open — запрос
+NET_CTORS = frozenset({
+    "aiohttp.ClientSession", "aiohttp.ClientRequest", "urllib.request.build_opener", "urllib.request.OpenerDirector",
+    "http.client.HTTPConnection", "http.client.HTTPSConnection", "requests.Session", "requests.session",
+    "httpx.Client", "httpx.AsyncClient", "websockets.connect", "socket.socket", "socket.create_connection",
+})
+# вызовы (и аннотации), которые дают заведомо не сетевой объект: его .put/.delete/.send — не запрос
+LOCAL_CTORS = frozenset({
+    "dict", "list", "set", "frozenset", "tuple", "bytearray", "str", "int", "float", "bool", "bytes",
+    "asyncio.Queue", "asyncio.LifoQueue", "asyncio.PriorityQueue", "asyncio.Event", "asyncio.Lock", "asyncio.Semaphore",
+    "asyncio.BoundedSemaphore", "asyncio.Condition", "queue.Queue", "queue.SimpleQueue", "queue.LifoQueue",
+    "queue.PriorityQueue", "collections.deque", "collections.OrderedDict", "collections.defaultdict",
+    "collections.Counter", "contextvars.ContextVar", "threading.Event", "threading.Lock", "sqlite3.connect",
+})
+SESSION_NAMES = ("s", "sess", "session", "http", "client", "opener")   # параметр/self-атрибут с таким именем — сессия
+LOCAL_NAME = re.compile(r"(?i)(?:^|_)(?:q|queue|store|cache|db|registry|pending|jobs|tasks|events|lock)$")
+URL_NAME = re.compile(r"(?i)url|uri$|endpoint|(?:^|_)base$")
+HTTP_KWARGS = frozenset({"headers", "params", "allow_redirects", "json", "data", "proxy", "ssl", "cookies", "auth",
+                         "verify"})
+NET, LOCAL, UNKNOWN = "net", "local", "?"
 
 # (модуль, функция) — кто вообще может отправить запрос. У каждого — свой узкий allowlist путей или один хост.
 ALLOWED_SENDERS = {
+    ("accounts", "_get_json"): "подписанные GET Bybit/MEXC/HTX/KuCoin — пути только из *_READ_PATHS (чтение)",
+    ("accounts", "bingx_get"): "GET BingX — только BINGX_READ_PATHS, без редиректов",
     ("accounts", "bybit_post"): "POST к Bybit — только BYBIT_POST_PATHS (история P2P-ордеров), запинено",
     ("accounts", "cryptomus_call"): "Cryptomus — только CRYPTOMUS_CALLS (балансы, история), чтение",
     ("payouts", "payout_call"): "выплаты Cryptomus — только PAYOUT_CALLS, защищённый payouts.py",
-    ("p2p", "_json"): "публичные объявления площадок без ключей (POST Bybit otc/item/online, queryAllPaymentList)",
+    ("p2p", "_json"): "публичные запросы без ключей — только p2p.JSON_ALLOWED (пин JSON_ALLOWED_PIN ниже)",
+    ("p2p", "_bc_download"): "выгрузка BestChange: GET BC_URL (info.zip), без ключей",
     ("bot", "Bot.call"): "Telegram Bot API",
     ("bot", "Bot._post_photo"): "Telegram sendPhoto",
     ("bot", "Bot.send_document"): "Telegram sendDocument",
     ("launcher", "notify"): "уведомление владельцу в Telegram (urllib, защищённый launcher.py)",
 }
-# вызов функции своего модуля (payouts.send, self.send в классе со своим send) — не отправитель: тело этой функции
-# проверяется само, и отправитель внутри неё уже в списке выше (payouts.send → payout_call)
-# сетевой модуль, импортированный целиком: (модуль, сетевой модуль) → какие его атрибуты можно трогать
+# p2p._json шлёт только это (метод, хост, путь; путь с «/» на конце — префикс + монета). Расширить — только владелец:
+# сначала сюда (защищённый файл), потом в p2p.JSON_ALLOWED.
+JSON_ALLOWED_PIN = frozenset({
+    ("POST", "api2.bybit.com", "/fiat/otc/configuration/queryAllPaymentList"),
+    ("POST", "api2.bybit.com", "/fiat/otc/item/online"),
+    ("GET", "www.htx.com", "/-/x/otc/v1/data/trade-market"),
+    ("GET", "www.kucoin.com", "/_api/otc/ad/list"),
+    ("GET", "www.mexc.com", "/api/platform/p2p/api/payment/method"),
+    ("GET", "www.mexc.com", "/api/platform/p2p/api/common/coins"),
+    ("GET", "p2p.mexc.com", "/api/market"),
+    ("GET", "bitpapa.com", "/api/v1/pro/search"),
+    ("GET", "www.lbank.com", "/lbk-api/otc-trade-center/fiat/p2p/adv/advertisementList"),
+    ("GET", "api.rapira.net", "/open/market/rates"),
+    ("GET", "api.bybit.com", "/v5/market/tickers"),
+    ("GET", "api.mexc.com", "/api/v3/ticker/bookTicker"),
+    ("GET", "api.htx.com", "/market/tickers"),
+    ("GET", "api.kucoin.com", "/api/v1/market/allTickers"),
+    ("GET", "api.htx.com", "/v2/reference/currencies"),
+    ("GET", "api.kucoin.com", "/api/v3/currencies/"),
+})
+# сетевой модуль, импортированный целиком: (модуль бота или "*" — любой, сетевой модуль) → какие его атрибуты можно
+# трогать (только через точку: socket.gethostname(), не s = socket)
 ALLOWED_NET_IMPORTS = {
-    ("p2p", "socket"): ("gethostbyname_ex", "gethostname"),       # локальные адреса ПК: BestChange в обход VPN
+    ("*", "socket"): ("gethostbyname", "gethostbyname_ex", "gethostname", "timeout", "gaierror", "herror", "error"),
+    ("*", "ssl"): ("SSLError", "SSLCertVerificationError", "SSLEOFError", "SSLZeroReturnError", "CertificateError"),
+    ("*", "http"): ("HTTPStatus",),
     ("launcher", "urllib.request"): ("build_opener", "ProxyHandler"),
 }
-# getattr с вычисляемым именем — только эти (чтение настроек), в точности как написано
+# getattr с вычисляемым именем — только эти (чтение настроек), в точности как написано. Не считается вычисляемым
+# getattr(obj, k), где k — переменная цикла (for или генератор) в той же функции по константе модуля: кортеж/список/
+# множество строк или словарь со строковыми ключами, связанной в модуле ровно один раз (presets.save_preset: for k in
+# FIELDS) — имена видны в исходнике; есть среди них имя метода запроса — это отправитель.
 ALLOWED_DYNAMIC = {
     ("bot", "Bot.apply_preset", "getattr(self.cfg, key)"),
-    ("presets", "save_preset", "getattr(cfg, k)"),
 }
 
 
@@ -347,6 +445,18 @@ def _top_defs(src):
     return {n.name for n in ast.parse(src).body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))}
 
 
+def _own_classes(tree):
+    """{класс: его методы} — классы верхнего уровня без чужих базовых классов (только свои из этого модуля или object):
+    экземпляр такого класса — код бота, а не подкласс aiohttp.ClientSession."""
+    classes = {n.name: n for n in tree.body if isinstance(n, ast.ClassDef)}
+    out = {}
+    for name, node in classes.items():
+        bases = [_dotted(b) for b in node.bases]
+        if not node.keywords and all(b == "object" or b in classes for b in bases):
+            out[name] = frozenset(n.name for n in node.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)))
+    return out
+
+
 def _local_imports(tree, local_defs):
     """{имя в модуле: модуль бота}: import payouts, import payouts as p, from research import metrics."""
     out = {}
@@ -362,16 +472,165 @@ def _local_imports(tree, local_defs):
     return out
 
 
-def _surface(mod_name, src, local_defs=None):
+def _import_aliases(tree):
+    """{имя в модуле: полное имя}: import urllib.request → urllib; import x as y → y: x; from a import b as c → c: a.b.
+    И множество путей модулей, импортированных целиком (urllib.request, http.client), — это модуль, а не метод."""
+    aliases, modules = {}, set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                if a.asname:
+                    aliases[a.asname] = a.name
+                else:
+                    aliases[a.name.split(".")[0]] = a.name.split(".")[0]
+                parts = a.name.split(".")
+                modules |= {".".join(parts[:i]) for i in range(1, len(parts) + 1)}
+        elif isinstance(node, ast.ImportFrom) and not node.level and node.module:
+            for a in node.names:
+                aliases[a.asname or a.name] = f"{node.module}.{a.name}"
+    return aliases, modules
+
+
+def _scope_nodes(scope):
+    """Узлы области видимости scope (функция, lambda или модуль) без тел вложенных функций и классов."""
+    stack = list(ast.iter_child_nodes(scope))
+    while stack:
+        node = stack.pop()
+        yield node
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+            stack.extend(ast.iter_child_nodes(node))
+
+
+def _params(fn):
+    """{имя параметра: аннотация или None} функции или lambda."""
+    if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+        return {}
+    a = fn.args
+    args = a.posonlyargs + a.args + a.kwonlyargs + [x for x in (a.vararg, a.kwarg) if x]
+    return {x.arg: x.annotation for x in args}
+
+
+def _bindings(name, scope):
+    """Что связывается с именем в области scope: значения присваиваний и with … as; None — неизвестно что (цикл,
+    распаковка, +=, global)."""
+    out = []
+    for node in _scope_nodes(scope):
+        if isinstance(node, ast.Assign):
+            for t in node.targets:
+                if isinstance(t, ast.Name) and t.id == name:
+                    out.append(node.value)
+                elif not isinstance(t, ast.Name) and any(isinstance(x, ast.Name) and x.id == name
+                                                         and isinstance(x.ctx, ast.Store) for x in ast.walk(t)):
+                    out.append(None)
+        elif isinstance(node, (ast.AnnAssign, ast.AugAssign, ast.NamedExpr)) and isinstance(node.target, ast.Name) \
+                and node.target.id == name:
+            out.append(node.value if isinstance(node, (ast.AnnAssign, ast.NamedExpr)) else None)
+        elif isinstance(node, ast.withitem) and node.optional_vars is not None \
+                and any(isinstance(x, ast.Name) and x.id == name for x in ast.walk(node.optional_vars)):
+            out.append(node.context_expr if isinstance(node.optional_vars, ast.Name) else None)
+        elif isinstance(node, (ast.For, ast.AsyncFor, ast.comprehension)) \
+                and any(isinstance(x, ast.Name) and x.id == name for x in ast.walk(node.target)):
+            out.append(None)
+        elif isinstance(node, ast.ExceptHandler) and node.name == name:
+            out.append(ast.Constant(None))   # объект исключения
+        elif isinstance(node, (ast.Global, ast.Nonlocal)) and name in node.names:
+            out.append(None)
+    return out
+
+
+def _store_count(name, scope):
+    """Сколько раз имя связывается в области scope (присваивания, for, with, except, import, global), не считая
+    переменных генераторов — у них своя область видимости."""
+    nodes = list(_scope_nodes(scope))
+    in_comp = {id(x) for n in nodes if isinstance(n, ast.comprehension) for x in ast.walk(n.target)}
+    count = 0
+    for n in nodes:
+        if isinstance(n, ast.Name) and n.id == name and not isinstance(n.ctx, ast.Load) and id(n) not in in_comp:
+            count += 1
+        elif isinstance(n, (ast.Global, ast.Nonlocal)) and name in n.names or \
+                isinstance(n, ast.ExceptHandler) and n.name == name or \
+                isinstance(n, (ast.Import, ast.ImportFrom)) and any((a.asname or a.name).split(".")[0] == name
+                                                                      for a in n.names):
+            count += 1
+    return count
+
+
+def _module_literals(tree):
+    """{имя: [строки]} — константы модуля: кортеж/список/множество строк или словарь со строковыми ключами; имя
+    связано во всём модуле ровно один раз (верхний уровень, простое присваивание) и нигде не global."""
+    stores = {}
+    for node in ast.walk(tree):
+        names = []
+        if isinstance(node, ast.Name) and not isinstance(node.ctx, ast.Load):
+            names = [node.id]
+        elif isinstance(node, (ast.Global, ast.Nonlocal)):
+            names = list(node.names) * 2
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            names = [(a.asname or a.name).split(".")[0] for a in node.names]
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names = [node.name]
+        for n in names:
+            stores[n] = stores.get(n, 0) + 1
+    out = {}
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name) \
+                and stores.get(node.targets[0].id) == 1:
+            v = node.value
+            elts = v.keys if isinstance(v, ast.Dict) else v.elts if isinstance(v, (ast.Tuple, ast.List, ast.Set)) \
+                else None
+            if elts is not None and all(isinstance(e, ast.Constant) and isinstance(e.value, str) for e in elts):
+                out[node.targets[0].id] = [e.value for e in elts]
+    return out
+
+
+def _url_like(node):
+    """Похоже на URL: строка/f-строка с «://» или «http…», склейка с таким началом, имя вроде url/BC_URL/BYBIT_BASE."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return "://" in node.value or node.value.startswith("http")
+    if isinstance(node, ast.JoinedStr) and node.values:
+        first = node.values[0]
+        return _url_like(first.value if isinstance(first, ast.FormattedValue) else first)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        return _url_like(node.left)
+    if isinstance(node, (ast.Name, ast.Attribute)):
+        return bool(URL_NAME.search(node.id if isinstance(node, ast.Name) else node.attr))
+    return False
+
+
+def _http_like(call):
+    """Вызов .get/.open похож на HTTP-запрос: URL первым аргументом (или url=) или HTTP-параметры (headers=, …)."""
+    if call is None:
+        return False
+    if {k.arg for k in call.keywords if k.arg} & HTTP_KWARGS:
+        return True
+    first = call.args[0] if call.args else next((k.value for k in call.keywords if k.arg == "url"), None)
+    return first is not None and _url_like(first)
+
+
+def _surface(mod_name, src, local_defs=None, local_classes=None):
     """→ (отправители {(модуль, функция): [что]}, динамика {(модуль, функция, код)}, нарушения сетевых импортов [..]).
     Функция — полное имя: «Класс.метод», «внешняя.внутренняя», «<module>», «….<lambda>». local_defs — {модуль бота:
-    имена его функций}: вызов своей функции другого модуля (payouts.send) — не отправитель, её тело проверяется само."""
+    имена его функций}: вызов своей функции другого модуля (payouts.send) — не отправитель, её тело проверяется само;
+    local_classes — {модуль бота: {класс: методы}} (без чужих базовых классов): экземпляр своего класса — не клиент."""
     tree = ast.parse(src)
     senders, dynamic, net_bad = {}, set(), []
     parents = {c: p for p in ast.walk(tree) for c in ast.iter_child_nodes(p)}
-    allowed_imports = {net: attrs for (m, net), attrs in ALLOWED_NET_IMPORTS.items() if m == mod_name}
+    allowed_imports = {}
+    for (m, net), attrs in ALLOWED_NET_IMPORTS.items():
+        if m in ("*", mod_name):
+            allowed_imports[net] = tuple(allowed_imports.get(net, ())) + tuple(attrs)
     local_defs = local_defs or {}
     local_mods = _local_imports(tree, local_defs)
+    aliases, module_paths = _import_aliases(tree)
+    own = _own_classes(tree)
+    local_classes = dict(local_classes or {})
+    local_classes[mod_name] = own
+    safe_classes = set(own) | {f"{m}.{c}" for m, classes in local_classes.items() for c in classes}
+    methods_by_class = {}
+    for classes in local_classes.values():
+        for c, methods in classes.items():
+            methods_by_class[c.lower()] = methods_by_class.get(c.lower(), frozenset()) | methods
+    literals = _module_literals(tree)
 
     def is_net(name):
         return name in NET_MODULES or name.split(".")[0] in NET_MODULES
@@ -379,18 +638,183 @@ def _surface(mod_name, src, local_defs=None):
     def add(where, what):
         senders.setdefault((mod_name, where), []).append(what)
 
-    def visit(node, where, own_methods):
+    def resolve(node):
+        d = _dotted(node)
+        if d is None:
+            return None
+        root, _, rest = d.partition(".")
+        full = aliases.get(root, root)
+        return f"{full}.{rest}" if rest else full
+
+    def chain(fn):
+        """Функция, внешние функции (замыкание) и модуль — где искать связывание имени."""
+        out = []
+        while fn is not None:
+            if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                out.append(fn)
+            fn = parents.get(fn)
+        return out + [tree]
+
+    def bound_locally(name, fn):
+        return any(name in _params(sc) or _bindings(name, sc) for sc in chain(fn)[:-1])
+
+    def combine(kinds):
+        kinds = list(kinds)
+        if NET in kinds:
+            return NET
+        return LOCAL if kinds and all(k == LOCAL for k in kinds) else UNKNOWN
+
+    def type_kind(ann):
+        name = resolve(ann) if ann is not None else None
+        if name in NET_CTORS:
+            return NET
+        if name in LOCAL_CTORS or name in safe_classes:
+            return LOCAL
+        return UNKNOWN
+
+    def kind(expr, fn, cls, depth=0):
+        if expr is None or depth > 8:
+            return UNKNOWN
+        if isinstance(expr, ast.Await):
+            return kind(expr.value, fn, cls, depth + 1)
+        if isinstance(expr, (ast.Dict, ast.List, ast.Set, ast.Tuple, ast.DictComp, ast.ListComp, ast.SetComp,
+                             ast.GeneratorExp, ast.Constant, ast.JoinedStr, ast.BinOp, ast.Compare)):
+            return LOCAL
+        if isinstance(expr, ast.IfExp):
+            return combine(kind(e, fn, cls, depth + 1) for e in (expr.body, expr.orelse))
+        if isinstance(expr, ast.BoolOp):
+            return combine(kind(e, fn, cls, depth + 1) for e in expr.values)
+        if isinstance(expr, ast.Call):
+            return type_kind(expr.func)
+        if isinstance(expr, ast.Name):
+            for sc in chain(fn):
+                params = _params(sc)
+                values = _bindings(expr.id, sc)
+                if expr.id in params:
+                    ann = type_kind(params[expr.id])
+                    return combine([ann if ann != UNKNOWN else NET if expr.id in SESSION_NAMES else UNKNOWN]
+                                   + [kind(v, sc, cls, depth + 1) for v in values])
+                if values:
+                    return combine(kind(v, sc, cls, depth + 1) for v in values)
+            return UNKNOWN
+        if isinstance(expr, ast.Attribute) and isinstance(expr.value, ast.Name) and expr.value.id == "self" \
+                and cls is not None:
+            want, kinds = f"self.{expr.attr}", []
+            for item in cls.body:
+                if isinstance(item, ast.AnnAssign) and isinstance(item.target, ast.Name) \
+                        and item.target.id == expr.attr:
+                    kinds.append(type_kind(item.annotation))   # attr: asyncio.Queue на уровне класса
+                if not isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                for node in ast.walk(item):   # self.attr = … в любом методе класса
+                    if isinstance(node, ast.Assign):
+                        pairs = []
+                        for t in node.targets:
+                            if isinstance(t, (ast.Tuple, ast.List)):
+                                same = isinstance(node.value, (ast.Tuple, ast.List)) \
+                                    and len(node.value.elts) == len(t.elts)
+                                pairs += [(x, node.value.elts[i] if same else None) for i, x in enumerate(t.elts)]
+                            else:
+                                pairs.append((t, node.value))
+                    elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
+                        pairs = [(node.target, getattr(node, "value", None))]
+                    else:
+                        continue
+                    for t, value in pairs:
+                        if _dotted(t) != want:
+                            continue
+                        if value is not None and not isinstance(node, ast.AugAssign):
+                            kinds.append(kind(value, item, cls, depth + 1))
+                        else:
+                            kinds.append(type_kind(node.annotation) if isinstance(node, ast.AnnAssign) else UNKNOWN)
+            if not kinds:
+                return NET if expr.attr in SESSION_NAMES else UNKNOWN
+            return combine(kinds)
+        return UNKNOWN
+
+    def module_of(recv, fn):
+        """Полное имя модуля, если получатель — импортированный модуль (и имя не связано в функции заново)."""
+        d = _dotted(recv)
+        if d is None or d.split(".")[0] not in aliases or bound_locally(d.split(".")[0], fn):
+            return None
+        return resolve(recv)
+
+    def sends(recv, method, call, fn, cls, own_methods):
+        mod = module_of(recv, fn)
+        if mod is not None:
+            local = local_mods.get(_dotted(recv))
+            if local is not None:                     # функция модуля бота: её тело проверяется само
+                return method not in local_defs.get(local, ())
+            root = mod.split(".")[0]
+            if root == "asyncio":
+                return method in ASYNC_NET
+            if root in NET_ROOTS:
+                return True
+            return method in STATE_METHODS            # неизвестный модуль: .send/.post — как раньше, отправитель
+        if isinstance(recv, ast.Name) and recv.id == "self" and method in own_methods:
+            return False                              # self.send в классе со своим send
+        k = kind(recv, fn, cls)
+        if k in (NET, LOCAL):
+            return k == NET
+        ident = recv.id if isinstance(recv, ast.Name) else recv.attr if isinstance(recv, ast.Attribute) else ""
+        if ident and LOCAL_NAME.search(ident):
+            return False                              # очередь, хранилище, кэш
+        if method in READ_METHODS:
+            return _http_like(call)
+        return method not in methods_by_class.get(ident.lower(), ())   # bot.send / self.bot.send → свой Bot.send
+
+    def loop_strings(arg, call, fn):
+        """Строки константы модуля, по которой идёт ближайший цикл (for или генератор) с переменной arg вокруг call в
+        этой же функции (см. ALLOWED_DYNAMIC); None — не такой случай."""
+        if not isinstance(arg, ast.Name) or fn is None or arg.id in _params(fn):
+            return None
+        child, node = call, parents.get(call)
+        while node is not None and node is not fn:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
+                return None
+            loops = []
+            if isinstance(node, (ast.For, ast.AsyncFor)) and child in node.body:
+                loops = [(node.target, node.iter, True)]
+            elif isinstance(node, (ast.ListComp, ast.SetComp, ast.GeneratorExp, ast.DictComp)) \
+                    and not isinstance(child, ast.comprehension):
+                loops = [(g.target, g.iter, False) for g in node.generators]
+            for target, it, is_for in loops:
+                names = [x.id for x in ast.walk(target) if isinstance(x, ast.Name)]
+                if arg.id not in names:
+                    continue
+                first = target.elts[0] if isinstance(target, ast.Tuple) and target.elts else target
+                if names.count(arg.id) != 1 or not (isinstance(first, ast.Name) and first.id == arg.id):
+                    return None
+                # for — переменная функции: больше нигде в ней не связывается (генераторы — свои области видимости)
+                if is_for and _store_count(arg.id, fn) != 1:
+                    return None
+                unpack = isinstance(target, ast.Tuple)
+                if isinstance(it, ast.Call) and isinstance(it.func, ast.Attribute) and not it.args \
+                        and not it.keywords and it.func.attr in ("items", "keys") \
+                        and unpack == (it.func.attr == "items"):
+                    it = it.func.value
+                elif unpack:
+                    return None
+                if not isinstance(it, ast.Name) or it.id not in literals or bound_locally(it.id, fn):
+                    return None
+                return literals[it.id]
+            child, node = node, parents.get(node)
+        return None
+
+    def visit(node, where, own_methods, fn, cls):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             where = node.name if where == "<module>" else f"{where}.{node.name}"
             if isinstance(node, ast.ClassDef):
                 own_methods = {n.name for n in node.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+                cls = node
+            else:
+                fn = node
         elif isinstance(node, ast.Lambda):
-            where = f"{where}.<lambda>"
-        if isinstance(node, ast.Attribute) and node.attr in SEND_METHODS:
-            base = node.value.id if isinstance(node.value, ast.Name) else None
-            own = (base == "self" and node.attr in own_methods          # self.send в классе со своим send
-                   or node.attr in local_defs.get(local_mods.get(base), ()))   # payouts.send — функция модуля бота
-            if not own:
+            where, fn = f"{where}.<lambda>", node
+        if isinstance(node, ast.Attribute) and node.attr in SEND_METHODS and _dotted(node) not in module_paths:
+            parent = parents.get(node)
+            call = parent if isinstance(parent, ast.Call) and parent.func is node else None
+            if sends(node.value, node.attr, call, fn, cls, own_methods):
                 add(where, f"{ast.unparse(node)} (стр. {node.lineno})")
         if isinstance(node, ast.Call):
             func = node.func
@@ -401,7 +825,11 @@ def _surface(mod_name, src, local_defs=None):
                                    and a.value.lower() in SEND_METHODS for a in args):
                     add(where, f"{ast.unparse(node)} (стр. {node.lineno})")
                 elif any(not (isinstance(a, ast.Constant) and isinstance(a.value, str)) for a in args):
-                    dynamic.add((mod_name, where, ast.unparse(node)))
+                    names = loop_strings(args[0], node, fn) if name == "getattr" else None
+                    if names is None:
+                        dynamic.add((mod_name, where, ast.unparse(node)))
+                    elif any(n.lower() in SEND_METHODS for n in names):
+                        add(where, f"{ast.unparse(node)} (стр. {node.lineno})")
             if name in DYNAMIC_IMPORT:
                 a = node.args[0] if node.args else None
                 if not (isinstance(a, ast.Constant) and isinstance(a.value, str)) or is_net(a.value) \
@@ -418,11 +846,14 @@ def _surface(mod_name, src, local_defs=None):
                     or m.split(".")[0] == "aiohttp" and names & set(AIOHTTP_SENDERS):
                 add(where, f"from {m} import {', '.join(sorted(names))} (стр. {node.lineno})")
         for child in ast.iter_child_nodes(node):
-            visit(child, where, own_methods)
+            visit(child, where, own_methods, fn, cls)
 
-    visit(tree, "<module>", set())
-    # разрешённый сетевой модуль: только его разрешённые атрибуты и только через точку (не x = socket)
+    visit(tree, "<module>", set(), None, None)
+    # разрешённый сетевой модуль (если модуль его импортирует): только его разрешённые атрибуты и только через точку
+    imported = {a.name for n in ast.walk(tree) if isinstance(n, ast.Import) for a in n.names if a.asname is None}
     for net, attrs in allowed_imports.items():
+        if net not in imported:
+            continue
         root = net.split(".")[0]
         for node in ast.walk(tree):
             if not (isinstance(node, ast.Name) and node.id == root) or isinstance(parents.get(node), ast.Import):
@@ -444,9 +875,10 @@ def _scan():
     runtime, research = _modules(), _modules(research=True)
     sources = {m: (p, _source(p)) for m, p in {**runtime, **research}.items()}
     local_defs = {m: _top_defs(src) for m, (_, src) in sources.items()}
+    local_classes = {m: _own_classes(ast.parse(src)) for m, (_, src) in sources.items()}
     senders, dynamic, net_bad = {}, set(), []
     for mod_name in runtime:
-        s, d, n = _surface(mod_name, sources[mod_name][1], local_defs)
+        s, d, n = _surface(mod_name, sources[mod_name][1], local_defs, local_classes)
         senders.update(s)
         dynamic |= d
         net_bad += n
@@ -465,20 +897,33 @@ def test_modules_found():
     assert not [m for m in mods if m.startswith("tests") or _is_research(m)]
 
 
+def _list_problems(found, allowed, show):
+    """Расхождение кода и списка: новые записи, пропавшие записи и пары «похоже на переименование» (тот же модуль:
+    запись пропала, а рядом появилась новая) — с именами, чтобы владелец перенёс запись, а не гадал."""
+    new, gone = sorted(set(found) - set(allowed)), sorted(set(allowed) - set(found))
+    lines = [f"новое, в списке нет: {show(k)}" for k in new]
+    lines += [f"есть в списке, в коде больше нет: {show(k)}" for k in gone]
+    lines += [f"похоже на переименование или перенос: {show(o)} → {show(n)} — это новый код: владелец проверяет его "
+              f"и переносит запись (защищённый файл); просто удалить старую запись — не то же самое"
+              for o in gone for n in new if o[0] == n[0]]
+    return lines
+
+
 def test_only_known_senders(scan):
-    """Запросы, меняющие состояние (и вообще любой сетевой клиент), шлют только функции из ALLOWED_SENDERS."""
+    """Запросы (и вообще любой сетевой клиент) шлют только функции из ALLOWED_SENDERS; запись, которой в коде уже
+    нет, — тоже красный тест (её место не должен занять другой код)."""
     senders, _, _, _ = scan
-    unknown = {k: v for k, v in senders.items() if k not in ALLOWED_SENDERS and not _is_trading(k[0])}
-    assert not unknown, HOW_TO_UPDATE + "\n" + "\n".join(f"{m}.{f}: {', '.join(v)}" for (m, f), v in unknown.items())
-    stale = set(ALLOWED_SENDERS) - set(senders)
-    assert not stale, f"в ALLOWED_SENDERS есть то, чего в коде нет (убери, чтобы место не занял другой код): {stale}"
+    senders = {k: v for k, v in senders.items() if not _is_trading(k[0])}
+    problems = _list_problems(senders, ALLOWED_SENDERS, lambda k: f"{k[0]}.{k[1]}"
+                              + (f" ({', '.join(senders[k])})" if k in senders else ""))
+    assert not problems, HOW_TO_UPDATE + "\nALLOWED_SENDERS:\n" + "\n".join(problems)
 
 
 def test_only_known_dynamic_lookups(scan):
     _, dynamic, _, _ = scan
     dynamic = {d for d in dynamic if not _is_trading(d[0])}
-    assert dynamic == ALLOWED_DYNAMIC, HOW_TO_UPDATE + f"\nнеизвестные: {dynamic - ALLOWED_DYNAMIC}, " \
-                                                       f"пропавшие: {ALLOWED_DYNAMIC - dynamic}"
+    problems = _list_problems(dynamic, ALLOWED_DYNAMIC, lambda k: f"{k[0]}.{k[1]}: {k[2]}")
+    assert not problems, HOW_TO_UPDATE + "\nALLOWED_DYNAMIC:\n" + "\n".join(problems)
 
 
 def test_net_modules_used_only_as_allowed(scan):
@@ -486,8 +931,27 @@ def test_net_modules_used_only_as_allowed(scan):
     assert not net_bad, HOW_TO_UPDATE + "\n" + "\n".join(net_bad)
 
 
+def test_public_json_allowlist_pinned():
+    """p2p._json (публичные запросы без ключей) шлёт только p2p.JSON_ALLOWED — и он ровно JSON_ALLOWED_PIN: новая
+    площадка или адрес — только после проверки владельцем (этот файл защищён)."""
+    import p2p
+    assert p2p.JSON_ALLOWED == JSON_ALLOWED_PIN, HOW_TO_UPDATE + (
+        f"\nв p2p.JSON_ALLOWED лишнее: {sorted(p2p.JSON_ALLOWED - JSON_ALLOWED_PIN)}"
+        f"\nнет в p2p.JSON_ALLOWED: {sorted(JSON_ALLOWED_PIN - p2p.JSON_ALLOWED)}")
+    for method, host, path in JSON_ALLOWED_PIN:
+        url = "https" + "://" + host + path + ("USDT" if path.endswith("/") else "")
+        assert p2p.json_allowed(method, url), url
+        assert not p2p.json_allowed(method, url.replace(host, host + ":443", 1))
+        assert not p2p.json_allowed("PUT" if method == "GET" else "GET", url)
+
+
 def _hits(patterns, text):
     return [p for p in patterns if re.search(p, text, re.I)]
+
+
+# списки запретных путей самого guard (TRADING_CODE — регулярные выражения по этим же путям): он ничего не отправляет,
+# сам защищён путём, а его строки — описание запрета, а не вызов
+PATTERN_FILES = ("scripts/guard.py",)
 
 
 def test_no_trading_endpoints_or_trade_keys_outside_trading(scan):
@@ -495,7 +959,7 @@ def test_no_trading_endpoints_or_trade_keys_outside_trading(scan):
     _, _, _, strings = scan
     bad = []
     for mod_name, (path, src) in strings.items():
-        if _is_trading(path):
+        if _is_trading(path) or path in PATTERN_FILES:
             continue
         tree = ast.parse(src)
         for s, line in _strings(tree):
@@ -513,6 +977,8 @@ def test_no_withdrawals_transfers_or_p2p_release_anywhere(scan):
     _, _, _, strings = scan
     bad = []
     for mod_name, (path, src) in strings.items():
+        if path in PATTERN_FILES:
+            continue
         for s, line in _strings(ast.parse(src)):
             for p in _hits(MONEY_OUT, s):
                 bad.append(f"{path}:{line}: /{p}/ в {s[:80]!r}")
@@ -599,8 +1065,12 @@ def test_research_checks_catch():
     "/api/v3/order", "/api/v3/order/test", "/api/v3/batchOrders", "/v1/order/orders/place",
     "/linear-swap-api/v1/swap_cross_order", "/api/v1/orders", "/api/v1/hf/orders", "/api/v3/margin/order",
     "https://api.bybit.com/v5/order/create", "https://open-api.bingx.com/openApi/swap/v2/trade/order?x=1",
+    # фьючерсы — и чтение (позиции, исполнения, баланс фьючерсного счёта): так задумано, всё это — только trading/
+    "/v5/position/list", "/v5/position/closed-pnl", "/openApi/swap/v2/user/balance", "/openApi/swap/v2/user/income",
 ])
 def test_trading_endpoint_patterns_catch(path):
+    """Ордера, позиции, маржа, свои P2P-объявления — вне trading/ нельзя; фьючерсные эндпоинты чтения тоже (решение
+    владельца: торговое ядро целиком в защищённом trading/, бот вне его фьючерсы не читает)."""
     assert _hits(TRADING_ENDPOINTS, path), path
 
 
@@ -689,30 +1159,114 @@ def test_surface_skips_calls_into_bot_modules():
 
 def test_surface_ignores_plain_reads():
     body = ("import aiohttp\nimport urllib.parse\n"
-            "async def f(s, d, cfg, key):\n"
+            "async def f(d, cfg, key, row):\n"
             "    x = getattr(d, 'name', None)\n"
-            "    async with s.get('u') as r:\n        j = await r.json()\n"
-            "    return d.get('post'), x, r.request_info, urllib.parse.urlencode({}), aiohttp.ClientTimeout(total=5)\n")
+            "    y = row.get('plan_facts'), d.get(key, 0), cfg.get('url')\n"
+            "    return d.get('post'), x, y, urllib.parse.urlencode({}), aiohttp.ClientTimeout(total=5)\n"
+            "def g(r):\n    return r.request_info, r.url\n")
     senders, dynamic, net_bad = _fake_surface(body)
     assert senders == set() and dynamic == set() and net_bad == []
     _, dynamic, _ = _fake_surface("def f(cfg, k):\n    return getattr(cfg, k)\n")
     assert dynamic == {("m", "f", "getattr(cfg, k)")}
 
 
+@pytest.mark.parametrize("body", [
+    "async def f(s):\n    async with s.get('u') as r:\n        return await r.json()\n",   # параметр-сессия
+    "async def f(session, u):\n    return await session.head(u)\n",
+    "import aiohttp\nasync def f(u):\n    async with aiohttp.ClientSession() as c:\n        return await c.get(u)\n",
+    "import aiohttp\nasync def f(u, own, s):\n    x = aiohttp.ClientSession() if own else s\n    return x.get(u)\n",
+    "import aiohttp\nasync def f(x: aiohttp.ClientSession, u):\n    return x.get(u)\n",   # аннотация
+    "async def f(obj, url):\n    return obj.get(url)\n",                                   # URL первым аргументом
+    "async def f(obj, key):\n    return obj.get(key, headers={'X': '1'})\n",               # HTTP-параметры
+    "async def f(obj, BYBIT_BASE):\n    return obj.get(f'{BYBIT_BASE}/v5/x')\n",
+    "def f(u):\n    import urllib.request\n    o = urllib.request.build_opener()\n    return o.open(u)\n",
+    "def f(u):\n    import requests\n    return requests.get(u)\n",
+    "class C:\n    def __init__(self, s):\n        self.s = s\n    def f(self, u):\n        return self.s.get(u)\n",
+])
+def test_surface_sees_get_requests_on_network_clients(body):
+    """GET тоже запрос: .get/.head/.open у сетевого клиента — отправитель (иначе список публичных адресов p2p._json
+    обходился бы простым s.get(...) в новой функции)."""
+    senders, _, _ = _fake_surface(body)
+    assert senders and all(s.split(".")[-1] == "f" for s in senders), senders
+
+
+def test_surface_ignores_queues_stores_and_own_bot_methods():
+    """Ложные срабатывания, которых быть не должно: asyncio.Queue.put, store/cache/dict .delete, bot.send и
+    self.bot.send (свой Bot.send — его тело проверяется само), .put своего класса, .send своей очереди."""
+    body = ("import asyncio\nimport collections\n"
+            "class Bot:\n"
+            "    def __init__(self, s):\n        self.s = s\n        self.jobs = {}\n"
+            "    async def send(self, text):\n        return await self.call('sendMessage', text)\n"
+            "    async def call(self, m, t):\n        return await self.s.post(m, json=t)\n"
+            "class Box:\n    def put(self, x):\n        return x\n"
+            "class Paper:\n"
+            "    def __init__(self, bot):\n        self.bot = bot\n        self.q = asyncio.Queue()\n"
+            "        self.box, self.d = Box(), {}\n"
+            "    async def note(self, store, cache, bot, queue):\n"
+            "        await self.bot.send('x')\n        await bot.send('y')\n        await self.q.put(1)\n"
+            "        store.delete('k')\n        cache.delete('k')\n        await queue.put(3)\n"
+            "        self.box.put(1)\n        self.d.pop('a', None)\n        d = {}\n        d.get('url')\n"
+            "        q = asyncio.Queue()\n        await q.put(2)\n        dq = collections.deque()\n"
+            "        dq.append(1)\n        return self.jobs.get('a'), Box().put(2)\n")
+    senders, dynamic, net_bad = _fake_surface(body)
+    assert senders == {"Bot.call"} and dynamic == set() and net_bad == []
+    # но то же имя с сетевым клиентом — отправитель: bot = aiohttp.ClientSession(); неизвестный obj.put — тоже
+    for bad in ("import aiohttp\nasync def f(u):\n    bot = aiohttp.ClientSession()\n    return await bot.send(u)\n",
+                "def f(obj, u):\n    return obj.put(u)\n", "def f(conn):\n    return conn.request('GET', '/')\n",
+                "import aiohttp\nclass S(aiohttp.ClientSession):\n    pass\ndef f(u):\n    return S().post(u)\n"):
+        assert _fake_surface(bad)[0] == {"f"}, bad
+
+
+def test_getattr_over_module_literal_is_not_dynamic():
+    """getattr(obj, k), где k — переменная цикла в той же функции по константе модуля (кортеж/список/множество строк,
+    словарь со строковыми ключами; связана в модуле один раз): имена видны в исходнике — это не вычисляемый getattr.
+    Имя метода запроса среди них — отправитель; всё остальное — по-прежнему в ALLOWED_DYNAMIC."""
+    ok = ("FIELDS = ('assets', 'amount')\nMAP = {'a': 1, 'b': 2}\nNAMES = ['x']\n"
+          "def f(cfg):\n    return {k: getattr(cfg, k) for k in FIELDS}\n"
+          "def g(cfg):\n    for k, v in MAP.items():\n        getattr(cfg, k)\n    for n in NAMES:\n        getattr(cfg, n)\n"
+          "def h(cfg):\n    return [getattr(cfg, k) for k in MAP.keys()] + [getattr(cfg, k) for k in MAP]\n")
+    assert _fake_surface(ok) == (set(), set(), [])
+    senders, dynamic, _ = _fake_surface("FIELDS = ('assets', 'post')\ndef f(s):\n    return [getattr(s, k) for k in FIELDS]\n")
+    assert senders == {"f"} and dynamic == set()
+    for body in (
+            "FIELDS = ('a',)\nFIELDS = ('b',)\ndef f(c):\n    return [getattr(c, k) for k in FIELDS]\n",   # связано дважды
+            "FIELDS = ('a',)\ndef g():\n    global FIELDS\n    FIELDS = ('post',)\n"
+            "def f(c):\n    return [getattr(c, k) for k in FIELDS]\n",
+            "def f(c, FIELDS):\n    return [getattr(c, k) for k in FIELDS]\n",                            # параметр
+            "FIELDS = ('a',)\ndef f(c, FIELDS):\n    return [getattr(c, k) for k in FIELDS]\n",
+            "X = 'post'\nFIELDS = ('a', X)\ndef f(c):\n    return [getattr(c, k) for k in FIELDS]\n",       # не строки
+            "FIELDS = ('a',)\ndef f(c):\n    k = 'x'\n    for k in FIELDS:\n        getattr(c, k)\n",   # k связано дважды
+            "FIELDS = ('a',)\ndef f(c):\n    for k in FIELDS:\n        pass\n    return lambda: getattr(c, k)\n",
+            "FIELDS = ('a',)\ndef f(c):\n    return [getattr(c, k) for k in FIELDS.values()]\n",
+            "FIELDS = {'a': 'post'}\ndef f(c):\n    return [getattr(c, v) for k, v in FIELDS.items()]\n"):
+        senders, dynamic, _ = _fake_surface(body)
+        assert dynamic and not senders, body
+
+
 def test_allowed_net_import_limits_attributes():
     ok = "import socket\ndef f():\n    return socket.gethostbyname_ex(socket.gethostname())\n"
     assert _fake_surface(ok, "p2p") == (set(), set(), [])
+    # в любом модуле: исключения ssl/socket, gethostbyname, HTTPStatus
+    anywhere = ("import http\nimport socket\nimport ssl\nfrom http import HTTPStatus\nfrom socket import timeout\n"
+                "def f(e):\n    return isinstance(e, (ssl.SSLError, socket.gaierror, socket.timeout)), "
+                "socket.gethostbyname('localhost'), http.HTTPStatus.OK, HTTPStatus.NOT_FOUND\n")
+    assert _fake_surface(anywhere, "bot") == (set(), set(), [])
     for body in ("import socket\ndef f(h):\n    return socket.create_connection((h, 80))\n",
                  "import socket\nS = socket\n",
                  "from socket import create_connection\n",
-                 "import socket as s\n"):
+                 "import socket as s\n",
+                 "import ssl\ndef f():\n    return ssl.create_default_context()\n",
+                 "import http\ndef f(h):\n    return http.client.HTTPSConnection(h)\n",
+                 "from http import client\n", "import http.client\n"):
         senders, _, net_bad = _fake_surface(body, "p2p")
         assert senders or net_bad, body
     launcher_ok = ("import urllib.error\nimport urllib.parse\nimport urllib.request\n"
                    "def notify(t):\n    o = urllib.request.build_opener(urllib.request.ProxyHandler({}))\n"
+                   "    o.open(t, b'x', timeout=5)\n"
                    "    return urllib.parse.urlencode({}), urllib.error.HTTPError\n")
     senders, _, net_bad = _fake_surface(launcher_ok, "launcher")
     assert senders == {"notify"} and net_bad == []
+    assert _fake_surface(launcher_ok.replace("    o.open(t, b'x', timeout=5)\n", ""), "launcher") == (set(), set(), [])
     senders, _, net_bad = _fake_surface("import urllib.request\ndef g(u):\n    return urllib.request.urlopen(u)\n",
                                         "launcher")
     assert "g" in senders and net_bad
