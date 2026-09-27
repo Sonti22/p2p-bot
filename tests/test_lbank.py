@@ -1,5 +1,4 @@
 """P2P LBank: разбор ответа advertisementList (фикстуры — урезанные живые ответы RUB), ссылки, подключение площадки."""
-import asyncio
 import json
 import os
 
@@ -9,13 +8,13 @@ import bot
 import cards
 import p2p
 import trades
-from helpers import make_ad
+from helpers import arun, make_ad
 
 FIX = os.path.join(os.path.dirname(__file__), "fixtures")
 
 
 def _run(side, asset="USDT"):
-    return asyncio.run(p2p.lbank(None, p2p.Config(), side, asset))
+    return arun(p2p.lbank(None, p2p.Config(), side, asset))
 
 
 def test_lbank_buy_skips_mirrored_mexc_ads(offline):

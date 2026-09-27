@@ -1,15 +1,15 @@
-import asyncio
 import io
 import zipfile
 
 import pytest
 
 import p2p
+from helpers import arun
 
 
 @pytest.mark.parametrize("name", ["bybit", "htx", "kucoin", "mexc", "bitpapa", "lbank"])
 def test_adapter_parses_fixture(offline, name):
-    ads = asyncio.run(p2p.FETCHERS[name](None, p2p.Config(), "buy", "USDT"))
+    ads = arun(p2p.FETCHERS[name](None, p2p.Config(), "buy", "USDT"))
     assert ads, name
     for a in ads:
         assert a.price > 0 and a.side == "buy" and a.asset == "USDT"
@@ -18,14 +18,14 @@ def test_adapter_parses_fixture(offline, name):
 
 
 def test_htx_unknown_coin_is_empty(offline):
-    assert asyncio.run(p2p.htx(None, p2p.Config(), "buy", "TON")) == []
+    assert arun(p2p.htx(None, p2p.Config(), "buy", "TON")) == []
 
 
 def test_bybit_buy_and_sell_use_different_fixture_ads(offline):
     """Тело POST несёт сторону запроса (side) — фикстура должна отвечать разными объявлениями/мерчантами
     для buy и sell, как настоящий стакан Bybit, а не одним и тем же списком под обе стороны."""
-    buy = asyncio.run(p2p.bybit(None, p2p.Config(), "buy", "USDT"))
-    sell = asyncio.run(p2p.bybit(None, p2p.Config(), "sell", "USDT"))
+    buy = arun(p2p.bybit(None, p2p.Config(), "buy", "USDT"))
+    sell = arun(p2p.bybit(None, p2p.Config(), "sell", "USDT"))
     assert {a.nick for a in buy}.isdisjoint({a.nick for a in sell})
     assert all(a.side == "sell" for a in sell)
 
@@ -34,8 +34,8 @@ def test_bybit_buy_and_sell_use_different_fixture_ads(offline):
 def test_buy_and_sell_use_different_fixture_ads(offline, name):
     """Как и у Bybit — HTX/KuCoin/MEXC/BitPapa/LBank кодируют сторону бота в URL (tradeType/side/type), и
     фикстура должна отвечать разными объявлениями/мерчантами для buy и sell."""
-    buy = asyncio.run(p2p.FETCHERS[name](None, p2p.Config(), "buy", "USDT"))
-    sell = asyncio.run(p2p.FETCHERS[name](None, p2p.Config(), "sell", "USDT"))
+    buy = arun(p2p.FETCHERS[name](None, p2p.Config(), "buy", "USDT"))
+    sell = arun(p2p.FETCHERS[name](None, p2p.Config(), "sell", "USDT"))
     assert buy and sell, name
     assert {a.nick for a in buy}.isdisjoint({a.nick for a in sell}), name
     assert all(a.side == "sell" for a in sell), name
@@ -48,7 +48,7 @@ def test_ads_price_matches_requested_coin(offline, name, asset, low, high):
     монеты (реальные цены BTC/ETH отличаются от USDT на порядки) — конфтест теперь разбирает монету
     из запроса каждой площадки (coinId/currency/tokenId/crypto_currency_code) и подставляет фикстуру
     с ценами нужного порядка."""
-    ads = asyncio.run(p2p.FETCHERS[name](None, p2p.Config(), "buy", asset))
+    ads = arun(p2p.FETCHERS[name](None, p2p.Config(), "buy", asset))
     assert ads, name
     for a in ads:
         assert a.asset == asset and low < a.price < high, (name, a.price)
@@ -56,14 +56,14 @@ def test_ads_price_matches_requested_coin(offline, name, asset, low, high):
 
 @pytest.mark.parametrize("name", ["bybit", "htx", "kucoin", "mexc", "bitpapa"])
 def test_ads_btc_and_eth_use_different_prices_than_usdt(offline, name):
-    usdt = asyncio.run(p2p.FETCHERS[name](None, p2p.Config(), "buy", "USDT"))
-    btc = asyncio.run(p2p.FETCHERS[name](None, p2p.Config(), "buy", "BTC"))
-    eth = asyncio.run(p2p.FETCHERS[name](None, p2p.Config(), "buy", "ETH"))
+    usdt = arun(p2p.FETCHERS[name](None, p2p.Config(), "buy", "USDT"))
+    btc = arun(p2p.FETCHERS[name](None, p2p.Config(), "buy", "BTC"))
+    eth = arun(p2p.FETCHERS[name](None, p2p.Config(), "buy", "ETH"))
     assert max(a.price for a in usdt) < min(a.price for a in eth) < min(a.price for a in btc), name
 
 
 def test_spot_prices(offline):
-    spot = asyncio.run(p2p.spot_prices(None, ["USDT", "BTC", "ETH", "USDC"]))
+    spot = arun(p2p.spot_prices(None, ["USDT", "BTC", "ETH", "USDC"]))
     for venue in ("Bybit", "MEXC", "HTX", "KuCoin"):
         bid, ask = spot[venue]["ETH"]
         assert 0 < bid <= ask, venue
@@ -80,7 +80,7 @@ def test_spot_prices_survive_one_venue_down(offline, monkeypatch):
         return await real(s, method, url, body)
 
     monkeypatch.setattr(p2p, "_json", flaky)
-    spot = asyncio.run(p2p.spot_prices(None, ["USDT", "ETH"]))
+    spot = arun(p2p.spot_prices(None, ["USDT", "ETH"]))
     assert "ETH" not in spot["HTX"] and spot["KuCoin"]["ETH"][0] > 0
 
 
@@ -97,7 +97,7 @@ def test_spot_prices_survive_garbage_ticker(offline, monkeypatch):
         return j
 
     monkeypatch.setattr(p2p, "_json", garbage_bid)
-    spot = asyncio.run(p2p.spot_prices(None, ["USDT", "BTC", "ETH"]))
+    spot = arun(p2p.spot_prices(None, ["USDT", "BTC", "ETH"]))
     assert "ETH" not in spot["Bybit"]           # битый тикер пропущен
     assert spot["Bybit"]["BTC"][0] > 0          # остальные монеты той же площадки не задеты
     assert spot["KuCoin"]["ETH"][0] > 0          # другие площадки не задеты вовсе

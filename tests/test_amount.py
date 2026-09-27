@@ -1,8 +1,7 @@
-import asyncio
 import dataclasses
 
 import p2p
-from helpers import make_ad
+from helpers import arun, make_ad
 
 
 def test_parse_amount_plain_and_spaces():
@@ -82,11 +81,11 @@ def test_scan_amount_limits_ad_usability(offline, monkeypatch):
 
     monkeypatch.setitem(p2p.FETCHERS, "fake", fake_fetch)
     c = p2p.Config(exchanges=["fake"], assets=["USDT"], min_orders=0, min_rate=0, amount=50000)
-    snap = asyncio.run(p2p.scan(None, c))
+    snap = arun(p2p.scan(None, c))
     assert not snap.deals                          # 50 000 ₽ вне лимита объявления 15–25 тыс.
 
     c2 = dataclasses.replace(c, amount=20000)
-    snap2 = asyncio.run(p2p.scan(None, c2, force_alt=True))
+    snap2 = arun(p2p.scan(None, c2, force_alt=True))
     assert snap2.deals                              # 20 000 ₽ внутри лимита
 
 
@@ -99,11 +98,11 @@ def test_scan_force_alt_refetches_without_touching_shared_cache(offline, monkeyp
 
     monkeypatch.setitem(p2p.FETCHERS, "fake", fake_fetch)
     c = p2p.Config(exchanges=["fake"], assets=["USDT", "ETH"], min_orders=0, min_rate=0, amount=50000)
-    asyncio.run(p2p.scan(None, c))
+    arun(p2p.scan(None, c))
     assert [v for a, v in calls if a == "ETH"] == [50000, 50000]
     cached_ads, cached_t = p2p._alt["ads"], p2p._alt["t"]
 
     c2 = dataclasses.replace(c, amount=20000)
-    asyncio.run(p2p.scan(None, c2, force_alt=True))
+    arun(p2p.scan(None, c2, force_alt=True))
     assert [v for a, v in calls if a == "ETH"][-2:] == [20000, 20000]   # свежий запрос под новую сумму
     assert p2p._alt["ads"] is cached_ads and p2p._alt["t"] == cached_t   # общий кэш не тронут

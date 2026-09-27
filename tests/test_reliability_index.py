@@ -1,12 +1,11 @@
 """Индекс надёжности 0–10 на карточке и риск «обменник → обменник» (круги сухого прогона 25.09: BestChange →
 BestChange с планом 7–8% — выгодные курсы обменников часто с условиями и AML-заморозкой)."""
-import asyncio
 
 import pytest
 
 import cards
 import p2p
-from helpers import make_ad
+from helpers import arun, make_ad
 
 PNG = b"\x89PNG\r\n\x1a\n"
 
@@ -89,7 +88,7 @@ def test_scan_ranks_by_risk_weights_not_by_reason_count(offline, monkeypatch):
     monkeypatch.setitem(p2p.FETCHERS, "w", fake_w)
     monkeypatch.setitem(p2p.FETCHERS, "v", fake_v)
     c = p2p.Config(exchanges=["w", "v"], assets=["USDT"], min_orders=0, min_rate=0)
-    s = asyncio.run(p2p.scan(None, c))
+    s = arun(p2p.scan(None, c))
     w = next(d for d in s.deals if d[1].ex == "W" and d[2].ex == "W")
     v = next(d for d in s.deals if d[1].ex == "V" and d[2].ex == "V")
     assert len(p2p.reliability(w, c, s)[1]) == len(p2p.reliability(v, c, s)[1]) == 1

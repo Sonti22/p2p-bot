@@ -1,9 +1,8 @@
 """Пороги мерчантов по площадкам (MERCHANT_MIN): разбор, фильтры usable/_signal_ok, причина «у порога», без MERCHANT_MIN — как раньше."""
-import asyncio
 import logging
 
 import p2p
-from helpers import make_ad
+from helpers import arun, make_ad
 
 VENUES = ("bybit", "htx", "kucoin", "mexc", "bitpapa", "lbank")
 
@@ -85,7 +84,7 @@ def test_near_threshold_reason_uses_venue_thresholds():
 def _fixture_ads():
     c = p2p.Config()
     return [a for ex in VENUES for asset in ("USDT", "BTC", "ETH") for side in ("buy", "sell")
-            for a in asyncio.run(p2p.FETCHERS[ex](None, c, side, asset))]
+            for a in arun(p2p.FETCHERS[ex](None, c, side, asset))]
 
 
 def test_default_unchanged_on_fixture_ads(offline):
@@ -105,9 +104,9 @@ def test_default_unchanged_on_fixture_ads(offline):
 def test_scan_drops_venue_below_its_threshold(offline):
     """Скан: порог одной площадки убирает только её мерчантов; остальные площадки — как без MERCHANT_MIN."""
     base = p2p.Config(exchanges=["bybit", "htx", "kucoin", "mexc"], assets=["USDT"])
-    before = asyncio.run(p2p.scan(None, base))
+    before = arun(p2p.scan(None, base))
     assert ("Bybit", "buy", "USDT") in before.best
     tight = p2p.Config(exchanges=base.exchanges, assets=["USDT"], merchant_min={"Bybit": (p2p.MERCHANT_ORDERS_MAX, None)})
-    after = asyncio.run(p2p.scan(None, tight))
+    after = arun(p2p.scan(None, tight))
     assert not any(k[0] == "Bybit" for k in after.best)
     assert {k: a.nick for k, a in after.best.items()} == {k: a.nick for k, a in before.best.items() if k[0] != "Bybit"}

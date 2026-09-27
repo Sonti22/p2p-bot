@@ -1,4 +1,3 @@
-import asyncio
 import dataclasses
 
 import pytest
@@ -6,7 +5,7 @@ import pytest
 import p2p
 import trades
 from conftest import load
-from helpers import make_ad
+from helpers import arun, make_ad
 
 SPOT = {"Bybit": {"USDT": (1.0, 1.0), "ETH": (2500.0, 2501.0), "USDC": (0.9999, 1.0)},
         "MEXC": {"USDT": (1.0, 1.0), "ETH": (2499.0, 2500.0)}}
@@ -225,7 +224,7 @@ def test_usable_and_signal_ok_respect_blacklist():
 
 def test_scan_offline_keeps_prices_near_reference(offline):
     c = p2p.Config(exchanges=["bybit", "htx", "kucoin", "mexc", "bitpapa"], assets=["USDT"], min_orders=0, min_rate=0)
-    snap = asyncio.run(p2p.scan(None, c))
+    snap = arun(p2p.scan(None, c))
     assert snap.ref > 0 and not snap.errors
     for a in snap.best.values():
         assert abs(a.price / snap.ref - 1) * 100 <= c.max_dev
@@ -237,7 +236,7 @@ def test_scan_offline_btc_prices_near_reference(offline):
     """Фикстуры BTC (разобранные по монете из запроса, см. tests/conftest.py) должны давать цены
     у ₽-ориентира BTC (ref × спот-курс BTC/USDT), а не у ориентира USDT на порядки ниже."""
     c = p2p.Config(exchanges=["bybit", "htx", "kucoin", "mexc", "bitpapa"], assets=["BTC"], min_orders=0, min_rate=0)
-    snap = asyncio.run(p2p.scan(None, c))
+    snap = arun(p2p.scan(None, c))
     assert snap.refs["BTC"] > 1_000_000 and not snap.errors
     for a in snap.best.values():
         assert abs(a.price / snap.refs["BTC"] - 1) * 100 <= c.max_dev
@@ -245,10 +244,10 @@ def test_scan_offline_btc_prices_near_reference(offline):
 
 def test_scan_drops_blacklisted_merchant(offline, monkeypatch):
     c = p2p.Config(exchanges=["bybit", "htx", "kucoin", "mexc", "bitpapa"], assets=["USDT"], min_orders=0, min_rate=0)
-    before = asyncio.run(p2p.scan(None, c))
+    before = arun(p2p.scan(None, c))
     best_nick = before.best[("Bybit", "buy", "USDT")].nick
     monkeypatch.setattr(p2p.blacklist, "blocked", lambda: {("Bybit", best_nick)})
-    after = asyncio.run(p2p.scan(None, c))
+    after = arun(p2p.scan(None, c))
     assert after.best[("Bybit", "buy", "USDT")].nick != best_nick   # лучшую цену давал именно он
 
 
@@ -257,7 +256,7 @@ def test_scan_removes_venue_entirely_when_all_merchants_blacklisted(offline, mon
     # buy и sell на Bybit отдают разных мерчантов (bybit_ads.json/bybit_ads_sell.json) — блокируем обоих
     nicks = {i["nickName"] for f in ("bybit_ads.json", "bybit_ads_sell.json") for i in load(f)["result"]["items"]}
     monkeypatch.setattr(p2p.blacklist, "blocked", lambda: {("Bybit", n) for n in nicks})
-    after = asyncio.run(p2p.scan(None, c))
+    after = arun(p2p.scan(None, c))
     assert ("Bybit", "buy", "USDT") not in after.best
     assert ("Bybit", "sell", "USDT") not in after.best
 
@@ -325,9 +324,9 @@ def test_scan_stacks_exchangers_per_network(offline, monkeypatch):
     monkeypatch.setitem(p2p.FETCHERS, "fakemexc", mexc)
     monkeypatch.setitem(p2p.FETCHERS, "bestchange", bc)
     c = cfg(exchanges=["fakemexc", "bestchange"], assets=["USDT"], min_orders=0, min_rate=0)
-    assert not asyncio.run(p2p.scan(None, c)).deals   # 25 000 в TRC20 + 25 000 в ERC20 — ни одна сеть не покрывает круг
+    assert not arun(p2p.scan(None, c)).deals   # 25 000 в TRC20 + 25 000 в ERC20 — ни одна сеть не покрывает круг
     nets += ["TRC20", "TRC20"]
-    snap = asyncio.run(p2p.scan(None, c))
+    snap = arun(p2p.scan(None, c))
     profit, b, s, route = snap.deals[0]
     assert s.net == "TRC20" and "объявл." in s.nick
     assert s.parts == 3   # три TRC20-объявления в стакане — три отдельных перевода с биржи
@@ -349,7 +348,7 @@ def test_scan_keeps_one_deal_per_venue_pair(offline, monkeypatch):
     monkeypatch.setitem(p2p.FETCHERS, "fakebybit", fetcher(sells=[make_ad("Bybit", "sell", 89.7)]))
     monkeypatch.setitem(p2p.FETCHERS, "fakehtx", fetcher(sells=[make_ad("HTX", "sell", 89.6)]))
     c = cfg(exchanges=["fakemexc", "bestchange", "fakebybit", "fakehtx"], assets=["USDT"], min_orders=0, min_rate=0)
-    snap = asyncio.run(p2p.scan(None, c))
+    snap = arun(p2p.scan(None, c))
     keys = [(b.ex, b.asset, s.ex, s.asset) for _, b, s, _ in snap.deals]
     assert len(keys) == len(set(keys)) == 3
     assert {k[2] for k in keys[:3]} == {"BestChange", "Bybit", "HTX"}
@@ -448,7 +447,7 @@ def _fake_sell_scan(monkeypatch, sell_ads):
 
     monkeypatch.setitem(p2p.FETCHERS, "fake", fake_fetcher)
     c = p2p.Config(exchanges=["fake"], assets=["USDT"], min_orders=0, min_rate=0)
-    return asyncio.run(p2p.scan(None, c))
+    return arun(p2p.scan(None, c))
 
 
 def test_scan_drops_deal_when_sell_depth_below_output_qty(offline, monkeypatch):
@@ -489,7 +488,7 @@ def test_scan_combines_depth_across_ads_to_form_deal(offline, monkeypatch):
 
     monkeypatch.setitem(p2p.FETCHERS, "fake", fake_fetcher)
     c = p2p.Config(exchanges=["fake"], assets=["USDT"], min_orders=0, min_rate=0)
-    snap = asyncio.run(p2p.scan(None, c))
+    snap = arun(p2p.scan(None, c))
     assert snap.deals
     qty = 20000 / 85.0 + 30000 / 86.0
     buy_price = 50000 / qty
@@ -504,7 +503,7 @@ def test_scan_drops_deal_when_depth_does_not_cover_amount(offline, monkeypatch):
 
     monkeypatch.setitem(p2p.FETCHERS, "fake", fake_fetcher)
     c = p2p.Config(exchanges=["fake"], assets=["USDT"], min_orders=0, min_rate=0)
-    snap = asyncio.run(p2p.scan(None, c))
+    snap = arun(p2p.scan(None, c))
     assert not snap.deals   # 20 000 доступного объёма не хватает на круг в 50 000
 
 
@@ -519,11 +518,11 @@ def test_same_venue_only_filters_cross_exchange_deals(offline, monkeypatch):
     monkeypatch.setitem(p2p.FETCHERS, "b", fetcher_b)
     c = p2p.Config(exchanges=["a", "b"], assets=["USDT"], min_orders=0, min_rate=0)
 
-    without_filter = asyncio.run(p2p.scan(None, c))
+    without_filter = arun(p2p.scan(None, c))
     assert any(b.ex != s.ex for _, b, s, _ in without_filter.deals)   # межбиржевые связки есть без фильтра
 
     c.same_venue_only = True
-    with_filter = asyncio.run(p2p.scan(None, c))
+    with_filter = arun(p2p.scan(None, c))
     assert with_filter.deals
     assert all(b.ex == s.ex for _, b, s, _ in with_filter.deals)   # только внутри одной площадки
 
@@ -602,7 +601,7 @@ def test_scan_ranks_deals_by_profit_times_reliability(offline, monkeypatch):
     monkeypatch.setitem(p2p.FETCHERS, "r", fake_r)
     monkeypatch.setitem(p2p.FETCHERS, "k", fake_k)
     c = p2p.Config(exchanges=["r", "k"], assets=["USDT"], min_orders=0, min_rate=0, risk_penalty=3.0)
-    snap = asyncio.run(p2p.scan(None, c))
+    snap = arun(p2p.scan(None, c))
     rel = next(d for d in snap.deals if d[1].ex == "R" and d[2].ex == "R")
     risky = next(d for d in snap.deals if d[1].ex == "K" and d[2].ex == "K")
     assert risky[0] > rel[0]                                  # чистый профит выше у рискованной связки
@@ -652,7 +651,7 @@ def test_scan_applies_auto_fee_for_bank_over_limit(offline, monkeypatch):
                         lambda bank, path=trades.DB_PATH, now=None: 150000.0 if bank == "T-Bank" else 0.0)
     monkeypatch.setenv("OWN_BANKS", "T-Bank")
     c = p2p.Config(exchanges=["fake"], assets=["USDT"], min_orders=0, min_rate=0)
-    snap = asyncio.run(p2p.scan(None, c))
+    snap = arun(p2p.scan(None, c))
     assert snap.deals
     assert "лимит СБП Т-Банк исчерпан" in snap.deals[0][3]
 

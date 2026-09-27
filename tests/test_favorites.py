@@ -1,11 +1,11 @@
 """⭐ Избранные маршруты: кнопка на карточке, сигнал от FAV_MIN_PROFIT вне порога и топа, /fav, гостям — нет."""
-import asyncio
 
 import bot as B
 import favorites
 import p2p
 from test_bot import Stub, texts
 from test_guests import Stub as GuestStub, msg
+from helpers import arun
 
 
 def ad(ex, side, price, asset="USDT"):
@@ -36,13 +36,13 @@ def test_star_button_toggles_route_and_updates_card(monkeypatch):
     d = deal(2.5)
     deal_id = bot.remember_deal(d)
     assert _buttons(B.deal_markup(d, deal_id))[f"fav:{deal_id}"] == "⭐ В избранное"
-    asyncio.run(bot.on_callback({"id": "1", "data": f"fav:{deal_id}", "message": {"message_id": 3}}))
+    arun(bot.on_callback({"id": "1", "data": f"fav:{deal_id}", "message": {"message_id": 3}}))
     assert favorites.is_fav(("HTX", "USDT", "KuCoin", "USDT"))
     answers = [p for m, p in bot.out if m == "answerCallbackQuery"]
     assert len(answers) == 1 and "В избранном" in answers[0]["text"]          # один ответ на нажатие
     edit = [p for m, p in bot.out if m == "editMessageReplyMarkup"][-1]
     assert _buttons(edit["reply_markup"])[f"fav:{deal_id}"].startswith("★ Убрать")
-    asyncio.run(bot.on_callback({"id": "2", "data": f"fav:{deal_id}", "message": {"message_id": 3}}))
+    arun(bot.on_callback({"id": "2", "data": f"fav:{deal_id}", "message": {"message_id": 3}}))
     assert not favorites.is_fav(("HTX", "USDT", "KuCoin", "USDT"))
 
 
@@ -54,16 +54,16 @@ def test_favorite_route_signals_below_threshold_and_outside_top(monkeypatch):
     top, fav_low, other_low = deal(3.0), deal(1.4, "Bybit", "MEXC"), deal(1.6, "HTX", "Bybit")
     s = snap([top, fav_low, other_low])
     bot.track_liveness(s)
-    asyncio.run(bot.notify(s))
+    arun(bot.notify(s))
     sent = [p["caption"] for m, p in bot.out if m == "sendPhoto"]
     assert len(sent) == 2 and sent[1].startswith("⭐")        # обычный сигнал + избранный ниже порога
     assert "Bybit" in sent[1] and "MEXC" in sent[1]
-    asyncio.run(bot.notify(s))                                  # антидубль: повторно не шлём
+    arun(bot.notify(s))                                  # антидубль: повторно не шлём
     assert len([m for m, _ in bot.out if m == "sendPhoto"]) == 2
     below = snap([deal(0.8, "Bybit", "MEXC")])                  # ниже FAV_MIN_PROFIT — нет
     bot2 = _stub(monkeypatch)
     bot2.track_liveness(below)
-    asyncio.run(bot2.notify(below))
+    arun(bot2.notify(below))
     assert not [m for m, _ in bot2.out if m == "sendPhoto"]
 
 
@@ -73,24 +73,24 @@ def test_favorite_waits_for_liveness_like_normal_signals(monkeypatch):
     favorites.toggle(("Bybit", "USDT", "MEXC", "USDT"))
     s = snap([deal(1.5, "Bybit", "MEXC")])
     bot.track_liveness(s)
-    asyncio.run(bot.notify(s))
+    arun(bot.notify(s))
     assert not [m for m, _ in bot.out if m == "sendPhoto"]      # первый скан — ждём
     bot.track_liveness(s)
-    asyncio.run(bot.notify(s))
+    arun(bot.notify(s))
     assert [m for m, _ in bot.out if m == "sendPhoto"]
 
 
 def test_fav_list_and_remove(monkeypatch):
     bot = _stub(monkeypatch)
-    asyncio.run(bot.dispatch("/fav", ""))
+    arun(bot.dispatch("/fav", ""))
     assert "Избранных маршрутов нет" in texts(bot)[-1]
     favorites.toggle(("Bybit", "USDT", "MEXC", "USDT"))
     favorites.toggle(("HTX", "USDT", "KuCoin", "USDT"))
     text, kb = bot.favorites_view()
     assert "Bybit USDT → MEXC USDT" in text and "HTX USDT → KuCoin USDT" in text
-    asyncio.run(bot.on_callback({"id": "1", "data": "favdel:1", "message": {"message_id": 4}}))
+    arun(bot.on_callback({"id": "1", "data": "favdel:1", "message": {"message_id": 4}}))
     assert favorites.keys() == {"HTX|USDT|KuCoin|USDT"}
-    asyncio.run(bot.on_callback({"id": "1", "data": "favdel:99", "message": {"message_id": 4}}))   # мимо — не падаем
+    arun(bot.on_callback({"id": "1", "data": "favdel:99", "message": {"message_id": 4}}))   # мимо — не падаем
     assert favorites.keys() == {"HTX|USDT|KuCoin|USDT"}
 
 
@@ -100,9 +100,9 @@ def test_guest_has_no_star_and_cannot_use_favorites(monkeypatch):
     bot = GuestStub(p2p.Config(), guests=["42"])
     for data in ("fav:0", "favdel:1"):
         before = len(bot.out)
-        asyncio.run(bot.on_update({"callback_query": {"id": "1", "data": data,
+        arun(bot.on_update({"callback_query": {"id": "1", "data": data,
                                                       "message": {"chat": {"id": 42}, "message_id": 5}}}))
         assert [m for m, _ in bot.out[before:]] == ["answerCallbackQuery"], data
-    asyncio.run(bot.on_update(msg(42, "/fav")))
+    arun(bot.on_update(msg(42, "/fav")))
     assert bot.out[-1][1]["text"] == B.GUEST_DENIED
     assert favorites.keys() == set()

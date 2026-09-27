@@ -9,7 +9,7 @@ import pytest
 import bot as B
 import p2p
 import simmaker as S
-from helpers import make_ad
+from helpers import arun, make_ad
 
 REF = 90.0
 FEE = p2p.MAKER_FEE["Bybit"]["buy_ad"]   # 0.3% с объявления на покупку
@@ -94,7 +94,7 @@ def test_scan_loop_skips_simmaker_when_off_and_runs_when_on(monkeypatch):
     for env, expected in (("0", 0), ("1", 1)):
         monkeypatch.setenv("SIM_MAKER", env)
         try:
-            asyncio.run(bot.scan_loop())
+            arun(bot.scan_loop())
         except asyncio.CancelledError:
             pass
         assert len(calls) == expected
@@ -299,10 +299,10 @@ class Stub(B.Bot):
 def test_maker_paper_owner_only(monkeypatch):
     monkeypatch.setattr(S, "report_view", lambda cfg=None, path=None: "🧪 отчёт")
     bot = Stub(guests=["42"])
-    asyncio.run(bot.on_update({"message": {"chat": {"id": 42}, "text": "/maker paper", "from": {}}}))
+    arun(bot.on_update({"message": {"chat": {"id": 42}, "text": "/maker paper", "from": {}}}))
     last = [p for m, p in bot.out if m == "sendMessage"][-1]
     assert last["chat_id"] == "42" and last["text"] == B.GUEST_DENIED
-    asyncio.run(bot.handle("/maker paper"))
+    arun(bot.handle("/maker paper"))
     last = [p for m, p in bot.out if m == "sendMessage"][-1]
     assert last["chat_id"] == "1" and last["text"] == "🧪 отчёт"
 
@@ -310,7 +310,7 @@ def test_maker_paper_owner_only(monkeypatch):
 def test_on_scan_with_fixture_books_matches_maker_view(offline, monkeypatch, tmp_path):
     """Живые формы снимка (фикстуры площадок): место своего объявления — как в /maker; отчёт влезает в сообщение."""
     cfg = p2p.Config(assets=["USDT"])
-    sn = asyncio.run(p2p.scan(None, cfg))
+    sn = arun(p2p.scan(None, cfg))
     db = str(tmp_path / "sim_maker.db")
     cfg_env(monkeypatch, SIM_MAKER_BAND="10", SIM_MAKER_MIN_SPREAD="-10")   # в фикстуре спред Bybit отрицательный
     S.on_scan(sn, cfg, path=db, now=1000.0)

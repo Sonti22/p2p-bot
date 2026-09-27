@@ -1,6 +1,5 @@
 """Точность сухого прогона (разбор 25.09): межмонетный маршрут, покупка из нескольких объявлений, объём продажи =
 выход маршрута, сеть обменника, сбой площадки — ожидание, план ниже порога — не берём, без двойного запаса на курс."""
-import asyncio
 import dataclasses
 import json
 import time
@@ -11,6 +10,7 @@ import bot as B
 import p2p
 import paper
 from test_bot import Stub
+from helpers import arun
 
 
 def ad(ex, side, price, nick=None, asset="USDT", avail=10000, max_amt=500000, min_amt=1000, net=""):
@@ -94,11 +94,11 @@ def test_bot_waits_on_venue_error_instead_of_failing(monkeypatch):
     b, s = ad("Bybit", "buy", 85.0, "nick"), ad("MEXC", "sell", 90.0)
     cid = paper.start_cycle(10000, b, s, "r", 2.0, ts=time.time() - 400)
     bot = Stub(p2p.Config(min_profit=2.0))
-    asyncio.run(bot.process_paper_cycles(snap({}, errors={"bybit/USDT": "ClientError"})))
+    arun(bot.process_paper_cycles(snap({}, errors={"bybit/USDT": "ClientError"})))
     c = paper.get_cycle(cid)
     assert c["result"] is None and c["stage"] == "buy"
     paper.set_stage(cid, "sell")
-    asyncio.run(bot.process_paper_cycles(snap({}, errors={"mexc/USDT": "ClientError"})))
+    arun(bot.process_paper_cycles(snap({}, errors={"mexc/USDT": "ClientError"})))
     assert paper.get_cycle(cid)["result"] is None
 
 
@@ -115,7 +115,7 @@ def test_no_cycle_when_plan_at_paper_amount_is_below_threshold(monkeypatch):
                      groups={("HTX", "buy", "USDT"): [good_big, bad_small], ("KuCoin", "sell", "USDT"): [sell]})
     bot = Stub(p2p.Config(min_profit=2.0, amount=50000))
     bot.live_scans = 1
-    asyncio.run(bot.maybe_start_paper_cycle([deal], s))
+    arun(bot.maybe_start_paper_cycle([deal], s))
     assert not paper.open_cycles()
 
 
@@ -129,7 +129,7 @@ def test_bot_stores_route_output_and_network_at_start(monkeypatch):
                       groups={("HTX", "buy", "USDT"): [b], ("KuCoin", "sell", "USDT"): [s]})
     bot = Stub(p2p.Config(min_profit=2.0))
     bot.live_scans = 1
-    asyncio.run(bot.maybe_start_paper_cycle([deal], sn))
+    arun(bot.maybe_start_paper_cycle([deal], sn))
     (c,) = paper.open_cycles()
     d = p2p.deal_for_amount(deal, bot.cfg, sn, 10000)
     assert abs(c["sell_qty"] - d[2].avail) < 1e-9 and c["sell_qty"] < 10000 / 87.5   # после комиссий
@@ -189,7 +189,7 @@ def test_spot_routes_are_not_taken_into_dry_run(monkeypatch):
     assert d is not None and d[0] > cfg.min_profit     # без фильтра круг бы завёлся
     bot = Stub(cfg)
     bot.live_scans = 1
-    asyncio.run(bot.maybe_start_paper_cycle([deal], sn))
+    arun(bot.maybe_start_paper_cycle([deal], sn))
     assert not paper.open_cycles()
 
 
@@ -258,7 +258,7 @@ def test_virtually_exhausted_sbp_limit_puts_fee_into_plan_and_volume(monkeypatch
                       groups={("HTX", "buy", "USDT"): [b], ("KuCoin", "sell", "USDT"): [s]})
     bot = Stub(p2p.Config(min_profit=2.0))
     bot.live_scans = 1
-    asyncio.run(bot.maybe_start_paper_cycle([deal], sn))
+    arun(bot.maybe_start_paper_cycle([deal], sn))
     (c,) = paper.open_cycles()
     no_fee = p2p.deal_for_amount(deal, bot.cfg, sn, 10000)
     assert c["pay_kind"] == "sbp" and c["planned_pct"] < no_fee[0] - 0.4

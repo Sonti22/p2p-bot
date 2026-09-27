@@ -1,11 +1,10 @@
-import asyncio
 
 import pytest
 
 import netstatus
 import p2p
 from conftest import _htx_currency, _kucoin_currency
-from helpers import make_ad
+from helpers import arun, make_ad
 
 
 @pytest.mark.parametrize("raw,want", [
@@ -74,7 +73,7 @@ def test_parse_bybit_and_mexc_shapes():
 
 
 def test_refresh_offline_fills_status_and_detects_changes(offline):
-    asyncio.run(netstatus.refresh(None, ["USDT", "ETH"], ["htx", "kucoin", "bybit"], p2p._json))
+    arun(netstatus.refresh(None, ["USDT", "ETH"], ["htx", "kucoin", "bybit"], p2p._json))
     assert netstatus.withdraw_ok("HTX", "USDT", "BEP20") is True
     assert netstatus.withdraw_ok("KuCoin", "USDT", "BEP20") is True
     assert netstatus.withdraw_ok("Bybit", "USDT", "BEP20") is None    # ключа нет — статус неизвестен
@@ -96,8 +95,8 @@ def test_refresh_if_due_throttles(offline):
         calls.append(url)
         return await p2p._json(s, method, url, body)
 
-    assert asyncio.run(netstatus.refresh_if_due(None, ["USDT"], ["htx"], counting)) == {}
-    assert asyncio.run(netstatus.refresh_if_due(None, ["USDT"], ["htx"], counting)) is None
+    assert arun(netstatus.refresh_if_due(None, ["USDT"], ["htx"], counting)) == {}
+    assert arun(netstatus.refresh_if_due(None, ["USDT"], ["htx"], counting)) is None
     assert len(calls) == 1
 
 
@@ -106,7 +105,7 @@ def test_refresh_keeps_old_data_on_error():
         raise RuntimeError("down")
 
     netstatus._apply("HTX", "USDT", {"TRC20": {"dep": True, "wd": True, "fee": 1.0}})
-    errors = asyncio.run(netstatus.refresh(None, ["USDT"], ["htx"], boom))
+    errors = arun(netstatus.refresh(None, ["USDT"], ["htx"], boom))
     assert "HTX" in errors and netstatus.withdraw_ok("HTX", "USDT", "TRC20") is True
 
 
@@ -132,7 +131,7 @@ def test_refresh_keeps_old_data_on_http_200_api_error():
         return {"code": 500, "message": "boom"}
 
     netstatus._apply("HTX", "USDT", {"TRC20": {"dep": True, "wd": True, "fee": 1.0}})
-    errors = asyncio.run(netstatus.refresh(None, ["USDT"], ["htx"], bad_body))
+    errors = arun(netstatus.refresh(None, ["USDT"], ["htx"], bad_body))
     assert "HTX" in errors and netstatus.withdraw_ok("HTX", "USDT", "TRC20") is True
 
 
@@ -326,6 +325,6 @@ def test_min_withdraw_ignored_when_withdraw_stage_disabled():
 
 def test_scan_offline_refreshes_networks(offline):
     c = p2p.Config(exchanges=["htx", "kucoin"], assets=["USDT"], min_orders=0, min_rate=0)
-    snap = asyncio.run(p2p.scan(None, c))
+    snap = arun(p2p.scan(None, c))
     assert netstatus.withdraw_ok("KuCoin", "USDT", "TRC20") is not None
     assert not [k for k in snap.errors if k.startswith("сети")]

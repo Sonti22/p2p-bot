@@ -1,9 +1,8 @@
 """Кнопки нового Bot API: цвета (style 9.4), «📋» копировать (copy_text 7.11) и откат на обычные кнопки."""
-import asyncio
 
 import bot as B
 import p2p
-from helpers import make_ad
+from helpers import arun, make_ad
 
 
 def deal():
@@ -78,19 +77,19 @@ def test_plain_markup_strips_style_and_copy():
 def test_send_falls_back_to_plain_buttons_once():
     bot = Stub(p2p.Config(), fail_fancy=True)
     kb = B.deal_markup(deal(), deal_id=1, cfg=p2p.Config(), snap=snap([deal()]))
-    r = asyncio.run(bot.send("hi", markup=kb))
+    r = arun(bot.send("hi", markup=kb))
     assert r["ok"] and not bot.fancy
     sent = [p["reply_markup"] for m, p in bot.out if m == "sendMessage"]
     assert len(sent) == 2 and B.is_fancy(sent[0]) and not B.is_fancy(sent[1])
     bot.out.clear()
-    asyncio.run(bot.send("again", markup=kb))                # дальше сразу обычные, без повтора
+    arun(bot.send("again", markup=kb))                # дальше сразу обычные, без повтора
     assert [B.is_fancy(p["reply_markup"]) for m, p in bot.out] == [False]
 
 
 def test_send_photo_falls_back_to_plain_buttons():
     bot = Stub(p2p.Config(), fail_fancy=True)
     kb = B.deal_markup(deal(), deal_id=1, cfg=p2p.Config(), snap=snap([deal()]))
-    r = asyncio.run(bot.send_photo(b"png", "cap", kb))
+    r = arun(bot.send_photo(b"png", "cap", kb))
     assert r["ok"] and not bot.fancy
     assert [B.is_fancy(p["reply_markup"]) for m, p in bot.out if m == "sendPhoto"] == [True, False]
 
@@ -99,7 +98,7 @@ def test_fancy_buttons_env_off(monkeypatch):
     monkeypatch.setenv("FANCY_BUTTONS", "0")
     bot = Stub(p2p.Config())
     kb = B.deal_markup(deal(), deal_id=1, cfg=p2p.Config(), snap=snap([deal()]))
-    asyncio.run(bot.send("hi", markup=kb))
+    arun(bot.send("hi", markup=kb))
     assert not B.is_fancy(bot.out[0][1]["reply_markup"]) and len(bot.out) == 1
 
 
@@ -107,6 +106,6 @@ def test_send_deal_passes_cfg_and_snap(monkeypatch):
     monkeypatch.setattr(B, "deal_card", lambda *a, **k: b"png")
     bot = Stub(p2p.Config(amount=50000))
     d = deal()
-    asyncio.run(bot.send_deal(d, snap=snap([d])))
+    arun(bot.send_deal(d, snap=snap([d])))
     kb = [p["reply_markup"] for m, p in bot.out if m == "sendPhoto"][0]
     assert sum("copy_text" in b for b in buttons(kb)) == 2
