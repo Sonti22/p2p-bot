@@ -333,13 +333,24 @@ def check_sell_stage(cycle, snap, cfg=None, now=None, stale_minutes=30.0):
 
     Возвращает (action, note, price): price — фактическая цена продажи (для realized_pct) при
     "advance", note — чем факт отличается от плана; "fail" — result станет failed_sell; "wait" — площадка
-    продажи в этом скане не ответила (дольше stale_minutes — срыв). Объём — выход маршрута в монете продажи,
-    у обменника — только стакан той же сети (sell_net), что и в плане."""
+    продажи (или площадка конвертации на споте — см. ниже) в этом скане не ответила (дольше stale_minutes —
+    срыв). Объём — выход маршрута в монете продажи, у обменника — только стакан той же сети (sell_net), что
+    и в плане.
+
+    Межмонетная/спот связка (cfg передан, cycle_hops хранит venues) — курс берём именно с площадок,
+    сохранённых при старте круга (p2p.spot_venues_ready), другую биржу вместо пропавшего тикера не
+    подбираем: сбой — тоже «wait»/срыв по stale_minutes, как и пропажа площадки продажи."""
     now = now if now is not None else time.time()
     if _venue_down(snap, cycle["sell_ex"], cycle["sell_asset"]):
         if _stale(cycle, stale_minutes, now):
             return "fail", f"площадка {cycle['sell_ex']} недоступна", None
         return "wait", "", None
+    if cfg is not None:
+        venues = cycle_hops(cycle)["venues"]
+        if venues and not p2p.spot_venues_ready(snap.spot, venues, cycle["buy_asset"], cycle["sell_asset"]):
+            if _stale(cycle, stale_minutes, now):
+                return "fail", f"площадка {'/'.join(venues)} недоступна", None
+            return "wait", "", None
     qty = recompute_sell_qty(cycle, cfg, snap.spot) if cfg is not None else sell_qty(cycle)
     if qty is None:
         return "fail", "конвертация на споте недоступна", None

@@ -5,6 +5,8 @@ import dataclasses
 import json
 import time
 
+import pytest
+
 import bot as B
 import p2p
 import paper
@@ -205,6 +207,35 @@ def test_cross_asset_sell_recomputes_output_from_fresh_spot():
     qty_fresh = paper.recompute_sell_qty(c, cfg, up_spot)
     assert qty_fresh > qty_start * 1.05          # выход вырос вместе с курсом, а не остался на уровне старта
     assert paper.realized_pct(c, price, qty_fresh) > paper.realized_pct(c, price, qty_start)
+
+
+def test_cross_asset_sell_waits_when_saved_venue_ticker_missing():
+    """Разбор «межмонетные связки, часть 2, п.2»: тикер BTC на Bybit (площадка конвертации, сохранённая при
+    старте) пропал на один скан — круг ждёт, а не срывается и не считает через другую биржу, даже если там
+    тикер есть."""
+    b = ad("Bybit", "buy", 6_000_000.0, asset="BTC")
+    s = ad("Bybit", "sell", 105.0, asset="USDT", avail=1_000_000)
+    cfg = p2p.Config(min_profit=2.0, pay_fee=0.0)
+    start_spot = {"Bybit": {"BTC": (60000.0, 60100.0)}}
+    qty_start = p2p._route_qty(b, s, dataclasses.replace(cfg, amount=10000), start_spot, disable=frozenset({"risk"}))
+    cid = paper.start_cycle(10000, b, s, "спот BTC→USDT на Bybit", 1.0, ts=time.time() - 400,
+                            sell_qty=qty_start, pay_fee=0.0, hops=p2p.route_hops(b, s, cfg, start_spot))
+    paper.set_stage(cid, "sell")
+    c = paper.get_cycle(cid)
+    assert paper.cycle_hops(c)["venues"] == ["Bybit"]
+    # Bybit пропал из спота, MEXC тикер BTC есть — не должны молча уйти на другую биржу
+    gone = snap({("Bybit", "sell", "USDT"): [s]}, spot={"MEXC": {"BTC": (66000.0, 66100.0)}})
+    action, note, price = paper.check_sell_stage(c, gone, cfg=cfg, now=time.time())
+    assert action == "wait" and price is None
+    late = snap({("Bybit", "sell", "USDT"): [s]}, spot={"MEXC": {"BTC": (66000.0, 66100.0)}})
+    action, note, price = paper.check_sell_stage(c, late, cfg=cfg, now=time.time() + 31 * 60)
+    assert action == "fail" and "недоступна" in note and price is None
+    # тикер вернулся на Bybit — считаем по нему же, курс не изменился, выход как при старте
+    back_spot = {"Bybit": {"BTC": (60000.0, 60100.0)}, "MEXC": {"BTC": (66000.0, 66100.0)}}
+    back = snap({("Bybit", "sell", "USDT"): [s]}, spot=back_spot)
+    action, note, price = paper.check_sell_stage(c, back, cfg=cfg)
+    assert action == "advance"
+    assert paper.recompute_sell_qty(c, cfg, back_spot) == pytest.approx(qty_start)
 
 
 def test_virtually_exhausted_sbp_limit_puts_fee_into_plan_and_volume(monkeypatch):
