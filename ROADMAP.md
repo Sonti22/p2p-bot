@@ -571,6 +571,14 @@ _(облачный Claude добавляет сюда предложения, к
 - Площадки под санкциями или с сомнительным статусом (Garantex, Grinex, A7A5, ABCeX).
 
 ## Журнал
+- 2026-09-27 — фьючерсы, этап 3.3: `simperp.py` — бумажный хедж кругов сухого прогона с BTC/ETH/TON шортом перпа
+  на дешёвой из Bybit/BingX (исполнение по стакану, тейкер на входе и выходе, ожидаемый фандинг; лот округляется,
+  площадка с коэффициентом вне 1 ± `HEDGE_RATIO_BAND` не берётся), фандинг — по расчётам в окне (`perp.settle`),
+  закрытие — когда круг завершён или через `HEDGE_MAX_HOURS`=6 ч. Колонки `hedge_*` в `paper.py` (миграции
+  отдельным блоком; `get_cycle`/`open_cycles` теперь берут колонки по именам, а не по позиции — порядок ALTER у
+  веток разный). `HEDGE_PLAN=1` — план круга со стоимостью хеджа и остаточным запасом (USDT/RUB `HEDGE_RESIDUAL` +
+  недохеджированная доля) вместо запаса на курс. `/paper report` — σ(факт − план) без хеджа и с хеджем. Факт и
+  баланс прогона хедж не меняет. TON сейчас без хеджа (перпа нет ни на Bybit, ни на BingX).
 - 2026-09-27 — фьючерсы, этап 3.2: `perp.py` — публичные данные перпов Bybit v5 (tickers linear, instruments-info,
   orderbook linear/spot, time, kline 1ч) и BingX swap v2 (premiumIndex, contracts, depth, server time) по
   BTCUSDT/ETHUSDT/TONUSDT (`PERP_SYMBOLS`); `PerpQuote` на (площадку, символ): mark/index/last/bid/ask, ставка и

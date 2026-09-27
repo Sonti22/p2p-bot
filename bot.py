@@ -28,6 +28,7 @@ import payouts
 import perp
 import presets
 import simmaker
+import simperp
 import snapshots
 import trades
 from cards import deal_card, history_card, history_compare_card, portfolio_card, top_chart
@@ -1685,6 +1686,7 @@ class Bot:
                 if g["avg_realized_pct"] is not None:
                     line += f" / факт {g['avg_realized_pct']:+.2f}%"
                 lines.append(line)
+        lines += simperp.report_lines()
         lines += ["", *self.paper_vs_real_lines(rows)]
         lines.append("")
         lines.append("📄 разбор по связкам — файлом CSV ниже.")
@@ -2081,6 +2083,7 @@ class Bot:
                     await self.check_alerts(self.last)
                     await self.check_networks()
                     await self.process_paper_cycles(self.last)
+                    self.paper_hedge_tick(self.last)
                     await self.check_paper_ladder()
                     await self.quiet_and_pause_tick(self.last)
                     await self.update_market_status(self.last)
@@ -2416,10 +2419,23 @@ class Bot:
                     "snapshot_id": snapshots.scan_id(snap)}
         if measures["snapshot_id"] is not None:   # снимок этого скана запишется, даже если он не SNAPSHOT_EVERY-й
             self.snapshot_keep.add(measures["snapshot_id"])
+        # бумажный хедж (simperp): шорт перпа на монету круга; HEDGE_PLAN=1 — в плане стоимость хеджа вместо запаса
+        try:
+            hedge, hedge_note = simperp.choose(b.asset, qty or s.avail, settings["amount"], psnap.ref, b.price,
+                                               risk=self.cfg.risk_buffer.get(b.asset, 0.0))
+        except Exception as e:   # сбой симуляции хеджа не мешает кругу
+            logger.error("simperp: %s", e)
+            hedge, hedge_note = None, ""
+        if hedge and simperp.settings()["plan"]:
+            profit = simperp.hedged_plan(raw, hedge)
         # over — тот же, что в плане и qty: банк оплаты и комиссия СБП в круге совпадут с планом
         cycle = paper.get_cycle(paper.start_cycle(settings["amount"], b, s, route, profit, label=label,
                                                   sell_qty=qty or s.avail, pay_fee=self.cfg.pay_fee, over=over,
                                                   planned_raw=raw, hops=hops, **measures)) or {}
+        try:
+            simperp.open_hedge(cycle.get("id"), hedge, hedge_note)
+        except Exception as e:
+            logger.error("simperp: %s", e)
         pay = trades.pay_label(cycle.get("pay_kind", ""), cycle.get("bank", ""), b.pays)
         qty = settings["amount"] / b.price
         text = (f"🧪 <b>Сухой прогон</b>: купил бы {_money(qty)} {b.asset} у {html.escape(b.nick)} "
@@ -2427,6 +2443,9 @@ class Bot:
                 f" · оценка {rank:+.2f}")
         if reasons:
             text += "\n" + "\n".join(f"• {html.escape(r)}" for r in reasons)
+        hedge_line = simperp.card_line(hedge, hedge_note, b.asset)
+        if hedge_line:
+            text += "\n" + html.escape(hedge_line)
         await self.send(text, topic="signals")
 
     async def process_paper_cycles(self, snap):
@@ -2487,6 +2506,13 @@ class Bot:
                     await self.send(f"🧪 Сухой прогон: круг #{cycle['id']} завершён — план "
                                     f"{plan:.2f}%, факт {rp:.2f}%"
                                     + (f" ({note})" if note else ""), topic="signals")
+
+    def paper_hedge_tick(self, snap):
+        """Бумажный хедж (simperp): фандинг по расчётам и откуп шорта у завершённых кругов — сбой не мешает скану."""
+        try:
+            simperp.tick(snap.ref)
+        except Exception as e:
+            logger.error("simperp: %s", e)
 
     async def check_paper_ladder(self):
         """Лестница суммы сухого прогона (paper.ladder_suggestion): сам PAPER_AMOUNT не меняет —
