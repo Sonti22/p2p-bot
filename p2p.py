@@ -16,6 +16,7 @@ import socket
 import statistics
 import sys
 import time
+import urllib.parse
 import zipfile
 from collections import deque
 from dataclasses import dataclass, field
@@ -332,7 +333,53 @@ class Ad:
     last_seen: float = field(default=0.0, compare=False)
 
 
+# Публичные запросы без ключей (объявления, справочники оплат и монет, спот-тикеры, сети монет): (метод, хост, путь).
+# Путь — ровно этот; путь с «/» на конце — префикс, после которого только имя монеты. Любой другой запрос _json не
+# отправляет (ValueError до отправки, как accounts.bybit_post). Список запинен в tests/test_trading_surface.py
+# (защищённый файл): новая площадка или адрес — только после проверки владельцем.
+JSON_ALLOWED = frozenset({
+    ("POST", "api2.bybit.com", "/fiat/otc/configuration/queryAllPaymentList"),
+    ("POST", "api2.bybit.com", "/fiat/otc/item/online"),
+    ("GET", "www.htx.com", "/-/x/otc/v1/data/trade-market"),
+    ("GET", "www.kucoin.com", "/_api/otc/ad/list"),
+    ("GET", "www.mexc.com", "/api/platform/p2p/api/payment/method"),
+    ("GET", "www.mexc.com", "/api/platform/p2p/api/common/coins"),
+    ("GET", "p2p.mexc.com", "/api/market"),
+    ("GET", "bitpapa.com", "/api/v1/pro/search"),
+    ("GET", "www.lbank.com", "/lbk-api/otc-trade-center/fiat/p2p/adv/advertisementList"),
+    ("GET", "api.rapira.net", "/open/market/rates"),
+    ("GET", "api.bybit.com", "/v5/market/tickers"),
+    ("GET", "api.mexc.com", "/api/v3/ticker/bookTicker"),
+    ("GET", "api.htx.com", "/market/tickers"),
+    ("GET", "api.kucoin.com", "/api/v1/market/allTickers"),
+    ("GET", "api.htx.com", "/v2/reference/currencies"),       # netstatus: сети монеты (?currency=)
+    ("GET", "api.kucoin.com", "/api/v3/currencies/"),         # netstatus: сети монеты — префикс + монета
+})
+_JSON_TAIL = re.compile(r"[A-Za-z0-9_-]{1,20}")   # что может стоять после пути-префикса: только имя монеты
+
+
+def json_allowed(method, url):
+    """Входит ли запрос в JSON_ALLOWED: https, хост — ровно из списка (без логина, пароля и порта: сравнивается весь
+    netloc), путь — ровно или префикс + имя монеты; без фрагмента, пробелов, управляющих символов и «\\»."""
+    if not isinstance(method, str) or not isinstance(url, str) or not url.isascii() \
+            or any(ord(c) <= 32 or ord(c) == 127 or c == "\\" for c in url):
+        return False
+    try:
+        u = urllib.parse.urlsplit(url)
+    except ValueError:
+        return False
+    if u.scheme != "https" or u.fragment:
+        return False
+    return any(method == m and u.netloc == host
+               and (_JSON_TAIL.fullmatch(u.path[len(path):]) is not None and u.path.startswith(path)
+                    if path.endswith("/") else u.path == path)
+               for m, host, path in JSON_ALLOWED)
+
+
 async def _json(s, method, url, body=None):
+    if not json_allowed(method, url):   # до отправки: новый адрес — только через JSON_ALLOWED и пин владельца
+        where = str(url).split("?", 1)[0][:120]
+        raise ValueError(f"_json: {method} {where} не входит в список публичных запросов (p2p.JSON_ALLOWED)")
     async with s.request(method, url, json=body, headers=HEADERS) as r:
         r.raise_for_status()
         return await r.json(content_type=None)
