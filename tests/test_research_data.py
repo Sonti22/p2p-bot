@@ -220,6 +220,6 @@ def test_opener_ignores_windows_registry_proxy(monkeypatch):
     monkeypatch.setattr(urllib.request, "getproxies_environment", lambda: {})
     handlers = [h for h in data._opener().handlers if isinstance(h, urllib.request.ProxyHandler)]
     assert all(h.proxies == {} for h in handlers)      # пустой ProxyHandler в цепочку не встаёт — прямое соединение
-    monkeypatch.setattr(urllib.request, "getproxies_environment", lambda: {"https": "http://env-proxy:8080"})
+    monkeypatch.setattr(urllib.request, "getproxies_environment", lambda: {"https": "env-proxy-marker"})
     handlers = [h for h in data._opener().handlers if isinstance(h, urllib.request.ProxyHandler)]
-    assert [h.proxies for h in handlers] == [{"https": "http://env-proxy:8080"}]
+    assert [h.proxies for h in handlers] == [{"https": "env-proxy-marker"}]
