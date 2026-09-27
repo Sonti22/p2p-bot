@@ -1695,6 +1695,15 @@ class Bot:
                 line += f", не хватило глубины {r['depth_shortfall']}×"
             if r["avg_duration_min"] is not None:
                 line += f", среднее время круга {r['avg_duration_min']:.0f} мин"
+            if r.get("avg_buy_slip_pct") is not None:
+                line += f", покупка к плану {r['avg_buy_slip_pct']:+.2f}%"
+            if r.get("buy_from_book"):
+                line += f", у других мерчантов {r['buy_from_book']}×"
+            if r.get("net_unknown"):
+                line += f", статус сети неизвестен {r['net_unknown']}×"
+            if r.get("fail_reasons"):
+                line += " · причины срывов: " + ", ".join(
+                    f"{paper.REASON_LABELS.get(k, k)} {v}" for k, v in r["fail_reasons"].items())
             lines.append(line)
         by_label = paper.label_stats()
         if by_label:
@@ -2475,9 +2484,9 @@ class Bot:
         route_cfg = dataclasses.replace(self.cfg, amount=settings["amount"])
         qty = _route_qty(b, s, route_cfg, psnap.spot, over, disable=frozenset({"risk"}))
         raw = (qty * s.price / settings["amount"] - 1) * 100 if qty else profit
-        # площадки конвертации и сеть/комиссия каждого хопа на момент старта — для стадий transfer/sell
-        # межмонетных связок позже (ROADMAP «межмонетные, часть 2»); сейчас связка простая (paper.simple_route)
-        # — venues пусто, один хоп, но сохраняем и для неё, чтобы данные были у всех кругов подряд
+        # площадки конвертации и сеть/комиссия каждого хопа на момент старта: стадия transfer проверяет именно эти
+        # переводы, sell считает выход по их комиссиям, время перевода круга — по их сетям (paper.start_cycle);
+        # межмонетные связки фильтр paper.simple_route пока не пускает (снятие — шаг владельца)
         hops = route_hops(b, s, route_cfg, psnap.spot, over)
         # для разбора (этап 1 «измерения»): индекс и причины надёжности, серия «живости», запас глубины и id снимка
         # скана — снимок пишется после сигналов, но id (время начала скана) известен уже сейчас
@@ -2514,11 +2523,13 @@ class Bot:
 
     async def process_paper_cycles(self, snap):
         """Сухой прогон: стадии открытых виртуальных кругов по свежему снимку/справочникам, без сети.
-        buy — через PAPER_PAY_MINUTES объявление покупки ещё на месте (цена ордера зафиксирована при
-        создании); transfer — через PAPER_TRANSFER_MINUTES вывод всё ещё возможен (fees/netstatus); sell —
-        продаём лучшим объявлениям стакана на весь объём, прибыль — по фактической цене (может быть ниже
-        плана и в минус). Срыв (failed_buy/failed_transfer/failed_sell): мерчант покупки ушёл, вывод
-        закрыт, покупателей на весь объём нет."""
+        buy — через PAPER_PAY_MINUTES покупка по свежему стакану (мерчанты круга, не хватило — другие по цене;
+        цена хуже плана больше PAPER_BUY_SLIP_MAX — срыв; у обменника — только по свежей котировке BestChange),
+        цена покупки пишется в круг; transfer — через время перевода по сетям круга переводы маршрута ещё возможны
+        (fees/netstatus), неизвестный статус сети — риск в круге; sell — продаём лучшим объявлениям стакана на весь
+        объём, прибыль — по фактическим ценам покупки и продажи (может быть ниже плана и в минус). Срыв
+        (failed_buy/failed_transfer/failed_sell): стакана покупки не хватило или цена ушла, перевод закрыт,
+        покупателей на весь объём нет. Всё состояние круга — в data/paper.db: перезапуск бота круг продолжает."""
         if not self.chat_id:
             return
         settings = paper.settings()
@@ -2535,6 +2546,8 @@ class Bot:
                     await self.send(f"🧪 Сухой прогон: круг #{cycle['id']} сорвался на покупке — {note}",
                                     topic="signals")
                 else:
+                    # цена покупки по свежему стакану (проскальзывание, другие мерчанты) — для факта на продаже
+                    paper.set_buy_fill(cycle["id"], paper.buy_fill(cycle, snap))
                     paper.set_stage(cycle["id"], "transfer")
             elif cycle["stage"] == "transfer":
                 action, note = paper.check_transfer_stage(cycle, self.cfg, settings["transfer_minutes"])
@@ -2546,6 +2559,7 @@ class Bot:
                     await self.send(f"🧪 Сухой прогон: круг #{cycle['id']} сорвался на переводе — {note}",
                                     topic="signals")
                 else:
+                    paper.add_risks(cycle["id"], paper.transfer_risks(cycle, self.cfg))   # неизвестный статус сети — риск
                     paper.set_stage(cycle["id"], "sell")
             elif cycle["stage"] == "sell":
                 action, note, price = paper.check_sell_stage(cycle, snap, cfg=self.cfg,

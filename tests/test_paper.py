@@ -9,11 +9,12 @@ from helpers import make_ad
 
 
 def test_settings_defaults(monkeypatch):
-    for k in ("PAPER", "PAPER_AMOUNT", "PAPER_PAY_MINUTES", "PAPER_TRANSFER_MINUTES", "PAPER_MAX_OPEN"):
+    for k in ("PAPER", "PAPER_AMOUNT", "PAPER_PAY_MINUTES", "PAPER_TRANSFER_MINUTES", "PAPER_MAX_OPEN",
+              "PAPER_BUY_SLIP_MAX", "PAPER_BC_FRESH_MINUTES"):
         monkeypatch.delenv(k, raising=False)
     s = paper.settings()
     assert s == {"on": False, "amount": 10000.0, "pay_minutes": 5.0, "transfer_minutes": 3.0, "max_open": 1,
-                 "traps": False, "stale_minutes": 30.0}
+                 "traps": False, "stale_minutes": 30.0, "buy_slip_max": 1.0, "bc_fresh_minutes": 5.0}
 
 
 def test_settings_reads_env_each_call(monkeypatch):
@@ -199,10 +200,13 @@ def test_check_buy_stage_waits_before_pay_minutes():
 
 
 def test_check_buy_stage_advances_when_ad_still_there_at_same_or_better_price():
-    cycle = {"ts_stage": 1000.0, "buy_ex": "Bybit", "buy_asset": "USDT", "buy_nick": "nick", "buy_price": 85.0}
+    cycle = {"ts_stage": 1000.0, "buy_ex": "Bybit", "buy_asset": "USDT", "buy_nick": "nick", "buy_price": 85.0,
+             "amount": 10000.0}
     ad = make_ad("Bybit", "buy", 84.5)   # nick по умолчанию "nick", цена даже лучше плана
     action, note = paper.check_buy_stage(cycle, _cycle_snap(ads=[ad]), pay_minutes=5, now=1400.0)
     assert action == "advance" and note == ""
+    fill = paper.buy_fill(cycle, _cycle_snap(ads=[ad]))
+    assert fill["price"] == 84.5 and fill["slip_pct"] < 0 and not fill["book"]   # по свежей цене, не по плану
 
 
 def test_check_buy_stage_fails_when_ad_gone():
@@ -211,19 +215,29 @@ def test_check_buy_stage_fails_when_ad_gone():
     assert action == "fail" and "исчезло" in note
 
 
-def test_check_buy_stage_ignores_price_change_of_same_merchant():
-    """Цена в ордере фиксируется при создании: рост цены объявления потом круг не срывает."""
-    cycle = {"ts_stage": 1000.0, "buy_ex": "Bybit", "buy_asset": "USDT", "buy_nick": "nick", "buy_price": 85.0}
-    ad = make_ad("Bybit", "buy", 86.0)
+def test_check_buy_stage_rechecks_price_of_same_merchant():
+    """Этап 2.4: цена покупки — по свежему стакану на проверке, а не по плану. Рост в пределах PAPER_BUY_SLIP_MAX
+    (1%) круг не срывает; дальше допуска — «цена ушла»."""
+    cycle = {"ts_stage": 1000.0, "buy_ex": "Bybit", "buy_asset": "USDT", "buy_nick": "nick", "buy_price": 85.0,
+             "amount": 10000.0}
+    assert paper.check_buy_stage(cycle, _cycle_snap(ads=[make_ad("Bybit", "buy", 85.5)]), pay_minutes=5,
+                                 now=1400.0) == ("advance", "")
+    action, note = paper.check_buy_stage(cycle, _cycle_snap(ads=[make_ad("Bybit", "buy", 86.0)]), pay_minutes=5,
+                                         now=1400.0)
+    assert action == "fail" and "цена ушла" in note and "+1.18%" in note
+    assert paper.check_buy_stage(cycle, _cycle_snap(ads=[make_ad("Bybit", "buy", 86.0)]), pay_minutes=5,
+                                 now=1400.0, slip_max=2.0)[0] == "advance"
+
+
+def test_check_buy_stage_walks_book_when_merchant_gone():
+    """Мерчант круга ушёл — покупаем у тех, кто есть в стакане (проскальзывание), а не срываем круг сразу."""
+    cycle = {"ts_stage": 1000.0, "buy_ex": "Bybit", "buy_asset": "USDT", "buy_nick": "other", "buy_price": 85.0,
+             "amount": 10000.0}
+    ad = make_ad("Bybit", "buy", 84.0)   # другой мерчант (nick "nick"), цена лучше плана
     action, note = paper.check_buy_stage(cycle, _cycle_snap(ads=[ad]), pay_minutes=5, now=1400.0)
     assert action == "advance" and note == ""
-
-
-def test_check_buy_stage_ignores_different_merchant():
-    cycle = {"ts_stage": 1000.0, "buy_ex": "Bybit", "buy_asset": "USDT", "buy_nick": "other", "buy_price": 85.0}
-    ad = make_ad("Bybit", "buy", 84.0)   # цена ок, но не тот мерчант — не считается тем же объявлением
-    action, note = paper.check_buy_stage(cycle, _cycle_snap(ads=[ad]), pay_minutes=5, now=1400.0)
-    assert action == "fail" and "исчезло" in note
+    fill = paper.buy_fill(cycle, _cycle_snap(ads=[ad]))
+    assert fill["book"] and fill["own"] == 0 and fill["price"] == 84.0
 
 
 def _cfg():

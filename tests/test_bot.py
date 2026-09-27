@@ -93,6 +93,8 @@ def _patch_paper_db(monkeypatch, db):
     monkeypatch.setattr(B.paper, "start_cycle", functools.partial(B.paper.start_cycle, path=db))
     monkeypatch.setattr(B.paper, "finish_cycle", functools.partial(B.paper.finish_cycle, path=db))
     monkeypatch.setattr(B.paper, "set_stage", functools.partial(B.paper.set_stage, path=db))
+    monkeypatch.setattr(B.paper, "set_buy_fill", functools.partial(B.paper.set_buy_fill, path=db))
+    monkeypatch.setattr(B.paper, "add_risks", functools.partial(B.paper.add_risks, path=db))
     monkeypatch.setattr(B.paper, "get_balance", functools.partial(B.paper.get_balance, path=db))
     monkeypatch.setattr(B.paper, "balance_change", functools.partial(B.paper.balance_change, path=db))
     monkeypatch.setattr(B.paper, "stats", functools.partial(B.paper.stats, path=db))
@@ -196,19 +198,28 @@ def test_process_paper_cycles_fails_when_ad_gone(monkeypatch, tmp_path):
     assert len(msgs) == 1 and "исчезло" in msgs[0]
 
 
-def test_process_paper_cycles_buy_price_change_does_not_fail(monkeypatch, tmp_path):
+def test_process_paper_cycles_buy_rechecks_price(monkeypatch, tmp_path):
+    """Этап 2.4: покупка — по свежему стакану на проверке. Тот же мерчант чуть дороже (+0,47%, в допуске 1%) —
+    круг идёт дальше, цена покупки записана; дороже на 1,18% — «цена ушла», срыв."""
     monkeypatch.setenv("PAPER_PAY_MINUTES", "5")
     db = str(tmp_path / "paper.db")
     _patch_paper_db(monkeypatch, db)
     buy, sell = make_ad("Bybit", "buy", 85.0), make_ad("MEXC", "sell", 90.0)
     cid = paper.start_cycle(10000, buy, sell, "route", 2.0, path=db, ts=time.time() - 400)
     bot = Stub(p2p.Config(min_profit=2.0))
-    worse = make_ad("Bybit", "buy", 86.0)   # тот же мерчант, цена выросла — ордер уже по старой цене
-    s = p2p.Snapshot(88.0, "test", {}, {}, [], {}, {}, {}, groups={("Bybit", "buy", "USDT"): [worse]})
+    slightly = make_ad("Bybit", "buy", 85.4)
+    s = p2p.Snapshot(88.0, "test", {}, {}, [], {}, {}, {}, groups={("Bybit", "buy", "USDT"): [slightly]})
     asyncio.run(bot.process_paper_cycles(s))
     c = paper.get_cycle(cid, path=db)
     assert c["stage"] == "transfer" and c["result"] is None
+    assert c["buy_fill_price"] == 85.4 and abs(c["buy_slip_pct"] - (85.4 / 85 - 1) * 100) < 1e-9
     assert not [t for t in texts(bot) if "сорвался" in t]
+    gone = paper.start_cycle(10000, buy, sell, "route", 2.0, path=db, ts=time.time() - 400)
+    worse = make_ad("Bybit", "buy", 86.0)
+    asyncio.run(bot.process_paper_cycles(p2p.Snapshot(88.0, "test", {}, {}, [], {}, {}, {},
+                                                      groups={("Bybit", "buy", "USDT"): [worse]})))
+    g = paper.get_cycle(gone, path=db)
+    assert g["result"] == "failed_buy" and "цена ушла" in g["note"]
 
 
 def test_process_paper_cycles_noop_without_chat_id(monkeypatch, tmp_path):

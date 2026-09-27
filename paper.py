@@ -15,6 +15,9 @@ SQLite data/paper.db, таблицы:
             надёжности и серия «живости» связки, сделки/% успешных мерчантов покупки и продажи, запас глубины
             стакана (depth_margin) и id снимка скана (snapshot_id, snapshots.py); на проверке покупки — лучшая
             цена и доступный объём у мерчантов покупки (buy_check_price/buy_check_avail). У старых кругов — NULL.
+            Реализм (этап 2.4): цена покупки по свежему стакану и её сдвиг к плану (buy_fill_price/buy_slip_pct),
+            время перевода по сетям, записанное на старте (transfer_min), риски стадий (risk_notes: неизвестный
+            статус сети, покупка у других мерчантов). У старых кругов — NULL/пусто, стадии идут как раньше.
   balance — один виртуальный баланс: старт = PAPER_AMOUNT, меняется на realized_pct каждого
             завершённого круга.
 """
@@ -22,10 +25,12 @@ import csv
 import dataclasses
 import datetime
 import json
+import math
 import os
 import sqlite3
 import time
 
+import netstatus
 import p2p
 import trades
 
@@ -36,7 +41,8 @@ REPORT_COLUMNS = ("buy_ex", "buy_asset", "sell_ex", "sell_asset", "total", "done
                    "depth_shortfall", "avg_planned_pct", "avg_realized_pct", "avg_duration_min",
                    "avg_buy_min", "avg_transfer_min", "avg_sell_min", "avg_index_start", "avg_streak_start",
                    "avg_depth_margin", "avg_buy_orders", "avg_buy_rate", "avg_sell_orders", "avg_sell_rate",
-                   "avg_buy_check_drift_pct", "avg_buy_check_cover", "failed_by_reason")
+                   "avg_buy_check_drift_pct", "avg_buy_check_cover", "avg_buy_slip_pct", "buy_from_book",
+                   "net_unknown", "fail_reasons", "failed_by_reason")
 
 STAGES = ("buy", "transfer", "sell")
 RESULTS = ("done", "failed_buy", "failed_transfer", "failed_sell")
@@ -78,6 +84,58 @@ HEDGE_COLUMNS = (("hedge_venue", "TEXT DEFAULT ''"), ("hedge_qty", "REAL DEFAULT
                  ("hedge_pnl", "REAL DEFAULT NULL"), ("hedge_state", "TEXT DEFAULT ''"))
 # колонки хеджа добавляет свой блок миграций после колонок разбора — и у новой базы, и у старой они последние
 _COLUMNS += tuple(col for col, _ddl in HEDGE_COLUMNS)
+# реализм прогона (план, этап 2.4): цена покупки по свежему стакану на проверке и её сдвиг к плану (%), время перевода
+# круга по сетям (мин, считается на старте — перезапуск его не меняет) и риски стадий (JSON [[код, текст], ...])
+REALISM_COLUMNS = (("buy_fill_price", "REAL DEFAULT NULL"), ("buy_slip_pct", "REAL DEFAULT NULL"),
+                   ("transfer_min", "REAL DEFAULT NULL"), ("risk_notes", "TEXT DEFAULT ''"))
+_COLUMNS += tuple(col for col, _ddl in REALISM_COLUMNS)
+
+# Время перевода монеты между площадками по сети, мин: вывод + подтверждения до зачисления. Грубые средние по
+# правилам зачисления бирж (число подтверждений × время блока + обработка вывода) — уточнять по факту прогона;
+# переопределение — PAPER_NET_MINUTES="TRC20:3,BTC:40". Сеть неизвестна (нет в таблице или не выбрана) —
+# PAPER_TRANSFER_MINUTES.
+NET_MINUTES = {"TRC20": 3.0, "BEP20": 2.0, "ERC20": 6.0, "TON": 2.0, "SOL": 2.0, "POLYGON": 5.0, "ARBITRUM": 3.0,
+               "APT": 2.0, "BTC": 40.0}
+
+# Причины срыва по тексту note (как depth_shortfall в report_rows): (код, подстрока note, подпись для отчёта).
+# Порядок важен: «конвертация на споте недоступна» — раньше общего «недоступна».
+FAIL_REASONS = (
+    ("buy_gone", "объявление покупки исчезло", "мерчант покупки ушёл, стакана не хватило"),
+    ("buy_part", "остальные сумму не покрывают", "часть мерчантов ушла, остаток не покрыл"),
+    ("buy_depth", "стакана покупки не хватает", "стакана покупки не хватило"),
+    ("buy_slip", "цена ушла", "цена покупки ушла дальше допуска"),
+    ("bc_stale", "нет свежей котировки BestChange", "нет свежей котировки BestChange"),
+    ("spot", "конвертация на споте недоступна", "спот-конвертация недоступна"),
+    ("venue_down", "недоступна", "площадка недоступна"),
+    ("net_closed", "закрыт", "перевод закрыт"),
+    ("sell_depth", "не хватает глубины стакана продажи", "не хватило глубины продажи"),
+)
+REASON_LABELS = {code: label for code, _sub, label in FAIL_REASONS} | {"other": "другое"}
+# Риски круга (risk_notes): не срыв, но круг прошёл стадию на допущении — видно в отчёте
+RISK_LABELS = {"net_unknown": "статус сети неизвестен", "buy_book": "покупка у других мерчантов"}
+
+
+def _env_float(name, default):
+    """Число из .env; пусто, не число, nan/inf или минус — значение по умолчанию."""
+    try:
+        v = float(os.getenv(name, default))
+    except ValueError:
+        return default
+    return v if math.isfinite(v) and v >= 0 else default
+
+
+def net_minutes_table():
+    """NET_MINUTES с правками из PAPER_NET_MINUTES («сеть:минуты» через запятую; кривая часть пропускается)."""
+    table = dict(NET_MINUTES)
+    for part in os.getenv("PAPER_NET_MINUTES", "").split(","):
+        net, _, val = part.partition(":")
+        try:
+            v = float(val)
+        except ValueError:
+            continue
+        if net.strip() and math.isfinite(v) and 0 <= v < 1e4:
+            table[net.strip().upper()] = v
+    return table
 
 
 def settings():
@@ -93,6 +151,10 @@ def settings():
         "traps": os.getenv("PAPER_TRAPS", "0").strip().lower() in ("1", "true", "yes", "on"),
         # площадка круга не отвечает дольше — круг сорван (иначе занятый слот висел бы вечно)
         "stale_minutes": float(os.getenv("PAPER_STALE_MINUTES", 30)),
+        # покупка по свежему стакану хуже плана больше чем на столько % — круг не покупаем («цена ушла»)
+        "buy_slip_max": _env_float("PAPER_BUY_SLIP_MAX", 1.0),
+        # покупка у обменника: котировка BestChange по направлению должна быть не старше стольких минут
+        "bc_fresh_minutes": _env_float("PAPER_BC_FRESH_MINUTES", 5.0),
     }
 
 
@@ -120,6 +182,9 @@ def _connect(path):
         if col not in cols:   # база от прошлой версии — добавляем колонку, данные не трогаем
             con.execute(f"ALTER TABLE cycles ADD COLUMN {col} {ddl}")
     for col, ddl in HEDGE_COLUMNS:   # хедж simperp — отдельным блоком миграций
+        if col not in cols:
+            con.execute(f"ALTER TABLE cycles ADD COLUMN {col} {ddl}")
+    for col, ddl in REALISM_COLUMNS:   # реализм прогона (этап 2.4) — свой блок после хеджа
         if col not in cols:
             con.execute(f"ALTER TABLE cycles ADD COLUMN {col} {ddl}")
     con.execute("CREATE TABLE IF NOT EXISTS balance (id INTEGER PRIMARY KEY CHECK (id = 1), "
@@ -180,13 +245,17 @@ def start_cycle(amount, buy, sell, route, planned_pct, path=DB_PATH, ts=None, la
     банк оплаты и pay_fee_used берём по ним же, иначе комиссия в круге разошлась бы с планом; не передан —
     только виртуальный оборот прогона. planned_raw — план без запаса на курс (для сравнения с фактом).
     hops — p2p.route_hops(buy, sell, ...) (площадки конвертации и сеть/комиссия каждого хопа маршрута на
-    момент старта) — не передан, пишем пустой маршрут; для стадий transfer/sell позже (ROADMAP «межмонетные,
-    часть 2») — в этой задаче только сохраняем, не используем.
+    момент старта) — не передан, пишем пустой маршрут; стадия transfer проверяет именно эти переводы
+    (transfer_check), стадия sell считает выход по их комиссиям (qty_from_hops).
     Для разбора: index/reasons — индекс и причины надёжности связки на старте (p2p.reliability_index/reliability),
     streak — сколько сканов подряд она держалась (Bot.live), depth — запас глубины (depth_margin), snapshot_id —
     id снимка скана (snapshots.scan_id); сделки/% успешных мерчантов берём из buy/sell.
+    По hops же — время перевода круга по сетям (transfer_min, hops_transfer_minutes): пишется сразу, чтобы перезапуск
+    или правка PAPER_NET_MINUTES не меняли уже идущий круг.
     Возвращает id круга."""
     ts = ts if ts is not None else time.time()
+    transfer_min = hops_transfer_minutes(hops["hops"], net_minutes_table(), settings()["transfer_minutes"]) \
+        if hops and hops.get("hops") else None
     if over is None:
         own = trades.own_banks()[0]
         over = {b for b in own if bank_month_total(b, path, ts) >= trades.free_limit(b)}
@@ -198,16 +267,17 @@ def start_cycle(amount, buy, sell, route, planned_pct, path=DB_PATH, ts=None, la
             "INSERT INTO cycles (ts_start, amount, buy_ex, buy_asset, buy_price, buy_nick, sell_ex, sell_asset, "
             "sell_price, sell_nick, route, planned_pct, stage, ts_stage, bank, label, pay_kind, sell_qty, sell_net, "
             "buy_nicks, buy_net, buy_pays, sell_parts, pay_fee_used, planned_raw, route_hops, index_start, "
-            "reasons_start, streak_start, buy_orders, buy_rate, sell_orders, sell_rate, depth_margin, snapshot_id) "
+            "reasons_start, streak_start, buy_orders, buy_rate, sell_orders, sell_rate, depth_margin, snapshot_id, "
+            "transfer_min) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'buy', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
-            "?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (ts, amount, buy.ex, buy.asset, buy.price, buy.nick,
              sell.ex, sell.asset, sell.price, sell.nick, route, planned_pct, ts, bank, label, kind,
              sell_qty, sell.net or "", json.dumps(list(buy.nicks or (buy.nick,)), ensure_ascii=False),
              buy.net or "", json.dumps(list(buy.pays or []), ensure_ascii=False), sell.parts or 1, pay_fee_used,
              planned_raw, json.dumps(hops, ensure_ascii=False) if hops else "",
              index, json.dumps(list(reasons), ensure_ascii=False) if reasons is not None else None, streak,
-             buy.orders, buy.rate, sell.orders, sell.rate, depth, snapshot_id))
+             buy.orders, buy.rate, sell.orders, sell.rate, depth, snapshot_id, transfer_min))
         cycle_id = cur.lastrowid
     con.close()
     return cycle_id
@@ -298,18 +368,71 @@ def _stale(cycle, stale_minutes, now, after=0.0):
     return now - cycle["ts_stage"] - after > stale_minutes * 60
 
 
-def check_buy_stage(cycle, snap, pay_minutes, now=None, stale_minutes=30.0):
+def _buy_nicks(cycle):
+    return set(json.loads(cycle.get("buy_nicks") or "[]") or [cycle["buy_nick"]])
+
+
+def _buy_book(cycle, snap):
+    """Свежий стакан покупки круга (годные объявления snap.groups, лучшая цена первой); у обменника — только сеть круга."""
+    grp = snap.groups.get((cycle["buy_ex"], "buy", cycle["buy_asset"]), [])
+    if cycle["buy_ex"] == "BestChange" and cycle.get("buy_net"):
+        grp = [a for a in grp if a.net == cycle["buy_net"]]
+    return grp
+
+
+def buy_fill(cycle, snap):
+    """Покупка на сумму круга по свежему стакану (только чтение): сначала мерчанты круга (buy_nicks) по их СВЕЖИМ цене,
+    лимитам и объёму, не хватило (ушли, подняли минимум, мало монеты) — дальше остальные объявления стакана по цене
+    (проскальзывание; у обменника — той же сети). Лимиты и объём — как в p2p._stack. Возвращает {"price": средняя
+    цена, "slip_pct": сдвиг к плановой цене (+ — дороже), "book": пришлось ли брать у других мерчантов, "own": сколько
+    мерчантов круга на месте} или None — стакана на сумму не хватает."""
+    nicks = _buy_nicks(cycle)
+    grp = _buy_book(cycle, snap)
+    own = sorted((a for a in grp if a.nick in nicks), key=lambda a: a.price)
+    others = [a for a in grp if a.nick not in nicks]
+    st = p2p._stack(own + others, cycle["amount"])
+    if st is None:
+        return None
+    used = set(st.nicks or (st.nick,))
+    return {"price": st.price, "slip_pct": (st.price / cycle["buy_price"] - 1) * 100, "book": bool(used - nicks),
+            "own": len(own)}
+
+
+def bc_data_ts(snap, asset):
+    """Время выгрузки BestChange, из которой собран снимок, по монете: fetched_ts объявлений обменников (у всей выгрузки
+    одно время скачивания), без объявлений — по замеру запроса (конец запроса − возраст данных); 0 — неизвестно."""
+    ts = [a.fetched_ts for side in ("buy", "sell") for a in snap.groups.get(("BestChange", side, asset), [])
+          if a.fetched_ts]
+    if ts:
+        return max(ts)
+    for rec in snap.jobs:
+        if rec.get("ex") == "bestchange" and rec.get("asset") == asset and rec.get("age") is not None:
+            return rec.get("t1", 0.0) - rec["age"]
+    return 0.0
+
+
+def bc_quote_fresh(cycle, snap, now, fresh_minutes):
+    """Покупка у обменника засчитывается только по свежей котировке BestChange этого направления: выгрузка скачана
+    после начала стадии (не та, по которой круг стартовал) и не старше fresh_minutes. Старая выгрузка из кэша (сбой
+    скачивания, VPN) живёт в скане сколько угодно — по ней покупка «проходила» бы всегда."""
+    ts = bc_data_ts(snap, cycle["buy_asset"])
+    return bool(ts) and ts > cycle["ts_stage"] and now - ts <= fresh_minutes * 60
+
+
+def check_buy_stage(cycle, snap, pay_minutes, now=None, stale_minutes=30.0, slip_max=None, bc_fresh_minutes=None):
     """Проверка исполнимости стадии buy по свежему снимку (только чтение snap.groups, без сети и
     без записи в БД — решение применяет вызывающий). Раньше PAPER_PAY_MINUTES с начала круга не
-    ждём. После — ищем в текущем стакане покупки то же объявление (тот же мерчант): нет — мерчант
-    ушёл/снял объявление, круг не состоялся. Цену не сравниваем: в ордере она фиксируется при создании.
-    Покупка собрана из нескольких объявлений (buy_nicks) — срыв, только если ушли все мерчанты. Площадка в
-    этом скане не ответила — ждём (дольше stale_minutes — срыв «площадка недоступна»).
+    ждём. После — покупаем по свежему стакану (buy_fill): мерчанты круга по их текущим цене, лимитам и объёму, не
+    хватило — остальные объявления по цене (проскальзывание). Цена хуже плана больше slip_max % (PAPER_BUY_SLIP_MAX)
+    — круг не покупаем («цена ушла»). Площадка в этом скане не ответила — ждём (дольше stale_minutes — срыв
+    «площадка недоступна»). Покупка у обменника (BestChange) — только по свежей котировке направления (bc_quote_fresh,
+    PAPER_BC_FRESH_MINUTES): её нет — ждём, дольше stale_minutes — срыв «нет свежей котировки BestChange».
 
     Возвращает (action, note):
-      "wait"    — ещё не прошло pay_minutes или площадка не ответила, ничего не решаем;
-      "advance" — объявление на месте — можно переходить к transfer;
-      "fail"    — все мерчанты покупки ушли (result станет failed_buy).
+      "wait"    — ещё не прошло pay_minutes, площадка не ответила или нет свежей котировки BestChange;
+      "advance" — на сумму круга стакана хватает по цене в пределах допуска — можно переходить к transfer
+                  (цену и проскальзывание вызывающий берёт из buy_fill);
+      "fail"    — result станет failed_buy, note — причина.
     """
     now = now if now is not None else time.time()
     if now - cycle["ts_stage"] < pay_minutes * 60:
@@ -318,31 +441,191 @@ def check_buy_stage(cycle, snap, pay_minutes, now=None, stale_minutes=30.0):
         if _stale(cycle, stale_minutes, now, after=pay_minutes * 60):
             return "fail", f"площадка {cycle['buy_ex']} недоступна"
         return "wait", ""
-    nicks = set(json.loads(cycle.get("buy_nicks") or "[]") or [cycle["buy_nick"]])
-    left = [a for a in snap.groups.get((cycle["buy_ex"], "buy", cycle["buy_asset"]), []) if a.nick in nicks]
-    if not left:
-        return "fail", "объявление покупки исчезло"
-    if len(nicks) > 1 and p2p._stack(left, cycle["amount"]) is None:   # составная покупка: оставшиеся — на всю сумму?
-        return "fail", "часть мерчантов покупки ушла, остальные сумму не покрывают"
+    st = settings()
+    if cycle["buy_ex"] == "BestChange":
+        fresh = st["bc_fresh_minutes"] if bc_fresh_minutes is None else bc_fresh_minutes
+        if not bc_quote_fresh(cycle, snap, now, fresh):
+            if _stale(cycle, stale_minutes, now, after=pay_minutes * 60):
+                return "fail", (f"нет свежей котировки BestChange по {cycle['buy_asset']}"
+                                f"{' (' + cycle['buy_net'] + ')' if cycle.get('buy_net') else ''} "
+                                f"(не старше {fresh:g} мин)")
+            return "wait", ""
+    nicks = _buy_nicks(cycle)
+    grp = _buy_book(cycle, snap)
+    left = [a for a in grp if a.nick in nicks]
+    fill = buy_fill(cycle, snap) if grp else None
+    if fill is None:
+        if not left:
+            return "fail", "объявление покупки исчезло"
+        if len(nicks) > 1:
+            return "fail", "часть мерчантов покупки ушла, остальные сумму не покрывают"
+        return "fail", "стакана покупки не хватает на сумму круга"
+    limit = st["buy_slip_max"] if slip_max is None else slip_max
+    if fill["slip_pct"] > limit:
+        return "fail", (f"цена ушла: покупка по {fill['price']:g} ₽ вместо {cycle['buy_price']:g} ₽ "
+                        f"({fill['slip_pct']:+.2f}%, допуск {limit:g}%)")
     return "advance", ""
 
 
+def buy_fill_risks(fill):
+    """Риски покупки для risk_notes: пришлось брать у других мерчантов (проскальзывание по стакану)."""
+    if not fill or not fill["book"]:
+        return []
+    return [["buy_book", f"мерчанты круга ушли или их мало — покупка у других по {fill['price']:g} ₽ "
+                         f"({fill['slip_pct']:+.2f}% к плану)"]]
+
+
+def set_buy_fill(cycle_id, fill, path=DB_PATH):
+    """Запомнить покупку по свежему стакану (buy_fill): цену и сдвиг к плану; взяли у других мерчантов — риск в круге."""
+    if not fill:
+        return
+    con = _connect(path)
+    with con:
+        con.execute("UPDATE cycles SET buy_fill_price = ?, buy_slip_pct = ? WHERE id = ?",
+                    (fill["price"], fill["slip_pct"], cycle_id))
+    con.close()
+    add_risks(cycle_id, buy_fill_risks(fill), path=path)
+
+
+def cycle_risks(cycle):
+    """Риски круга [[код, текст], ...] из risk_notes (у старых кругов — пусто)."""
+    try:
+        risks = json.loads(cycle.get("risk_notes") or "[]")
+    except ValueError:
+        return []
+    return [r for r in risks if isinstance(r, list) and len(r) == 2]
+
+
+def add_risks(cycle_id, risks, path=DB_PATH):
+    """Дописать риски в risk_notes круга (без повторов)."""
+    if not risks:
+        return
+    con = _connect(path)
+    row = con.execute("SELECT risk_notes FROM cycles WHERE id = ?", (cycle_id,)).fetchone()
+    if row is not None:
+        have = cycle_risks({"risk_notes": row[0]})
+        have += [list(r) for r in risks if list(r) not in have]
+        with con:
+            con.execute("UPDATE cycles SET risk_notes = ? WHERE id = ?",
+                        (json.dumps(have, ensure_ascii=False), cycle_id))
+    con.close()
+
+
+def _real_hops(hops):
+    """Хопы, где монета действительно переводится (у той же биржи — нет; обменник всегда внешний)."""
+    return [h for h in hops if h.get("frm") != h.get("to") or h.get("frm") == "BestChange"]
+
+
+def hops_transfer_minutes(hops, table, default):
+    """Время перевода круга, мин: сумма по реальным переводам маршрута по таблице сетей (NET_MINUTES с правками
+    PAPER_NET_MINUTES); сеть хопа неизвестна или её нет в таблице — default (PAPER_TRANSFER_MINUTES). Обменник →
+    свой кошелёк на Bybit → другой обменник — два перевода. Переводов нет (одна биржа) — 0."""
+    def one(net):
+        return table.get((net or "").upper(), default) if net else default
+    total = 0.0
+    for h in _real_hops(hops):
+        if h.get("frm") == "BestChange" and h.get("to") == "BestChange":
+            total += one(h.get("frm_net")) + one(h.get("to_net"))
+        else:
+            total += one(h.get("to_net") or h.get("frm_net"))
+    return total
+
+
+def transfer_minutes_for(cycle, default):
+    """Сколько ждать стадию transfer: записанное на старте время по сетям (transfer_min), у кругов без него —
+    по сохранённым хопам и таблице сейчас, без хопов (старые круги) — default, как раньше."""
+    if cycle.get("transfer_min") is not None:
+        try:
+            return float(cycle["transfer_min"])
+        except (TypeError, ValueError):
+            pass
+    hops = cycle_hops(cycle)["hops"]
+    return hops_transfer_minutes(hops, net_minutes_table(), default) if hops else default
+
+
+def _net_state(venue, asset, net, deposit):
+    """Статус ввода (deposit) или вывода монеты в сети по живому справочнику: True/False, None — неизвестно. Справочник
+    площадки есть, а такой сети в нём нет — закрыта (как в p2p._withdraw). Сеть не выбрана — неизвестно."""
+    if not net:
+        return None
+    known = netstatus.known_nets(venue, asset)
+    if known and net not in known:
+        return False
+    return (netstatus.deposit_ok if deposit else netstatus.withdraw_ok)(venue, asset, net)
+
+
+def _hop_state(h):
+    """(закрыто: [текст], неизвестно: [текст]) для сохранённого хопа маршрута. Обменник шлёт монету сам — проверяем
+    только ввод у получателя в сети обменника; обменник → Bybit → обменник — ввод и вывод на Bybit; биржа → биржа —
+    вывод у отправителя и ввод у получателя; на обменник — только вывод (его приём проверен при старте по стакану)."""
+    frm, to, asset = h.get("frm"), h.get("to"), h.get("asset")
+    net, frm_net = h.get("to_net") or "", h.get("frm_net") or ""
+    if frm == "BestChange" and to == "BestChange":
+        checks = [("ввод", "Bybit", frm_net, True), ("вывод", "Bybit", net, False)]
+    elif frm == "BestChange":
+        checks = [("ввод", to, frm_net or net, True)]
+    else:
+        checks = [("вывод", frm, net, False)] + ([("ввод", to, net, True)] if to != "BestChange" else [])
+    closed, unknown = [], []
+    for what, venue, n, deposit in checks:
+        state = _net_state(venue, asset, n, deposit)
+        where = f"{'на' if deposit else 'с'} {venue}"
+        if state is False:
+            closed.append(f"{what} {asset}{f' ({n})' if n else ''} {where} закрыт")
+        elif state is None:
+            unknown.append(f"{what} {asset}{f' ({n})' if n else ''} {where}" if n
+                           else f"{what} {asset} {where}: сеть не выбрана")
+    return closed, unknown
+
+
+def transfer_check(cycle, cfg):
+    """Переводы круга по живому справочнику (только чтение netstatus/fees.json): (срыв: текст или None, риски). С
+    сохранёнными хопами (route_hops) — именно они: монета и сеть каждого перевода маршрута (buy_ex → площадка
+    конвертации в монете покупки, → вторая площадка в USDT, → sell_ex в монете продажи), а не вывод монеты покупки
+    напрямую buy_ex → sell_ex; buy_ex == sell_ex с конвертацией на третьей бирже — тоже оба перевода. Закрыт вывод или
+    ввод — срыв. Статус неизвестен (у площадки нет справочника, ключа или сеть не выбрана) — не «открыто», а риск
+    ["net_unknown", текст]. Круг без хопов (старая версия) — вывод монеты покупки buy_ex → sell_ex, как раньше."""
+    hops = cycle_hops(cycle)["hops"]
+    if not hops:
+        if cycle["buy_ex"] == cycle["sell_ex"] and cycle["buy_ex"] != "BestChange":
+            return None, []
+        if cycle["buy_ex"] == "BestChange":
+            hops = [{"frm": "BestChange", "frm_net": cycle.get("buy_net") or "", "to": cycle["sell_ex"],
+                     "to_net": cycle.get("buy_net") or "", "asset": cycle["buy_asset"]}]
+        else:
+            w = p2p._withdraw(cfg, cycle["buy_ex"], cycle["buy_asset"], receiver=cycle["sell_ex"])
+            if w is None:
+                return f"вывод {cycle['buy_asset']} с {cycle['buy_ex']} закрыт", []
+            hops = [{"frm": cycle["buy_ex"], "frm_net": "", "to": cycle["sell_ex"], "to_net": w[1],
+                     "asset": cycle["buy_asset"]}]
+    risks = []
+    for h in _real_hops(hops):
+        closed, unknown = _hop_state(h)
+        if closed:
+            return "; ".join(closed), []
+        risks += [["net_unknown", f"{h['frm']}→{h['to']}: статус неизвестен — {u}"] for u in unknown]
+    return None, risks
+
+
+def transfer_risks(cycle, cfg):
+    """Риски стадии transfer (неизвестный статус сетей переводов) — для risk_notes при переходе к продаже."""
+    return transfer_check(cycle, cfg)[1]
+
+
 def check_transfer_stage(cycle, cfg, transfer_minutes, now=None):
-    """Проверка стадии transfer по свежему справочнику (только чтение fees.json/netstatus через
-    p2p.withdraw_open, без сети и без записи в БД). Раньше PAPER_TRANSFER_MINUTES с начала стадии
-    не ждём. После — проверяем, что вывод buy_asset с buy_ex на sell_ex всё ещё возможен (известна комиссия,
-    сеть открыта, получатель принимает) — иначе перевод сорвался бы в реальности. Внутри одной площадки перевода
-    нет; монету от обменника (buy_ex=BestChange) шлёт сам обменник — сведений о его выводе нет, не проверяем.
+    """Проверка стадии transfer по свежему справочнику (только чтение fees.json/netstatus, без сети и без записи в
+    БД). Ждём время перевода круга по сетям (transfer_minutes_for: записанное на старте, у старых кругов —
+    transfer_minutes = PAPER_TRANSFER_MINUTES), потом проверяем переводы маршрута (transfer_check): закрыт вывод или
+    ввод — перевод сорвался бы в реальности. Неизвестный статус сети — не срыв, а риск круга (transfer_risks).
 
     Возвращает (action, note) как check_buy_stage: "wait"/"advance"/"fail" (result станет
     failed_transfer)."""
     now = now if now is not None else time.time()
-    if now - cycle["ts_stage"] < transfer_minutes * 60:
+    if now - cycle["ts_stage"] < transfer_minutes_for(cycle, transfer_minutes) * 60:
         return "wait", ""
-    if cycle["buy_ex"] == cycle["sell_ex"] or cycle["buy_ex"] == "BestChange":
-        return "advance", ""
-    if not p2p.withdraw_open(cfg, cycle["buy_ex"], cycle["buy_asset"], receiver=cycle["sell_ex"]):
-        return "fail", f"вывод {cycle['buy_asset']} с {cycle['buy_ex']} закрыт"
+    closed, _risks = transfer_check(cycle, cfg)
+    if closed:
+        return "fail", closed
     return "advance", ""
 
 
@@ -373,6 +656,68 @@ def sell_qty(cycle):
     return cycle["amount"] * (1 + cycle["planned_pct"] / 100) / cycle["sell_price"]
 
 
+def _fill_price(cycle):
+    """Цена покупки по факту: записанная на проверке покупки (buy_fill_price), иначе плановая."""
+    try:
+        fill = float(cycle.get("buy_fill_price") or 0)
+    except (TypeError, ValueError):
+        fill = 0.0
+    return fill if fill > 0 else cycle["buy_price"]
+
+
+def _coins_bought(cycle, price):
+    return cycle["amount"] * (1 - (cycle.get("pay_fee_used") or 0.0) / 100) / price
+
+
+def _same_asset_qty(cycle, price):
+    """Выход простой связки (одна монета) при покупке по price: купленная монета минус те же комиссии переводов, что
+    заложены в сохранённом sell_qty (он посчитан при плановой цене). Цена — плановая — sell_qty как есть."""
+    base = sell_qty(cycle)
+    if abs(price - cycle["buy_price"]) <= 1e-12 * max(1.0, price):
+        return base
+    fees = max(_coins_bought(cycle, cycle["buy_price"]) - base, 0.0)
+    return _coins_bought(cycle, price) - fees
+
+
+def qty_from_hops(cycle, hops, cfg, spot, price):
+    """Выход маршрута в монете продажи по сохранённым хопам (p2p.route_hops на старте): комиссия каждого перевода —
+    из хопа (сети заново не проверяем), конвертации — по свежему spot именно сохранённых площадок (venues) с
+    комиссией спота из cfg, покупка — по price. Та же арифметика, что p2p._route_qty без запаса на курс и банка (банк —
+    pay_fee_used). None — тикера сохранённой площадки нет или хопы не сходятся с маршрутом."""
+    venues, hs = hops.get("venues") or [], hops.get("hops") or []
+    b_asset, s_asset = cycle["buy_asset"], cycle["sell_asset"]
+    qty = _coins_bought(cycle, price)
+    if not venues:
+        return qty - sum(h.get("fee") or 0.0 for h in hs)
+    if len(venues) == 1 and len(hs) == 2:
+        v = venues[0]
+        q = spot.get(v, {})
+        sf = p2p._spot_fee(cfg, v)
+        qty -= hs[0].get("fee") or 0.0
+        if "USDT" in (b_asset, s_asset):
+            alt = s_asset if b_asset == "USDT" else b_asset
+            if alt not in q:
+                return None
+            bid, ask = q[alt]
+            qty = (qty / ask if b_asset == "USDT" else qty * bid) * (1 - sf / 100)
+        else:
+            if b_asset not in q or s_asset not in q:
+                return None
+            qty = qty * q[b_asset][0] * (1 - sf / 100)
+            qty = qty / q[s_asset][1] * (1 - sf / 100)
+        return qty - (hs[1].get("fee") or 0.0)
+    if len(venues) == 2 and len(hs) == 3:
+        v1, v2 = venues
+        if b_asset not in spot.get(v1, {}) or s_asset not in spot.get(v2, {}):
+            return None
+        qty -= hs[0].get("fee") or 0.0
+        qty = qty * spot[v1][b_asset][0] * (1 - p2p._spot_fee(cfg, v1) / 100)
+        qty -= hs[1].get("fee") or 0.0
+        qty = qty / spot[v2][s_asset][1] * (1 - p2p._spot_fee(cfg, v2) / 100)
+        return qty - (hs[2].get("fee") or 0.0)
+    return None
+
+
 def recompute_sell_qty(cycle, cfg, spot):
     """Свежий выход маршрута в монете продажи по текущим курсам спота (snap.spot из свежего скана) —
     для межмонетных связок и связок через промежуточную монету: курс между стартом круга и стадией sell
@@ -383,10 +728,19 @@ def recompute_sell_qty(cycle, cfg, spot):
     Комиссия банка (и решение о том, какой банк исчерпал лимит СБП) уже приняты на старте и сохранены
     как pay_fee_used — здесь не пересчитываем их заново с чужим over_banks, а просто уменьшаем сумму
     круга на эту долю и отключаем банковскую комиссию в _route_qty (disable={"bank"}), пересчитывая
-    только шаги перевода/спота монеты. None — маршрут (нужная спот-пара) сейчас недоступен."""
+    только шаги перевода/спота монеты. None — маршрут (нужная спот-пара) сейчас недоступен.
+
+    Реализм (этап 2.4): покупка идёт по цене проверки buy_fill_price (свежий стакан, проскальзывание), если она
+    записана, иначе по плану. Круг с сохранёнными хопами (route_hops) пересчитывается по ним (qty_from_hops): комиссии
+    переводов — сохранённые на старте, сети, приём у обменника и минимум вывода уже прошедших переводов заново не
+    проверяются (ROADMAP «межмонетные, часть 2», п. 3) — меняется только курсовая часть."""
+    price = _fill_price(cycle)
     if cycle["buy_asset"] == cycle["sell_asset"]:
-        return sell_qty(cycle)
-    b = p2p.Ad(cycle["buy_ex"], "buy", cycle["buy_price"], 0, 0, 0, json.loads(cycle.get("buy_pays") or "[]"),
+        return _same_asset_qty(cycle, price)
+    hops = cycle_hops(cycle)
+    if hops["hops"]:
+        return qty_from_hops(cycle, hops, cfg, spot, price)
+    b = p2p.Ad(cycle["buy_ex"], "buy", price, 0, 0, 0, json.loads(cycle.get("buy_pays") or "[]"),
                cycle["buy_nick"], 0, 0, asset=cycle["buy_asset"], net=cycle.get("buy_net") or "")
     s = p2p.Ad(cycle["sell_ex"], "sell", cycle["sell_price"], 0, 0, 0, [], cycle["sell_nick"], 0, 0,
                asset=cycle["sell_asset"], net=cycle.get("sell_net") or "", parts=cycle.get("sell_parts") or 1)
@@ -630,22 +984,30 @@ def report_rows(path=DB_PATH):
     con = _connect(path)
     rows = con.execute(
         f"SELECT buy_ex, buy_asset, sell_ex, sell_asset, result, {_PLAN_CMP}, realized_pct, "
-        f"ts_start, ts_stage, note, {_MEASURE_SQL} FROM cycles WHERE result IS NOT NULL").fetchall()
+        f"ts_start, ts_stage, risk_notes, buy_slip_pct, note, {_MEASURE_SQL} FROM cycles "
+        "WHERE result IS NOT NULL").fetchall()
     con.close()
     groups = {}
-    for buy_ex, buy_asset, sell_ex, sell_asset, result, planned, realized, ts_start, ts_stage, note, *m in rows:
+    for buy_ex, buy_asset, sell_ex, sell_asset, result, planned, realized, ts_start, ts_stage, risk_notes, slip, note, \
+            *m in rows:
         g = groups.setdefault((buy_ex, buy_asset, sell_ex, sell_asset), {
-            "total": 0, "done": 0, "failed_by_reason": {}, "depth_shortfall": 0,
-            "planned": [], "realized_done": [], "duration_done": [], "measures": []})
+            "total": 0, "done": 0, "failed_by_reason": {}, "depth_shortfall": 0, "fail_reasons": {}, "risks": {},
+            "slips": [], "planned": [], "realized_done": [], "duration_done": [], "measures": []})
         g["total"] += 1
         g["planned"].append(planned)
         g["measures"].append(_measures(ts_start, *m))
+        for code in dict.fromkeys(code for code, _text in cycle_risks({"risk_notes": risk_notes})):
+            g["risks"][code] = g["risks"].get(code, 0) + 1   # кругов с этим риском, а не записей
+        if slip is not None:
+            g["slips"].append(float(slip))
         if result == "done":
             g["done"] += 1
             g["realized_done"].append(realized)
             g["duration_done"].append(ts_stage - ts_start)
         else:
             g["failed_by_reason"][result] = g["failed_by_reason"].get(result, 0) + 1
+            code = fail_reason(note)
+            g["fail_reasons"][code] = g["fail_reasons"].get(code, 0) + 1
             if result == "failed_sell" and "не хватает глубины" in (note or ""):
                 g["depth_shortfall"] += 1
     out = []
@@ -659,8 +1021,19 @@ def report_rows(path=DB_PATH):
             "avg_duration_min": (sum(g["duration_done"]) / len(g["duration_done"]) / 60)
                                  if g["duration_done"] else None,
             **_measure_avgs(g["measures"]),
+            "avg_buy_slip_pct": sum(g["slips"]) / len(g["slips"]) if g["slips"] else None,
+            "buy_from_book": g["risks"].get("buy_book", 0), "net_unknown": g["risks"].get("net_unknown", 0),
+            "fail_reasons": g["fail_reasons"],
         })
     return out
+
+
+def fail_reason(note):
+    """Код причины срыва по тексту note (FAIL_REASONS); не распознана — "other"."""
+    for code, sub, _label in FAIL_REASONS:
+        if sub in (note or ""):
+            return code
+    return "other"
 
 
 def first_start(path=DB_PATH):
@@ -710,7 +1083,11 @@ def write_report_csv(rows, path=REPORT_CSV_PATH):
         w.writerow(REPORT_COLUMNS)
         for r in rows:
             reasons = ";".join(f"{FAIL_LABELS.get(k, k)}:{v}" for k, v in r["failed_by_reason"].items())
-            w.writerow([r.get(c) for c in REPORT_COLUMNS[:-1]] + [reasons])   # нет поля — пустая ячейка
+            cells = [r.get(c) for c in REPORT_COLUMNS[:-1]]   # нет поля — пустая ячейка
+            if isinstance(r.get("fail_reasons"), dict):        # причины срыва — подписями: «цена покупки ушла…:2»
+                cells[REPORT_COLUMNS.index("fail_reasons")] = ";".join(
+                    f"{REASON_LABELS.get(k, k)}:{v}" for k, v in r["fail_reasons"].items())
+            w.writerow(cells + [reasons])
     return path
 
 
