@@ -36,7 +36,7 @@ SHRINK_K = 20              # сила сжатия поправки к клас�
 MIN_BUCKET = 10            # меньше кругов в корзине p — берём корзину грубее
 DEFAULT_MIN_N = 30         # CAL_MIN_N: с какого числа завершённых кругов прогона EV активна
 DEFAULT_FAIL_COST = 0.5    # CAL_FAIL_COST, п.п. суммы круга: цена срыва, если наблюдаемая меньше
-PLAN_FACTS = ("plan", "plan±")   # fact_source «как расчёт» — не факт
+PLAN_FACTS = trades.PLAN_SOURCES   # fact_source «как расчёт» / «±0.5 п.п.» — расчёт, а не факт
 RISK_MIN_PAIRS = 20        # меньше пар точек — p90 движения курса не считаем
 
 

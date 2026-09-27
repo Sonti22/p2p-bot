@@ -231,9 +231,11 @@ def test_real_paper_schema(tmp_path):
 
 
 def make_trades(path, facts, with_source=True):
-    con = trades._connect(str(path))
-    if with_source:
-        con.execute("ALTER TABLE trades ADD COLUMN fact_source TEXT DEFAULT NULL")
+    """Журнал сделок своей схемы: с колонкой fact_source (как сейчас) или без неё (база до этапа 2.5)."""
+    con = sqlite3.connect(str(path))
+    con.execute("CREATE TABLE trades (id INTEGER PRIMARY KEY, ts REAL, route TEXT, buy_ex TEXT, buy_asset TEXT, "
+                "sell_ex TEXT, sell_asset TEXT, amount REAL, profit REAL, fact REAL"
+                + (", fact_source TEXT)" if with_source else ")"))
     for i, (asset, profit, fact, source) in enumerate(facts):
         cols = "ts, route, buy_ex, buy_asset, sell_ex, sell_asset, amount, profit, fact"
         vals = [float(i), "перевод", "Bybit", asset, "MEXC", asset, 10000.0, profit, fact]
@@ -262,6 +264,19 @@ def test_trade_facts_fact_source(tmp_path, monkeypatch):
     cal = C.Calibration(got + [S(0.0) for _ in range(30)])
     assert cal.n == 30 and cal.n_facts == 3 and cal.n_diffs == 33
     assert cal.fill("⚠️", "MEXC", "BestChange")[0] == pytest.approx(31 / 32)
+
+
+def test_real_trades_schema(tmp_path):
+    """Журнал, записанный самим trades.py: «как расчёт»/«±0.5 п.п.» не берём, введённый и найденный — берём."""
+    path = str(tmp_path / "trades.db")
+    d = (1.0, make_ad("Bybit", "buy", 80.0), make_ad("MEXC", "sell", 81.0), "перевод −1 USDT (TRC20) на MEXC")
+    for fact, source in ((1.0, trades.FACT_PLAN), (1.5, trades.FACT_PLAN_SHIFT), (0.4, trades.FACT_MANUAL),
+                         (0.7, trades.FACT_AUTO), (None, None)):
+        trade_id = trades.log_trade(d, 10000, path=path, ts=1_790_000_000.0)[0]
+        if fact is not None:
+            trades.set_fact(trade_id, fact, path=path, source=source)
+    got = C.trade_samples(path)
+    assert [round(s.diff, 6) for s in got] == [-0.6, -0.3] and all(s.rtype == "same" for s in got)
 
 
 def test_deal_ev_and_rank():
