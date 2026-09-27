@@ -633,6 +633,9 @@ FETCHERS = {"bybit": bybit, "htx": htx, "kucoin": kucoin, "mexc": mexc, "bitpapa
             "bestchange": bestchange}
 
 
+REF_MEDIAN = "медиана P2P"   # ref_src ориентира без Rapira: медиана USDT по объявлениям скана (assemble)
+
+
 async def rapira_mid(s):
     j = await _json(s, "GET", "https://api.rapira.net/open/market/rates")
     r = next(x for x in j["data"] if x["symbol"] == "USDT/RUB")
@@ -1624,7 +1627,7 @@ def assemble(cfg, ads, ref=None, ref_src="-", spot=None, errors=None, blocked=fr
     errors = dict(errors or {})
     if ref is None:
         usdt = [a.price for a in ads if a.asset == "USDT"]
-        ref, ref_src = (statistics.median(usdt), "медиана P2P") if usdt else (None, "-")
+        ref, ref_src = (statistics.median(usdt), REF_MEDIAN) if usdt else (None, "-")
     refs = {}
     for a in cfg.assets:
         mid = _mid(spot, a)

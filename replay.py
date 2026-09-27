@@ -71,7 +71,8 @@ def _value(name, text):
         items = [x.strip() for x in text.split(",") if x.strip()]
         if name == "assets":
             return [x.upper() for x in items]
-        return [x.lower() for x in items] if name == "exchanges" else items   # ключи FETCHERS, как EXCHANGES в .env
+        # ключи FETCHERS и подстроки способов оплаты (_pays ищет в p.lower()) — в нижнем регистре, как p2p._list в .env
+        return [x.lower() for x in items] if name in ("exchanges", "include_pay", "exclude_pay") else items
     return text
 
 
@@ -109,14 +110,24 @@ def enabled_ads(ads, cfg):
     return [a for a in ads if a.ex in venues and a.asset in cfg.assets]
 
 
+def _usdt(ads):
+    return sum(a.asset == "USDT" for a in ads)
+
+
 def rebuild(scan, cfg):
     """Снимок p2p.Snapshot из сохранённого скана при настройках cfg (объявления каждый раз свежие — фильтры
     меняют у них способы оплаты). Выключенные в cfg площадки и монеты отсеиваются до сборки (enabled_ads) — их нет
-    ни в ориентирах, ни в стаканах, ни в связках."""
+    ни в ориентирах, ни в стаканах, ни в связках. Ориентир снимка — медиана P2P (Rapira не ответила), а часть
+    объявлений USDT отсеяна — медиану считает assemble заново по оставшимся, как живой скан с этим набором; USDT не
+    отсеяно — записанная (в снимке только топ-20 объявлений группы: пересчёт ушёл бы от живого скана)."""
     spot = {v: {a: tuple(p) for a, p in q.items()} for v, q in (scan.get("spot") or {}).items()}
-    ads = enabled_ads(snapshots.ads_of(scan), cfg)
+    stored = snapshots.ads_of(scan)
+    ads = enabled_ads(stored, cfg)
+    ref = scan.get("ref") or None
+    if scan.get("ref_src") == p2p.REF_MEDIAN and _usdt(ads) < _usdt(stored):
+        ref = None
     with stored_networks(scan.get("net")):
-        return p2p.assemble(cfg, ads, ref=scan.get("ref") or None, ref_src=scan.get("ref_src", "-"),
+        return p2p.assemble(cfg, ads, ref=ref, ref_src=scan.get("ref_src", "-"),
                             spot=spot or None, errors=scan.get("errors"),
                             blocked=frozenset(tuple(x) for x in scan.get("blocked") or ()),
                             over_banks=frozenset(scan.get("over_banks") or ()), ts=scan.get("ts", 0.0))
