@@ -37,6 +37,7 @@ PINS = {
         "DPAPI_PREFIX": "558fa5806742bd9dece7f93fc15499948c74c69c3724d6a97fafe265411376c4",
         "KEYS_PATH": "bcdeb6ae8b057cdb6fbfe88423177cb553cc0421de5b60d76ec912b2555ca73a",
         "_dpapi": "e05c4989f06bb3225abce35ae8fca035f0149e4b285b0f0ea2472183c148ca7d",
+        "_cryptomus_err": "4e69147c388598e0f03113d51f48e926a7a01d6fa4439d4e851e00d3982db3bf",
         "_json_no_redirect": "cce7ba856bee23dd5e1fa262ddcc67f386bc736f5bcd2952a9c612dd28de1b13",
         "_keys_file": "f2562b36bc299ad07fbb421381d0cb00911e58066a7dca2b6ae75a0861d46f93",
         "_scrub": "3146a0186a5c4e8da7816f3b707295e02ff572db3321f2177eaeec11c9d0108f",

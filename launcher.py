@@ -39,6 +39,9 @@ import urllib.parse
 import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+# Windows ищет git/python сначала в текущей папке (папка бота): git.exe из коммита запустился бы вместо настоящего.
+# Переменная окружения это выключает — для launcher и всех процессов, которые он запускает
+os.environ["NoDefaultCurrentDirectoryInExePath"] = "1"
 LAST_GOOD = os.path.join(HERE, ".last_good")
 DEV_STATUS = os.path.join(HERE, ".dev_status.json")   # для кнопки «🛠 Разработка» в боте
 STABLE_AFTER = 600            # сек работы, после которых версия считается рабочей
@@ -65,9 +68,12 @@ _lock_fd = None   # дескриптор замка держим открыты�
 PROTECTED_PREFIXES = (".github/", "launcher.py", "run.bat", "scripts/guard.py", "claude.md", ".gitignore",
                       ".gitattributes", "payouts.py", "scripts/payout_whitelist.py", "tests/trading/",
                       "tests/test_launcher_money_gate.py", "data/", "logs/")
-PROTECTED_NAMES = ("payout", "trading")   # подстрока в любом месте пути
+PROTECTED_NAMES = ("payout", "trading", "__pycache__")   # подстрока в любом месте пути
 PROTECTED_BASENAMES = ("conftest.py", "pytest.ini", "pyproject.toml", "setup.cfg", "tox.ini", "sitecustomize.py",
-                       "usercustomize.py", "requirements.txt")   # на любой глубине; и *.pth
+                       "usercustomize.py", "requirements.txt")   # на любой глубине
+# исполняемое и то, что Windows/Python запустят мимо .py-исходника (git.exe в папке бота вызвался бы вместо git)
+PROTECTED_SUFFIXES = (".pth", ".exe", ".dll", ".pyd", ".pyc", ".so", ".bat", ".cmd", ".ps1")
+STDLIB_NAMES = frozenset(n.lower() for n in sys.stdlib_module_names)   # json.py/hashlib/ в корне — подмена модуля
 PROTECTED_EXACT = (".env", ".last_good", ".dev_status.json")
 APPROVED_PATH = os.path.join(HERE, "logs", "approved_shas")   # sha, подтверждённые владельцем: по одному в строке
 MONEY_KEYS = ("PAYOUTS", "TRADING")
@@ -159,8 +165,11 @@ def protected_paths(files):
     for f in files:
         low = f.lower()
         base = low.rsplit("/", 1)[-1]
+        first = low.split("/", 1)[0]
+        stem = first[:-3] if first.endswith(".py") else first
+        shadows = ("/" in low or first.endswith(".py")) and stem in STDLIB_NAMES   # Python возьмёт его вместо модуля
         if (low.startswith(PROTECTED_PREFIXES) or any(n in low for n in PROTECTED_NAMES) or low in PROTECTED_EXACT
-                or base in PROTECTED_BASENAMES or base.endswith(".pth")):
+                or base in PROTECTED_BASENAMES or base.endswith(PROTECTED_SUFFIXES) or shadows):
             out.append(f)
     return out
 
@@ -549,8 +558,9 @@ class Launcher:
         docs_only = bool(files) and all(f.endswith(".md") for f in files)
         try:   # не fast-forward (в папке свой коммит) — merge не пройдёт: не ставим и деньги не трогаем
             git("merge-base", "--is-ancestor", head, remote)
-        except RuntimeError as e:
-            notify(f"⚠️ Не смог обновиться (ветки разошлись): {e}")
+        except RuntimeError:
+            notify(f"⚠️ Не смог обновиться до {remote[:7]} (ветки разошлись): в папке бота есть коммиты, которых нет "
+                   f"в main, — обновление не ставлю, работает {head[:7]}. Проверь на ПК: git log {remote[:7]}..{head[:7]}")
             self.bad.add(remote)
             return False
         # деньги — до merge: launcher, убитый между merge и концом смоука, при следующем старте запустил бы новый код
@@ -561,7 +571,8 @@ class Launcher:
         try:   # ровно на проверенный sha: pull сходил бы в origin заново и мог принести ещё не проверенный коммит
             git("merge", "--ff-only", "--quiet", remote)
         except RuntimeError as e:
-            notify(f"⚠️ Не смог обновиться (ветки разошлись): {e}")
+            notify(f"⚠️ Не смог обновиться до {remote[:7]} (ветки разошлись или файлы заняты), работает {head[:7]}: "
+                   f"{str(e).split(': ', 1)[-1] or 'git merge без подробностей'}")
             self.bad.add(remote)
             return False
         if docs_only:   # код не менялся: ни смоука, ни перезапуска бота
@@ -642,6 +653,10 @@ class Launcher:
         head = git("rev-parse", "HEAD")
         good = open(LAST_GOOD).read().strip() if os.path.exists(LAST_GOOD) else ""
         if good and good != head and clean_tree():
+            # откат — тоже смена кода под деньгами: как и обновление, только с выключенными выплатами/торговлей;
+            # .env не записать — не откатываем (падающий бот денег не шлёт, а старый код с включёнными — мог бы)
+            if not self.money_off_for(head, good):
+                return
             git("reset", "--hard", good)
             self.bad.add(head)
             notify(f"⚠️ Бот падал {CRASH_LIMIT} раза подряд на {head[:7]} — откатил на рабочую {good[:7]}.")

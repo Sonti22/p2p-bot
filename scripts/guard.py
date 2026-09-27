@@ -20,12 +20,16 @@ PROTECTED = (".github/", "scripts/guard.py", "launcher.py", "CLAUDE.md", ".gitig
              # локальное состояние: git merge молча перезапишет игнорируемый файл, если коммит добавит его в git
              "data/", "logs/")
 PROTECTED_EXACT = (".env", ".last_good", ".dev_status.json")   # ровно эти пути (.env.example — нет)
-PROTECTED_NAMES = ("payout", "trading")   # любой путь с этим словом (payouts/__init__.py, paper_trading.py…) — защищён
+PROTECTED_NAMES = ("payout", "trading", "__pycache__")   # любой путь с этим словом (payouts/__init__.py,
+# paper_trading.py…) — защищён; __pycache__/*.pyc Python загрузит вместо исходника, если метка времени совпадёт
 # по имени файла на любой глубине (tests/sub/conftest.py, pkg/pyproject.toml…): настройки pytest и файлы, которые Python
 # выполняет сам при старте (sitecustomize/usercustomize, *.pth), зависимости — тоже только вручную
 PROTECTED_BASENAMES = ("conftest.py", "pytest.ini", "pyproject.toml", "setup.cfg", "tox.ini", "sitecustomize.py",
                        "usercustomize.py", "requirements.txt")
-PROTECTED_SUFFIXES = (".pth",)
+# исполняемое и то, что Windows/Python запустят мимо .py-исходника (git.exe в папке бота launcher вызвал бы вместо
+# настоящего git) — только вручную
+PROTECTED_SUFFIXES = (".pth", ".exe", ".dll", ".pyd", ".pyc", ".so", ".bat", ".cmd", ".ps1")
+STDLIB_NAMES = frozenset(n.lower() for n in sys.stdlib_module_names)
 # код выплат в остальных файлах (bot.py: /payout, кнопки pay_*, PAYOUTS; accounts.py, .env.example…): любая добавленная
 # или удалённая строка — ручная проверка владельца. Документацию (.md) не проверяем.
 PAYOUT_CODE = r"payout|\bpay_(?:to|ok|no|hist|stop)\b"
@@ -40,12 +44,20 @@ def git(*args):
     return subprocess.run(["git", *args], capture_output=True, text=True, encoding="utf-8", check=True).stdout
 
 
+def shadows_stdlib(low):
+    """Файл или папка в корне с именем модуля стандартной библиотеки (json.py, hashlib/…): Python возьмёт его вместо
+    настоящего модуля — подмена поведения без единого слова «payout»."""
+    first = low.split("/", 1)[0]
+    stem = first[:-3] if first.endswith(".py") else first
+    return ("/" in low or first.endswith(".py")) and stem in STDLIB_NAMES
+
+
 def protected(path):
     low = path.lower()
     base = low.rsplit("/", 1)[-1]
     return (low.startswith(tuple(p.lower() for p in PROTECTED)) or low in PROTECTED_EXACT
             or any(n in low for n in PROTECTED_NAMES) or base in PROTECTED_BASENAMES
-            or base.endswith(PROTECTED_SUFFIXES))
+            or base.endswith(PROTECTED_SUFFIXES) or shadows_stdlib(low))
 
 
 GIT_RAW = ("-c", "core.quotepath=false", "--literal-pathspecs")   # пути как есть: не-ASCII без кавычек, «:(…)» не магия
@@ -65,7 +77,7 @@ def check(base):
             problems.append(f"изменён защищённый файл: {f}")
     payout_lines = {}
     for name in files:
-        if name.startswith("tests/fixtures/"):
+        if name.lower().startswith("tests/fixtures/") and name.lower().endswith(".json"):   # данные, не код
             continue
         # по одному файлу: имя берём из -z списка, а не из заголовков «+++ b/…» (там кавычки и \t у путей с пробелом)
         diff = git(*GIT_RAW, "diff", "-U0", "--no-renames", f"{base}...HEAD", "--", name).splitlines()

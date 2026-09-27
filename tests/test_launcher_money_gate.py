@@ -329,6 +329,42 @@ def test_diverged_folder_neither_merges_nor_touches_money(gate):
     assert lau.try_update() is False and not gate.merged() and gate.smoked == 0 and R1 in lau.bad
     assert gate.env.read_bytes() == b"PAYOUTS=1\n" and not gate.money_notes()
     assert len(gate.notes) == 1 and "разошлись" in gate.notes[0]
+    # понятный текст: не пустой хвост ошибки git, а что случилось и что проверить
+    assert R1[:7] in gate.notes[0] and HEAD[:7] in gate.notes[0] and "git log" in gate.notes[0]
+
+
+def test_rollback_turns_money_off_before_reset(gate):
+    """Откат после падений — тоже смена кода под деньгами: сначала PAYOUTS/TRADING=0 и уведомление, потом reset."""
+    gate.head = R1
+    open(launcher.LAST_GOOD, "w").write(HEAD)
+    gate.env.write_bytes(b"PAYOUTS=1\nTRADING=1\n")
+    lau = launcher.Launcher()
+    lau.rollback()
+    assert gate.env.read_bytes() == b"PAYOUTS=0\nTRADING=0\n" and gate.head == HEAD and R1 in lau.bad
+    assert gate.money_notes() == [money_note(HEAD)] and any("откатил" in n for n in gate.notes)
+
+
+def test_rollback_without_writable_env_keeps_code(gate, monkeypatch):
+    """.env не записать — не откатываем: падающий бот денег не шлёт, а другой код с включёнными деньгами — мог бы."""
+    gate.head = R1
+    open(launcher.LAST_GOOD, "w").write(HEAD)
+
+    def locked(path):
+        raise PermissionError("locked")
+    monkeypatch.setattr(launcher, "money_off", locked)
+    launcher.Launcher().rollback()
+    assert gate.head == R1 and not any(c.startswith("reset") for c in gate.git)
+    assert any(n.startswith("🚨") for n in gate.notes)
+
+
+def test_launcher_never_runs_exe_from_bot_folder():
+    """git.exe/python.exe из папки бота (текущей) Windows не ищет: переменная ставится при импорте launcher."""
+    assert os.environ.get("NoDefaultCurrentDirectoryInExePath") == "1"
+
+
+def test_launcher_and_guard_protect_same_suffixes():
+    guard = _load_guard()
+    assert guard.PROTECTED_SUFFIXES == launcher.PROTECTED_SUFFIXES
 
 
 def test_env_unwritable_right_before_new_bot_keeps_old_version(loop):
@@ -414,10 +450,13 @@ PROTECTED = [".github/workflows/ci.yml", "launcher.py", "LAUNCHER.PY", "run.bat"
              "conftest.py", "tests/conftest.py", "tests/sub/Conftest.py", "pytest.ini", "pkg/pyproject.toml",
              "setup.cfg", "tools/tox.ini", "sitecustomize.py", "lib/usercustomize.py", "evil.pth", "x/Evil.PTH",
              "requirements.txt", "tools/requirements.txt", ".env", "data/keys.json", "logs/approved_shas",
-             ".last_good", ".dev_status.json"]
+             ".last_good", ".dev_status.json", "git.exe", "tools/Evil.DLL", "x.pyd", "__pycache__/bot.cpython-310.pyc",
+             "lib/x.so", "update.bat", "tools/x.CMD", "x.ps1", "json.py", "Hashlib.py", "hashlib/__init__.py",
+             "email/x.py"]
 NOT_PROTECTED = ["bot.py", "p2p.py", "accounts.py", "jsonstore.py", "tests/test_bot.py", "tests/helpers.py",
                  "README.md", "ROADMAP.md", ".env.example", "scripts/tool.py", "requirements-dev.md", "docs/data/x.md",
-                 "tests/fixtures/bybit_ads.json", "trades.py", "cards.py"]
+                 "tests/fixtures/bybit_ads.json", "trades.py", "cards.py", "scripts/json.py", "tests/test_json.py",
+                 "docs/token.md", "calibration.py", "snapshots.py", "replay.py", "perp.py", "simmaker.py"]
 
 
 def test_protected_paths_list():
@@ -567,7 +606,8 @@ def _samples(prefixes, basenames, exact, names):
     """Пути, которые список обязан защищать: сами префиксы, файлы внутри папок, имена на глубине, точные пути,
     слова в пути, *.pth — и всё то же ЗАГЛАВНЫМИ (Windows запишет LAUNCHER.PY поверх launcher.py)."""
     out = (list(prefixes) + [p + "x.py" for p in prefixes if p.endswith("/")] + [f"deep/dir/{b}" for b in basenames]
-           + list(exact) + [f"x/my_{n}_notes.txt" for n in names] + ["a/b/x.pth"])
+           + list(exact) + [f"x/my_{n}_notes.txt" for n in names] + ["a/b/x.pth"]
+           + [f"a/b/x{s}" for s in launcher.PROTECTED_SUFFIXES] + ["json.py", "hashlib/x.py", "a/__pycache__/x.pyc"])
     return out + [s.upper() for s in out]
 
 
@@ -594,5 +634,5 @@ def test_claude_md_names_every_protected_path():
     with open(os.path.join(ROOT, "CLAUDE.md"), encoding="utf-8") as f:
         text = f.read().lower()
     listed = (launcher.PROTECTED_PREFIXES + launcher.PROTECTED_BASENAMES + launcher.PROTECTED_EXACT
-              + launcher.PROTECTED_NAMES + ("*.pth",))
+              + launcher.PROTECTED_NAMES + tuple("*" + s for s in launcher.PROTECTED_SUFFIXES))
     assert [p for p in listed if f"`{p}`" not in text] == []

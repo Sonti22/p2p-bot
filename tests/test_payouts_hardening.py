@@ -139,6 +139,12 @@ def test_guard_sees_renamed_payout_code_and_pytest_config(tmp_path, monkeypatch)
     (".gitattributes", True), ("trading/venues.py", True), ("tests/trading/test_risk.py", True),
     ("paper_Trading.py", True), ("data/keys.json", True), ("logs/approved_shas", True), (".env", True),
     (".last_good", True), (".dev_status.json", True),
+    # исполняемое мимо .py (git.exe в папке бота launcher вызвал бы вместо git), кэш байткода, подмена stdlib в корне
+    ("git.exe", True), ("tools/Evil.DLL", True), ("x.pyd", True), ("__pycache__/bot.cpython-310.pyc", True),
+    ("lib/x.so", True), ("update.bat", True), ("x.CMD", True), ("tools/x.ps1", True), ("json.py", True),
+    ("Hashlib.py", True), ("hashlib/__init__.py", True), ("email/x.py", True),
+    ("scripts/json.py", False), ("tests/test_json.py", False), ("docs/token.md", False),
+    ("tests/fixtures/bybit_ads.json", False),
     ("bot.py", False), ("tests/test_bot.py", False), ("tests/helpers.py", False), ("requirements-dev.md", False),
     ("docs/conftest.md", False), ("pthelper.py", False), (".env.example", False), ("docs/data/x.md", False),
     ("trades.py", False)])
@@ -150,6 +156,23 @@ def test_guard_protects_pytest_config_and_python_startup_files_at_any_depth(monk
     monkeypatch.setattr(guard, "git", lambda *args: path + "\0" if "--name-only" in args else "")
     assert bool(guard.check("origin/main")) is protected
     assert guard.protected(path) is protected
+
+
+def test_guard_reads_code_in_fixtures_folder(tmp_path, monkeypatch):
+    """tests/fixtures/ пропускается только для .json (данные): .py там — такой же код, строки выплат в нём — ручная
+    проверка, иначе через «фикстуру» можно было бы подложить код выплат мимо guard."""
+    from test_payouts import _load_guard
+    guard = _load_guard()
+    g = _repo(tmp_path, monkeypatch, guard)
+    (tmp_path / "tests" / "fixtures").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "tests" / "fixtures" / "ads.json").write_text('{"note": "payout 100"}\n', encoding="utf-8")
+    g("add", "-A")
+    g("commit", "-q", "-m", "fixture")
+    assert guard.check("main") == []
+    (tmp_path / "tests" / "fixtures" / "Helper.py").write_text("PAYOUT_MAX_ONE = '1000000'\n", encoding="utf-8")
+    g("add", "-A")
+    g("commit", "-q", "-m", "helper")
+    assert any("Helper.py" in p and "код выплат" in p for p in guard.check("main"))
 
 
 def _answers(bot):

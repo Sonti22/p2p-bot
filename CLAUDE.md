@@ -36,7 +36,9 @@ python cards.py    # перерисовать аватарки
 `tests/test_launcher_money_gate.py`, `data/`, `logs/`, `.env`, `.last_good`, `.dev_status.json`; любой путь со словом
 `payout` или `trading` (tests/test_payouts.py, tests/payout_stubs.py, paper_trading.py…); на любой глубине —
 `conftest.py`, `pytest.ini`, `pyproject.toml`, `setup.cfg`, `tox.ini`, `sitecustomize.py`, `usercustomize.py`,
-`requirements.txt`, `*.pth`. Новые файлы называть без этих слов. Guard блокирует и любую добавленную/удалённую
+`requirements.txt`, `*.pth`, `*.exe`, `*.dll`, `*.pyd`, `*.pyc`, `*.so`, `*.bat`, `*.cmd`, `*.ps1`, `__pycache__`;
+в корне — файлы и папки с именем модуля стандартной библиотеки (`json.py`, `hashlib/`…). Новые файлы называть без
+этих слов. В `tests/fixtures/` guard пропускает только `.json`. Guard блокирует и любую добавленную/удалённую
 строку с `payout`/`PAYOUT`/`pay_to|ok|no|hist|stop` в других файлах (bot.py, accounts.py, .env.example…).
 Guard также блокирует: новые домены в коде, `subprocess`/`os.system`/`eval`/`exec`, браузерную и UI-автоматизацию, секреты.
 
