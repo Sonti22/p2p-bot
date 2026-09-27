@@ -1262,15 +1262,17 @@ class Bot:
             await self.call("answerCallbackQuery", callback_query_id=cq["id"], text="Сделка не найдена")
             return
         fact = {"calc": row["profit"], "minus": row["profit"] - 0.5, "plus": row["profit"] + 0.5}[mode]
-        await self.save_fact(cq, trade_id, row, fact)
+        await self.save_fact(cq, trade_id, row, fact, trades.FACT_PLAN if mode == "calc" else trades.FACT_PLAN_SHIFT)
 
-    async def save_fact(self, cq, trade_id, row, fact):
-        trades.set_fact(trade_id, fact)
+    async def save_fact(self, cq, trade_id, row, fact, source=trades.FACT_MANUAL):
+        trades.set_fact(trade_id, fact, source=source)
         if cq is not None:
             await self.call("answerCallbackQuery", callback_query_id=cq["id"], text="Факт записан")
             await self.call("editMessageReplyMarkup", chat_id=self.chat_id, message_id=cq["message"]["message_id"],
                             reply_markup={"inline_keyboard": []})
-        await self.send(f"✅ Факт: {fact:+.2f}% (расчёт был {row['profit']:+.2f}%)", topic="journal")
+        note = ("\nЭто оценка, а не факт: в сравнение расчёт→факт не идёт. Найдутся ордера в истории биржи — заменю."
+                if source in trades.PLAN_SOURCES else "")
+        await self.send(f"✅ Факт: {fact:+.2f}% (расчёт был {row['profit']:+.2f}%){note}", topic="journal")
 
     async def set_fact_from_text(self, trade_id, text):
         """Ввод факта текстом после «✏️ ввести число»: проценты или сумма в ₽ — `trades.parse_fact`."""
@@ -1282,7 +1284,7 @@ class Bot:
         if fact is None:
             await self.send("Не понял результат. Пример: +1.2%, 1.2, 650 ₽, -300.")
             return
-        await self.save_fact(None, trade_id, row, fact)
+        await self.save_fact(None, trade_id, row, fact, trades.FACT_MANUAL)
 
     async def hide_deal(self, cq, deal_id):
         """Кнопка «🚫 Скрыть мерчанта»: занести обе стороны связки в блэклист (у стакана — всех его мерчантов),
@@ -1396,6 +1398,8 @@ class Bot:
                 if s["fact_count"]:
                     line += (f"; факт указан у {s['fact_count']} из {s['count']}, средний факт "
                             f"{s['avg_fact']:+.2f}%, расхождение расчёт→факт {s['avg_diff']:+.2f} п.п.")
+                if s.get("plan_facts"):
+                    line += f"; «как расчёт»/±0.5 у {s['plan_facts']} — не факт, в сравнение не идут"
                 lines.append(line)
             else:
                 lines.append(f"{label}: сделок нет")
@@ -2390,15 +2394,17 @@ class Bot:
             await self.auto_match_facts(hist_by_ex)
 
     async def auto_match_facts(self, hist_by_ex):
-        """Сделки журнала без факта (`trades.unmatched`) сверить с историей бирж этого опроса
-        (`trades.match_fact`) и заполнить факт автоматически, если нашлась и покупка, и продажа."""
+        """Сделки журнала без факта или с фактом «как расчёт»/«±0.5 п.п.» (`trades.unmatched`) сверить с историей
+        бирж этого опроса (`trades.match_fact`, чистыми) и записать факт (fact_source=auto), если нашлись P2P-ордера
+        и покупки, и продажи."""
         since = time.time() - 86400  # не старше суток — дальше сопоставлять по времени уже нет смысла
         for trade in trades.unmatched(since=since):
             fact = trades.match_fact(trade, hist_by_ex)
             if fact is None:
                 continue
-            trades.set_fact(trade["id"], fact)
-            await self.send(f"✅ автосопоставление сделки #{trade['id']}: факт {fact:+.2f}% "
+            trades.set_fact(trade["id"], fact, source=trades.FACT_AUTO)
+            was = " вместо «как расчёт»" if trade.get("fact_source") in trades.PLAN_SOURCES else ""
+            await self.send(f"✅ автосопоставление сделки #{trade['id']}: факт {fact:+.2f}% чистыми{was} "
                             f"(расчёт был {trade['profit']:+.2f}%)", topic="journal")
 
     async def accounts_loop(self):

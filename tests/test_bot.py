@@ -3091,6 +3091,11 @@ def _fact_prompt_trade_id(bot):
     return int(msg["reply_markup"]["inline_keyboard"][0][0]["callback_data"].split(":")[1])
 
 
+def _fact_source(db, trade_id):
+    """Откуда записан факт сделки (trades.fact_source): plan / plan± / manual / auto."""
+    return next(r["fact_source"] for r in trades.export_rows(0, path=db) if r["id"] == trade_id)
+
+
 def test_mark_done_offers_fact_quick_buttons(tmp_path, monkeypatch):
     db = str(tmp_path / "trades.db")
     monkeypatch.setattr(B.trades, "log_trade", functools.partial(B.trades.log_trade, path=db))
@@ -3117,8 +3122,10 @@ def test_fact_button_calc_records_calc_profit(tmp_path, monkeypatch):
     asyncio.run(bot.mark_done({"id": "1", "message": {"message_id": 9}}, deal_id))
     trade_id = _fact_prompt_trade_id(bot)
     asyncio.run(bot.on_callback({"id": "2", "data": f"fact:{trade_id}:calc", "message": {"message_id": 10}}))
-    assert "Факт: +5.00%" in texts(bot)[-1]
-    assert "факт указан у 1 из 1" in bot.stats_view()
+    assert "Факт: +5.00%" in texts(bot)[-1] and "в сравнение расчёт→факт не идёт" in texts(bot)[-1]
+    view = bot.stats_view()                              # «как расчёт» — это расчёт: в сравнение не идёт
+    assert "факт указан у" not in view and "«как расчёт»/±0.5 у 1" in view
+    assert _fact_source(db, trade_id) == "plan"
 
 
 def test_fact_button_plus_minus_offsets_calc(tmp_path, monkeypatch):
@@ -3131,7 +3138,11 @@ def test_fact_button_plus_minus_offsets_calc(tmp_path, monkeypatch):
     asyncio.run(bot.mark_done({"id": "1", "message": {"message_id": 9}}, deal_id))
     trade_id = _fact_prompt_trade_id(bot)
     asyncio.run(bot.on_callback({"id": "2", "data": f"fact:{trade_id}:minus", "message": {"message_id": 10}}))
-    assert "Факт: +4.50%" in texts(bot)[-1]
+    assert "Факт: +4.50%" in texts(bot)[-1] and "в сравнение расчёт→факт не идёт" in texts(bot)[-1]
+    assert _fact_source(db, trade_id) == "plan±"
+    asyncio.run(bot.on_callback({"id": "3", "data": f"fact:{trade_id}:plus", "message": {"message_id": 10}}))
+    assert "Факт: +5.50%" in texts(bot)[-1]
+    assert _fact_source(db, trade_id) == "plan±"
 
 
 def test_fact_manual_button_arms_awaiting_then_parses_text(tmp_path, monkeypatch):
@@ -3147,7 +3158,8 @@ def test_fact_manual_button_arms_awaiting_then_parses_text(tmp_path, monkeypatch
     assert bot.awaiting_fact == trade_id
     asyncio.run(bot.handle("650 ₽"))
     assert bot.awaiting_fact is None
-    assert "Факт:" in texts(bot)[-1]
+    assert "Факт:" in texts(bot)[-1] and "не идёт" not in texts(bot)[-1]
+    assert _fact_source(db, trade_id) == "manual"
 
 
 def test_fact_manual_garbage_reports_error_and_resets_awaiting(tmp_path, monkeypatch):

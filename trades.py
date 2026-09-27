@@ -1,6 +1,8 @@
 """Журнал сделок: SQLite data/trades.db — время, связка, сумма, расчётный %. Пишется по кнопке «✅ Сделал».
 Факт (реальный результат сделки) — необязательное поле `fact`, вводится кнопками или числом после
-«✅ Сделал»; `/stats` показывает расчёт vs факт, `/export` выгружает журнал в CSV."""
+«✅ Сделал»; `/stats` показывает расчёт vs факт, `/export` выгружает журнал в CSV. Откуда факт — `fact_source`:
+plan — кнопка «как расчёт», plan± — «±0.5 п.п.», manual — введён числом, auto — автосопоставление с историей
+биржи; NULL — записи до этой колонки. plan/plan± — это расчёт, а не факт: в сравнение расчёт→факт не идут."""
 import csv
 import datetime
 import os
@@ -67,6 +69,10 @@ _FACT_PLAIN = re.compile(r"^([+-]?\d+(?:[.,]\d+)?)$")
 COUNTERPARTY_DAY = 10
 COUNTERPARTY_MONTH = 50
 COUNTERPARTY_WARN = 0.8
+# Откуда факт сделки (fact_source). «как расчёт» и «±0.5 п.п.» — тот же расчёт, в калибровку не идут.
+FACT_PLAN, FACT_PLAN_SHIFT, FACT_MANUAL, FACT_AUTO = "plan", "plan±", "manual", "auto"
+PLAN_SOURCES = (FACT_PLAN, FACT_PLAN_SHIFT)
+_REAL_FACT = "fact IS NOT NULL AND (fact_source IS NULL OR fact_source NOT IN ('plan', 'plan±'))"
 
 
 def _connect(path):
@@ -76,7 +82,7 @@ def _connect(path):
                 "id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, route TEXT, "
                 "buy_ex TEXT, buy_asset TEXT, sell_ex TEXT, sell_asset TEXT, "
                 "amount REAL, profit REAL, bank TEXT DEFAULT '', fact REAL DEFAULT NULL, kind TEXT DEFAULT '', "
-                "buy_nick TEXT DEFAULT '', sell_nick TEXT DEFAULT '')")
+                "buy_nick TEXT DEFAULT '', sell_nick TEXT DEFAULT '', fact_source TEXT DEFAULT NULL)")
     cols = [r[1] for r in con.execute("PRAGMA table_info(trades)")]
     if "bank" not in cols:
         con.execute("ALTER TABLE trades ADD COLUMN bank TEXT DEFAULT ''")
@@ -87,6 +93,8 @@ def _connect(path):
     for col in ("buy_nick", "sell_nick"):   # '' — старые записи: мерчанты не записывались, в счётчик не идут
         if col not in cols:
             con.execute(f"ALTER TABLE trades ADD COLUMN {col} TEXT DEFAULT ''")
+    if "fact_source" not in cols:   # NULL — факт записан до колонки: откуда он, неизвестно, считаем как раньше
+        con.execute("ALTER TABLE trades ADD COLUMN fact_source TEXT DEFAULT NULL")
     return con
 
 
@@ -277,11 +285,13 @@ def get_trade(trade_id, path=DB_PATH):
     return {"amount": row[0], "profit": row[1]} if row else None
 
 
-def set_fact(trade_id, fact_percent, path=DB_PATH):
-    """Записать фактический результат (%) для сделки; True — сделка найдена и обновлена."""
+def set_fact(trade_id, fact_percent, path=DB_PATH, source=None):
+    """Записать фактический результат (%) для сделки и откуда он (source: FACT_PLAN/FACT_PLAN_SHIFT/FACT_MANUAL/
+    FACT_AUTO; None — неизвестно); True — сделка найдена и обновлена."""
     con = _connect(path)
     with con:
-        cur = con.execute("UPDATE trades SET fact = ? WHERE id = ?", (fact_percent, trade_id))
+        cur = con.execute("UPDATE trades SET fact = ?, fact_source = ? WHERE id = ?",
+                          (fact_percent, source, trade_id))
     con.close()
     return cur.rowcount > 0
 
@@ -292,29 +302,54 @@ AUTO_MATCH_AMOUNT_TOLERANCE = 0.25  # 25% — насколько сумма за
 
 
 def unmatched(path=DB_PATH, since=None):
-    """Сделки без введённого факта (для автосопоставления) не старше `since` (epoch, по умолчанию — все).
-    [{"id", "ts", "buy_ex", "buy_asset", "sell_ex", "sell_asset", "amount", "profit"}, ...]."""
+    """Сделки без настоящего факта (для автосопоставления) не старше `since` (epoch, по умолчанию — все): факта
+    нет или он с кнопок «как расчёт»/«±0.5 п.п.» (PLAN_SOURCES) — найденные ноги в истории биржи лучше расчёта.
+    [{"id", "ts", "buy_ex", "buy_asset", "sell_ex", "sell_asset", "amount", "profit", "route", "fact_source"}, ...]."""
     if not os.path.exists(path):
         return []
     since = 0.0 if since is None else since
     con = _connect(path)
-    rows = con.execute("SELECT id, ts, buy_ex, buy_asset, sell_ex, sell_asset, amount, profit FROM trades "
-                       "WHERE fact IS NULL AND ts >= ? ORDER BY ts", (since,)).fetchall()
+    rows = con.execute("SELECT id, ts, buy_ex, buy_asset, sell_ex, sell_asset, amount, profit, route, fact_source "
+                       "FROM trades WHERE (fact IS NULL OR fact_source IN ('plan', 'plan±')) AND ts >= ? ORDER BY ts",
+                       (since,)).fetchall()
     con.close()
     return [{"id": r[0], "ts": r[1], "buy_ex": r[2], "buy_asset": r[3], "sell_ex": r[4],
-             "sell_asset": r[5], "amount": r[6], "profit": r[7]} for r in rows]
+             "sell_asset": r[5], "amount": r[6], "profit": r[7], "route": r[8] or "", "fact_source": r[9]}
+            for r in rows]
+
+
+# Издержки плана в строке маршрута (p2p._route): «комиссия банка −0.5%», «перевод −1 USDT (TRC20) на MEXC»,
+# «через Bybit: перевод −0.8 USDT (TRC20) ×2» — комиссия уже умножена на число частей стакана. Число — формат {:g}.
+_NUM = r"(\d+(?:\.\d+)?(?:e-?\d+)?)"
+_ROUTE_BANK_FEE = re.compile(r"комиссия банка [−-]" + _NUM + "%")
+_ROUTE_WITHDRAW = re.compile(r"перевод [−-]" + _NUM + r" ([A-Z0-9]+)")
+
+
+def route_costs(route):
+    """(комиссия банка %, {монета: комиссия вывода в монете}) — издержки, которые расчёт заложил в маршрут.
+    Запас на курс — не издержка (в факте его нет), спот есть только у межмонетных — их match_fact не считает."""
+    bank = sum(float(x) for x in _ROUTE_BANK_FEE.findall(route or ""))
+    fees = {}
+    for fee, asset in _ROUTE_WITHDRAW.findall(route or ""):
+        fees[asset] = fees.get(asset, 0.0) + float(fee)
+    return bank, fees
+
+
+def _p2p_leg(it):
+    """Запись истории — P2P-ордер (accounts.bybit_p2p_orders: цена в фиате, есть поле fiat, нет kind). Депозиты,
+    выводы и спот-сделки других площадок (kind=deposit/withdraw/trade, цена спота — в USDT) ногой P2P не бывают."""
+    return it.get("kind", "p2p") == "p2p" and bool(it.get("fiat"))
 
 
 def _match_leg(hist, asset, side, ts, want_fiat, window, amount_tolerance):
     """Ближайшая по времени запись истории биржи (`accounts.account_history`) для одной ноги сделки:
-    та же монета, та же сторона (buy/sell), цена есть (депозиты/выводы её не несут — не подтверждают
-    цену исполнения), сумма в ₽ (amount*price) не дальше `amount_tolerance` от суммы круга сделки,
-    само время — не дальше `window` секунд от времени сделки. Кандидатов несколько — берём ближайший
-    по времени. Ничего не подошло — None."""
+    P2P-ордер (_p2p_leg), та же монета, та же сторона (buy/sell), цена есть, сумма в ₽ (amount*price)
+    не дальше `amount_tolerance` от суммы круга сделки, само время — не дальше `window` секунд от времени
+    сделки. Кандидатов несколько — берём ближайший по времени. Ничего не подошло — None."""
     asset = (asset or "").upper()
     best, best_dt = None, None
     for it in hist or []:
-        if (it.get("asset") or "").upper() != asset or it.get("side") != side:
+        if not _p2p_leg(it) or (it.get("asset") or "").upper() != asset or it.get("side") != side:
             continue
         price = it.get("price") or 0
         if price <= 0 or abs(it.get("ts", 0) - ts) > window:
@@ -329,30 +364,48 @@ def _match_leg(hist, asset, side, ts, want_fiat, window, amount_tolerance):
 
 
 def match_fact(trade, hist_by_ex, window=AUTO_MATCH_WINDOW, amount_tolerance=AUTO_MATCH_AMOUNT_TOLERANCE):
-    """Реализованный % прибыли по истории подключённых бирж для сделки журнала (`unmatched`), если в
-    истории нашлась и покупка, и продажа той же монеты рядом по времени и сумме — иначе None (нет ключа
-    у нужной биржи в этом опросе, движения ещё не видно, или сумма/время слишком не совпадают).
-    `hist_by_ex` — {биржа (в нижнем регистре): список записей `accounts.account_history` за этот опрос}."""
+    """Чистый реализованный % сделки журнала (`unmatched`) по истории подключённых бирж: в истории нашлись
+    P2P-ордер покупки и P2P-ордер продажи той же монеты рядом по времени и сумме (_match_leg). Считаем от
+    реальных цен и количества ордера покупки, вычитая издержки, которые заложил расчёт (route_costs): комиссию
+    банка и вывод монеты между площадками (как p2p._route_qty) — а не валовое «продажа / покупка − 1».
+    `hist_by_ex` — {биржа (в нижнем регистре): список записей `accounts.account_history` за этот опрос}.
+
+    None — не сопоставляем: нет ключа у нужной биржи в этом опросе, движения ещё не видно, сумма/время слишком
+    не совпадают; у площадки в истории нет P2P-ордеров (сейчас они есть только у Bybit — у остальных депозиты,
+    выводы и спот, _p2p_leg); межмонетная связка (монета покупки ≠ монете продажи — нужны курс и комиссия
+    спота, которых в истории нет, валовый % был бы выдумкой) или вывод съел бы всю монету.
+    Пределы: комиссии — по расчёту, а не списанные биржей на деле; покупка/продажа из нескольких ордеров
+    (стакан) — берётся один ближайший ордер, остальные не видны; запас на курс в факт не входит (его и нет)."""
+    asset = (trade["buy_asset"] or "").upper()
+    if asset != (trade["sell_asset"] or "").upper():
+        return None
     buy_hist = hist_by_ex.get((trade["buy_ex"] or "").lower())
     sell_hist = hist_by_ex.get((trade["sell_ex"] or "").lower())
     if buy_hist is None or sell_hist is None:
         return None
-    buy = _match_leg(buy_hist, trade["buy_asset"], "buy", trade["ts"], trade["amount"], window, amount_tolerance)
-    sell = _match_leg(sell_hist, trade["sell_asset"], "sell", trade["ts"], trade["amount"], window, amount_tolerance)
+    buy = _match_leg(buy_hist, asset, "buy", trade["ts"], trade["amount"], window, amount_tolerance)
+    sell = _match_leg(sell_hist, asset, "sell", trade["ts"], trade["amount"], window, amount_tolerance)
     if not buy or not sell:
         return None
-    return (sell["price"] / buy["price"] - 1) * 100
+    bank, fees = route_costs(trade.get("route"))
+    qty, fee = buy["amount"], fees.get(asset, 0.0)
+    if qty <= fee or bank >= 100:
+        return None
+    spent = qty * buy["price"] / (1 - bank / 100)   # ушло с карты: мерчанту за монету + комиссия банка
+    got = (qty - fee) * sell["price"]                # монета после вывода — по цене ордера продажи
+    return (got / spent - 1) * 100
 
 
 def stats(path=DB_PATH, now=None):
-    """{"day"/"week"/"month": {"count", "amount", "avg_profit", "fact_count", "avg_fact", "avg_diff"}} —
+    """{"day"/"week"/"month": {"count", "amount", "avg_profit", "fact_count", "avg_fact", "avg_diff", "plan_facts"}} —
     для /stats. «day» — календарные сутки по МСК, «month» — календарный месяц (как счётчик лимита СБП),
-    «week» — последние 7 суток. `fact_count`/`avg_fact`/`avg_diff` — только по сделкам, где введён факт
-    (avg_diff = среднее факт-расчёт, п.п.); при отсутствии таких сделок avg_fact/avg_diff — None."""
+    «week» — последние 7 суток. `fact_count`/`avg_fact`/`avg_diff` — только по сделкам с настоящим фактом
+    (avg_diff = среднее факт-расчёт, п.п.); факт с кнопок «как расчёт»/«±0.5 п.п.» (PLAN_SOURCES) — это расчёт,
+    он не в счёт, их число — `plan_facts`. Нет таких сделок — avg_fact/avg_diff None."""
     now = time.time() if now is None else now
     starts = {"day": _day_start(now), "week": now - PERIODS["week"], "month": _month_start(now)}
-    out = {p: {"count": 0, "amount": 0.0, "avg_profit": 0.0, "fact_count": 0, "avg_fact": None, "avg_diff": None}
-           for p in PERIODS}
+    out = {p: {"count": 0, "amount": 0.0, "avg_profit": 0.0, "fact_count": 0, "avg_fact": None, "avg_diff": None,
+               "plan_facts": 0} for p in PERIODS}
     if not os.path.exists(path):
         return out
     con = _connect(path)
@@ -361,23 +414,25 @@ def stats(path=DB_PATH, now=None):
             "SELECT COUNT(*), COALESCE(SUM(amount), 0), COALESCE(AVG(profit), 0) FROM trades WHERE ts >= ?",
             (start,)).fetchone()
         fact_count, avg_fact, avg_diff = con.execute(
-            "SELECT COUNT(*), AVG(fact), AVG(fact - profit) FROM trades WHERE ts >= ? AND fact IS NOT NULL",
+            f"SELECT COUNT(*), AVG(fact), AVG(fact - profit) FROM trades WHERE ts >= ? AND {_REAL_FACT}",
             (start,)).fetchone()
-        out[period] = {"count": count, "amount": amount, "avg_profit": avg_profit,
-                       "fact_count": fact_count, "avg_fact": avg_fact, "avg_diff": avg_diff}
+        plan_facts, = con.execute("SELECT COUNT(*) FROM trades WHERE ts >= ? AND fact IS NOT NULL "
+                                  "AND fact_source IN ('plan', 'plan±')", (start,)).fetchone()
+        out[period] = {"count": count, "amount": amount, "avg_profit": avg_profit, "fact_count": fact_count,
+                       "avg_fact": avg_fact, "avg_diff": avg_diff, "plan_facts": plan_facts}
     con.close()
     return out
 
 
 def facts_by_pair(since=0.0, path=DB_PATH):
-    """Реальные сделки с введённым фактом не старше `since` по связке площадка/монета покупки → площадка/монета
-    продажи — для сравнения с сухим прогоном в `/paper report`:
+    """Реальные сделки с настоящим фактом (не «как расчёт»/«±0.5 п.п.») не старше `since` по связке площадка/монета
+    покупки → площадка/монета продажи — для сравнения с сухим прогоном в `/paper report`:
     {(buy_ex, buy_asset, sell_ex, sell_asset): {"count", "avg_fact"}}."""
     if not os.path.exists(path):
         return {}
     con = _connect(path)
     rows = con.execute("SELECT buy_ex, buy_asset, sell_ex, sell_asset, COUNT(*), AVG(fact) FROM trades "
-                       "WHERE fact IS NOT NULL AND ts >= ? GROUP BY buy_ex, buy_asset, sell_ex, sell_asset",
+                       f"WHERE {_REAL_FACT} AND ts >= ? GROUP BY buy_ex, buy_asset, sell_ex, sell_asset",
                        (since,)).fetchall()
     con.close()
     return {tuple(r[:4]): {"count": r[4], "avg_fact": r[5]} for r in rows}
