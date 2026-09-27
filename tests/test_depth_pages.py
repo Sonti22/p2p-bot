@@ -1,9 +1,10 @@
 """Глубина стакана (план, этап 2.3): вторая страница, когда стек годных объявлений стороны меньше DEPTH_PAGE2 × сумма
-круга; запросы под фишки сумм — только для связки карточки; бюджет DEPTH_EXTRA_MAX на скан, кэш, бэкофф, счётчик
-snap.extra. Всё офлайн: фикстуры tests/fixtures (вторая страница Bybit — bybit_ads_p2.json)."""
+круга; запросы под фишки сумм — только для связки карточки, фоном после отправки; свои бюджеты DEPTH_PAGE2_MAX и
+DEPTH_CHIPS_MAX на скан, кэш, счётчик snap.extra; сбой второй страницы площадку не останавливает. Всё офлайн: фикстуры
+tests/fixtures (вторая страница Bybit — bybit_ads_p2.json)."""
 import asyncio
+import copy
 import dataclasses
-import os
 import time
 
 import pytest
@@ -36,11 +37,12 @@ def paged(offline, monkeypatch):
         return await offline(s, method, url, body)
 
     monkeypatch.setattr(p2p, "_json", fake)
-    p2p._page2_skip.clear()
-    p2p._amount_cache.clear()
+    monkeypatch.setattr(p2p, "PAGE_SIZE", {n: 1 for n in p2p.PAGED})   # фикстуры — урезанные страницы: считаем полными
+    for cache in (p2p._page2_skip, p2p._amount_cache, p2p._page_raw):
+        cache.clear()
     yield calls
-    p2p._page2_skip.clear()
-    p2p._amount_cache.clear()
+    for cache in (p2p._page2_skip, p2p._amount_cache, p2p._page_raw):
+        cache.clear()
 
 
 def _pages(calls, page="2", side=None, token="USDT"):
@@ -62,6 +64,7 @@ def test_page2_when_stack_short_merged_without_duplicates(paged):
     assert snap.extra == {"page2": 1}
     (rec,) = [j for j in snap.jobs if j.get("page") == 2]
     assert rec["ex"] == "bybit" and rec["side"] == "buy" and rec["new"] == 2 and "err" not in rec
+    assert rec["gain"] == 160_000                                # KursPlus 100 000 + NovyKurs 60 000
     assert p2p.usable_depth(snap.groups[("Bybit", "buy", "USDT")], _cfg(amount=100_000), snap.refs) > 140_000
 
 
@@ -73,16 +76,16 @@ def test_no_page2_when_stack_deep_enough(paged):
 
 def test_page2_budget_shortest_side_first_and_switch_off(paged, monkeypatch):
     # сумма 150 000: коротки обе стороны (140 000 и 200 000 < 225 000), бюджет 1 — только самая короткая (покупка)
-    monkeypatch.setenv("DEPTH_EXTRA_MAX", "1")
+    monkeypatch.setenv("DEPTH_PAGE2_MAX", "1")
     snap = asyncio.run(p2p.scan(None, _cfg(amount=150_000)))
     assert len(_pages(paged, side="1")) == 1 and not _pages(paged, side="0") and snap.extra == {"page2": 1}
     paged.clear()
-    monkeypatch.setenv("DEPTH_EXTRA_MAX", "6")
+    monkeypatch.setenv("DEPTH_PAGE2_MAX", "4")
     monkeypatch.setenv("DEPTH_PAGE2", "0")                       # выключено
     snap = asyncio.run(p2p.scan(None, _cfg(amount=150_000)))
     assert not _pages(paged) and snap.extra == {"page2": 0}
     monkeypatch.setenv("DEPTH_PAGE2", "мусор")                   # кривое значение — по умолчанию 1.5
-    assert p2p.depth_settings() == {"page2": 1.5, "extra_max": 6}
+    assert p2p.depth_settings() == {"page2": 1.5, "page2_max": 4, "chips_max": 6}
 
 
 def test_page2_without_new_ads_is_not_repeated(paged):
@@ -96,23 +99,122 @@ def test_page2_without_new_ads_is_not_repeated(paged):
     assert len(_pages(paged, side="1")) == 1 and not _pages(paged, side="0") and snap.extra == {"page2": 1}
 
 
-def test_page2_error_keeps_page1_and_backs_off_venue(paged, monkeypatch):
+class Limited(Exception):
+    """Ответ площадки 429 (как aiohttp.ClientResponseError: код — в .status)."""
+    status = 429
+
+
+def _raising(monkeypatch, exc, when):
     inner = p2p._json
 
     async def broken(s, method, url, body=None):
-        if (body or {}).get("page") == "2":
-            raise TimeoutError("page 2")
+        if when(url, body or {}):
+            raise exc
         return await inner(s, method, url, body)
 
     monkeypatch.setattr(p2p, "_json", broken)
+
+
+def test_page2_error_keeps_venue_in_scan_and_pauses_only_page2(paged, monkeypatch):
+    """Разбор ревью: ошибка второй страницы не ставит площадку на паузу (раньше бэкофф рос 30 → 600 с, и площадка с
+    рабочей первой страницей выпадала из скана) — не просим вторую страницу этой стороны DEPTH_PAGE2_RETRY сек."""
+    _raising(monkeypatch, TimeoutError("page 2"), lambda url, body: body.get("page") == "2")
+    for _ in range(3):
+        paged.clear()
+        snap = asyncio.run(p2p.scan(None, _cfg(amount=100_000)))
+        assert _pages(paged, page="1") and "VaSa" in _nicks(snap) and "KursPlus" not in _nicks(snap)
+        assert not snap.errors and not p2p._venue_paused_until("bybit") and "bybit" not in p2p._venue_backoff
+    jobs = [j for j in snap.jobs if j.get("page") == 2]
+    assert jobs == []                                                  # 2-й и 3-й скан вторую страницу не просили
+    assert p2p._page2_skip[("bybit", "buy", "USDT")] > time.time() + p2p.DEPTH_PAGE2_RETRY - 60
+
+
+def test_page2_403_or_429_gives_one_pause_without_growth(paged, monkeypatch):
+    _raising(monkeypatch, Limited("429 Too Many Requests"), lambda url, body: body.get("page") == "2")
+    asyncio.run(p2p.scan(None, _cfg(amount=100_000)))
+    st = p2p._venue_backoff["bybit"]
+    assert st["delay"] == 0 and 0 < st["until"] - time.time() <= p2p.VENUE_BACKOFF_BASE   # одна пауза, без роста
+
+
+def test_page2_not_asked_from_venue_whose_page1_failed_this_scan(paged, monkeypatch):
+    _raising(monkeypatch, RuntimeError("429"), lambda url, body: "otc/item/online" in url and body.get("page") == "1"
+             and body.get("side") == "1")
+    asyncio.run(p2p.scan(None, _cfg(amount=250_000)))                 # продажа 200 000 < 375 000 — коротка
+    assert not _pages(paged)
+
+
+def test_page2_only_after_full_first_page(paged, monkeypatch):
+    """Первая страница короче размера страницы — второй нет, не просим (фикстура — 4 объявления, страница Bybit — 20)."""
+    monkeypatch.setattr(p2p, "PAGE_SIZE", dict(p2p.PAGE_SIZE, bybit=20))
     snap = asyncio.run(p2p.scan(None, _cfg(amount=100_000)))
-    assert "VaSa" in _nicks(snap) and "KursPlus" not in _nicks(snap)   # первая страница в скане
-    assert not snap.errors                                             # площадка ответила — не «ошибка площадки»
-    assert [j["err"] for j in snap.jobs if j.get("page") == 2] == ["TimeoutError: page 2"]
-    assert p2p._venue_paused_until("bybit")                            # бэкофф, как у любой ошибки площадки
+    assert not _pages(paged) and snap.extra == {"page2": 0}
+    p2p._note_page("lbank", "buy", "USDT", 1, 100_000.0, 3, True)        # LBank сам говорит «есть ещё» (hasNext)
+    assert p2p._page_full("lbank", "buy", "USDT", 100_000.0)
+    p2p._note_page("lbank", "buy", "USDT", 1, 100_000.0, 20, False)
+    assert not p2p._page_full("lbank", "buy", "USDT", 100_000.0)
+
+
+def test_page2_with_new_but_unusable_ads_is_paused(paged, monkeypatch):
+    """Разбор ревью: вторая страница с новыми, но негодными объявлениями (мало сделок) не просится каждый скан."""
+    inner = p2p._json
+
+    async def unusable(s, method, url, body=None):
+        if "otc/item/online" in url and (body or {}).get("page") == "2":
+            paged.append((url, dict(body)))
+            d = copy.deepcopy(await inner(s, method, url, dict(body, page="1")))
+            for i, it in enumerate(d["result"]["items"]):
+                it["nickName"], it["recentOrderNum"] = f"fresh{i}", 5
+            return d
+        return await inner(s, method, url, body)
+
+    monkeypatch.setattr(p2p, "_json", unusable)
+    cfg = _cfg(amount=150_000)                                         # обе стороны коротки
+    asyncio.run(p2p.scan(None, cfg))
+    assert len(_pages(paged)) == 2
+    assert {("bybit", "buy", "USDT"), ("bybit", "sell", "USDT")} <= set(p2p._page2_skip)
     paged.clear()
+    snap = asyncio.run(p2p.scan(None, cfg))
+    assert not _pages(paged) and snap.extra == {"page2": 0}
+
+
+def test_page2_round_is_bounded_by_timeout(paged, monkeypatch):
+    inner = p2p._json
+
+    async def slow(s, method, url, body=None):
+        if (body or {}).get("page") == "2":
+            await asyncio.sleep(1.0)
+        return await inner(s, method, url, body)
+
+    monkeypatch.setattr(p2p, "_json", slow)
+    monkeypatch.setattr(p2p, "DEPTH_TIMEOUT", 0.1)
+    t0 = time.monotonic()
     snap = asyncio.run(p2p.scan(None, _cfg(amount=100_000)))
-    assert not _pages(paged, page="1") and not _pages(paged) and "пауза до" in snap.errors["bybit"]   # на паузе
+    assert time.monotonic() - t0 < 0.8                                 # скан не ждёт медленную вторую страницу
+    assert "VaSa" in _nicks(snap) and not snap.errors and "bybit" not in p2p._venue_backoff
+    (rec,) = [j for j in snap.jobs if j.get("page") == 2]
+    assert rec["err"].startswith("таймаут") and ("bybit", "buy", "USDT") in p2p._page2_skip
+
+
+def test_page2_dedup_survives_price_change_between_pages(paged, monkeypatch):
+    """Разбор ревью: объявление переехало на вторую страницу, потому что сменило цену, — считаем его один раз (свежую
+    копию), а не дважды (фантомная глубина)."""
+    inner = p2p._json
+
+    async def moved(s, method, url, body=None):
+        if "otc/item/online" in url and (body or {}).get("page") == "2" and body.get("side") == "1":
+            paged.append((url, dict(body)))
+            d = copy.deepcopy(load("bybit_ads_p2.json"))
+            d["result"]["items"][0]["price"] = "85.05"                 # VaSa (на первой странице по 85.00)
+            return d
+        return await inner(s, method, url, body)
+
+    monkeypatch.setattr(p2p, "_json", moved)
+    snap = asyncio.run(p2p.scan(None, _cfg(amount=100_000)))
+    vasa = [a for a in snap.groups[("Bybit", "buy", "USDT")] if a.nick == "VaSa"]
+    assert [a.price for a in vasa] == [85.05]                          # одна копия — с второй (свежей) страницы
+    by_id = [p2p.Ad("LBank", "buy", 85.0, 1000, 5000, 10, ["SBP"], "m", 1, 99.0, ad_id="u1", fetched_ts=1.0),
+             p2p.Ad("LBank", "buy", 85.2, 1000, 9000, 10, ["SBP"], "m", 1, 99.0, ad_id="u1", fetched_ts=2.0)]
+    assert [a.price for a in p2p._dedup(by_id)] == [85.2]              # есть id — по нему, свежая копия
 
 
 def test_page2_for_other_coins_only_with_their_poll(paged):
@@ -214,10 +316,11 @@ def test_amount_chips_budget_pause_error_and_other_venues(paged, offline, monkey
     snap = asyncio.run(p2p.scan(None, cfg))                         # page2 = 1 (покупка короткая)
     deal = snap.deals[0]
     _amount_fake(paged, offline, monkeypatch)
-    monkeypatch.setenv("DEPTH_EXTRA_MAX", "2")                      # на фишки остаётся 1 запрос
+    monkeypatch.setenv("DEPTH_PAGE2_MAX", "0")                      # вторые страницы бюджет фишек не едят
+    monkeypatch.setenv("DEPTH_CHIPS_MAX", "1")
     asyncio.run(p2p.depth_for_deal(object(), cfg, snap, deal))
     assert snap.extra == {"page2": 1, "amounts": 1}
-    monkeypatch.setenv("DEPTH_EXTRA_MAX", "6")
+    monkeypatch.setenv("DEPTH_CHIPS_MAX", "6")
     p2p._amount_cache.clear()
     assert asyncio.run(p2p.depth_for_deal(None, cfg, snap, deal)) is snap          # без сессии — без запросов
     p2p._venue_backoff["bybit"] = {"delay": 30, "until": time.time() + 30}        # площадка на паузе
@@ -233,7 +336,20 @@ def test_amount_chips_budget_pause_error_and_other_venues(paged, offline, monkey
 
     monkeypatch.setattr(p2p, "_json", broken)
     asyncio.run(p2p.depth_for_deal(object(), cfg, dataclasses.replace(snap, extra={}), deal))
-    assert p2p._venue_paused_until("bybit")                         # ошибка — бэкофф площадки
+    assert not p2p._venue_paused_until("bybit")                     # доп. запрос площадку из скана не выкидывает
+    n = len(paged)
+    asyncio.run(p2p.depth_for_deal(object(), cfg, dataclasses.replace(snap, extra={}), deal))
+    assert len(paged) == n                                          # ошибка закэширована — до конца кэша не повторяем
+    p2p._amount_cache.clear()
+
+    async def limited(s, method, url, body=None):
+        if (body or {}).get("amount") == "300000":
+            raise Limited("429")
+        return await inner(s, method, url, body)
+
+    monkeypatch.setattr(p2p, "_json", limited)
+    asyncio.run(p2p.depth_for_deal(object(), cfg, dataclasses.replace(snap, extra={}), deal))
+    assert p2p._venue_paused_until("bybit") and p2p._venue_backoff["bybit"]["delay"] == 0   # 429 — одна пауза
     # площадки, которые не отбирают выдачу по сумме (KuCoin, BitPapa, LBank, BestChange), под фишки не опрашиваются
     kb = p2p.Ad("KuCoin", "buy", 85.0, 1000, 500000, 10000, ["SBP"], "k", 500, 99.0)
     ks = p2p.Ad("BestChange", "sell", 90.0, 1000, 500000, 10000, ["SBP"], "x [TRC20]", 500, 99.0, net="TRC20")
@@ -290,7 +406,7 @@ def test_card_is_sent_before_chip_requests_and_edited_later(paged, offline, monk
     bot.live_msg[bot._deal_key(deal)]["last_edit"] = 0
     asyncio.run(bot.update_live_card(bot._deal_key(deal), deal, snap, time.time()))
     assert [p for m, p in bot.out if m == "editMessageCaption"][-1]["caption"].endswith(line)
-    assert "вторые страницы 1, под суммы 4 (лимит 6)" in bot.status_view()
+    assert "вторые страницы 1 (лимит 4), под суммы 4 (лимит 6)" in bot.status_view()
 
 
 @pytest.mark.parametrize("mode", ["fail", "timeout"])
@@ -308,11 +424,61 @@ def test_chip_failure_or_timeout_leaves_original_card(paged, offline, monkeypatc
     assert "chips" not in bot.live_msg[bot._deal_key(snap.deals[0])]
 
 
-def test_chip_timeout_setting_and_line():
+def test_chip_timeout_setting_and_line(monkeypatch):
+    monkeypatch.delenv("CHIP_DEPTH_TIMEOUT", raising=False)
     assert B.chip_depth_timeout() == 4.0
     for bad in ("0", "-1", "nan", "мусор"):
-        os.environ["CHIP_DEPTH_TIMEOUT"] = bad
+        monkeypatch.setenv("CHIP_DEPTH_TIMEOUT", bad)
         assert B.chip_depth_timeout() == 4.0
-    os.environ["CHIP_DEPTH_TIMEOUT"] = "2.5"
+    monkeypatch.setenv("CHIP_DEPTH_TIMEOUT", "2.5")
     assert B.chip_depth_timeout() == 2.5
     assert B.chips_line({50_000: 1.234, 300_000: None}) == "📏 На другую сумму: 50 000 ₽ +1.23% · 300 000 ₽ нет объёма"
+
+
+def test_chip_edit_keeps_keyboard_and_current_text(paged, offline, monkeypatch):
+    """Разбор ревью: правка фишек передаёт кнопки карточки (без reply_markup Telegram их снимает) и берёт текст,
+    который на карточке сейчас; после «✅ Сделал» — кнопки уже без журнала."""
+    cfg = _cfg(amount=100_000)
+    snap = asyncio.run(p2p.scan(None, cfg))
+    d = snap.deals[0]
+    bot, _ = _card_bot(cfg, snap, monkeypatch)
+    _amount_fake(paged, offline, monkeypatch, delay=0.1)
+
+    async def run(pressed_done=False):
+        await bot.send_deal(d, snap=snap, topic="signals", nav=False)
+        live = bot.live_msg[bot._deal_key(d)]
+        live["caption"] = "🔔 новый текст живой правки"                 # живая правка успела раньше фишек
+        if pressed_done:
+            bot.deals_by_id.clear()
+        await asyncio.gather(*list(bot.chip_tasks))
+    asyncio.run(run())
+    edit = [p for m, p in bot.out if m == "editMessageCaption"][-1]
+    buttons = [b["text"] for row in edit["reply_markup"]["inline_keyboard"] for b in row]
+    assert "✅ Сделал" in buttons and "📝 Инструкция" in buttons
+    assert edit["caption"].startswith("🔔 новый текст живой правки\n📏 На другую сумму:")
+    p2p._amount_cache.clear()
+    snap.extra["amounts"] = 0                                          # как новый скан: бюджет фишек заново
+    bot.out.clear()
+    asyncio.run(run(pressed_done=True))
+    edit = [p for m, p in bot.out if m == "editMessageCaption"][-1]
+    assert "✅ Сделал" not in [b["text"] for row in edit["reply_markup"]["inline_keyboard"] for b in row]
+
+
+def test_chip_edit_after_stale_mark_keeps_it(paged, offline, monkeypatch):
+    """Разбор ревью: фишки пришли после «⌛ связка устарела» — пометка остаётся."""
+    cfg = _cfg(amount=100_000)
+    snap = asyncio.run(p2p.scan(None, cfg))
+    d = snap.deals[0]
+    bot, _ = _card_bot(cfg, snap, monkeypatch)
+    _amount_fake(paged, offline, monkeypatch, delay=0.2)
+
+    async def run():
+        await bot.send_deal(d, snap=snap, topic="signals", nav=False)
+        await bot.mark_stale_deals(active=set())                         # следующий скан: связка ушла из топа
+        await asyncio.gather(*list(bot.chip_tasks))
+    asyncio.run(run())
+    edits = [p for m, p in bot.out if m == "editMessageCaption"]
+    assert len(edits) == 2 and edits[0]["caption"].endswith(B.STALE_MARK)
+    assert "📏 На другую сумму:" in edits[1]["caption"] and edits[1]["caption"].endswith(B.STALE_MARK)
+    live = bot.live_msg[bot._deal_key(d)]
+    assert live["stale"] and live["chips"] and not live["caption"].endswith(B.STALE_MARK)

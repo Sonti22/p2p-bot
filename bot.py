@@ -1108,6 +1108,7 @@ def apply_mybanks(data):
         save_env("SBP_FREE_LIMITS", ",".join(f"{k}:{v}" for k, v in limits.items()))
 
 
+STALE_MARK = "\n\n⌛ <i>связка устарела</i>"   # пометка последнего сигнала по связке, ушедшей из топа
 CHIP_DEPTH_TIMEOUT = 4.0   # сек: фоновое уточнение фишек сумм карточки не дольше (CHIP_DEPTH_TIMEOUT в .env)
 
 
@@ -1413,8 +1414,8 @@ class Bot:
         amounts = deal_amounts(d, cfg, snap) if snap else None
         rel = (*reliability(d, cfg, snap), reliability_index(d, cfg, snap)) if snap else None
         caption = prefix + fmt_signal(d, cfg, snap)
-        r, is_photo = await self.photo_or_text(lambda: deal_card(d, cfg, amounts, rel), caption,
-                                               deal_markup(d, deal_id, cfg, snap, nav), topic,
+        markup = deal_markup(d, deal_id, cfg, snap, nav)
+        r, is_photo = await self.photo_or_text(lambda: deal_card(d, cfg, amounts, rel), caption, markup, topic,
                                                chat_id)
         message_id = (r.get("result") or {}).get("message_id") if r.get("ok") else None
         if topic == "signals" and message_id is not None and not guest:
@@ -1422,8 +1423,9 @@ class Bot:
             self.live_msg[key] = {"message_id": message_id, "photo": is_photo, "deal_id": deal_id,
                                   "last_edit": time.time(), "caption": caption, "stale": False}
         if message_id is not None and snap is not None and not guest and self.s is not None:
-            task = asyncio.ensure_future(self.chip_refresh(d, cfg, snap, amounts, message_id, is_photo, caption,
-                                                           self.chat_for(chat_id)))
+            card = {"message_id": message_id, "photo": is_photo, "caption": caption, "chat_id": self.chat_for(chat_id),
+                    "markup": markup, "deal_id": deal_id, "nav": nav}
+            task = asyncio.ensure_future(self.chip_refresh(d, cfg, snap, amounts, card))
             self.chip_tasks.add(task)
             task.add_done_callback(self.chip_tasks.discard)
         return r
@@ -1437,31 +1439,42 @@ class Bot:
             logger.warning("глубина под суммы: %s: %s", type(e).__name__, e)
             return snap
 
-    async def chip_refresh(self, d, cfg, snap, amounts, message_id, is_photo, caption, chat_id):
+    async def chip_refresh(self, d, cfg, snap, amounts, card):
         """Фоном после отправки карточки: фишки 50/100/300 тыс. по запросам под каждую сумму (chip_depth). Изменилась
         хоть одна — строка фишек дописывается в подпись/текст отправленного сообщения (Bot.call editMessageCaption/
-        editMessageText: картинку без новой загрузки не поменять) и остаётся при правках «живой карточки». Не
-        изменилось, сбой или таймаут — карточка как была. Исключения только в лог."""
+        editMessageText: картинку без новой загрузки не поменять) и остаётся при правках «живой карточки». Текст — тот,
+        что на карточке к моменту правки (живая правка могла его сменить), «⌛ связка устарела» сохраняется; кнопки —
+        те же (без reply_markup Telegram их снял бы; после «✅ Сделал» — уже без кнопок журнала). Не изменилось, сбой
+        или таймаут — карточка как была. Исключения только в лог. card — message_id, photo, caption, chat_id, markup,
+        deal_id, nav отправленной карточки."""
         try:
             fresh = deal_amounts(d, cfg, await self.chip_depth(d, cfg, snap))
             if not fresh or fresh == amounts:
                 return
             line = chips_line(fresh)
-            text = caption + "\n" + line
-            if len(text) > (1024 if is_photo else 4096):
+            live = self.live_msg.get(self._deal_key(d))
+            live = live if live and live["message_id"] == card["message_id"] else None
+            base = live["caption"] if live else card["caption"]
+            text = base + "\n" + line + (STALE_MARK if live and live["stale"] else "")
+            if len(text) > (1024 if card["photo"] else 4096):
                 return
-            if is_photo:
-                r = await self.call("editMessageCaption", chat_id=chat_id, message_id=message_id, caption=text,
-                                    parse_mode="HTML")
-            else:
-                r = await self.call("editMessageText", chat_id=chat_id, message_id=message_id, text=text,
-                                    parse_mode="HTML", disable_web_page_preview=True)
+            markup = card["markup"]
+            if card["deal_id"] is not None and card["deal_id"] not in self.deals_by_id:   # «✅ Сделал» уже нажали
+                markup = deal_markup(d, None, cfg, snap, False)
+            kw = {"chat_id": card["chat_id"], "message_id": card["message_id"], "parse_mode": "HTML"}
+            for mk in (self.markup(markup), plain_markup(markup)):
+                if card["photo"]:
+                    r = await self.call("editMessageCaption", caption=text, reply_markup=mk, **kw)
+                else:
+                    r = await self.call("editMessageText", text=text, reply_markup=mk, disable_web_page_preview=True,
+                                        **kw)
+                if not self._fancy_failed(r, mk):
+                    break
             if not r.get("ok"):
                 logger.warning("фишки сумм: правка карточки не прошла: %s", r.get("description"))
                 return
-            live = self.live_msg.get(self._deal_key(d))
-            if live and live["message_id"] == message_id:   # живые правки и «⌛ устарел» строку фишек не теряют
-                live["chips"], live["caption"] = line, live["caption"] + "\n" + line
+            if live:   # живые правки и «⌛ устарел» строку фишек не теряют
+                live["chips"], live["caption"] = line, base + "\n" + line
         except Exception as e:
             logger.warning("фишки сумм: %s: %s", type(e).__name__, e)
 
@@ -2256,9 +2269,9 @@ class Bot:
             return "\n".join(lines)
         above = sum(1 for d in snap.deals if d[0] >= self.cfg.min_profit)
         lines.append(f"Связок выше порога {self.cfg.min_profit:g}%: {above}")
-        extra = snap.extra
-        lines.append(f"Доп. запросы глубины в скане: вторые страницы {extra.get('page2', 0)}, под суммы "
-                     f"{extra.get('amounts', 0)} (лимит {depth_settings()['extra_max']})")
+        extra, lim = snap.extra, depth_settings()
+        lines.append(f"Доп. запросы глубины в скане: вторые страницы {extra.get('page2', 0)} (лимит "
+                     f"{lim['page2_max']}), под суммы {extra.get('amounts', 0)} (лимит {lim['chips_max']})")
         if snap.errors:
             lines += ["", "<b>Ошибки площадок:</b>"]
             lines += [f"• {html.escape(k)}: {html.escape(e)}" for k, e in snap.errors.items()]
@@ -2784,12 +2797,11 @@ class Bot:
 
     async def mark_stale_deals(self, active):
         """Связка пропала из топа — один раз пометить последний сигнал по ней «⌛ устарел»."""
-        stale_mark = "\n\n⌛ <i>связка устарела</i>"
         for key, live in self.live_msg.items():
             if key in active or live["stale"]:
                 continue
             live["stale"] = True
-            text = live["caption"] + stale_mark
+            text = live["caption"] + STALE_MARK
             try:
                 if live["photo"]:
                     await self.call("editMessageCaption", chat_id=self.chat_id, message_id=live["message_id"],
