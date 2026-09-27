@@ -43,6 +43,7 @@ KLINE_TTL = 60        # 1ч свечи: докачка последних
 KLINE_FULL = 1000     # первая загрузка свечей — хватает на прогрев EMA(100)
 BACKOFF_BASE = 30
 BACKOFF_MAX = 600
+SETTLE_STALE = 600    # сек: ставка из котировки старше этого до расчёта — расчёт помечается оценочным
 HEADERS = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
 
 
@@ -308,14 +309,15 @@ def settle(st, q, now=None):
     сервера ближайшего расчёта, rate/mark — ставка и mark из последней котировки ДО этого расчёта (именно она
     и спишется), interval_h. q — текущая котировка (или None). Котировка обновляет ставку, только если говорит
     о том же ближайшем расчёте (после расчёта у площадки уже новая ставка на следующий). Пропущенные расчёты
-    (бот не работал) считаются по последней известной ставке — помечаются approx.
+    (бот не работал) считаются по последней известной ставке, как и расчёт, до которого свежей котировки не было
+    дольше SETTLE_STALE, — такие помечаются approx.
     Возвращает [(время расчёта, ставка, mark, approx)]; st меняется на месте."""
     now = time.time() if now is None else now
 
     def take(q):   # котировка о том же ближайшем расчёте — её ставка и спишется
         if q is not None and q.next_funding and abs(q.next_funding - st["next"]) < 1:
             st.update(rate=q.funding_rate, mark=q.mark, interval_h=q.interval_h or st.get("interval_h") or 8,
-                      used=False)
+                      used=False, seen=q.ts - (q.skew or 0.0))
 
     if q is not None:
         st["skew"] = q.skew or 0.0
@@ -327,7 +329,8 @@ def settle(st, q, now=None):
     out = []
     while st.get("next") and server_now >= st["next"]:
         if st.get("rate") is not None and st.get("mark"):
-            out.append((st["next"], st["rate"], st["mark"], bool(st.get("used"))))
+            stale = st["next"] - (st.get("seen") or st["next"]) > SETTLE_STALE
+            out.append((st["next"], st["rate"], st["mark"], bool(st.get("used")) or stale))
         st["used"] = True   # следующий расчёт по этой же ставке — уже оценка
         nxt = st["next"] + (st.get("interval_h") or 8) * 3600
         if q is not None and q.next_funding and st["next"] < q.next_funding <= nxt + 1:

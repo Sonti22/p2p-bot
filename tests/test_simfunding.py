@@ -153,3 +153,21 @@ def test_sim_tick_isolates_failures(monkeypatch):
         raise RuntimeError("x")
     monkeypatch.setattr(B.simfunding, "tick", boom)
     TB.Stub(p2p.Config()).sim_tick()   # не падает
+
+
+def test_perp_loop_refreshes_then_ticks_sims(monkeypatch):
+    calls = []
+
+    async def fake_refresh(s):
+        calls.append("refresh")
+        return {}
+
+    async def stop(_):
+        raise asyncio.CancelledError
+    monkeypatch.setattr(B.perp, "refresh_if_due", fake_refresh)
+    bot = TB.Stub(p2p.Config())
+    monkeypatch.setattr(bot, "sim_tick", lambda: calls.append("tick"))
+    monkeypatch.setattr(B.asyncio, "sleep", stop)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(bot.perp_loop())
+    assert calls == ["refresh", "tick"]

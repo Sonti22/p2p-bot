@@ -188,3 +188,11 @@ def test_scan_attaches_perps(offline):
 def test_public_get_only():
     src = inspect.getsource(perp)
     assert ".post(" not in src and "order/create" not in src and "X-BAPI-SIGN" not in src
+
+
+def test_settle_marks_stale_rate_as_approx():
+    t = NOW + 3600
+    st = {}
+    perp.settle(st, quote(rate=0.0001, mark=100.0, next_funding=t, ts=NOW), now=NOW)   # за час до расчёта
+    ev = perp.settle(st, None, now=t + 5)
+    assert ev == [(t, 0.0001, 100.0, True)]
