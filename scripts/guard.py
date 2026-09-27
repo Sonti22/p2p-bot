@@ -33,6 +33,15 @@ STDLIB_NAMES = frozenset(n.lower() for n in sys.stdlib_module_names)
 # код выплат в остальных файлах (bot.py: /payout, кнопки pay_*, PAYOUTS; accounts.py, .env.example…): любая добавленная
 # или удалённая строка — ручная проверка владельца. Документацию (.md) не проверяем.
 PAYOUT_CODE = r"payout|\bpay_(?:to|ok|no|hist|stop)\b"
+# торговый код вне trading/ и tests/trading/ (bot.py: TRADING/TRADING_MODE, кнопки trd_*, import trading; эндпоинты
+# ордеров и позиций, поля ордеров, ключи bybit_trade/bingx_trade…): любая добавленная или удалённая строка — ручная
+# проверка. TRADING и trd_ — с учётом регистра, а голого «trade» нет: «enableSpotAndMarginTrading», «paper trading»,
+# trades.py, log_trade, «/api/v3/myTrades» — не торговый код. Эндпоинты и поля — без учёта регистра.
+TRADING_CODE = (r"TRADING|\btrd_\w+"
+                r"|\b(?:import|from)\s+trading\b|\btrading\.\w|\b(?:import_module|__import__)\(\s*[\"']trading\b"
+                r"|(?i:/v5/(?:order|position|execution)/|/v5/p2p/(?:item/(?:create|update|cancel)|order/(?:finish|pay)\b)"
+                r"|/openApi/c?swap/v\d/(?:trade|user)/|/openApi/spot/v\d/trade/"
+                r"|orderLinkId|clientOrderId|reduceOnly|\b(?:bybit|bingx)_trade(?:\b|_))")
 ALLOWED_DOMAINS = ("bybit.com", "mexc.com", "htx.com", "kucoin.com", "bitpapa.com", "bestchange.ru",
                    "rapira.net", "telegram.org", "t.me", "lbank.com", "bingx.com", "cryptomus.com")
 FORBIDDEN = (r"\bsubprocess\b", r"\bos\.system\b", r"\bos\.popen\b", r"\beval\(", r"\bexec\(", r"captcha",
@@ -75,7 +84,7 @@ def check(base):
     for f in files:
         if protected(f):
             problems.append(f"изменён защищённый файл: {f}")
-    payout_lines = {}
+    payout_lines, trading_lines = {}, {}
     for name in files:
         if name.lower().startswith("tests/fixtures/") and name.lower().endswith(".json"):   # данные, не код
             continue
@@ -90,6 +99,8 @@ def check(base):
                 continue
             if not name.endswith(".md") and not protected(name) and re.search(PAYOUT_CODE, line[1:], re.I):
                 payout_lines[name] = payout_lines.get(name, 0) + 1
+            if not name.endswith(".md") and not protected(name) and re.search(TRADING_CODE, line[1:]):
+                trading_lines[name] = trading_lines.get(name, 0) + 1
             if not line.startswith("+"):
                 continue
             text = line[1:]
@@ -106,6 +117,8 @@ def check(base):
                     problems.append(f"{name}: похоже на секрет")
     for name, n in payout_lines.items():
         problems.append(f"{name}: изменён код выплат ({n} стр.) — только ручная проверка владельца")
+    for name, n in trading_lines.items():
+        problems.append(f"{name}: изменён торговый код ({n} стр.) — только ручная проверка")
     return problems
 
 
