@@ -38,6 +38,16 @@ jobs:
           n=$(echo "$last" | grep -oE '^[0-9]+ passed' | cut -d' ' -f1 || true)
           echo "payout tests passed: ${n:-0}"
           test "${n:-0}" -ge 200
+      - name: Торговые тесты отдельно (поверхность вне trading/, guard, блок сети; tests/trading/ — если есть)
+        run: |
+          paths="tests/test_trading_surface.py"
+          if [ -d tests/trading ]; then paths="$paths tests/trading"; fi
+          last=$(python -m pytest -q -o addopts= -p no:cacheprovider $paths 2>&1 | tail -1)
+          echo "trading tests: $last"
+          if echo "$last" | grep -qiE '\b(failed|errors?)\b'; then exit 1; fi
+          n=$(echo "$last" | grep -oE '^[0-9]+ passed' | cut -d' ' -f1 || true)
+          echo "trading tests passed: ${n:-0}"
+          test "${n:-0}" -ge 169
       - name: Guard (защищённые файлы, домены, опасные вызовы, секреты) — скрипт из main, а не из ветки
         run: git show origin/main:scripts/guard.py > "$RUNNER_TEMP/guard.py" && python "$RUNNER_TEMP/guard.py" origin/main
 
