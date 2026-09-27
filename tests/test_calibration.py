@@ -67,19 +67,43 @@ def test_shrink_formula():
     assert C.shrink(0, 0.0, 0.2, k=0) == 0.2
 
 
-def test_bias_shrinks_to_coarser_class_then_global():
+def test_bias_only_class_is_task_formula():
+    """Кругов вне класса нет — поправка ровно n/(n+k)·среднее класса (k = 20): 20 кругов по +1 → +0.5."""
+    for n, mean in ((20, 1.0), (5, -2.0), (180, 0.4)):
+        cal = C.Calibration([S(mean) for _ in range(n)])
+        adj, got_n = cal.bias("same", "USDT", "MEXC", "BestChange")
+        assert got_n == n and adj == pytest.approx(n / (n + 20) * mean)
+    assert C.Calibration([]).bias("same", "USDT", "MEXC", "BestChange") == (0.0, 0)   # нет данных — нет поправки
+    # corrected = план + поправка: EV считает от него
+    cal = C.Calibration([S(-1.0) for _ in range(30)])
+    assert cal.estimate(2.0, "same", "USDT", "MEXC", "BestChange")["corrected"] == pytest.approx(2.0 - 30 / 50)
+
+
+def test_bias_class_prior_from_neighbours():
+    """Априор класса — соседние классы (уровень грубее без своих кругов), свои круги дважды не считаются."""
     samples = [S(1.0) for _ in range(20)] + [S(-1.0, bex="HTX", sex="BitPapa") for _ in range(20)]
     cal = C.Calibration(samples)
     assert cal.global_bias == pytest.approx(0.0)
-    # (same,) и (same, USDT) — среднее 0; (same, USDT, BestChange) — 20 × 1 → 0.5; точный класс → (20 + 10) / 40
-    assert cal.bias("same", "USDT", "MEXC", "BestChange") == (pytest.approx(0.75), 20)
-    assert cal.bias("same", "USDT", "HTX", "BitPapa") == (pytest.approx(-0.75), 20)
-    # класса нет — оценка ближайшего известного грубее (та же площадка продажи и монета)
-    assert cal.bias("same", "USDT", "Bybit", "BestChange") == (pytest.approx(0.5), 0)
-    # неизвестный тип маршрута — общее среднее
+    # сосед HTX→BitPapa (same USDT): 20/40 × −1 = −0.5 — априор; точный класс: 20/40 × 1 + 20/40 × (−0.5)
+    assert cal.bias("same", "USDT", "MEXC", "BestChange") == (pytest.approx(0.25), 20)
+    assert cal.bias("same", "USDT", "HTX", "BitPapa") == (pytest.approx(-0.25), 20)
+    # класса нет — по соседям: та же площадка продажи (MEXC→BestChange, +0.5 с априором −0.5) → 0.25
+    assert cal.bias("same", "USDT", "Bybit", "BestChange") == (pytest.approx(0.25), 0)
+    # неизвестный тип маршрута — все круги (среднее 0) → 0
     assert cal.bias("spot", "BTC", "Bybit", "MEXC") == (pytest.approx(0.0), 0)
     # без сжатия — сырое среднее класса
     assert C.Calibration(samples, k=0).bias("same", "USDT", "MEXC", "BestChange")[0] == pytest.approx(1.0)
+
+
+def test_shrink_k_from_env(monkeypatch):
+    monkeypatch.setenv("CAL_SHRINK_K", "5")
+    cal = C.build([], trades_path="")
+    assert cal.k == 5
+    cal = C.Calibration([S(1.0) for _ in range(20)], **{k: v for k, v in C.settings().items()})
+    assert cal.bias("same", "USDT", "MEXC", "BestChange")[0] == pytest.approx(20 / 25)
+    for bad, want in (("-3", 0.0), ("много", C.SHRINK_K), ("nan", C.SHRINK_K), ("inf", C.SHRINK_K)):
+        monkeypatch.setenv("CAL_SHRINK_K", bad)
+        assert C.settings()["k"] == want
 
 
 def test_bias_many_rounds_approach_class_mean():
@@ -123,9 +147,12 @@ def test_activation_min_n(monkeypatch):
     assert C.Calibration([S() for _ in range(30)]).ev(None, "same", "USDT", "MEXC", "BestChange") is None
     monkeypatch.setenv("CAL_MIN_N", "5")
     monkeypatch.setenv("CAL_FAIL_COST", "1.25")
-    assert C.settings() == {"min_n": 5, "fail_cost": 1.25}
+    monkeypatch.setenv("CAL_MIN_BUCKET", "4")
+    assert C.settings() == {"min_n": 5, "fail_cost": 1.25, "k": C.SHRINK_K, "min_bucket": 4}
     monkeypatch.setenv("CAL_MIN_N", "много")
-    assert C.settings()["min_n"] == C.DEFAULT_MIN_N
+    monkeypatch.setenv("CAL_FAIL_COST", "-1")
+    monkeypatch.setenv("CAL_MIN_BUCKET", "0")
+    assert C.settings() == {"min_n": C.DEFAULT_MIN_N, "fail_cost": 0.0, "k": C.SHRINK_K, "min_bucket": 1}
 
 
 def test_ev_formula_and_sign_cases():
@@ -136,10 +163,13 @@ def test_ev_formula_and_sign_cases():
     # частые срывы и дорогой срыв — EV < 0 при плюсовом плане
     flaky = C.Calibration([S(0.0) for _ in range(10)] + [S(done=False) for _ in range(20)], fail_cost=2.0)
     assert flaky.ev(1.0, "same", "USDT", "MEXC", "BestChange") < 0
-    # факт стабильно ниже плана — поправка съедает плановую прибыль
-    biased = C.Calibration([S(-1.5) for _ in range(30)])
+    # факт стабильно ниже плана — поправка (30/50 × −2.5 = −1.5) съедает плановую прибыль
+    biased = C.Calibration([S(-2.5) for _ in range(30)])
     assert biased.bias("same", "USDT", "MEXC", "BestChange")[0] == pytest.approx(-1.5)
     assert biased.ev(1.0, "same", "USDT", "MEXC", "BestChange") < 0
+    e = biased.estimate(1.0, "same", "USDT", "MEXC", "BestChange", rel="⚠️")
+    assert e["ev"] == pytest.approx(p * (1.0 - 1.5) - (1 - p) * 0.5) and e["p"] == pytest.approx(p)
+    assert e["bucket"] == ("rvd", "⚠️", "MEXC→BestChange", "d?") and e["n_bucket"] == 30 and e["n_class"] == 30
     # факт выше плана — EV выше плана
     lucky = C.Calibration([S(0.5) for _ in range(30)], fail_cost=0.0)
     assert lucky.ev(1.0, "same", "USDT", "MEXC", "BestChange") > 1.0 * 31 / 32
@@ -280,7 +310,7 @@ def test_real_trades_schema(tmp_path):
 
 
 def test_deal_ev_and_rank():
-    samples = [S(-1.0) for _ in range(40)] + [S(0.0, bex="HTX", sex="BitPapa") for _ in range(40)]
+    samples = [S(-2.0) for _ in range(40)] + [S(0.0, bex="HTX", sex="BitPapa") for _ in range(40)]
     cal = C.Calibration(samples)
     bad = (2.0, make_ad("MEXC", "buy", 80.0), make_ad("BestChange", "sell", 82.0), "перевод на BestChange")
     good = (1.5, make_ad("HTX", "buy", 80.0), make_ad("BitPapa", "sell", 82.0), "перевод на BitPapa")

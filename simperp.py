@@ -228,6 +228,17 @@ def _tick_one(c, ref, now, max_hours, path):
     return done
 
 
+def fact_cost_pct(row, st):
+    """Фактическая стоимость хеджа закрытого круга, % суммы круга — как в плане: комиссии + спред/проскальзывание −
+    фандинг (у старых записей спреда нет). row — строка cycles (amount, hedge_fees, hedge_funding), st — hedge_state;
+    нет курса ₽/USDT или суммы — None. Её же берёт calibration (/calibration) для сравнения с запасом на курс."""
+    rub, amount = st.get("ref_close") or st.get("ref_open") or 0.0, row.get("amount") or 0.0
+    if not (rub and amount):
+        return None
+    fact = (row.get("hedge_fees") or 0.0) + (st.get("spread_usdt") or 0.0) - (row.get("hedge_funding") or 0.0)
+    return fact * rub / amount * 100
+
+
 def report(path=paper.DB_PATH):
     """Сводка хеджа по кругам: сколько открыто/закрыто/без хеджа (и почему), σ(факт − план) по исполненным кругам
     без хеджа и с хеджем, ожидаемая и фактическая стоимость, доля кругов с коэффициентом в полосе."""
@@ -252,11 +263,10 @@ def report(path=paper.DB_PATH):
         out["fundings"] += len(st.get("fundings") or [])
         if status != "closed" or st.get("pnl_pct") is None:
             continue
-        rub, amount = st.get("ref_close") or st.get("ref_open") or 0.0, r["amount"] or 0.0
-        if rub and amount:   # как в плане: комиссии + спред/проскальзывание − фандинг (у старых записей спреда нет)
+        fact = fact_cost_pct(r, st)
+        if fact is not None:
             exp_cost.append(st.get("exp_cost_pct") or 0.0)
-            fact = (r["hedge_fees"] or 0.0) + (st.get("spread_usdt") or 0.0) - (r["hedge_funding"] or 0.0)
-            fact_cost.append(fact * rub / amount * 100)
+            fact_cost.append(fact)
         if r["result"] == "done" and r["plan"] is not None and r["realized_pct"] is not None:
             diffs_u.append(r["realized_pct"] - r["plan"])
             diffs_h.append(r["realized_pct"] + st["pnl_pct"] - (r["plan"] - (st.get("exp_cost_pct") or 0.0)))
