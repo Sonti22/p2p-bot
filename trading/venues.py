@@ -933,7 +933,8 @@ def open_order_view(venue, item):
 async def open_orders(s, venue, category, venue_sym, creds):
     """Все открытые ордера символа — наши, владельца, условные: (список open_order_view, "") или (None, причина).
     Строго: не та форма ответа, ордер чужого символа, у Bybit LIST_LIMIT строк и больше (могли прочитать не все) —
-    ошибка."""
+    ошибка. TODO(api): у Bybit UTA для linear без orderFilter в ответе и условные ордера (стопы позиции) — сверить на
+    живом ключе владельца до первого реального ордера."""
     if venue == BYBIT:
         path, params = "/v5/order/realtime", {"category": category, "symbol": venue_sym, "limit": str(LIST_LIMIT)}
     else:

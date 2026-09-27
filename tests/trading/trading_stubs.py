@@ -173,6 +173,7 @@ class Book:
     шаги инструмента."""
     def __init__(self):
         self.orders = {}          # client_id -> вид для ответа
+        self.category = {}        # client_id -> категория Bybit (список открытых ордеров — по категории)
         self.next_id = 1321003749386327552
         self.foreign = []         # открытые ордера владельца / стопы позиции: виды биржи
         self.position = {}        # символ биржи -> знаковый размер (Decimal)
@@ -202,6 +203,7 @@ class Book:
                                      "side": b["side"], "orderType": b["orderType"], "qty": b["qty"],
                                      "price": b.get("price", "0"), "orderStatus": status, "cumExecQty": done,
                                      "avgPrice": "", "reduceOnly": b.get("reduceOnly", False)}, **over)
+            self.category[cid] = b["category"]
             if b["category"] != "spot" and D(done):
                 self._move(b["symbol"], b["side"], done, b.get("reduceOnly", False))
             return bybit_ok({"orderId": str(self.next_id), "orderLinkId": cid})
@@ -213,8 +215,9 @@ class Book:
         if cid is not None or q.get("openOnly") == "1":
             o = self.orders.get(cid)
             return bybit_ok({"category": q.get("category"), "list": [o] if o else [], "nextPageCursor": ""})
-        sym = q.get("symbol")
-        mine = [o for o in self.orders.values() if o.get("symbol") == sym and o.get("orderStatus") in _BYBIT_OPEN]
+        sym, cat = q.get("symbol"), q.get("category")
+        mine = [o for cid, o in self.orders.items() if o.get("symbol") == sym and o.get("orderStatus") in _BYBIT_OPEN
+                and self.category.get(cid, "linear") == cat]
         theirs = [o for o in self.foreign if o.get("symbol") == sym]
         return bybit_ok({"category": q.get("category"), "list": mine + theirs, "nextPageCursor": ""})
 

@@ -188,6 +188,19 @@ def test_bot_netting_on_one_symbol():
     ok(req(**d), ctx(positions=[dict(short[0], venue="bingx")]), "confirm")              # другая биржа
 
 
+def test_spot_leg_does_not_net_with_perp_leg():
+    """Фандинг «спот + шорт перпа» на одной бирже и символе: спот — отдельные монеты, не сальдируется с перпом; нога
+    считается отдельно (≤ 1000 USDT на ногу)."""
+    spot = [dict(pos("funding", notional="900", group="f1", venue="bybit", symbol="BTCUSDT", side="long"),
+                 category="spot")]
+    fund = dict(strategy="funding", hedge_ref_qty=None, group="f2", qty=D("0.0015"), stop_loss=None)   # 97.5 USDT
+    ok(req(**fund), ctx(positions=spot), "confirm")
+    bad(req(**fund), ctx(positions=[dict(spot[0], category="linear")]), "confirm", why="встречная")
+    ok(req(**fund), ctx(positions=[dict(spot[0], notional=D("950"))]), "confirm")        # спот — другая нога
+    bad(req(**fund), ctx(positions=[dict(spot[0], category="linear", side="short", notional=D("950"))]), "confirm",
+        why="итоговая позиция")                                                        # та же нога перпа: 950 + 97.5
+
+
 @pytest.mark.parametrize("foreign,why", [(None, "позиции и ордера символа на бирже не проверены"),
                                          (("позиция long 1",), risk.FOREIGN)])
 def test_foreign_on_symbol_refuses(foreign, why):
