@@ -48,6 +48,28 @@ def test_unknown_receiver_directory_stays_unknown_status():
     assert p2p._withdraw(_cfg(), "HTX", "USDT", "", "KuCoin") == (0.01, "BEP20")
 
 
+def test_partial_receiver_directory_stays_unknown_status():
+    """Справочник HTX по ETH/BTC урезан при разборе (только родная сеть, без обёрнутых токенов), а ETH в ARBITRUM HTX
+    принимает: для ввода на HTX «нет в справочнике» у этих монет — «неизвестно», дешёвая сеть остаётся."""
+    from conftest import _htx_currency
+    j = _htx_currency("https://api.htx.com/v2/reference/currencies?currency=eth")
+    netstatus._apply("HTX", "ETH", netstatus._parse_htx(j, "ETH"))
+    assert netstatus.known_nets("HTX", "ETH") == ["ERC20"] and netstatus.deposit_nets("HTX", "ETH") == []
+    _dir("Bybit", "ETH", ERC20=(0.0015, None), ARBITRUM=(0.0001, None))
+    assert p2p._withdraw(_cfg(), "Bybit", "ETH", "", "HTX") == (0.0001, "ARBITRUM")
+    _dir("KuCoin", "ETH", ERC20=(0.002, None))                  # полный справочник — ARBITRUM не поддерживается
+    assert p2p._withdraw(_cfg(), "Bybit", "ETH", "", "KuCoin") == (0.0015, "ERC20")
+
+
+@pytest.mark.parametrize("raw,want", [("Toncoin(TON)", "TON"), ("Bitcoin(BTC)", "BTC"), ("GRAM", "TON"),
+                                      ("TON", "TON"), ("Asset Hub(Polkadot)", "ASSET HUB(POLKADOT)"),
+                                      ("Tron(TRC20)", "TRC20"), ("AVAX C-Chain", "AVAX C-CHAIN")])
+def test_normalize_names_with_ticker_in_brackets(raw, want):
+    """Названия сетей вида «Имя(ТИКЕР)» — по тикеру: иначе сеть TON справочника «Toncoin(TON)» не совпала бы с TON
+    отправителя и маршрут отсеялся бы как «сеть не поддерживается»."""
+    assert netstatus.normalize(raw) == want
+
+
 def test_exchanger_network_absent_from_receiver_directory_rejected():
     """Обменник шлёт в своей сети (BEP20) — у биржи-получателя в известном справочнике её нет: связки нет. Та же
     проверка для кошелька на Bybit в связке обменник → обменник."""

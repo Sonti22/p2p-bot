@@ -891,9 +891,9 @@ def _receive_nets(to, asset):
 
 def _deposit_ok(venue, asset, net):
     """Примет ли venue монету asset в сети net: False — ввод закрыт или сети нет в известном непустом справочнике
-    площадки (такую сеть она не поддерживает); None — сведений нет (справочника нет или его не удалось получить,
-    сеть не названа) — не мешаем; True — ввод открыт."""
-    known = netstatus.known_nets(venue, asset)
+    площадки (такую сеть она не поддерживает); None — сведений нет (справочника нет, его не удалось получить, он урезан
+    при разборе — netstatus.PARTIAL, сеть не названа) — не мешаем; True — ввод открыт."""
+    known = netstatus.deposit_nets(venue, asset)
     if net and known and net not in known:
         return False
     return netstatus.deposit_ok(venue, asset, net)

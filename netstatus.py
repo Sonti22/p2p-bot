@@ -7,19 +7,25 @@ HTX и KuCoin — публичные справочники валют; Bybit и
 бот забирает их и шлёт алерт.
 """
 import asyncio
+import re
 import time
 
 import accounts
 
 TTL = 600
 KNOWN_NETS = ("TRC20", "BEP20", "ERC20", "TON", "SOL", "POLYGON", "ARBITRUM", "APT", "BTC")
+HTX_NATIVE_ONLY = ("BTC", "ETH")   # _parse_htx оставляет у этих монет только родную сеть (без обёрнутых токенов)
+# справочники, урезанные при разборе: сети, которой в них нет, у площадки может быть открыта (HTX ETH в ARBITRUM) —
+# для ввода «нет в справочнике» у них значит «неизвестно», а не «не поддерживается» (deposit_nets)
+PARTIAL = {("HTX", a) for a in HTX_NATIVE_ONLY}
 STATUS = {}      # (площадка, монета) -> {сеть: {"dep": bool|None, "wd": bool|None, "fee": float|None, "min": float|None}}
 CHANGES = []     # (площадка, монета, сеть, "вывод"/"ввод", открыт: bool)
 _meta = {"t": 0.0, "errors": {}}
 
 
 def normalize(name):
-    """Название сети у биржи -> наше: TRC20/BEP20/ERC20/TON/SOL/POLYGON/ARBITRUM/APT/BTC, иначе как есть."""
+    """Название сети у биржи -> наше: TRC20/BEP20/ERC20/TON/SOL/POLYGON/ARBITRUM/APT/BTC, иначе как есть.
+    «Имя(ТИКЕР)» (Toncoin(TON), Bitcoin(BTC)) — по тикеру в скобках, если он из наших; TON с 15.06.2026 — ещё и GRAM."""
     n = (name or "").upper().strip()
     if "TRC20" in n or n in ("TRX", "TRON") or n.startswith("TRON"):
         return "TRC20"
@@ -27,7 +33,7 @@ def normalize(name):
         return "BEP20"
     if "ERC20" in n or n in ("ETH", "ETHEREUM"):
         return "ERC20"
-    if n in ("TON", "TONCOIN") or n.startswith("TON("):
+    if n in ("TON", "TONCOIN", "GRAM") or n.startswith("TON("):
         return "TON"
     if n in ("SOL", "SOLANA") or "SOLANA" in n:
         return "SOL"
@@ -39,6 +45,9 @@ def normalize(name):
         return "APT"
     if n in ("BTC", "BITCOIN"):
         return "BTC"
+    m = re.fullmatch(r".+\(([^()]+)\)", n)
+    if m and normalize(m.group(1)) in KNOWN_NETS:
+        return normalize(m.group(1))
     return n
 
 
@@ -60,7 +69,7 @@ def _parse_htx(j, asset=None):
     out = {}
     for c in j.get("data") or []:
         for ch in c.get("chains") or []:
-            if asset in ("BTC", "ETH") and (ch.get("chain") or "").lower() != asset.lower():
+            if asset in HTX_NATIVE_ONLY and (ch.get("chain") or "").lower() != asset.lower():
                 continue
             out[normalize(ch.get("displayName") or ch.get("chain"))] = {
                 "dep": ch.get("depositStatus") == "allowed", "wd": ch.get("withdrawStatus") == "allowed",
@@ -199,6 +208,12 @@ def open_nets(venue, asset):
 def known_nets(venue, asset):
     """Все сети площадки из живого справочника; пусто — сведений нет."""
     return list(STATUS.get((venue, asset)) or {})
+
+
+def deposit_nets(venue, asset):
+    """Сети полного живого справочника площадки: сети, которой в нём нет, площадка монету не примет. Пусто — сведений
+    нет или справочник урезан при разборе (PARTIAL): тогда «нет в справочнике» — это «неизвестно»."""
+    return [] if (venue, asset) in PARTIAL else known_nets(venue, asset)
 
 
 def pop_changes():
