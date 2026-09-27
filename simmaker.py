@@ -372,10 +372,12 @@ def stats(path=DB_PATH):
 
 
 def _rub(x):
-    return f"{x:+,.0f}".replace(",", " ") + " ₽"
+    return "0 ₽" if abs(x) < 0.5 else f"{x:+,.0f}".replace(",", " ") + " ₽"
 
 
 def _qty(x, asset):
+    if abs(x) < 1e-9:
+        return f"0 {asset}"
     return f"{x:+,.2f}".replace(",", " ") + f" {asset}" if abs(x) >= 1 else f"{x:+.6g} {asset}"
 
 

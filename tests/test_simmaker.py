@@ -286,3 +286,22 @@ def test_maker_paper_owner_only(monkeypatch):
     asyncio.run(bot.handle("/maker paper"))
     last = [p for m, p in bot.out if m == "sendMessage"][-1]
     assert last["chat_id"] == "1" and last["text"] == "🧪 отчёт"
+
+
+def test_on_scan_with_fixture_books_matches_maker_view(offline, monkeypatch, tmp_path):
+    """Живые формы снимка (фикстуры площадок): место своего объявления — как в /maker; отчёт влезает в сообщение."""
+    cfg = p2p.Config(assets=["USDT"])
+    sn = asyncio.run(p2p.scan(None, cfg))
+    db = str(tmp_path / "sim_maker.db")
+    cfg_env(monkeypatch, SIM_MAKER_BAND="10", SIM_MAKER_MIN_SPREAD="-10")   # в фикстуре спред Bybit отрицательный
+    S.on_scan(sn, cfg, path=db, now=1000.0)
+    S.on_scan(sn, cfg, path=db, now=1020.0)   # тот же стакан — потока нет
+    r = S.stats(db)[0]
+    assert r["fills"] == 0 and r["ads"]["sell_ad"]["price"] == pytest.approx(84.99)
+    assert (r["ads"]["sell_ad"]["place"], r["ads"]["sell_ad"]["total"]) == (2, 4)   # как «Место в стакане» в /maker
+    cfg_env(monkeypatch, SIM_MAKER_MIN_SPREAD="0")
+    S.on_scan(sn, cfg, path=db, now=1040.0)
+    r = S.stats(db)[0]
+    assert r["ads"] == {} and r["paused"]["buy_ad"]["spread"] == 1 and r["paused"]["sell_ad"]["spread"] == 1
+    text = S.report_view(cfg, path=db)
+    assert "объявлений нет" in text and "узкий спред" in text and len(text) < 4000
