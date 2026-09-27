@@ -29,24 +29,38 @@ jobs:
       - run: pip install -r requirements.txt pytest
       - run: python -m py_compile *.py scripts/*.py
       - run: python -m pytest -q
+      # shell: bash — это bash -eo pipefail; код выхода pytest сохраняется отдельно: ненулевой (упал, ошибка сборки,
+      # тесты не найдены) — красный шаг, даже если последняя строка вывода «N passed»
       - name: Тесты выплат отдельно (без addopts из конфига; выпали, упали или стало меньше — CI красный)
+        shell: bash
         run: |
-          last=$(python -m pytest -q -o addopts= -p no:cacheprovider \
-            tests/test_payouts.py tests/test_payouts_hardening.py tests/test_payout_pins.py 2>&1 | tail -1)
-          echo "payout tests: $last"
+          set -o pipefail
+          rc=0
+          out=$(python -m pytest -q -o addopts= -p no:cacheprovider \
+            tests/test_payouts.py tests/test_payouts_hardening.py tests/test_payout_pins.py 2>&1) || rc=$?
+          last=$(printf '%s\n' "$out" | tail -1)
+          echo "payout tests: $last (код $rc)"
+          if [ "$rc" -ne 0 ]; then printf '%s\n' "$out" | tail -40; exit 1; fi
           if echo "$last" | grep -qiE '\b(failed|errors?)\b'; then exit 1; fi
           n=$(echo "$last" | grep -oE '^[0-9]+ passed' | cut -d' ' -f1 || true)
           echo "payout tests passed: ${n:-0}"
           test "${n:-0}" -ge 200
       - name: Торговые тесты отдельно (поверхность вне trading/, guard, блок сети; tests/trading/ — если есть)
+        shell: bash
         run: |
+          set -o pipefail
           paths="tests/test_trading_surface.py"
           if [ -d tests/trading ]; then paths="$paths tests/trading"; fi
-          last=$(python -m pytest -q -o addopts= -p no:cacheprovider $paths 2>&1 | tail -1)
-          echo "trading tests: $last"
+          rc=0
+          out=$(python -m pytest -q -o addopts= -p no:cacheprovider $paths 2>&1) || rc=$?
+          last=$(printf '%s\n' "$out" | tail -1)
+          echo "trading tests: $last (код $rc)"
+          if [ "$rc" -ne 0 ]; then printf '%s\n' "$out" | tail -40; exit 1; fi
           if echo "$last" | grep -qiE '\b(failed|errors?)\b'; then exit 1; fi
           n=$(echo "$last" | grep -oE '^[0-9]+ passed' | cut -d' ' -f1 || true)
           echo "trading tests passed: ${n:-0}"
+          # порог — нынешнее число тестов tests/test_trading_surface.py (не ниже 173); когда в main появится
+          # tests/trading/ (ветка claude/trading-core, ~656 тестов), поднять его до нового общего числа
           test "${n:-0}" -ge 173
       - name: Guard (защищённые файлы, домены, опасные вызовы, секреты) — скрипт из main, а не из ветки
         run: git show origin/main:scripts/guard.py > "$RUNNER_TEMP/guard.py" && python "$RUNNER_TEMP/guard.py" origin/main
