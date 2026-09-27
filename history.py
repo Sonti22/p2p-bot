@@ -1,6 +1,12 @@
-"""История спредов: SQLite data/history.db — лучший % по каждой паре площадок, раз в 5 минут
-(пишет scan_loop бота). Агрегации для /history: лучшее время суток и хитмап час×день недели за
-7 дней (МСК = UTC+3, без перехода на летнее время), медиана P2P против BestChange за окно 7-30 дней.
+"""История спредов: SQLite data/history.db — лучший % по каждой связке (площадка и монета покупки, площадка и
+монета продажи), раз в 5 минут (пишет scan_loop бота). Агрегации для /history — по паре площадок, как раньше
+(лучшая из монет пары в момент записи): лучшее время суток и хитмап час×день недели за 7 дней (МСК = UTC+3, без
+перехода на летнее время), медиана P2P против BestChange за окно 7-30 дней.
+
+Таблица signals (этап 1 «измерения») — эпизоды связок выше порога сигнала: связка непрерывно, скан за сканом,
+держится от порога — одна строка: первый и последний скан, сколько сканов, максимум прибыли, был ли сигнал (и когда)
+и, если не было, почему (последняя преграда: unconfirmed / max_signals / cooldown / quiet / trap / paused / unsent).
+Пишет бот после отправки сигналов (Bot.record_signals); доля «пропущенных» — signal_stats().
 """
 import os
 import sqlite3
@@ -25,6 +31,11 @@ def _connect(path):
     if "amount" not in cols:   # старая база без колонки — довносим её
         con.execute("ALTER TABLE history ADD COLUMN amount REAL")
     con.execute("CREATE INDEX IF NOT EXISTS idx_history_ts ON history (ts)")
+    con.execute("CREATE TABLE IF NOT EXISTS signals ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, buy_ex TEXT, buy_asset TEXT, sell_ex TEXT, sell_asset TEXT, "
+                "first_seen REAL, last_seen REAL, scans INTEGER, max_profit REAL, signalled INTEGER, signal_ts REAL, "
+                "reason_not_signalled TEXT, amount REAL, min_profit REAL)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_signals_last ON signals (last_seen)")
     return con
 
 
@@ -46,43 +57,113 @@ _last = {"t": 0.0}   # время последней записи — тротт
 
 
 def record(snap, amount=None, path=DB_PATH):
-    """Лучший % по каждой паре площадок (buy_ex, sell_ex) из snap.deals + ориентир snap.ref и
-    сумма круга (`amount`, cfg.amount на момент скана — от неё зависит сам % через комиссию вывода
+    """Лучший % по каждой связке (buy_ex, монета покупки, sell_ex, монета продажи) из snap.deals + ориентир
+    snap.ref и сумма круга (`amount`, cfg.amount на момент скана — от неё зависит сам % через комиссию вывода
     и глубину стакана), чтобы backtest() честно переводил исторический % в рубли той суммы, для
-    которой он был посчитан, а не текущей настройки. Не чаще раза в 5 минут; пустой снимок (нет
-    связок) кулдаун не расходует — запишем, как только связки появятся."""
+    которой он был посчитан, а не текущей настройки. Раньше писали одну строку на пару площадок (лучшую из
+    монет) — агрегации (_rows) по-прежнему берут лучшую из монет пары, старые записи читаются как были.
+    Не чаще раза в 5 минут; пустой снимок (нет связок) кулдаун не расходует — запишем, как только связки появятся."""
     now = time.time()
     if now - _last["t"] < THROTTLE or not snap.deals:
         return False
-    best = {}   # (buy_ex, sell_ex) -> (profit, asset_buy, asset_sell)
+    best = {}   # (buy_ex, asset_buy, sell_ex, asset_sell) -> profit
     for profit, b, s, _route in snap.deals:
-        key = (b.ex, s.ex)
-        if key not in best or profit > best[key][0]:
-            best[key] = (profit, b.asset, s.asset)
+        key = (b.ex, b.asset, s.ex, s.asset)
+        if key not in best or profit > best[key]:
+            best[key] = profit
     _insert([(now, buy_ex, sell_ex, ab, sa, profit, snap.ref, amount)
-            for (buy_ex, sell_ex), (profit, ab, sa) in best.items()], path)
+            for (buy_ex, ab, sell_ex, sa), profit in best.items()], path)
     _last["t"] = now
     return True
 
 
+SIGNAL_REASONS = ("unconfirmed", "max_signals", "cooldown", "quiet", "trap", "paused", "unsent")
+
+
+def track_signals(rows, ts, open_ids, amount=None, min_profit=None, path=DB_PATH):
+    """Эпизоды связок выше порога сигнала (таблица signals) по одному скану.
+    rows — [(ключ (buy_ex, монета, sell_ex, монета), прибыль %, сигнал ушёл в этом скане, причина или None)] — все
+    связки скана выше порога; ts — время скана. open_ids — {ключ: id строки} открытых эпизодов (хранит вызывающий,
+    после рестарта бота эпизоды начинаются заново): связка есть и в прошлом скане — дописываем её строку (последний
+    скан, максимум прибыли, сигнал; причина — последняя, у связки с сигналом — пусто), новой — новая строка; ключ,
+    которого в rows нет, выпал из-под порога — эпизод закрыт. Возвращает open_ids для следующего скана."""
+    out = {}
+    con = _connect(path)
+    try:
+        with con:
+            for key, profit, sent, reason in rows:
+                sent = 1 if sent else 0
+                reason = None if sent else reason
+                rid = open_ids.get(key)
+                if rid is not None:
+                    cur = con.execute(
+                        "UPDATE signals SET last_seen = ?, scans = scans + 1, max_profit = MAX(max_profit, ?), "
+                        "signal_ts = COALESCE(signal_ts, CASE WHEN ? THEN ? END), "
+                        "reason_not_signalled = CASE WHEN signalled OR ? THEN NULL ELSE ? END, "
+                        "signalled = MAX(signalled, ?) WHERE id = ?",
+                        (ts, profit, sent, ts, sent, reason, sent, rid))
+                    if cur.rowcount:
+                        out[key] = rid
+                        continue
+                cur = con.execute(
+                    "INSERT INTO signals (buy_ex, buy_asset, sell_ex, sell_asset, first_seen, last_seen, scans, "
+                    "max_profit, signalled, signal_ts, reason_not_signalled, amount, min_profit) "
+                    "VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)",
+                    (*key, ts, ts, profit, sent, ts if sent else None, reason, amount, min_profit))
+                out[key] = cur.lastrowid
+    finally:
+        con.close()
+    return out
+
+
+def signal_stats(path=DB_PATH, days=7, now=None, min_minutes=3):
+    """Сводка эпизодов signals за `days` дней: всего, с сигналом, «долгие» (держались ≥ min_minutes от первого до
+    последнего скана) и сколько из них прошло без сигнала — доля пропущенных связок (цель этапа 2 — ≤ 10%), и
+    причины пропуска. Эпизод, который ещё идёт, считается по уже увиденным сканам."""
+    now = time.time() if now is None else now
+    out = {"episodes": 0, "signalled": 0, "long": 0, "missed": 0, "missed_share": None, "reasons": {}}
+    if not os.path.exists(path):
+        return out
+    con = _connect(path)
+    rows = con.execute("SELECT first_seen, last_seen, signalled, reason_not_signalled FROM signals "
+                       "WHERE last_seen >= ?", (now - days * 86400,)).fetchall()
+    con.close()
+    for first, last, signalled, reason in rows:
+        out["episodes"] += 1
+        out["signalled"] += 1 if signalled else 0
+        if last - first < min_minutes * 60:
+            continue
+        out["long"] += 1
+        if not signalled:
+            out["missed"] += 1
+            out["reasons"][reason or "?"] = out["reasons"].get(reason or "?", 0) + 1
+    if out["long"]:
+        out["missed_share"] = out["missed"] / out["long"]
+    return out
+
+
 def cleanup(path=DB_PATH, now=None):
-    """Удалить записи старше 30 дней; возвращает число удалённых строк."""
+    """Удалить записи старше 30 дней (и эпизоды signals, закончившиеся раньше); возвращает число удалённых строк
+    истории."""
     if not os.path.exists(path):
         return 0
     now = time.time() if now is None else now
     con = _connect(path)
     with con:
         cur = con.execute("DELETE FROM history WHERE ts < ?", (now - RETENTION,))
+        con.execute("DELETE FROM signals WHERE last_seen < ?", (now - RETENTION,))
     con.close()
     return cur.rowcount
 
 
 def _rows(path, since):
+    """(ts, buy_ex, sell_ex, profit, amount) — лучшая из монет пары площадок на каждую запись (с ключом по монетам
+    у одной пары в одно время несколько строк; старые записи — по строке на пару)."""
     if not os.path.exists(path):
         return []
     con = _connect(path)
-    rows = con.execute("SELECT ts, buy_ex, sell_ex, profit, amount FROM history WHERE ts >= ? ORDER BY ts",
-                       (since,)).fetchall()
+    rows = con.execute("SELECT ts, buy_ex, sell_ex, MAX(profit), amount FROM history WHERE ts >= ? "
+                       "GROUP BY ts, buy_ex, sell_ex ORDER BY ts, buy_ex, sell_ex", (since,)).fetchall()
     con.close()
     return rows
 

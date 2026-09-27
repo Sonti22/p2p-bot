@@ -20,19 +20,106 @@ def reset(monkeypatch, t):
     return clock
 
 
-def test_record_writes_best_profit_per_exchange_pair(tmp_path, monkeypatch):
+def test_record_writes_best_profit_per_deal_key_with_coins(tmp_path, monkeypatch):
     db = str(tmp_path / "history.db")
     reset(monkeypatch, BASE)
     deals = [
         (3.0, make_ad("Bybit", "buy", 85.0), make_ad("MEXC", "sell", 90.0), "route1"),
         (5.0, make_ad("Bybit", "buy", 85.0), make_ad("MEXC", "sell", 92.0, asset="USDC"), "route2"),
         (2.0, make_ad("HTX", "buy", 80.0), make_ad("BestChange", "sell", 95.0), "route3"),
+        (1.0, make_ad("Bybit", "buy", 86.0), make_ad("MEXC", "sell", 89.0), "route4"),   # та же связка хуже
     ]
     assert history.record(snap(deals), path=db) is True
     con = sqlite3.connect(db)
-    rows = con.execute("SELECT buy_ex, sell_ex, profit, ref FROM history ORDER BY sell_ex").fetchall()
+    rows = con.execute("SELECT buy_ex, asset_buy, sell_ex, asset_sell, profit, ref FROM history "
+                       "ORDER BY sell_ex, asset_sell").fetchall()
     con.close()
-    assert rows == [("HTX", "BestChange", 2.0, 88.0), ("Bybit", "MEXC", 5.0, 88.0)]   # выбран лучший из пары
+    assert rows == [("HTX", "USDT", "BestChange", "USDT", 2.0, 88.0), ("Bybit", "USDT", "MEXC", "USDC", 5.0, 88.0),
+                    ("Bybit", "USDT", "MEXC", "USDT", 3.0, 88.0)]                    # лучший на каждую связку
+
+
+def test_aggregations_take_best_coin_per_exchange_pair(tmp_path, monkeypatch):
+    """Строк на пару площадок в одну запись теперь несколько (по монетам) — агрегации считают, как раньше, по лучшей."""
+    db = str(tmp_path / "history.db")
+    reset(monkeypatch, BASE)
+    deals = [(3.0, make_ad("Bybit", "buy", 85.0), make_ad("MEXC", "sell", 90.0), "r"),
+             (5.0, make_ad("Bybit", "buy", 85.0), make_ad("MEXC", "sell", 92.0, asset="USDC"), "r")]
+    assert history.record(snap(deals), 50000, path=db) is True
+    history._insert([(BASE - 3600, "Bybit", "MEXC", "USDT", "USDT", 1.0, 88.0)], db)   # старая запись: пара одной строкой
+    assert history.hourly_avg(path=db, now=BASE + 60)[10] == 5.0
+    assert history.hourly_avg(path=db, now=BASE + 60)[9] == 1.0
+    bt = history.backtest(2.0, 50000, path=db, now=BASE + 60)[7]
+    assert [(r["buy_ex"], r["sell_ex"], r["hits"], r["total"], r["avg"]) for r in bt] == [("Bybit", "MEXC", 1, 2, 5.0)]
+    _labels, p2p_med, _bc = history.median_vs_bestchange(path=db, now=BASE + 60)
+    assert p2p_med == [3.0]                                                          # медиана из 1.0 и 5.0
+
+
+# --- signals: эпизоды связок выше порога ---
+
+K1 = ("Bybit", "USDT", "MEXC", "USDT")
+K2 = ("HTX", "USDT", "BestChange", "USDT")
+
+
+def _signals(db):
+    con = sqlite3.connect(db)
+    rows = con.execute("SELECT buy_ex, buy_asset, sell_ex, sell_asset, first_seen, last_seen, scans, max_profit, "
+                       "signalled, signal_ts, reason_not_signalled, amount, min_profit FROM signals ORDER BY id").fetchall()
+    con.close()
+    return rows
+
+
+def test_track_signals_episode_lifecycle(tmp_path):
+    db = str(tmp_path / "history.db")
+    open_ids = history.track_signals([(K1, 1.5, False, "unconfirmed"), (K2, 2.0, False, "max_signals")], 100.0, {},
+                                     amount=50000, min_profit=1.0, path=db)
+    assert set(open_ids) == {K1, K2}
+    open_ids = history.track_signals([(K1, 2.5, True, None), (K2, 1.8, False, "cooldown")], 120.0, open_ids,
+                                     amount=50000, min_profit=1.0, path=db)
+    open_ids = history.track_signals([(K1, 2.0, False, "cooldown")], 140.0, open_ids, amount=50000, min_profit=1.0,
+                                     path=db)
+    assert set(open_ids) == {K1}                                                     # K2 ушла под порог — эпизод закрыт
+    rows = _signals(db)
+    assert rows == [(*K1, 100.0, 140.0, 3, 2.5, 1, 120.0, None, 50000.0, 1.0),     # сигнал был — причины нет
+                    (*K2, 100.0, 120.0, 2, 2.0, 0, None, "cooldown", 50000.0, 1.0)]   # последняя преграда
+    history.track_signals([(K2, 1.1, False, "quiet")], 160.0, open_ids, path=db)     # вернулась — новый эпизод
+    rows = _signals(db)
+    assert len(rows) == 3 and rows[2][:7] == (*K2, 160.0, 160.0, 1) and rows[2][10] == "quiet"
+
+
+def test_track_signals_row_gone_starts_new_episode(tmp_path):
+    db = str(tmp_path / "history.db")
+    open_ids = history.track_signals([(K1, 1.5, False, "unconfirmed")], 100.0, {}, path=db)
+    history.cleanup(path=db, now=100.0 + history.RETENTION + 1)                     # строку удалила очистка
+    open_ids = history.track_signals([(K1, 1.7, True, None)], 120.0, open_ids, path=db)
+    rows = _signals(db)
+    assert len(rows) == 1 and rows[0][4:11] == (120.0, 120.0, 1, 1.7, 1, 120.0, None)
+
+
+def test_cleanup_drops_old_signal_episodes(tmp_path):
+    db = str(tmp_path / "history.db")
+    now = BASE + 40 * 86400
+    history.track_signals([(K1, 1.5, False, "paused")], now - 31 * 86400, {}, path=db)
+    history.track_signals([(K2, 1.5, False, "paused")], now - 1 * 86400, {}, path=db)
+    history.cleanup(path=db, now=now)
+    assert [r[:4] for r in _signals(db)] == [K2]
+
+
+def test_signal_stats_missed_share(tmp_path):
+    db = str(tmp_path / "history.db")
+    now = BASE
+    ids = {}
+    # K1: 5 минут выше порога, сигнал был; K2: 5 минут без сигнала (кулдаун) — пропуск; k3: минута — не в счёт
+    k3 = ("KuCoin", "USDT", "MEXC", "USDT")
+    ids = history.track_signals([(K1, 1.5, False, "unconfirmed"), (K2, 2.0, False, "unconfirmed"),
+                                 (k3, 1.2, False, "unconfirmed")], now - 300, ids, path=db)
+    ids = history.track_signals([(K1, 1.6, True, None), (K2, 2.0, False, "cooldown"), (k3, 1.2, False, "unconfirmed")],
+                                now - 240, ids, path=db)
+    ids = history.track_signals([(K1, 1.6, False, "cooldown"), (K2, 2.1, False, "cooldown")], now, ids, path=db)
+    st = history.signal_stats(path=db, now=now)
+    assert st == {"episodes": 3, "signalled": 1, "long": 2, "missed": 1, "missed_share": 0.5,
+                  "reasons": {"cooldown": 1}}
+    empty = history.signal_stats(path=str(tmp_path / "none.db"), now=now)
+    assert empty["episodes"] == 0 and empty["missed_share"] is None
 
 
 def test_record_stores_amount_next_to_profit(tmp_path, monkeypatch):
