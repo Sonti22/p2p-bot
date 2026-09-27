@@ -100,7 +100,7 @@ def test_export_csv_columns_and_rows(tmp_path):
     trades.write_export_csv(rows, path=out)
     header, first, second = read_csv(out)
     assert header == list(trades.EXPORT_COLUMNS) + ["Маршрут"]
-    assert first == ["2026-09-10 12:30", "Bybit", "USDT", "MEXC", "USDT", "50000,00", "3,00", "2,00", "1000,00",
+    assert first == ["2026-09-10 12:30", "Bybit", "USDT", "MEXC", "USDT", "50000,00", "3,00", "2,00", "1000,00", "",
                      "Т-Банк", "внутри банка", "перевод −0.2 USDT (BEP20) на MEXC"]   # запятая — числа в русском Excel
     assert second[:9] == ["2026-09-11 08:05", "HTX", "USDT", "Bybit", "USDT", "20000,00", "1,50", "", ""]
 
@@ -124,11 +124,63 @@ def test_export_csv_includes_merchant_nicks_when_columns_exist(tmp_path):
 
 def test_export_summary_numbers():
     rows = [{"amount": 50000.0, "fact": 2.0}, {"amount": 30000.0, "fact": -0.5}, {"amount": 20000.0, "fact": None}]
-    assert trades.export_summary(rows) == {"count": 3, "amount": 100000.0, "result": 850.0, "no_fact": 1}
-    assert trades.export_summary([]) == {"count": 0, "amount": 0, "result": 0, "no_fact": 0}
+    assert trades.export_summary(rows) == {"count": 3, "amount": 100000.0, "result": 850.0, "no_fact": 1,
+                                           "estimated": 0}
+    assert trades.export_summary([]) == {"count": 0, "amount": 0, "result": 0, "no_fact": 0, "estimated": 0}
+
+
+def _log_sourced(ts, amount, fact, source, path=None, **kw):
+    """Сделка с фактом и его источником (trades.fact_source): plan / plan± / manual / auto, None — до колонки."""
+    extra = {"path": path} if path else {}
+    trade_id, *_ = trades.log_trade(deal(**kw), amount, ts=ts, **extra)
+    trades.set_fact(trade_id, fact, source=source, **extra)
+    return trade_id
+
+
+def test_export_csv_marks_plan_estimate_not_as_fact(tmp_path):
+    """«как расчёт»/«±0.5 п.п.» — оценка: в CSV не в «Факт, %» и не в «Результат по факту, ₽», а в своей колонке."""
+    db, out = str(tmp_path / "trades.db"), str(tmp_path / "export.csv")
+    _log_sourced(msk(2026, 9, 10, 10, 0), 50000, 3.0, trades.FACT_PLAN, path=db)          # расчёт был 3.0
+    _log_sourced(msk(2026, 9, 10, 11, 0), 50000, 2.5, trades.FACT_PLAN_SHIFT, path=db)
+    _log_sourced(msk(2026, 9, 10, 12, 0), 40000, 1.5, trades.FACT_MANUAL, path=db)
+    _log_sourced(msk(2026, 9, 10, 13, 0), 20000, 2.0, trades.FACT_AUTO, path=db)
+    _log_sourced(msk(2026, 9, 10, 14, 0), 10000, 1.0, None, path=db)                      # факт до колонки источника
+    log(msk(2026, 9, 10, 15, 0), 10000, path=db)                                          # без факта
+    trades.write_export_csv(trades.export_rows(0, path=db), path=out)
+    header, *rows = read_csv(out)
+    col = {name: header.index(name) for name in ("Факт, %", "Результат по факту, ₽", "Оценка (не факт), %")}
+    got = [(r[col["Факт, %"]], r[col["Результат по факту, ₽"]], r[col["Оценка (не факт), %"]]) for r in rows]
+    assert got == [("", "", "3,00"), ("", "", "2,50"),
+                   ("1,50", "600,00", ""), ("2,00", "400,00", ""), ("1,00", "100,00", ""), ("", "", "")]
+
+
+def test_export_summary_does_not_count_estimates_as_fact():
+    rows = [{"amount": 50000.0, "fact": 2.0, "fact_source": "manual"},
+            {"amount": 30000.0, "fact": 3.0, "fact_source": trades.FACT_PLAN},
+            {"amount": 20000.0, "fact": 2.5, "fact_source": trades.FACT_PLAN_SHIFT},
+            {"amount": 10000.0, "fact": 1.0, "fact_source": None},
+            {"amount": 10000.0, "fact": None, "fact_source": None}]
+    assert trades.export_summary(rows) == {"count": 5, "amount": 120000.0, "result": 1100.0, "no_fact": 3,
+                                           "estimated": 2}
+    assert trades.is_estimate(rows[1]) and trades.is_estimate(rows[2])
+    assert not any(trades.is_estimate(r) for r in (rows[0], rows[3], rows[4]))
+    assert trades.fact_rub(rows[1]) is None and trades.fact_rub(rows[0]) == 1000.0
 
 
 # --- /export: команда бота ---
+
+def test_export_command_marks_estimates():
+    month = trades.period_start("month")
+    log(month + 60, 50000, fact=2.0)                                  # введён числом до колонки источника
+    _log_sourced(month + 120, 30000, 3.0, trades.FACT_PLAN)           # «как расчёт»
+    bot = Stub(p2p.Config())
+    asyncio.run(bot.handle("/export"))
+    header, *rows = read_csv(docs(bot)[-1]["path"])
+    est = header.index("Оценка (не факт), %")
+    assert [r[est] for r in rows] == ["", "3,00"] and rows[1][header.index("Факт, %")] == ""
+    text = texts(bot)[-1]
+    assert "Результат по факту: +1 000 ₽" in text                      # оценка +900 ₽ в результат не вошла
+    assert "Без факта: 1 из 2" in text and "Из них 1 — с оценкой «как расчёт» (не факт)" in text
 
 def test_export_command_sends_csv_then_summary():
     month = trades.period_start("month")
