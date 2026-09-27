@@ -738,3 +738,78 @@ def test_implausible_rate_through_bot_shows_reason_and_no_send_button():
     run(go())
     assert _texts(bot)[-1].startswith("⛔ Выплата не готова: курс BTC к USDT неправдоподобен (1.000E-30)")
     assert bot.payout_preview is None and not s.posts() and payouts.history() == []
+
+
+# --- неправдоподобная комиссия Cryptomus: отказ с причиной, а не исключение ---
+
+FEE_REASON = "Cryptomus не отдал правдоподобную комиссию"
+
+
+def _services(*items):
+    return Resp(200, {"state": 0, "result": list(items)})
+
+
+@pytest.mark.parametrize("fee,pct,shown", [
+    ("1e30", "0", "fee_amount 1.000E+30, percent 0"), ("1e1000000", "0", "fee_amount 1.000E+1000000, percent 0"),
+    ("1", "1e30", "fee_amount 1, percent 1.000E+30"), ("1", "1e1000000", "fee_amount 1, percent 1.000E+1000000"),
+    ("NaN", "0", "fee_amount ?, percent 0"), ("Infinity", "0", "fee_amount ?, percent 0"),
+    ("-1", "0", "fee_amount -1, percent 0"), ("1", "-0.5", "fee_amount 1, percent -0.5"),
+    ("abc", "0", "fee_amount ?, percent 0"), (None, "0", "fee_amount ?, percent 0"),
+    ([1], "0", "fee_amount ?, percent 0"), ({"x": 1}, "0", "fee_amount ?, percent 0"),
+    (True, "0", "fee_amount ?, percent 0"), ("1", "много", "fee_amount 1, percent ?")])
+def test_absurd_fee_in_preview_is_a_refusal_not_a_crash(fee, pct, shown):
+    """Комиссия из /v1/payout/services — не число, NaN, отрицательная или такая, что расчёт не помещается в Decimal
+    (quantize раньше бросал InvalidOperation из quote): отказ с причиной и значениями, коротко; ничего не записано."""
+    s = Session(routes({SERVICES: _services(svc("USDT", "TRON", fee=fee, pct=pct))}))
+    q, why = run(payouts.quote(s, entry("w1"), Decimal("25")))
+    assert q is None and why == f"{FEE_REASON} ({shown}) — лимит не проверить, выплату не отправляю"
+    assert len(why) < 200 and not s.posts() and payouts.history() == [] and payouts.used_today() == 0
+
+
+@pytest.mark.parametrize("fee,pct", [("1e30", "0"), ("1", "1e1000000"), ("NaN", "0"), ("-1", "0"), ("abc", "0")])
+def test_absurd_fee_at_send_refused_before_post_and_counts_nothing(fee, pct):
+    """Предпросмотр с нормальной комиссией, к отправке Cryptomus отдаёт неправдоподобную — отказ до POST (раньше
+    1e30 бросал исключение из send, и бот писал «сбой»); после этого выплата с нормальной комиссией идёт."""
+    s = Session(routes())
+    q = quote(s, "w1", "25")
+    s.routes[SERVICES] = _services(svc("USDT", "TRON", fee=fee, pct=pct))
+    res = run(payouts.send(s, entry("w1"), Decimal("25"), q))
+    assert res["state"] == "refused" and res["reason"].startswith(FEE_REASON)
+    assert not s.posts() and payouts.history() == [] and payouts.used_today() == 0
+    s.routes[SERVICES] = _services(*SERVICE_LIST)
+    assert run(payouts.send(s, entry("w1"), Decimal("25"), q))["state"] == "sent" and len(s.posts()) == 1
+
+
+@pytest.mark.parametrize("limit,commission,reason", [
+    ("abc", {"fee_amount": "1", "percent": "0"}, "не отдал лимиты"),
+    ([1, 2], {"fee_amount": "1", "percent": "0"}, "не отдал лимиты"),
+    ({"min_amount": "NaN", "max_amount": "100000"}, {"fee_amount": "1", "percent": "0"}, "не отдал лимиты"),
+    ({"min_amount": "1", "max_amount": "100000"}, "abc", FEE_REASON),
+    ({"min_amount": "1", "max_amount": "100000"}, [1], FEE_REASON),
+    ({"min_amount": "1", "max_amount": "100000"}, None, FEE_REASON)])
+def test_garbage_limit_or_commission_objects_refused_without_crash(limit, commission, reason):
+    """limit/commission не словарь (строка, список) — раньше AttributeError на .get; теперь отказ с причиной."""
+    service = {"network": "TRON", "currency": "USDT", "is_available": True, "limit": limit, "commission": commission}
+    s = Session(routes({SERVICES: _services(service)}))
+    q, why = run(payouts.quote(s, entry("w1"), Decimal("25")))
+    assert q is None and reason in why and payouts.history() == []
+
+
+def test_huge_but_countable_fee_is_stopped_by_limits():
+    """Огромная, но считаемая комиссия (1e15 USDT) не проходит мимо лимитов: списание = сумма + комиссия."""
+    s = Session(routes({SERVICES: _services(svc("USDT", "TRON", fee="1e15"))}))
+    q, why = run(payouts.quote(s, entry("w1"), Decimal("25")))
+    assert q is None and "больше лимита одной выплаты" in why and payouts.history() == []
+
+
+def test_absurd_fee_through_bot_shows_reason_and_no_send_button():
+    s = Session(routes({SERVICES: _services(svc("USDT", "TRON", fee="1e30"))}))
+    bot = owner(s)
+
+    async def go():
+        await bot.on_update(_msg(1, "/payout"))
+        await bot.on_update(_cb(1, "pay_to:w1"))
+        await bot.on_update(_msg(1, "25"))
+    run(go())
+    assert _texts(bot)[-1].startswith(f"⛔ Выплата не готова: {FEE_REASON} (fee_amount 1.000E+30, percent 0)")
+    assert bot.payout_preview is None and not s.posts() and payouts.history() == []

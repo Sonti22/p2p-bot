@@ -542,19 +542,30 @@ async def service(s, creds, entry):
 
 def service_fee(svc, entry, amount):
     """Комиссия по сервису: (fee, None) или (None, причина) — сервис выключен, сумма вне мин/макс, нет данных.
-    fee = fee_amount + amount × percent / 100 с округлением вверх (итоговую комиссию Cryptomus опросом не узнать)."""
+    fee = fee_amount + amount × percent / 100 с округлением вверх (итоговую комиссию Cryptomus опросом не узнать).
+    Комиссия не число, NaN, отрицательная или такая, что расчёт не помещается в Decimal (Cryptomus отдал, скажем,
+    fee_amount "1e30"), — отказ с причиной, а не исключение посреди предпросмотра или отправки."""
     if not _true(svc.get("is_available")):
         return None, f"Cryptomus сейчас не выплачивает {entry['currency']} в сети {entry['network']}"
-    lim, comm = svc.get("limit") or {}, svc.get("commission") or {}
+    lim, comm = svc.get("limit"), svc.get("commission")
+    lim, comm = lim if isinstance(lim, dict) else {}, comm if isinstance(comm, dict) else {}
     lo, hi = _dec(lim.get("min_amount")), _dec(lim.get("max_amount"))
+    if None in (lo, hi):
+        return None, "Cryptomus не отдал лимиты выплаты — выплата не посчитана"
     fixed, pct = _dec(comm.get("fee_amount")), _dec(comm.get("percent"))
-    if None in (lo, hi, fixed, pct) or fixed < 0 or pct < 0:
-        return None, "Cryptomus не отдал лимиты или комиссию — выплата не посчитана"
+    shown = [_rate_text(v) if v is not None else "?" for v in (fixed, pct)]
+    bad = (f"Cryptomus не отдал правдоподобную комиссию (fee_amount {shown[0]}, percent {shown[1]}) — лимит не "
+           f"проверить, выплату не отправляю")
+    if None in (fixed, pct) or fixed < 0 or pct < 0:
+        return None, bad
     if amount < lo:
         return None, f"меньше минимума Cryptomus: {fmt(lo)} {entry['currency']}"
     if amount > hi:
         return None, f"больше максимума Cryptomus: {fmt(hi)} {entry['currency']}"
-    return (fixed + amount * pct / 100).quantize(QUANT, rounding=ROUND_UP), None
+    try:
+        return (fixed + amount * pct / 100).quantize(QUANT, rounding=ROUND_UP), None
+    except DecimalException:
+        return None, bad
 
 
 # --- журнал ---
