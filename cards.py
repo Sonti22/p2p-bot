@@ -9,7 +9,7 @@ import time
 
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
-from p2p import _money, _price, route_actions, sell_step_number, terms_flags
+from p2p import TRAP, _money, _price, reliability, route_actions, sell_step_number, terms_flags
 
 FONT_DIR = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts")
 BG, PANEL, BORDER = "#0F1419", "#18212C", "#2A3441"
@@ -234,8 +234,10 @@ def top_chart(snap, cfg, n=8):
     bar_x0, bar_x1 = 560, 930
     for i, (profit, b, s, route) in enumerate(deals):
         y = 172 + i * 84
-        d.text((40, y), _fit(f"{i + 1}. {b.ex} {b.asset} → {s.ex} {s.asset}", _font(26, "semi"), 500),
-               font=_font(26, "semi"), fill=TEXT)
+        # «🪤 ловушка» в топе видна, но сигналом не приходит (SIGNAL_TRAPS) — помечаем строку красным
+        trap = reliability(deals[i], cfg, snap)[0] == TRAP
+        title = f"{i + 1}. {'ЛОВУШКА · ' if trap else ''}{b.ex} {b.asset} → {s.ex} {s.asset}"
+        d.text((40, y), _fit(title, _font(26, "semi"), 500), font=_font(26, "semi"), fill=RED if trap else TEXT)
         d.text((64, y + 36), _fit(route, _font(19), 476), font=_font(19), fill=MUTED)
         color = AMBER if profit >= 5 else GREEN if profit >= 2 else BLUE if profit > 0 else RED
         length = max(8, (bar_x1 - bar_x0) * max(profit, 0) / top)

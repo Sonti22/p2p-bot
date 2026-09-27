@@ -3,6 +3,9 @@ import datetime
 import sqlite3
 import time
 
+import pytest
+
+import p2p
 import trades
 from helpers import make_ad
 
@@ -52,7 +55,7 @@ def test_stats_month_is_calendar_month_not_rolling_30_days(tmp_path):
 def test_stats_empty_db_missing_file(tmp_path):
     st = trades.stats(path=str(tmp_path / "none.db"))
     assert all(s == {"count": 0, "amount": 0.0, "avg_profit": 0.0,
-                     "fact_count": 0, "avg_fact": None, "avg_diff": None} for s in st.values())
+                     "fact_count": 0, "avg_fact": None, "avg_diff": None, "plan_facts": 0} for s in st.values())
 
 
 def test_bank_of_knows_names_from_all_venues():
@@ -202,81 +205,169 @@ def test_unmatched_missing_db_is_empty_list(tmp_path):
     assert trades.unmatched(path=str(tmp_path / "none.db")) == []
 
 
-def _trade_row(ts, buy_ex="Bybit", sell_ex="MEXC", asset="USDT", amount=50000.0, profit=2.0):
-    return {"id": 1, "ts": ts, "buy_ex": buy_ex, "buy_asset": asset, "sell_ex": sell_ex, "sell_asset": asset,
-            "amount": amount, "profit": profit}
+def _trade_row(ts, buy_ex="Bybit", sell_ex="Bybit", asset="USDT", amount=50000.0, profit=2.0, route="внутри биржи",
+               sell_asset=None):
+    return {"id": 1, "ts": ts, "buy_ex": buy_ex, "buy_asset": asset, "sell_ex": sell_ex,
+            "sell_asset": sell_asset or asset, "amount": amount, "profit": profit, "route": route}
 
 
-def test_match_fact_computes_realized_spread_from_both_legs():
+def leg(side, amount, price, ts, asset="USDT"):
+    """Запись истории как у accounts.bybit_p2p_orders: P2P-ордер, цена в ₽, есть fiat, нет kind."""
+    return {"id": f"{side}{ts}", "side": side, "asset": asset, "fiat": "RUB", "amount": amount, "price": price, "ts": ts}
+
+
+def test_match_fact_computes_result_from_both_p2p_legs():
     now = time.time()
-    trade = _trade_row(now, amount=50000.0)
-    hist_by_ex = {
-        "bybit": [{"kind": "trade", "asset": "USDT", "side": "buy", "amount": 588.24, "price": 85.0, "ts": now}],
-        "mexc": [{"kind": "trade", "asset": "USDT", "side": "sell", "amount": 588.24, "price": 90.0, "ts": now + 60}],
-    }
+    trade = _trade_row(now, amount=50000.0)                        # Bybit → Bybit, «внутри биржи»: издержек нет
+    hist_by_ex = {"bybit": [leg("buy", 588.24, 85.0, now), leg("sell", 588.24, 90.0, now + 60)]}
+    assert trades.match_fact(trade, hist_by_ex) == pytest.approx((90.0 / 85.0 - 1) * 100)
+
+
+def test_match_fact_is_net_of_bank_fee_and_withdrawal_the_plan_used():
+    now = time.time()
+    route = "комиссия банка −0.5% → перевод −1 USDT (TRC20) на HTX → запас на курс −0.3%"
+    trade = _trade_row(now, sell_ex="HTX", route=route)
+    # будь у площадки продажи в истории P2P-ордера — вычитаются вывод 1 USDT и 0.5% банка, запас на курс — нет
+    hist_by_ex = {"bybit": [leg("buy", 585.3, 85.0, now)], "htx": [leg("sell", 584.3, 90.0, now + 900)]}
     fact = trades.match_fact(trade, hist_by_ex)
-    assert fact == (90.0 / 85.0 - 1) * 100
+    assert fact == pytest.approx(((585.3 - 1) * 90.0 / (585.3 * 85.0 / 0.995) - 1) * 100)
+    assert fact < (90.0 / 85.0 - 1) * 100 - 0.5                     # меньше валового спреда на издержки
+
+
+def test_match_fact_at_plan_prices_equals_plan_profit():
+    """Факт по ордерам ровно по ценам и объёму расчёта (без запаса на курс) совпадает с чистым расчётом p2p._route —
+    те же комиссия банка и вывод, разобранные из строки маршрута."""
+    cfg = p2p.Config(pay_fee=0.5, risk_buffer={})
+    b, s = make_ad("MEXC", "buy", 85.0), make_ad("Bybit", "sell", 90.0)
+    profit, route = p2p._route(b, s, cfg, {"MEXC": {"USDT": (1.0, 1.0)}, "Bybit": {"USDT": (1.0, 1.0)}})
+    bank, fees = trades.route_costs(route)
+    assert bank == 0.5 and fees.get("USDT", 0) > 0                  # в маршруте есть и комиссия банка, и вывод
+    now = time.time()
+    qty = cfg.amount * (1 - bank / 100) / b.price
+    trade = _trade_row(now, buy_ex="MEXC", route=route, profit=profit)
+    hist_by_ex = {"mexc": [leg("buy", qty, b.price, now)],
+                  "bybit": [leg("sell", qty - fees["USDT"], s.price, now + 600)]}
+    assert trades.match_fact(trade, hist_by_ex) == pytest.approx(profit)
+
+
+def test_route_costs_parses_route_labels():
+    assert trades.route_costs("внутри биржи") == (0.0, {})
+    assert trades.route_costs("перевод USDT без комиссии (TON) на MEXC") == (0.0, {})
+    assert trades.route_costs("комиссия банка −0.5% (лимит СБП Т-Банк исчерпан) → через Bybit: перевод −0.8 USDT "
+                              "(TRC20) ×2 → запас на курс −0.3%") == (0.5, {"USDT": 0.8})
+    assert trades.route_costs("перевод −5e-05 BTC (BTC) на MEXC") == (0.0, {"BTC": 5e-05})
+    assert trades.route_costs(None) == (0.0, {})
+
+
+def test_match_fact_spot_trades_of_other_venues_are_not_p2p_legs():
+    """У MEXC/KuCoin в истории спот-сделки (kind=trade, цена к USDT) — ногой P2P-продажи за рубли они не бывают;
+    раньше такая запись «сопоставлялась» и давала выдуманный факт."""
+    now = time.time()
+    trade = _trade_row(now, sell_ex="MEXC")
+    hist_by_ex = {"bybit": [leg("buy", 588.24, 85.0, now)],
+                  "mexc": [{"kind": "trade", "asset": "USDT", "side": "sell", "amount": 588.24, "price": 90.0,
+                            "ts": now + 60}]}
+    assert trades.match_fact(trade, hist_by_ex) is None
+
+
+def test_match_fact_cross_asset_trade_stays_unmatched():
+    now = time.time()
+    trade = _trade_row(now, sell_asset="ETH", route="спот USDT→ETH на Bybit (−0.1%)")
+    hist_by_ex = {"bybit": [leg("buy", 588.24, 85.0, now), leg("sell", 0.2, 250000.0, now + 60, asset="ETH")]}
+    assert trades.match_fact(trade, hist_by_ex) is None             # валового % между разными монетами нет
+
+
+def test_match_fact_none_when_withdrawal_eats_the_coin():
+    now = time.time()
+    trade = _trade_row(now, sell_ex="HTX", route="перевод −600 USDT (TRC20) на HTX")
+    hist_by_ex = {"bybit": [leg("buy", 588.24, 85.0, now)], "htx": [leg("sell", 588.24, 90.0, now)]}
+    assert trades.match_fact(trade, hist_by_ex) is None
 
 
 def test_match_fact_none_when_exchange_history_not_fetched_this_poll():
-    trade = _trade_row(time.time())
+    trade = _trade_row(time.time(), sell_ex="MEXC")
     assert trades.match_fact(trade, {"mexc": []}) is None        # bybit не опрашивался в этом цикле
 
 
 def test_match_fact_none_when_asset_or_side_does_not_match():
     now = time.time()
     trade = _trade_row(now)
-    hist_by_ex = {
-        "bybit": [{"asset": "BTC", "side": "buy", "amount": 1.0, "price": 85.0, "ts": now}],   # не та монета
-        "mexc": [{"asset": "USDT", "side": "buy", "amount": 588.24, "price": 90.0, "ts": now}],  # не та сторона
-    }
+    hist_by_ex = {"bybit": [leg("buy", 1.0, 85.0, now, asset="BTC"),    # не та монета
+                            leg("buy", 588.24, 90.0, now)]}             # продажи нет — только вторая покупка
     assert trades.match_fact(trade, hist_by_ex) is None
 
 
 def test_match_fact_ignores_deposit_without_price():
     now = time.time()
     trade = _trade_row(now)
-    hist_by_ex = {
-        "bybit": [{"kind": "deposit", "asset": "USDT", "amount": 588.24, "ts": now}],  # нет цены — не факт
-        "mexc": [{"kind": "trade", "asset": "USDT", "side": "sell", "amount": 588.24, "price": 90.0, "ts": now}],
-    }
+    hist_by_ex = {"bybit": [{"kind": "deposit", "asset": "USDT", "amount": 588.24, "ts": now},   # нет цены — не факт
+                            leg("sell", 588.24, 90.0, now)]}
     assert trades.match_fact(trade, hist_by_ex) is None
 
 
 def test_match_fact_none_outside_time_window():
     now = time.time()
     trade = _trade_row(now)
-    hist_by_ex = {
-        "bybit": [{"asset": "USDT", "side": "buy", "amount": 588.24, "price": 85.0,
-                   "ts": now - trades.AUTO_MATCH_WINDOW - 60}],
-        "mexc": [{"asset": "USDT", "side": "sell", "amount": 588.24, "price": 90.0, "ts": now}],
-    }
+    hist_by_ex = {"bybit": [leg("buy", 588.24, 85.0, now - trades.AUTO_MATCH_WINDOW - 60),
+                            leg("sell", 588.24, 90.0, now)]}
     assert trades.match_fact(trade, hist_by_ex) is None
 
 
 def test_match_fact_none_when_fiat_amount_too_different():
     now = time.time()
     trade = _trade_row(now, amount=50000.0)
-    hist_by_ex = {
-        # 10 USDT * 85 ₽ = 850 ₽ — совсем не похоже на круг в 50 000 ₽
-        "bybit": [{"asset": "USDT", "side": "buy", "amount": 10.0, "price": 85.0, "ts": now}],
-        "mexc": [{"asset": "USDT", "side": "sell", "amount": 588.24, "price": 90.0, "ts": now}],
-    }
+    # 10 USDT * 85 ₽ = 850 ₽ — совсем не похоже на круг в 50 000 ₽
+    hist_by_ex = {"bybit": [leg("buy", 10.0, 85.0, now), leg("sell", 588.24, 90.0, now)]}
     assert trades.match_fact(trade, hist_by_ex) is None
 
 
 def test_match_fact_picks_closest_candidate_by_time():
     now = time.time()
     trade = _trade_row(now, amount=50000.0)
-    hist_by_ex = {
-        "bybit": [
-            {"asset": "USDT", "side": "buy", "amount": 588.24, "price": 84.0, "ts": now - 600},   # дальше
-            {"asset": "USDT", "side": "buy", "amount": 588.24, "price": 85.0, "ts": now + 30},     # ближе
-        ],
-        "mexc": [{"asset": "USDT", "side": "sell", "amount": 588.24, "price": 90.0, "ts": now}],
-    }
-    fact = trades.match_fact(trade, hist_by_ex)
-    assert fact == (90.0 / 85.0 - 1) * 100
+    hist_by_ex = {"bybit": [leg("buy", 588.24, 84.0, now - 600),   # дальше
+                            leg("buy", 588.24, 85.0, now + 30),    # ближе
+                            leg("sell", 588.24, 90.0, now)]}
+    assert trades.match_fact(trade, hist_by_ex) == pytest.approx((90.0 / 85.0 - 1) * 100)
+
+
+def _fact_row(db, trade_id):
+    con = sqlite3.connect(db)
+    row = con.execute("SELECT fact, fact_source FROM trades WHERE id = ?", (trade_id,)).fetchone()
+    con.close()
+    return row
+
+
+def test_old_db_gets_fact_source_column_and_old_facts_stay_counted(tmp_path):
+    db = str(tmp_path / "trades.db")
+    con = sqlite3.connect(db)   # журнал прошлой версии: без fact_source
+    con.execute("CREATE TABLE trades (id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, route TEXT, buy_ex TEXT, "
+                "buy_asset TEXT, sell_ex TEXT, sell_asset TEXT, amount REAL, profit REAL, bank TEXT DEFAULT '', "
+                "fact REAL DEFAULT NULL, kind TEXT DEFAULT '', buy_nick TEXT DEFAULT '', sell_nick TEXT DEFAULT '')")
+    con.execute("INSERT INTO trades (ts, route, buy_ex, buy_asset, sell_ex, sell_asset, amount, profit, fact) "
+                "VALUES (?, 'r', 'Bybit', 'USDT', 'MEXC', 'USDT', 10000, 2.0, 1.5)", (time.time(),))
+    con.commit()
+    con.close()
+    st = trades.stats(path=db)["day"]
+    assert st["fact_count"] == 1 and st["avg_fact"] == 1.5 and st["plan_facts"] == 0   # откуда факт — неизвестно
+    assert _fact_row(db, 1) == (1.5, None)
+
+
+def test_plan_facts_are_excluded_from_calibration(tmp_path):
+    db = str(tmp_path / "trades.db")
+    now = time.time()
+    ids = [trades.log_trade(deal(2.0), 50000, path=db, ts=now)[0] for _ in range(5)]
+    trades.set_fact(ids[0], 2.0, path=db, source=trades.FACT_PLAN)          # «как расчёт»
+    trades.set_fact(ids[1], 2.5, path=db, source=trades.FACT_PLAN_SHIFT)    # «+0.5 п.п.»
+    trades.set_fact(ids[2], 1.0, path=db, source=trades.FACT_MANUAL)
+    trades.set_fact(ids[3], 0.0, path=db, source=trades.FACT_AUTO)
+    assert _fact_row(db, ids[0]) == (2.0, "plan") and _fact_row(db, ids[1]) == (2.5, "plan±")
+    st = trades.stats(path=db, now=now)["day"]
+    assert st["count"] == 5 and st["fact_count"] == 2 and st["plan_facts"] == 2
+    assert st["avg_fact"] == 0.5 and st["avg_diff"] == -1.5              # только manual и auto
+    assert trades.facts_by_pair(path=db) == {("Bybit", "USDT", "MEXC", "USDT"): {"count": 2, "avg_fact": 0.5}}
+    # автосопоставление берёт и сделки с фактом «как расчёт»/±0.5 — найденные ордера лучше расчёта
+    assert sorted(t["id"] for t in trades.unmatched(path=db)) == [ids[0], ids[1], ids[4]]
+    assert {t["id"]: t["fact_source"] for t in trades.unmatched(path=db)}[ids[0]] == "plan"
 
 
 def _cp_deal(buy_nick="b", sell_nick="s", pays=("T-Bank",), buy_nicks=(), sell_ex="MEXC"):

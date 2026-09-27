@@ -75,13 +75,31 @@ def test_trap_is_skipped_by_default_and_next_deal_taken(monkeypatch):
 
 def test_trap_taken_when_owner_allows_and_reasons_shown(monkeypatch):
     _on(monkeypatch, PAPER_TRAPS="1")
+    monkeypatch.delenv("SIGNAL_TRAPS", raising=False)
     bot = Stub(p2p.Config(min_profit=2.0))
     bot.live_scans = 1
-    asyncio.run(bot.notify(snap_of([trap_deal(), good_deal()])))
+    asyncio.run(bot.notify(snap_of([trap_deal()])))   # единственная связка — у ловушки оценка хуже любой чистой
     (c,) = paper.open_cycles()
     assert c["buy_ex"] == "Bybit" and c["label"] == p2p.TRAP
     card = [t for t in texts(bot) if "Сухой прогон" in t][0]
     assert "🪤" in card and "от ориентира" in card
+    assert not [m for m in bot.out if m[0] == "sendPhoto"]   # в прогон взята, но сигналом не пришла (SIGNAL_TRAPS=0)
+
+
+def test_paper_picks_best_score_not_first_in_list(monkeypatch):
+    """PAPER_TRAPS=1: и ловушка, и чистая связка в кандидатах — прогон берёт ту, у которой выше p2p.score на
+    PAPER_AMOUNT, а не первую в списке (у ловушки прибыль больше, но веса рисков её перевешивают)."""
+    _on(monkeypatch, PAPER_TRAPS="1")
+    bot = Stub(p2p.Config(min_profit=2.0))
+    bot.live_scans = 1
+    s = snap_of([trap_deal(), good_deal()])
+    trap, good = (p2p.deal_for_amount(d, bot.cfg, s, 10000) for d in (trap_deal(), good_deal()))
+    assert trap[0] > good[0] and p2p.score(trap, bot.cfg, s) < p2p.score(good, bot.cfg, s)
+    asyncio.run(bot.notify(s))
+    (c,) = paper.open_cycles()
+    assert c["buy_ex"] == "HTX"
+    card = [t for t in texts(bot) if "Сухой прогон" in t][0]
+    assert f"оценка {p2p.score(good, bot.cfg, s):+.2f}" in card
 
 
 def test_sell_stage_records_fact_price_and_note(monkeypatch):
