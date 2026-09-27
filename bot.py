@@ -1108,6 +1108,24 @@ def apply_mybanks(data):
         save_env("SBP_FREE_LIMITS", ",".join(f"{k}:{v}" for k, v in limits.items()))
 
 
+CHIP_DEPTH_TIMEOUT = 4.0   # сек: фоновое уточнение фишек сумм карточки не дольше (CHIP_DEPTH_TIMEOUT в .env)
+
+
+def chip_depth_timeout():
+    """CHIP_DEPTH_TIMEOUT из .env (сек); пусто, не число или не больше нуля — по умолчанию."""
+    try:
+        v = float(os.getenv("CHIP_DEPTH_TIMEOUT", CHIP_DEPTH_TIMEOUT))
+    except ValueError:
+        return CHIP_DEPTH_TIMEOUT
+    return v if 0 < v < 600 else CHIP_DEPTH_TIMEOUT
+
+
+def chips_line(amounts):
+    """Фишки сумм строкой для подписи карточки — те же, что на картинке (cards._amounts_chips)."""
+    parts = [f"{_money(a)} ₽ {v:+.2f}%" if v is not None else f"{_money(a)} ₽ нет объёма" for a, v in amounts.items()]
+    return "📏 На другую сумму: " + " · ".join(parts)
+
+
 def _lean(snap):
     """Снимок без полного стакана (Snapshot.book), всех объявлений скана (Snapshot.ads) и котировок перпов
     (Snapshot.perps): они нужны только /maker и записи снимка (snapshots.py) по свежему скану — запомненные сделки
@@ -1209,6 +1227,7 @@ class Bot:
         self.cal = None              # EV_RANK=1: калибровка (calibration.build) и когда собрана — пересборка раз в
         self.cal_ts = 0.0            # calibration.REFRESH сек, в отдельном потоке
         self.live_msg = {}   # (ex,asset,ex,asset) -> последнее сообщение сигнала для «живой карточки» (editMessage)
+        self.chip_tasks = set()   # фоновые уточнения фишек сумм у отправленных карточек (ссылки держим до конца)
         self.live = {}                                            # (ex,asset,ex,asset) -> {"first": ts, "streak": n}
         self.live_scans = int(os.getenv("LIVE_SCANS", 2))        # сигнал, только если связка держится ≥ N сканов
         self.venue = {}   # ex -> {"streak": сканов подряд с ошибкой, "down_since": ts, "alerted_at": ts}
@@ -1390,9 +1409,8 @@ class Bot:
         snap = snap if snap is not None else self.last
         guest = self.is_guest(self.chat_for(chat_id))
         deal_id = None if guest else self.remember_deal(d, cfg, snap)   # у гостя нет «✅ Сделал»/«📝 Инструкция»/«🚫»
-        # фишки сумм: площадки, которые сами отбирают выдачу под сумму запроса, опрашиваются под каждую сумму — только
-        # для связки, которая уходит карточкой (кэш, бэкофф и лимит доп. запросов на скан — в depth_for_deal)
-        amounts = deal_amounts(d, cfg, await self.chip_depth(d, cfg, snap)) if snap else None
+        # фишки сумм — по стакану скана: карточка уходит сразу, уточнение под каждую сумму (chip_refresh) — потом, фоном
+        amounts = deal_amounts(d, cfg, snap) if snap else None
         rel = (*reliability(d, cfg, snap), reliability_index(d, cfg, snap)) if snap else None
         caption = prefix + fmt_signal(d, cfg, snap)
         r, is_photo = await self.photo_or_text(lambda: deal_card(d, cfg, amounts, rel), caption,
@@ -1403,15 +1421,49 @@ class Bot:
             key = self._deal_key(d)
             self.live_msg[key] = {"message_id": message_id, "photo": is_photo, "deal_id": deal_id,
                                   "last_edit": time.time(), "caption": caption, "stale": False}
+        if message_id is not None and snap is not None and not guest and self.s is not None:
+            task = asyncio.ensure_future(self.chip_refresh(d, cfg, snap, amounts, message_id, is_photo, caption,
+                                                           self.chat_for(chat_id)))
+            self.chip_tasks.add(task)
+            task.add_done_callback(self.chip_tasks.discard)
         return r
 
     async def chip_depth(self, d, cfg, snap):
-        """Снимок со стаканом связки под фишки сумм карточки (p2p.depth_for_deal); сбой запроса — стакан скана как есть."""
+        """Снимок со стаканом связки под фишки сумм карточки (p2p.depth_for_deal), не дольше CHIP_DEPTH_TIMEOUT;
+        сбой или таймаут — стакан скана как есть."""
         try:
-            return await depth_for_deal(self.s, cfg, snap, d)
+            return await asyncio.wait_for(depth_for_deal(self.s, cfg, snap, d), chip_depth_timeout())
         except Exception as e:
             logger.warning("глубина под суммы: %s: %s", type(e).__name__, e)
             return snap
+
+    async def chip_refresh(self, d, cfg, snap, amounts, message_id, is_photo, caption, chat_id):
+        """Фоном после отправки карточки: фишки 50/100/300 тыс. по запросам под каждую сумму (chip_depth). Изменилась
+        хоть одна — строка фишек дописывается в подпись/текст отправленного сообщения (Bot.call editMessageCaption/
+        editMessageText: картинку без новой загрузки не поменять) и остаётся при правках «живой карточки». Не
+        изменилось, сбой или таймаут — карточка как была. Исключения только в лог."""
+        try:
+            fresh = deal_amounts(d, cfg, await self.chip_depth(d, cfg, snap))
+            if not fresh or fresh == amounts:
+                return
+            line = chips_line(fresh)
+            text = caption + "\n" + line
+            if len(text) > (1024 if is_photo else 4096):
+                return
+            if is_photo:
+                r = await self.call("editMessageCaption", chat_id=chat_id, message_id=message_id, caption=text,
+                                    parse_mode="HTML")
+            else:
+                r = await self.call("editMessageText", chat_id=chat_id, message_id=message_id, text=text,
+                                    parse_mode="HTML", disable_web_page_preview=True)
+            if not r.get("ok"):
+                logger.warning("фишки сумм: правка карточки не прошла: %s", r.get("description"))
+                return
+            live = self.live_msg.get(self._deal_key(d))
+            if live and live["message_id"] == message_id:   # живые правки и «⌛ устарел» строку фишек не теряют
+                live["chips"], live["caption"] = line, live["caption"] + "\n" + line
+        except Exception as e:
+            logger.warning("фишки сумм: %s: %s", type(e).__name__, e)
 
     async def show_steps(self, cq, deal_id):
         """Кнопка «📝 Инструкция»: отдельным сообщением пошаговый чек-лист маршрута."""
@@ -2711,6 +2763,9 @@ class Bot:
         if not live or live["stale"] or now - live["last_edit"] < LIVE_EDIT_INTERVAL:
             return
         caption = "🔔 " + self.held_label(d, now) + fmt_signal(d, self.cfg, snap)
+        chips = live.get("chips")   # строка уточнённых фишек сумм (chip_refresh) при живых правках остаётся
+        if chips and len(caption) + len(chips) + 1 <= (1024 if live["photo"] else 4096):
+            caption += "\n" + chips
         live["last_edit"], live["caption"] = now, caption
         try:
             if live["photo"]:

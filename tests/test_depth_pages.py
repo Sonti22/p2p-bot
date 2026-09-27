@@ -3,6 +3,7 @@
 snap.extra. Всё офлайн: фикстуры tests/fixtures (вторая страница Bybit — bybit_ads_p2.json)."""
 import asyncio
 import dataclasses
+import os
 import time
 
 import pytest
@@ -156,9 +157,10 @@ def test_paged_urls_stay_in_allowlist(monkeypatch):
 
 # --- фишки сумм (50/100/300 тыс.) — только для связки карточки ---
 
-def _amount_fake(paged_calls, offline, monkeypatch):
+def _amount_fake(paged_calls, offline, monkeypatch, delay=0.0, fail=False, log=None):
     """Bybit под сумму 300 000 отдаёт крупные объявления (покупка от 200 000, продажа до 400 000) — их нет в выдаче
-    под сумму круга; остальные суммы — как offline."""
+    под сумму круга; остальные суммы — как offline. delay — площадка отвечает не сразу, fail — ответ с ошибкой,
+    log — список, куда пишется ("chip_done", сторона), когда ответ под сумму пришёл."""
     big_buy = {"result": {"items": [{"price": "85.10", "minAmount": "200000", "maxAmount": "400000",
                                      "lastQuantity": "5000", "payments": ["14"], "nickName": "BigSeller",
                                      "recentOrderNum": 900, "recentExecuteRate": 100, "remark": ""}]}}
@@ -170,6 +172,12 @@ def _amount_fake(paged_calls, offline, monkeypatch):
     async def fake(s, method, url, body=None):
         if "otc/item/online" in url and (body or {}).get("amount") == "300000":
             paged_calls.append((url, dict(body)))
+            if delay:
+                await asyncio.sleep(delay)
+            if fail:
+                raise TimeoutError("amount")
+            if log is not None:
+                log.append(("chip_done", body.get("side")))
             return big_buy if body.get("side") == "1" else big_sell
         return await inner(s, method, url, body)
 
@@ -236,16 +244,75 @@ def test_amount_chips_budget_pause_error_and_other_venues(paged, offline, monkey
     assert other is snap and len(paged) == n
 
 
-def test_card_uses_amount_depth_and_status_shows_counter(paged, offline, monkeypatch):
-    cfg = _cfg(amount=100_000)
-    snap = asyncio.run(p2p.scan(None, cfg))
-    _amount_fake(paged, offline, monkeypatch)
+class CardBot(Stub):
+    """Бот без сети, карточка «ушла» с message_id — как настоящая отправка."""
+    async def send_photo(self, png, caption, markup=None, **kw):
+        self.out.append(("sendPhoto", {"caption": caption}))
+        return {"ok": True, "result": {"message_id": 77}}
+
+
+def _card_bot(cfg, snap, monkeypatch):
     captured = {}
     monkeypatch.setattr(B, "deal_card", lambda d, c, a=None, r=None, breakdown=None: captured.update(a=a) or b"png")
-    bot = Stub(cfg)
+    bot = CardBot(cfg)
     bot.s = object()                                                 # сессия есть — запросы под фишки идут
     bot.last = snap
-    asyncio.run(bot.send_deal(snap.deals[0], snap=snap))
-    assert captured["a"][300_000] is not None and snap.extra["amounts"] == 4
-    text = bot.status_view()
-    assert "вторые страницы 1, под суммы 4 (лимит 6)" in text
+    return bot, captured
+
+
+def _send_and_wait(bot, deal, snap):
+    """Отправить карточку; вернуть, что было в bot.out сразу после отправки, — потом дождаться фоновых задач."""
+    async def run():
+        t0 = time.monotonic()
+        await bot.send_deal(deal, snap=snap, topic="signals")
+        right_after = ([m for m, _ in bot.out], time.monotonic() - t0)
+        await asyncio.gather(*list(bot.chip_tasks), return_exceptions=True)
+        return right_after
+    return asyncio.run(run())
+
+
+def test_card_is_sent_before_chip_requests_and_edited_later(paged, offline, monkeypatch):
+    cfg = _cfg(amount=100_000)
+    snap = asyncio.run(p2p.scan(None, cfg))
+    deal = snap.deals[0]
+    bot, captured = _card_bot(cfg, snap, monkeypatch)
+    _amount_fake(paged, offline, monkeypatch, delay=0.3, log=bot.out)   # площадка под суммы отвечает медленно
+    (methods, took) = _send_and_wait(bot, deal, snap)
+    assert methods == ["sendPhoto"] and took < 0.3                  # карточка ушла, ни один запрос под суммы не ответил
+    assert captured["a"][300_000] is None                            # на картинке — фишки по стакану скана
+    methods = [m for m, _ in bot.out]
+    assert methods.index("sendPhoto") < methods.index("chip_done") < methods.index("editMessageCaption")
+    edit = [p for m, p in bot.out if m == "editMessageCaption"][0]
+    assert edit["message_id"] == 77 and edit["caption"].startswith(bot.live_msg[bot._deal_key(deal)]["caption"][:40])
+    line = edit["caption"].split("\n")[-1]
+    assert line.startswith("📏 На другую сумму:") and "300 000 ₽ +" in line and "нет объёма" not in line
+    assert bot.live_msg[bot._deal_key(deal)]["chips"] == line        # живая правка строку не потеряет
+    bot.live_msg[bot._deal_key(deal)]["last_edit"] = 0
+    asyncio.run(bot.update_live_card(bot._deal_key(deal), deal, snap, time.time()))
+    assert [p for m, p in bot.out if m == "editMessageCaption"][-1]["caption"].endswith(line)
+    assert "вторые страницы 1, под суммы 4 (лимит 6)" in bot.status_view()
+
+
+@pytest.mark.parametrize("mode", ["fail", "timeout"])
+def test_chip_failure_or_timeout_leaves_original_card(paged, offline, monkeypatch, mode):
+    cfg = _cfg(amount=100_000)
+    snap = asyncio.run(p2p.scan(None, cfg))
+    bot, _ = _card_bot(cfg, snap, monkeypatch)
+    if mode == "timeout":
+        monkeypatch.setenv("CHIP_DEPTH_TIMEOUT", "0.05")
+        _amount_fake(paged, offline, monkeypatch, delay=1.0, log=bot.out)
+    else:
+        _amount_fake(paged, offline, monkeypatch, fail=True, log=bot.out)
+    _send_and_wait(bot, snap.deals[0], snap)
+    assert [m for m, _ in bot.out] == ["sendPhoto"]                 # правки нет, карточка как была
+    assert "chips" not in bot.live_msg[bot._deal_key(snap.deals[0])]
+
+
+def test_chip_timeout_setting_and_line():
+    assert B.chip_depth_timeout() == 4.0
+    for bad in ("0", "-1", "nan", "мусор"):
+        os.environ["CHIP_DEPTH_TIMEOUT"] = bad
+        assert B.chip_depth_timeout() == 4.0
+    os.environ["CHIP_DEPTH_TIMEOUT"] = "2.5"
+    assert B.chip_depth_timeout() == 2.5
+    assert B.chips_line({50_000: 1.234, 300_000: None}) == "📏 На другую сумму: 50 000 ₽ +1.23% · 300 000 ₽ нет объёма"
