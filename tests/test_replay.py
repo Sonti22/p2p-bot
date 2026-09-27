@@ -49,6 +49,47 @@ def test_replay_threshold_of_each_variant(offline):
     assert res["a"]["deals"] == len(snap.deals) and res["b"]["deals"] == 0
 
 
+def _venues(snap):
+    """Площадки всего, из чего собран снимок: объявления, лучшие цены, стаканы связок и /maker, сами связки."""
+    return ({a.ex for a in snap.ads} | {k[0] for k in snap.best} | {k[0] for k in snap.groups}
+            | {k[0] for k in snap.book} | {x.ex for d in snap.deals for x in d[1:3]})
+
+
+def _assets(snap):
+    return ({a.asset for a in snap.ads} | {k[2] for k in snap.best} | {k[2] for k in snap.groups}
+            | {k[2] for k in snap.book} | {x.asset for d in snap.deals for x in d[1:3]} | set(snap.refs))
+
+
+def test_replay_disabled_venue_drops_its_routes(offline):
+    """B с выключенной площадкой — как живой скан без неё: объявлений, стаканов и связок этой площадки нет (а не
+    MEXC в результатах при exchanges=bybit). Регистр ключа — как в .env (там EXCHANGES приводится к нижнему)."""
+    assert set(p2p.MERCHANT_VENUES) == set(p2p.FETCHERS)   # ключ площадки → Ad.ex есть у каждой площадки скана
+    scan, snap = _saved_scan(_cfg())
+    assert "MEXC" in {x.ex for d in snap.deals for x in d[1:3]}
+    for spec in ("exchanges=bybit", "exchanges=Bybit"):
+        snap_b = replay.rebuild(scan, replay.override(replay.cfg_of(scan), [spec]))
+        assert _venues(snap_b) == {"Bybit"}
+        res = replay.compare([scan], [spec])
+        assert res["b"]["keys"] and all(k[0] == k[2] == "Bybit" for k in res["b"]["keys"])
+    live = asyncio.run(p2p.scan(None, _cfg(exchanges=["bybit"])))   # тот же ответ площадок, живой скан без MEXC
+    assert _venues(live) == {"Bybit"}                                # collect и сам опрашивает только включённые
+    assert {replay._key(d) for d in snap_b.deals} == {replay._key(d) for d in live.deals}
+
+
+def test_replay_excluded_asset_drops_it_from_results_and_books(offline):
+    """B без монеты — её нет ни в связках, ни в стаканах и ориентирах (а не USDT→USDT при assets=BTC)."""
+    scan, snap = _saved_scan(_cfg(assets=["USDT", "BTC"]))
+    assert {x.asset for d in snap.deals for x in d[1:3]} >= {"USDT", "BTC"}
+    snap_b = replay.rebuild(scan, replay.override(replay.cfg_of(scan), ["assets=btc"]))
+    assert _assets(snap_b) == {"BTC"}
+    res = replay.compare([scan], ["assets=BTC"])
+    assert res["b"]["keys"] and all(k[1] == k[3] == "BTC" for k in res["b"]["keys"])
+    assert res["a"]["deals"] == len(snap.deals) and res["live_hit"] == res["live"]   # A = живой скан, как и был
+    live = asyncio.run(p2p.scan(None, _cfg(assets=["BTC"])))
+    assert _assets(live) == {"BTC"}
+    assert {replay._key(d) for d in snap_b.deals} == {replay._key(d) for d in live.deals}
+
+
 def test_rebuild_uses_stored_networks_and_restores(monkeypatch):
     b, s = make_ad("Bybit", "buy", 85.0), make_ad("MEXC", "sell", 90.0)
     for a in (b, s):
