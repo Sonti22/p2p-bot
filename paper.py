@@ -382,15 +382,24 @@ def recompute_sell_qty(cycle, cfg, spot):
 
     Комиссия банка (и решение о том, какой банк исчерпал лимит СБП) уже приняты на старте и сохранены
     как pay_fee_used — здесь не пересчитываем их заново с чужим over_banks, а просто уменьшаем сумму
-    круга на эту долю и отключаем банковскую комиссию в _route_qty (disable={"bank"}), пересчитывая
-    только шаги перевода/спота монеты. None — маршрут (нужная спот-пара) сейчас недоступен."""
+    круга на эту долю.
+
+    Хопы маршрута сохранены при старте (route_hops, hops= у start_cycle) — комиссии переводов берём
+    зафиксированными оттуда (p2p.route_qty_from_hops): переводы к стадии sell уже прошли, живой статус
+    сети/приём у получателя/minWithdraw после самого перевода не пересматриваем, пересчитывается только
+    курсовая часть по свежему spot. Круг старой версии без сохранённых хопов — как раньше, собираем
+    синтетические Ad по полям круга и прогоняем p2p._route_qty заново (живые проверки сети). None —
+    маршрут (нужная спот-пара) сейчас недоступен."""
     if cycle["buy_asset"] == cycle["sell_asset"]:
         return sell_qty(cycle)
+    net_amount = cycle["amount"] * (1 - (cycle.get("pay_fee_used") or 0.0) / 100)
+    hops = cycle_hops(cycle)
+    if hops["hops"]:
+        return p2p.route_qty_from_hops(hops, net_amount / cycle["buy_price"], cfg, spot)
     b = p2p.Ad(cycle["buy_ex"], "buy", cycle["buy_price"], 0, 0, 0, json.loads(cycle.get("buy_pays") or "[]"),
                cycle["buy_nick"], 0, 0, asset=cycle["buy_asset"], net=cycle.get("buy_net") or "")
     s = p2p.Ad(cycle["sell_ex"], "sell", cycle["sell_price"], 0, 0, 0, [], cycle["sell_nick"], 0, 0,
                asset=cycle["sell_asset"], net=cycle.get("sell_net") or "", parts=cycle.get("sell_parts") or 1)
-    net_amount = cycle["amount"] * (1 - (cycle.get("pay_fee_used") or 0.0) / 100)
     route_cfg = dataclasses.replace(cfg, amount=net_amount)
     return p2p._route_qty(b, s, route_cfg, spot, disable=frozenset({"bank", "risk"}))
 

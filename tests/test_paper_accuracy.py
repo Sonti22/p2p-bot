@@ -238,6 +238,31 @@ def test_cross_asset_sell_waits_when_saved_venue_ticker_missing():
     assert paper.recompute_sell_qty(c, cfg, back_spot) == pytest.approx(qty_start)
 
 
+def test_cross_asset_sell_ignores_network_closed_after_transfer():
+    """Разбор «межмонетные связки, часть 2, п.3»: комиссию перевода с площадки конвертации на биржу продажи
+    фиксируем при старте круга (route_hops) — к стадии sell перевод уже состоялся, поэтому то, что сеть
+    вывода закрылась уже после него, не должно срывать продажу или менять пересчитанный объём."""
+    import netstatus
+    b = ad("Bybit", "buy", 6_000_000.0, asset="BTC")
+    s = ad("MEXC", "sell", 90.0, asset="USDT", avail=1_000_000)
+    cfg = p2p.Config(min_profit=2.0, pay_fee=0.0)
+    start_spot = {"Bybit": {"BTC": (60000.0, 60100.0)}}
+    hops = p2p.route_hops(b, s, cfg, start_spot)
+    assert hops["venues"] == ["Bybit"] and hops["hops"][-1]["fee"] > 0   # перевод USDT Bybit → MEXC не бесплатный
+    qty_start = p2p._route_qty(b, s, dataclasses.replace(cfg, amount=10000), start_spot, disable=frozenset({"risk"}))
+    cid = paper.start_cycle(10000, b, s, "спот BTC→USDT на Bybit", 1.0, ts=time.time() - 400,
+                            sell_qty=qty_start, pay_fee=0.0, hops=hops)
+    paper.set_stage(cid, "sell")
+    c = paper.get_cycle(cid)
+    # сеть, которой ушёл перевод Bybit → MEXC, закрылась уже после того, как он состоялся
+    netstatus._apply("Bybit", "USDT", {n: {"dep": True, "wd": False, "fee": 1.0} for n in netstatus.KNOWN_NETS})
+    assert p2p.withdraw_open(cfg, "Bybit", "USDT", receiver="MEXC") is False   # живой перерасчёт сейчас сорвался бы
+    snap_ = snap({("MEXC", "sell", "USDT"): [s]}, spot=start_spot)
+    action, note, price = paper.check_sell_stage(c, snap_, cfg=cfg)
+    assert action == "advance"
+    assert paper.recompute_sell_qty(c, cfg, start_spot) == pytest.approx(qty_start)
+
+
 def test_virtually_exhausted_sbp_limit_puts_fee_into_plan_and_volume(monkeypatch):
     """Виртуальный оборот прогона исчерпал бесплатный лимит СБП всех своих банков — комиссия 0,5% в плане и объёме."""
     monkeypatch.setattr(B, "deal_card", lambda d, c, a=None, r=None, breakdown=None: b"png")

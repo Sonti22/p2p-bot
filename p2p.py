@@ -1159,6 +1159,37 @@ def spot_venues_ready(spot, venues, b_asset, s_asset):
     return b_asset in spot.get(v1, {}) and s_asset in spot.get(v2, {})
 
 
+def route_qty_from_hops(data, qty0, cfg, spot):
+    """Свежий выход маршрута по хопам, сохранённым при старте круга (route_hops): комиссии переводов —
+    те, что были на старте (перевод уже состоялся к стадии sell — живой статус сети/приём у получателя/
+    minWithdraw заново не проверяем, он мог поменяться уже после перевода), пересчитывается только
+    курсовая часть — bid/ask площадок конвертации (data["venues"]) по свежему spot. qty0 — количество
+    b.asset на руках после покупки (и комиссии банка, если она есть). None — хопов нет (простая связка,
+    считать нечего) или нужного тикера сейчас в spot нет (стадия sell должна была проверить это заранее
+    через spot_venues_ready)."""
+    hops, venues = data.get("hops") or [], data.get("venues") or []
+    if not hops:
+        return None
+    qty = qty0
+    for i, hop in enumerate(hops):
+        qty -= hop["fee"]
+        if i == len(hops) - 1:
+            break
+        frm_asset, to_asset, venue = hop["asset"], hops[i + 1]["asset"], venues[i]
+        sf = _spot_fee(cfg, venue)
+        if frm_asset == "USDT":
+            prices = spot.get(venue, {}).get(to_asset)
+            if not prices:
+                return None
+            qty = (qty / prices[1]) * (1 - sf / 100)
+        else:
+            prices = spot.get(venue, {}).get(frm_asset)
+            if not prices:
+                return None
+            qty = qty * prices[0] * (1 - sf / 100)
+    return qty
+
+
 def _match(b, sell_ads, cfg, spot, over_banks=frozenset()):
     """Связка покупки b со стаканом продажи (sell_ads отсортированы: лучшая цена первой). Продажа
     собирается под фактический выход монеты маршрута: при прибыли его больше, чем сумма круга / цена,
