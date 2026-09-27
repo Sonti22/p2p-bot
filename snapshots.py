@@ -4,7 +4,8 @@
 scans — строка на записанный скан: id — мс от эпохи начала скана (известен до записи: круг сухого прогона
         запоминает его на старте, а снимок пишется после сигналов), ts, размер, zlib(JSON): замеры запросов (время,
         «из кэша» и возраст кэша, ошибка), ошибки площадок, ориентиры и спот, настройки скана, связки с меткой/
-        индексом/причинами надёжности и серией «живости» бота, ссылки на группы объявлений и справочник сетей.
+        индексом/причинами надёжности и серией «живости» бота, котировки перпов (Snapshot.perps — ставка фандинга,
+        цены и PERP_LEVELS уровней стакана; для разбора хеджа кругов), ссылки на группы объявлений и справочник сетей.
 packs — группы объявлений (топ-20 по цене на площадку/сторону/монету/сеть, до фильтров) и справочник сетей
         netstatus, изменившиеся с прошлого записанного скана, — все одним zlib(JSON-список) на скан: сжатые вместе,
         они в 2–3 раза меньше, чем по отдельности. Неизменившаяся группа (сравнение по хэшу содержимого без времени
@@ -30,6 +31,7 @@ import zlib
 
 import netstatus
 import p2p
+import perp
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +49,11 @@ DEFAULT_EVERY = 3       # писать каждый N-й скан
 AD_FIELDS = ("price", "min_amt", "max_amt", "avail", "pays", "nick", "orders", "rate", "ad_id", "online",
              "terms", "net", "url")
 NET_KEY = ("net",)      # ключ справочника сетей среди групп скана (у групп ключ — 4 поля)
+# котировка перпа (Snapshot.perps, perp.PerpQuote) — список в этом порядке; стакан — PERP_LEVELS лучших уровней
+# на сторону (опрос берёт perp.DEPTH): хеджу круга на сумму сухого прогона хватает с запасом, снимок не раздувается
+PERP_FIELDS = ("venue", "symbol", "asset", "kind", "mark", "index", "last", "bid", "ask", "funding_rate",
+               "next_funding", "interval_h", "ts", "skew", "lot", "min_qty", "min_notional", "taker_fee", "bids", "asks")
+PERP_LEVELS = 10
 
 _state = {"pruned": 0.0}   # время последнего удаления по сроку
 # что лежит в базе с прошлого записанного скана: {путь: {ключ группы: (хэш, пакет, номер, время пакета)}} — по нему
@@ -137,6 +144,23 @@ def _side(a):
             "ft": a.fetched_ts}
 
 
+def _perp_row(q):
+    return [q.venue, q.symbol, q.asset, q.kind, q.mark, q.index, q.last, q.bid, q.ask, q.funding_rate,
+            q.next_funding, q.interval_h, q.ts, q.skew, q.lot, q.min_qty, q.min_notional, q.taker_fee,
+            [list(lv) for lv in q.bids[:PERP_LEVELS]], [list(lv) for lv in q.asks[:PERP_LEVELS]]]
+
+
+def perps_of(scan):
+    """Котировки перпов снимка {(площадка, символ): perp.PerpQuote} — стакан PERP_LEVELS уровней; у снимка без
+    перпов (записан до них или PERPS=0) — {}."""
+    out = {}
+    for row in scan.get("perps") or []:
+        d = dict(zip(PERP_FIELDS, row))
+        d["bids"], d["asks"] = tuple(map(tuple, d["bids"])), tuple(map(tuple, d["asks"]))
+        out[(d["venue"], d["symbol"])] = perp.PerpQuote(**d)
+    return out
+
+
 def _deal(d, cfg, snap, live):
     profit, b, s, route = d
     label, reasons = p2p.reliability(d, cfg, snap)
@@ -158,7 +182,7 @@ def collect(snap, cfg, live=None):
             "spot": {v: {a: list(p) for a, p in q.items()} for v, q in snap.spot.items()},
             "errors": dict(snap.errors), "dropped": dict(snap.dropped), "jobs": [dict(j) for j in snap.jobs],
             "over_banks": sorted(snap.over_banks), "blocked": sorted(list(x) for x in snap.blocked),
-            "deals": deals}
+            "deals": deals, "perps": [_perp_row(q) for _key, q in sorted(snap.perps.items())]}
     net = [[v, a, nets] for (v, a), nets in sorted(netstatus.STATUS.items(), key=lambda kv: (kv[0][0], str(kv[0][1])))]
     return {"id": int(ts * 1000), "ts": ts, "scan": scan, "groups": _groups(snap.ads), "net": net}
 

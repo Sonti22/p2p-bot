@@ -25,8 +25,12 @@ import jsonstore
 import netstatus
 import paper
 import payouts
+import perp
 import presets
+import simdirectional
+import simfunding
 import simmaker
+import simperp
 import snapshots
 import trades
 from cards import deal_card, history_card, history_compare_card, portfolio_card, top_chart
@@ -90,6 +94,8 @@ COMMANDS = [{"command": "best", "description": "Лучшая связка сей
             {"command": "stats", "description": "Журнал сделок: день/неделя/месяц, расчёт vs факт"},
             {"command": "export", "description": "Журнал сделок в CSV для банка и 3-НДФЛ: /export month|year"},
             {"command": "paper", "description": "Сухой прогон: круги, статистика, /paper on|off|amount|report|reset"},
+            {"command": "funding", "description": "Арбитраж фандинга на бумаге: позиции, итог, ставки сейчас"},
+            {"command": "futures", "description": "Направленная стратегия на бумаге: сделки, PF, просадка, vs случайные"},
             {"command": "mybanks", "description": "Мои банки и бесплатные лимиты СБП"},
             {"command": "fav", "description": "Избранные маршруты"},
             {"command": "alert", "description": "Алерт на курс, напр. /alert USDT sell 92 7d"},
@@ -112,6 +118,7 @@ COMMANDS = [{"command": "best", "description": "Лучшая связка сей
             {"command": "help", "description": "Как работать с сигналами"}]
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEV_STATUS = os.path.join(HERE, ".dev_status.json")   # пишет launcher.py при каждом запуске
+PERP_LOOP_TICK = 5   # сек: как часто perp_loop проверяет, пора ли опросить перпы (сам интервал — PERP_INTERVAL)
 DESCRIPTION = ("Сканирую P2P Bybit, MEXC, HTX, KuCoin, BitPapa, LBank и обменники BestChange. "
                "Присылаю связки USDT, USDC, BTC, ETH, TON за рубли: чистая прибыль, карточка, ссылки на площадки.")
 SHORT_DESCRIPTION = "Сигналы P2P-связок за рубли"
@@ -1101,10 +1108,11 @@ def apply_mybanks(data):
 
 
 def _lean(snap):
-    """Снимок без полного стакана (Snapshot.book) и всех объявлений скана (Snapshot.ads): они нужны только /maker
-    и записи снимка (snapshots.py) по свежему скану — запомненные сделки (до 200) и живые карточки их не держат."""
-    if snap is not None and (snap.book or snap.ads or snap.jobs):
-        return dataclasses.replace(snap, book={}, ads=[], jobs=[])
+    """Снимок без полного стакана (Snapshot.book), всех объявлений скана (Snapshot.ads) и котировок перпов
+    (Snapshot.perps): они нужны только /maker и записи снимка (snapshots.py) по свежему скану — запомненные сделки
+    (до 200) и живые карточки их не держат."""
+    if snap is not None and (snap.book or snap.ads or snap.jobs or snap.perps):
+        return dataclasses.replace(snap, book={}, ads=[], jobs=[], perps={})
     return snap
 
 
@@ -1683,6 +1691,10 @@ class Bot:
                 if g["avg_realized_pct"] is not None:
                     line += f" / факт {g['avg_realized_pct']:+.2f}%"
                 lines.append(line)
+        try:   # сбой отчёта бумажного хеджа не ломает /paper report
+            lines += simperp.report_lines()
+        except Exception as e:
+            logger.error("simperp: %s: %s", type(e).__name__, e)
         lines += ["", *self.paper_vs_real_lines(rows)]
         lines.append("")
         lines.append("📄 разбор по связкам — файлом CSV ниже.")
@@ -2079,6 +2091,7 @@ class Bot:
                     await self.check_alerts(self.last)
                     await self.check_networks()
                     await self.process_paper_cycles(self.last)
+                    self.paper_hedge_tick(self.last)
                     await self.check_paper_ladder()
                     await self.quiet_and_pause_tick(self.last)
                     await self.update_market_status(self.last)
@@ -2105,6 +2118,25 @@ class Bot:
         except Exception as e:
             logger.warning("snapshot: %s", e)
             return None
+
+    async def perp_loop(self):
+        """Публичные данные перпов (perp.py) со своим интервалом PERP_INTERVAL — отдельно от скана P2P, чтобы
+        медленная площадка фьючерсов не задерживала сигналы. Только чтение, без ключей и ордеров."""
+        while True:
+            try:
+                if await perp.refresh_if_due(self.s) is not None:
+                    self.sim_tick()
+            except Exception as e:
+                logger.error("perp_loop error: %s", e)
+            await asyncio.sleep(PERP_LOOP_TICK)
+
+    def sim_tick(self):
+        """Бумажные симуляции на свежих котировках перпов; сбой одной не мешает другой и опросу."""
+        for name, run in (("simfunding", simfunding.tick), ("simdirectional", simdirectional.tick)):
+            try:
+                run()
+            except Exception as e:
+                logger.error("%s: %s", name, e)
 
     def status_view(self, status_path=DEV_STATUS):
         """Текст «/status»: версия, аптайм, время/длительность последнего скана, ошибки площадок,
@@ -2404,10 +2436,20 @@ class Bot:
                     "snapshot_id": snapshots.scan_id(snap)}
         if measures["snapshot_id"] is not None:   # снимок этого скана запишется, даже если он не SNAPSHOT_EVERY-й
             self.snapshot_keep.add(measures["snapshot_id"])
+        # бумажный хедж (simperp): шорт перпа на монету круга; HEDGE_PLAN=1 — в плане стоимость хеджа вместо запаса.
+        # Монета круга — выход маршрута, а без него купленное (не s.avail — это весь объём объявления продажи).
+        # for_cycle не бросает исключений: сбой хеджа не мешает ни кругу, ни сигналам после него
+        hedge, hedge_note, profit, hedge_line = simperp.for_cycle(
+            b.asset, qty or settings["amount"] / b.price, settings["amount"], psnap.ref, b.price, raw, profit,
+            risk=self.cfg.risk_buffer.get(b.asset, 0.0))
         # over — тот же, что в плане и qty: банк оплаты и комиссия СБП в круге совпадут с планом
         cycle = paper.get_cycle(paper.start_cycle(settings["amount"], b, s, route, profit, label=label,
                                                   sell_qty=qty or s.avail, pay_fee=self.cfg.pay_fee, over=over,
                                                   planned_raw=raw, hops=hops, **measures)) or {}
+        try:
+            simperp.open_hedge(cycle.get("id"), hedge, hedge_note)
+        except Exception as e:
+            logger.error("simperp: %s", e)
         pay = trades.pay_label(cycle.get("pay_kind", ""), cycle.get("bank", ""), b.pays)
         qty = settings["amount"] / b.price
         text = (f"🧪 <b>Сухой прогон</b>: купил бы {_money(qty)} {b.asset} у {html.escape(b.nick)} "
@@ -2415,6 +2457,8 @@ class Bot:
                 f" · оценка {rank:+.2f}")
         if reasons:
             text += "\n" + "\n".join(f"• {html.escape(r)}" for r in reasons)
+        if hedge_line:
+            text += "\n" + html.escape(hedge_line)
         await self.send(text, topic="signals")
 
     async def process_paper_cycles(self, snap):
@@ -2475,6 +2519,13 @@ class Bot:
                     await self.send(f"🧪 Сухой прогон: круг #{cycle['id']} завершён — план "
                                     f"{plan:.2f}%, факт {rp:.2f}%"
                                     + (f" ({note})" if note else ""), topic="signals")
+
+    def paper_hedge_tick(self, snap):
+        """Бумажный хедж (simperp): фандинг по расчётам и откуп шорта у завершённых кругов — сбой не мешает скану."""
+        try:
+            simperp.tick(snap.ref)
+        except Exception as e:
+            logger.error("simperp: %s", e)
 
     async def check_paper_ladder(self):
         """Лестница суммы сухого прогона (paper.ladder_suggestion): сам PAPER_AMOUNT не меняет —
@@ -3129,6 +3180,10 @@ class Bot:
         # план 2.6: отчёт калибровки — только владельцу (не в GUEST_CMDS), за флагом CALIBRATION=1 (по умолчанию выкл.)
         elif cmd == "/calibration" and calibration.enabled():
             await self.send(calibration.report_text())
+        elif cmd == "/funding":
+            await self.send(simfunding.view())
+        elif cmd == "/futures":   # и «/futures paper» — пока есть только бумага
+            await self.send(simdirectional.view())
         elif cmd == "/fav":
             text, kb = self.favorites_view()
             await self.send(text, markup=kb)
@@ -3408,6 +3463,7 @@ async def main():
         if bot.chat_id:
             await bot.setup_topics()
             await bot.check_key_safety()
+        bot.perp_task = asyncio.ensure_future(bot.perp_loop())   # публичные данные перпов — своим циклом (perp.py)
         logger.info("Бот запущен: каждые %ss, порог %g%%, биржи %s", cfg.interval, cfg.min_profit,
                     ', '.join(cfg.exchanges))
         await asyncio.gather(bot.scan_loop(), bot.command_loop(), bot.accounts_loop(), bot.payouts_loop())

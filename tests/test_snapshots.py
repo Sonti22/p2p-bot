@@ -168,6 +168,28 @@ def test_save_and_load_roundtrip(offline):
     assert snapshots.ids() == [sid]
 
 
+def test_perps_stored_compact_and_restored(_isolated_data):
+    """Котировки перпов скана (Snapshot.perps) — в снимке: все поля, стакан — PERP_LEVELS уровней; снимок без них
+    (replay, старые снимки, PERPS=0) — пустой список."""
+    import dataclasses
+    from perpfx import book, quote
+    bids, asks = book(5.0, 0.001, 100.0, levels=50)                     # как у живого опроса — perp.DEPTH уровней
+    ton = dataclasses.replace(quote(symbol="GRAMUSDT", mid=5.0, asset="TON", skew=0.4), bids=bids, asks=asks)
+    btc = quote(venue="BingX", symbol="BTC-USDT", asset="BTC", fee=0.05, interval_h=4.0)
+    snap = p2p.Snapshot(88.0, "t", {}, {}, [], {}, {}, {}, ts=1000.0,
+                        perps={("Bybit", "GRAMUSDT"): ton, ("BingX", "BTC-USDT"): btc})
+    got = snapshots.load(snapshots.write(snapshots.collect(snap, p2p.Config()), now=1000.0))
+    assert [r[:2] for r in got["perps"]] == [["BingX", "BTC-USDT"], ["Bybit", "GRAMUSDT"]]
+    assert all(len(r) == len(snapshots.PERP_FIELDS) for r in got["perps"])
+    back = snapshots.perps_of(got)
+    lv = snapshots.PERP_LEVELS
+    assert back == {("Bybit", "GRAMUSDT"): dataclasses.replace(ton, bids=bids[:lv], asks=asks[:lv]),
+                    ("BingX", "BTC-USDT"): btc}                           # у btc 5 уровней — все
+    assert back[("Bybit", "GRAMUSDT")].asset == "TON" and back[("Bybit", "GRAMUSDT")].mid == ton.mid
+    empty = snapshots.collect(p2p.Snapshot(88.0, "t", {}, {}, [], {}, {}, {}, ts=1001.0), p2p.Config())
+    assert empty["scan"]["perps"] == [] and snapshots.perps_of({"groups": []}) == {}
+
+
 def test_deals_below_floor_and_other_streaks_not_stored():
     b, s = make_ad("Bybit", "buy", 85.0), make_ad("MEXC", "sell", 90.0)
     deals = [(3.0, b, s, "r"), (-1.0, b, make_ad("HTX", "sell", 84.0), "r")]
@@ -489,6 +511,7 @@ def test_save_snapshot_every_nth_scan_and_paper_start_scan(monkeypatch):
 
 
 def test_lean_snapshot_drops_ads_and_jobs():
-    snap = p2p.Snapshot(88.0, "t", {}, {}, [], {}, {}, {}, ads=[make_ad()], jobs=[{"ex": "bybit"}])
+    snap = p2p.Snapshot(88.0, "t", {}, {}, [], {}, {}, {}, ads=[make_ad()], jobs=[{"ex": "bybit"}],
+                        perps={("Bybit", "BTCUSDT"): object()})
     lean = B._lean(snap)
-    assert lean.ads == [] and lean.jobs == [] and snap.ads
+    assert lean.ads == [] and lean.jobs == [] and lean.perps == {} and snap.ads and snap.perps

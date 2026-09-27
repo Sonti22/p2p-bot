@@ -25,6 +25,7 @@ import aiohttp
 
 import fees
 import netstatus
+import perp
 
 import blacklist
 import trades
@@ -1337,6 +1338,7 @@ class Snapshot:
     ads: list = field(default_factory=list)         # все объявления скана до фильтров — для снимков (snapshots.py)
     blocked: frozenset = field(default_factory=frozenset)   # блэклист (ex, nick), с которым собран снимок
     traps: list = field(default_factory=list)       # ловушки, отсеянные в этом скане (_trap_entry)
+    perps: dict = field(default_factory=dict)       # (площадка, символ) -> perp.PerpQuote: последние котировки перпов
 
 
 # key — (монеты, площадки, сумма круга), под которые собран кэш; jobs — замеры запросов, которыми он собран
@@ -1594,6 +1596,9 @@ async def scan(s, cfg, force_alt=False):
                     over_banks=trades.banks_over_limit(trades.own_banks()[0]),   # свои банки, у которых лимит СБП исчерпан
                     **raw)
     TRAPS_LOG.extend(snap.traps)
+    # котировки перпов опрашивает perp_loop бота со своим интервалом; скан сеть перпов не ждёт. Здесь, а не в
+    # assemble: сборка остаётся чистой — replay старых снимков живые котировки не читает
+    snap.perps = perp.quotes()
     return snap
 
 

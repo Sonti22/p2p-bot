@@ -70,6 +70,14 @@ _MEASURE_DDL = (("ts_buy_done", "REAL DEFAULT NULL"), ("ts_transfer_done", "REAL
                 ("buy_check_avail", "REAL DEFAULT NULL"), ("snapshot_id", "INTEGER DEFAULT NULL"))
 # план для сравнения с фактом: без запаса на курс; у кругов до planned_raw — план с запасом, как раньше
 _PLAN_CMP = "COALESCE(planned_raw, planned_pct)"
+# бумажный хедж круга шортом перпа (simperp.py): площадка, объём в монете, цены входа/выхода (USDT), комиссии,
+# фандинг (+ получено шортом) и итог хеджа в USDT; hedge_state — JSON симуляции (статус, ожидаемая стоимость, расчёты)
+HEDGE_COLUMNS = (("hedge_venue", "TEXT DEFAULT ''"), ("hedge_qty", "REAL DEFAULT NULL"),
+                 ("hedge_open", "REAL DEFAULT NULL"), ("hedge_close", "REAL DEFAULT NULL"),
+                 ("hedge_fees", "REAL DEFAULT NULL"), ("hedge_funding", "REAL DEFAULT NULL"),
+                 ("hedge_pnl", "REAL DEFAULT NULL"), ("hedge_state", "TEXT DEFAULT ''"))
+# колонки хеджа добавляет свой блок миграций после колонок разбора — и у новой базы, и у старой они последние
+_COLUMNS += tuple(col for col, _ddl in HEDGE_COLUMNS)
 
 
 def settings():
@@ -110,6 +118,9 @@ def _connect(path):
                      ("pay_fee_used", "REAL DEFAULT 0"), ("planned_raw", "REAL DEFAULT NULL"),
                      ("route_hops", "TEXT DEFAULT ''"), *_MEASURE_DDL):
         if col not in cols:   # база от прошлой версии — добавляем колонку, данные не трогаем
+            con.execute(f"ALTER TABLE cycles ADD COLUMN {col} {ddl}")
+    for col, ddl in HEDGE_COLUMNS:   # хедж simperp — отдельным блоком миграций
+        if col not in cols:
             con.execute(f"ALTER TABLE cycles ADD COLUMN {col} {ddl}")
     con.execute("CREATE TABLE IF NOT EXISTS balance (id INTEGER PRIMARY KEY CHECK (id = 1), "
                 "amount REAL, updated_ts REAL)")
@@ -202,13 +213,10 @@ def start_cycle(amount, buy, sell, route, planned_pct, path=DB_PATH, ts=None, la
     return cycle_id
 
 
-def _row_to_dict(row):
-    return dict(zip(_COLUMNS, row))
-
-
 def _dicts(cur):
     """Строки SELECT * — словари по именам колонок из курсора: порядок колонок в базе зависит от порядка миграций
-    (у каждой ветки свои ALTER TABLE) и не обязан совпадать с _COLUMNS."""
+    (у каждой ветки свои ALTER TABLE) и не обязан совпадать с _COLUMNS. По позиции (zip с _COLUMNS) строки
+    cycles не читать — остальные чтения берут колонки явным списком."""
     names = [d[0] for d in cur.description]
     return [dict(zip(names, r)) for r in cur.fetchall()]
 
