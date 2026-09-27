@@ -1,12 +1,12 @@
 """«🪤 Ловушки» не приходят сигналом — ни обычным, ни по избранному маршруту, ни в ночной дайджест (SIGNAL_TRAPS=1 —
 приходят); в /top и /best они видны с пометкой. Сухой прогон берёт их только при PAPER_TRAPS=1 (test_paper_realism)."""
-import asyncio
 
 import bot as B
 import cards
 import favorites
 import p2p
 from test_bot import Stub
+from helpers import arun
 
 PNG = b"\x89PNG\r\n\x1a\n"
 
@@ -50,7 +50,7 @@ def test_trap_is_not_signalled_and_does_not_take_a_top_slot(monkeypatch):
     monkeypatch.delenv("SIGNAL_TRAPS", raising=False)
     bot = _bot(monkeypatch)
     bot.max_signals = 1
-    asyncio.run(bot.notify(snap_of([trap_deal(), good_deal()])))
+    arun(bot.notify(snap_of([trap_deal(), good_deal()])))
     (cap,) = captions(bot)                              # единственный слот топа — чистой связке, не ловушке
     assert "HTX" in cap and p2p.TRAP not in cap
     assert set(bot.sent) == {("HTX", "USDT", "KuCoin", "USDT")}
@@ -59,7 +59,7 @@ def test_trap_is_not_signalled_and_does_not_take_a_top_slot(monkeypatch):
 def test_signal_traps_env_brings_traps_back(monkeypatch):
     monkeypatch.setenv("SIGNAL_TRAPS", "1")
     bot = _bot(monkeypatch)
-    asyncio.run(bot.notify(snap_of([trap_deal(), good_deal()])))
+    arun(bot.notify(snap_of([trap_deal(), good_deal()])))
     caps = captions(bot)
     assert len(caps) == 2 and p2p.TRAP in caps[0]
 
@@ -69,10 +69,10 @@ def test_trap_on_favorite_route_is_not_signalled(monkeypatch):
     favorites.toggle(("Bybit", "USDT", "MEXC", "USDT"))
     s = snap_of([trap_deal()])
     bot = _bot(monkeypatch, min_profit=50.0)            # выше общего порога нет ничего — только путь избранного
-    asyncio.run(bot.notify(s))
+    arun(bot.notify(s))
     assert not captions(bot)
     monkeypatch.setenv("SIGNAL_TRAPS", "1")
-    asyncio.run(bot.notify(s))
+    arun(bot.notify(s))
     (cap,) = captions(bot)
     assert cap.startswith("⭐") and p2p.TRAP in cap
 
@@ -89,13 +89,13 @@ def test_top_and_best_still_show_traps_marked(monkeypatch):
     monkeypatch.setattr(B, "top_chart", lambda snap, c: b"png")
     bot = _bot(monkeypatch)
     s = snap_of([trap_deal(), good_deal()])
-    asyncio.run(bot.show_top(s))
+    arun(bot.show_top(s))
     assert "🪤 Ловушек: 1" in captions(bot)[-1] and "Связок всего: 2" in captions(bot)[-1]
-    asyncio.run(bot.show_best(s))                       # /best — лучшая связка снимка, даже если это ловушка
+    arun(bot.show_best(s))                       # /best — лучшая связка снимка, даже если это ловушка
     assert p2p.TRAP in captions(bot)[-1]
     assert p2p.TRAP in p2p.fmt_top(s, bot.cfg)          # текстовый /top — с меткой у каждой связки
     monkeypatch.setenv("SIGNAL_TRAPS", "1")             # ловушки и так приходят сигналом — отдельной строки нет
-    asyncio.run(bot.show_top(s))
+    arun(bot.show_top(s))
     assert "Ловушек" not in captions(bot)[-1]
 
 

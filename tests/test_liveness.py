@@ -1,8 +1,7 @@
-import asyncio
 
 import bot as B
 import p2p
-from helpers import make_ad
+from helpers import arun, make_ad
 
 
 class Stub(B.Bot):
@@ -47,10 +46,10 @@ def test_notify_waits_for_second_scan(monkeypatch):
     bot = Stub(p2p.Config(min_profit=2.0))
     s = snap([deal(3.0)])
     bot.track_liveness(s, now=1000)
-    asyncio.run(bot.notify(s))
+    arun(bot.notify(s))
     assert not captions(bot)                                 # первый скан — не сигналим
     bot.track_liveness(s, now=1120)
-    asyncio.run(bot.notify(s))
+    arun(bot.notify(s))
     assert len(captions(bot)) == 1 and "держится" in captions(bot)[0]
 
 
@@ -60,7 +59,7 @@ def test_live_scans_one_signals_immediately(monkeypatch):
     bot.live_scans = 1
     s = snap([deal(3.0)])
     bot.track_liveness(s, now=1000)
-    asyncio.run(bot.notify(s))
+    arun(bot.notify(s))
     assert len(captions(bot)) == 1 and "держится" not in captions(bot)[0]
 
 
@@ -112,12 +111,12 @@ def test_signal_waits_for_second_fresh_scan(monkeypatch):
     for ts, b_ts, s_ts in ((1000, 1001, 1002), (1030, 1031, 1002), (1060, 1061, 1002)):
         s = fresh_snap(ts, b_ts, s_ts)
         bot.track_liveness(s, now=ts)
-        asyncio.run(bot.notify(s))
+        arun(bot.notify(s))
     assert not captions(bot)                    # три скана выше порога, но продажа — одни и те же данные из кэша
     assert [r for _, _, r in bot.signal_reasons(s, 0)] == ["unconfirmed"]
     s = fresh_snap(1090, 1091, 1092)
     bot.track_liveness(s, now=1090)
-    asyncio.run(bot.notify(s))
+    arun(bot.notify(s))
     assert len(captions(bot)) == 1
 
 
@@ -126,10 +125,10 @@ def test_alt_cache_scan_does_not_extend_streak(offline):
     продлевают (и не сбрасывают), связки только на USDT (опрошены заново) — продлевают."""
     cfg = p2p.Config(assets=["USDT", "BTC"], exchanges=["bybit", "htx", "kucoin", "mexc"], min_profit=-100.0)
     bot = Stub(cfg)
-    first = asyncio.run(p2p.scan(None, cfg))
+    first = arun(p2p.scan(None, cfg))
     assert first.deals and all(p2p.deal_fresh(d, first) for d in first.deals)
     bot.track_liveness(first)
-    second = asyncio.run(p2p.scan(None, cfg))
+    second = arun(p2p.scan(None, cfg))
     assert any(j.get("cached") for j in second.jobs if j.get("asset") == "BTC")
     bot.track_liveness(second)
     streaks = {bot._deal_key(d): bot.live[bot._deal_key(d)]["streak"] for d in second.deals}

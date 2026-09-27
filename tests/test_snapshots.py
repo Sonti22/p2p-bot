@@ -17,7 +17,7 @@ import bot as B
 import netstatus
 import p2p
 import snapshots
-from helpers import make_ad
+from helpers import arun, make_ad
 
 
 def _cfg(**kw):
@@ -43,13 +43,13 @@ def _count(path, table):
 # --- объявления: id, онлайн, время получения ---
 
 def test_lbank_ad_id_and_online_from_fixture(offline):
-    ads = asyncio.run(p2p.lbank(None, p2p.Config(), "sell", "USDT"))
+    ads = arun(p2p.lbank(None, p2p.Config(), "sell", "USDT"))
     assert [(a.ad_id, a.online) for a in ads] == [
         ("a0edc7f8-0872-49bd-a879-799f33d0749a", False), ("923f8d60-f54a-4063-90d0-e4543031311b", False),
         ("86a68d36-615d-4e34-b678-e878a1b80c98", False), ("1bc231f5-d32d-4944-8830-e22a81b2490b", True)]
-    buy = asyncio.run(p2p.lbank(None, p2p.Config(), "buy", "USDT"))
+    buy = arun(p2p.lbank(None, p2p.Config(), "buy", "USDT"))
     assert [a.ad_id for a in buy] == ["FP_4fad88b0-724e-41f7-8418-a252f8843ae9"]   # uuid как есть, с префиксом
-    bybit = asyncio.run(p2p.bybit(None, p2p.Config(), "buy", "USDT"))
+    bybit = arun(p2p.bybit(None, p2p.Config(), "buy", "USDT"))
     assert bybit and all(a.ad_id == "" and a.online is None for a in bybit)   # в выдаче Bybit id нет
 
 
@@ -71,7 +71,7 @@ def test_combined_keeps_oldest_fetched_ts_and_single_ad_id():
 
 def test_scan_sets_fetched_ts_and_job_timings(offline):
     t_before = time.time()
-    snap = asyncio.run(p2p.scan(None, _cfg(exchanges=["bybit", "lbank"])))
+    snap = arun(p2p.scan(None, _cfg(exchanges=["bybit", "lbank"])))
     t_after = time.time()
     assert t_before <= snap.ts <= t_after
     assert snap.ads and all(t_before <= a.fetched_ts <= t_after for a in snap.ads)
@@ -87,7 +87,7 @@ def test_scan_job_error_recorded(offline, monkeypatch):
     async def boom(s, cfg, side, asset):
         raise RuntimeError("down")
     monkeypatch.setitem(p2p.FETCHERS, "fake", boom)
-    snap = asyncio.run(p2p.scan(None, _cfg(exchanges=["fake"])))
+    snap = arun(p2p.scan(None, _cfg(exchanges=["fake"])))
     j = next(j for j in snap.jobs if j["ex"] == "fake")
     assert "RuntimeError: down" in j["err"] and j["n"] == 0 and j["cached"] is False and j["t1"] >= j["t0"]
 
@@ -104,12 +104,12 @@ def test_alt_cache_jobs_marked_cached_with_age(offline, monkeypatch):
     calls = []
     monkeypatch.setitem(p2p.FETCHERS, "fake", _fake("Fake", calls))
     cfg = _cfg(exchanges=["fake"], assets=["USDT", "ETH"], alt_interval=60)
-    first = asyncio.run(p2p.scan(None, cfg))
+    first = arun(p2p.scan(None, cfg))
     eth_ts = {a.fetched_ts for a in first.ads if a.asset == "ETH"}
     j1 = [j for j in first.jobs if j.get("asset") == "ETH"]
     assert len(j1) == 2 and not any(j["cached"] for j in j1)
     calls.clear()
-    second = asyncio.run(p2p.scan(None, cfg))
+    second = arun(p2p.scan(None, cfg))
     assert not [c for c in calls if c[2] == "ETH"]                     # ETH из кэша _alt
     j2 = [j for j in second.jobs if j.get("asset") == "ETH"]
     assert len(j2) == 2 and all(j["cached"] and j["age"] >= 0 for j in j2)
@@ -125,7 +125,7 @@ def test_bestchange_from_cache_flag_and_age(offline, monkeypatch):
                 asset="USDT", net="TRC20", fetched_ts=old)
     monkeypatch.setitem(p2p._bc, "ads", [ad])
     monkeypatch.setitem(p2p._bc, "t", old)
-    snap = asyncio.run(p2p.scan(None, _cfg(exchanges=["bestchange"], bc_refresh=120)))
+    snap = arun(p2p.scan(None, _cfg(exchanges=["bestchange"], bc_refresh=120)))
     j = next(j for j in snap.jobs if j["ex"] == "bestchange" and j["side"] == "buy")
     assert j["cached"] is True and 49 <= j["age"] <= 60 and j["n"] == 1
     empty = next(j for j in snap.jobs if j["ex"] == "bestchange" and j["side"] == "sell")
@@ -135,7 +135,7 @@ def test_bestchange_from_cache_flag_and_age(offline, monkeypatch):
 # --- запись и чтение снимка ---
 
 def _scan_snap(offline_cfg=None):
-    return asyncio.run(p2p.scan(None, offline_cfg or _cfg()))
+    return arun(p2p.scan(None, offline_cfg or _cfg()))
 
 
 def test_save_and_load_roundtrip(offline):
@@ -432,7 +432,7 @@ def test_default_cap_holds_14_days_at_default_interval(offline, monkeypatch):
     monkeypatch.delenv("SNAPSHOT_MAX_MB", raising=False)
     monkeypatch.delenv("SNAPSHOT_EVERY", raising=False)
     cfg = p2p.Config()                                                   # все площадки и монеты фикстур
-    data = snapshots.collect(asyncio.run(p2p.scan(None, cfg)), cfg)
+    data = snapshots.collect(arun(p2p.scan(None, cfg)), cfg)
     assert len(data["groups"]) > 50
     step = interval * snapshots.every()
     n = 12
@@ -464,7 +464,7 @@ def _loop_once(bot, monkeypatch, fake_scan):
         raise asyncio.CancelledError
     monkeypatch.setattr(B.asyncio, "sleep", stop)
     with pytest.raises(asyncio.CancelledError):
-        asyncio.run(bot.scan_loop())
+        arun(bot.scan_loop())
 
 
 def test_scan_loop_saves_snapshot_after_notify_in_thread(monkeypatch):
@@ -535,7 +535,7 @@ def test_save_snapshot_every_nth_scan_and_paper_start_scan(monkeypatch):
     for i, s in enumerate(snaps):
         if i in (4, 6):                                                  # на этих сканах стартовал круг сухого прогона
             bot.snapshot_keep.add(sid[i])
-        got.append(asyncio.run(bot.save_snapshot(s)))
+        got.append(arun(bot.save_snapshot(s)))
     assert snapshots.ids() == [sid[0], sid[3], sid[4], sid[6]]           # 0, 3, 6 — по очереди; 4 — ради круга
     assert got == [sid[0], None, None, sid[3], sid[4], None, sid[6], None] and not bot.snapshot_keep
 

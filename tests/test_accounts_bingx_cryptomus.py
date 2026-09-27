@@ -2,7 +2,6 @@
 определение кабинета Cryptomus, балансы, история, экраны бота, старт с ALLOW_UNSAFE_KEYS, гости.
 Все ключи — фиктивные, сеть — заглушка: ответ по (метод, путь)."""
 import ast
-import asyncio
 import hashlib
 import hmac
 import inspect
@@ -19,6 +18,7 @@ import accounts
 import bot as B
 import p2p
 from test_guests import Stub as GuestStub, msg, sent
+from helpers import arun
 
 BX_KEY, BX_SECRET = "FAKEBINGXKEY0123456789AB", "FAKEBINGXSECRET0123456789ABCDEF"
 CM_ID, CM_KEY = "11111111-2222-3333-4444-555555555555", "FAKECRYPTOMUSKEY0123456789ABCDEF"
@@ -107,7 +107,7 @@ class Session:
 
 
 def run(coro):
-    return asyncio.run(coro)
+    return arun(coro)
 
 
 # --- BingX: подпись и allowlist ---

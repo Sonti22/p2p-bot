@@ -93,6 +93,13 @@ def evaluate(scheme, long_q, short_q, cfg=None):
     if None in (lo, so, lc, sc):
         c["why"] = "не хватает глубины стакана"
         return c
+    # минимум ордера площадки — для каждой ноги по её цене входа после округления объёма до лота: FUND_NOTIONAL
+    # может быть выше минимума, а округлённая нога — уже ниже, такой ордер площадка не примет
+    for leg, q, px in (("лонг", long_q, lo), ("шорт", short_q, so)):
+        if q.min_notional and px * qty < q.min_notional:
+            c["why"] = (f"нога {leg} {q.venue}{' (спот)' if q.kind == 'spot' else ''}: {px * qty:.2f} USDT после "
+                        f"округления до лота — меньше минимума ордера {q.min_notional:g} USDT")
+            return c
     fl, fs = _fee(long_q, cfg["spot_fee"]), _fee(short_q, cfg["spot_fee"])
     fees_open = fl * lo * qty + fs * so * qty
     cost = (lo - lc) * qty + (sc - so) * qty + fees_open + fl * lc * qty + fs * sc * qty

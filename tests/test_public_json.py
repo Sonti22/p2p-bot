@@ -1,13 +1,13 @@
 """p2p._json — публичные запросы без ключей только из p2p.JSON_ALLOWED (пин списка — в tests/test_trading_surface.py).
 
 Адреса здесь склеиваются из частей (SCHEME + хост): это данные теста, а не новые домены для guard."""
-import asyncio
 import urllib.parse
 
 import pytest
 
 import netstatus
 import p2p
+from helpers import arun
 
 REAL_JSON = p2p._json   # настоящий _json — до фикстуры offline, которая его подменяет
 SCHEME = "https" + "://"
@@ -65,7 +65,7 @@ def test_every_public_request_of_the_bot_is_allowed_and_every_entry_is_used(offl
         await p2p.spot_prices(s, ["USDT", "BTC"])
         return await netstatus.refresh(s, ["USDT", "TON"], ["htx", "kucoin"], p2p._json)
 
-    errors = asyncio.run(go())
+    errors = arun(go())
     assert not [e for e in errors.values() if "JSON_ALLOWED" in e], errors
     assert s.sent and all(p2p.json_allowed(m, u) for m, u in s.sent), s.sent
     used = set().union(*(_entry(m, u) for m, u in s.sent))
@@ -115,5 +115,5 @@ def test_json_refuses_anything_else_before_sending(method, url):
     """Не из списка — ValueError до отправки: сессия запроса не видит вовсе."""
     s = _Session()
     with pytest.raises(ValueError, match="JSON_ALLOWED"):
-        asyncio.run(REAL_JSON(s, method, url))
+        arun(REAL_JSON(s, method, url))
     assert s.sent == [] and not p2p.json_allowed(method, url)

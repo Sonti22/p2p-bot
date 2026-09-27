@@ -10,6 +10,7 @@ import perp
 import simfunding as SF
 import test_bot as TB
 from perpfx import install, quote
+from helpers import arun
 
 NOW = 1790494000.0
 
@@ -139,12 +140,12 @@ def test_funding_command_owner_only(monkeypatch, tmp_path):
     orig = SF.view
     monkeypatch.setattr(B.simfunding, "view", lambda: orig(db))
     bot = TB.Stub(p2p.Config())
-    asyncio.run(bot.dispatch("/funding", ""))
+    arun(bot.dispatch("/funding", ""))
     assert "Арбитраж фандинга" in TB.texts(bot)[-1]
     bot.out.clear()
     token = B.REPLY_CHAT.set("999")   # гость
     try:
-        asyncio.run(bot.dispatch("/funding", ""))
+        arun(bot.dispatch("/funding", ""))
     finally:
         B.REPLY_CHAT.reset(token)
     assert "Арбитраж" not in TB.texts(bot)[-1] and "только для владельца" in TB.texts(bot)[-1]
@@ -171,5 +172,18 @@ def test_perp_loop_refreshes_then_ticks_sims(monkeypatch):
     monkeypatch.setattr(bot, "sim_tick", lambda: calls.append("tick"))
     monkeypatch.setattr(B.asyncio, "sleep", stop)
     with pytest.raises(asyncio.CancelledError):
-        asyncio.run(bot.perp_loop())
+        arun(bot.perp_loop())
     assert calls == ["refresh", "tick"]
+
+
+def test_leg_below_min_notional_after_lot_rounding_is_rejected(tmp_path):
+    """FUND_NOTIONAL 1000, но после округления до лота нога ~924 USDT, а минимум ордера BingX 950 — кандидат не
+    проходит, причина понятна; позиция не открывается."""
+    import dataclasses
+    _market(0.0, 0.0005)
+    q = perp._quotes[("BingX", "BTCUSDT")]
+    perp._quotes[("BingX", "BTCUSDT")] = dataclasses.replace(q, min_notional=950.0)
+    pp = next(c for c in SF.candidates(NOW) if c["scheme"] == "perp_perp")
+    assert pp["qty"] == pytest.approx(0.011)
+    assert not pp["ok"] and "шорт BingX" in pp["why"] and "минимума ордера 950" in pp["why"]
+    assert SF.tick(now=NOW, path=str(tmp_path / "f.db"))["opened"] == []   # спот–перп тоже нет: ставка Bybit 0

@@ -1,6 +1,5 @@
 """simdirectional.py: EMA(20/100) 1ч на бумаге — индикаторы, вход только по живой свече, стоп ATR (по котировке и по
 свече), разворот, одна позиция, случайная база, фандинг, итоги /futures; команда только владельцу."""
-import asyncio
 
 import pytest
 
@@ -10,6 +9,7 @@ import perp
 import simdirectional as SD
 import test_bot as TB
 from perpfx import install, quote
+from helpers import arun
 
 H = 3600
 L0 = 1790488800.0   # начало последней «ровной» свечи (кратно часу)
@@ -198,11 +198,11 @@ def test_view_and_owner_only_command(tmp_path, monkeypatch):
     orig = SD.view
     monkeypatch.setattr(B.simdirectional, "view", lambda: orig(db, now=t))
     bot = TB.Stub(p2p.Config())
-    asyncio.run(bot.dispatch("/futures", "paper"))
+    arun(bot.dispatch("/futures", "paper"))
     assert "Направленная стратегия" in TB.texts(bot)[-1]
     token = B.REPLY_CHAT.set("999")
     try:
-        asyncio.run(bot.dispatch("/futures", ""))
+        arun(bot.dispatch("/futures", ""))
     finally:
         B.REPLY_CHAT.reset(token)
     assert "только для владельца" in TB.texts(bot)[-1]
@@ -259,3 +259,37 @@ def test_switch_off(tmp_path, monkeypatch):
     monkeypatch.setenv("SIM_DIRECTIONAL", "0")
     perp._klines[("Bybit", "BTCUSDT")] = flat()
     assert SD.tick(now=L0 + H + 60, path=str(tmp_path / "d.db")) == {"opened": [], "closed": []}
+
+
+def test_restore_after_downtime_charges_funding_only_until_candle_stop(tmp_path):
+    """Бот лежал: стоп по свече случился раньше двух следующих расчётов фандинга. События — по времени: фандинг только
+    до стопа, время закрытия — время свечи стопа, а не «сейчас»."""
+    db = str(tmp_path / "d.db")
+    _, t = _enter_long(db)   # котировка входа: ставка 0.0001, расчёт через час (t + H), интервал 8 ч
+    p = SD._dicts(SD._connect(db).execute("SELECT * FROM positions"))[0]
+    kl = perp._klines[("Bybit", "BTCUSDT")]
+    stop_start = L0 + 5 * H
+    for start in range(int(L0 + 2 * H), int(L0 + 20 * H), H):
+        kl.append(candle(start, 110.0, prev=110.0, low=p["stop"] - 1 if start == stop_start else None))
+    now = L0 + 21 * H + 60   # расчёты в t+H, t+9H, t+17H уже «наступили», но стоп был в свече L0+5H
+    out = SD.tick(now=now, path=db)
+    assert [c["reason"] for c in out["closed"]] == ["стоп (по свече)"]
+    p = SD._dicts(SD._connect(db).execute("SELECT * FROM positions"))[0]
+    assert p["ts_close"] == pytest.approx(stop_start)
+    assert p["funding"] == pytest.approx(-0.0001 * 110.0 * p["qty"])   # один расчёт (t + H), а не три
+
+
+def test_unrecoverable_candle_gap_pauses_strategy_explicitly(tmp_path):
+    """После простоя свечи с last_ts не догрузить (perp.kline_gap) — пропущенные часы не торгуем, пауза видна в /futures;
+    со следующей свечи стратегия идёт дальше."""
+    db = str(tmp_path / "d.db")
+    _enter_long(db)
+    tail_end = L0 + 400 * H
+    perp._klines[("Bybit", "BTCUSDT")] = flat(150, price=110.0, end=tail_end)   # непрерывный хвост после разрыва
+    perp._kline_gap[("Bybit", "BTCUSDT")] = (L0 + 2 * H, tail_end - 149 * H)
+    out = SD.tick(now=tail_end + H + 60, path=db)
+    assert out["paused"] == [{"asset": "BTC", "reason": "разрыв свечей после простоя — пропущенные часы не торгуем"}]
+    assert "⏸ BTC: пауза стратегии" in SD.view(path=db, now=tail_end + H + 60)
+    perp._klines[("Bybit", "BTCUSDT")].append(candle(tail_end + H, 110.0, prev=110.0))
+    out = SD.tick(now=tail_end + 2 * H + 60, path=db)
+    assert "paused" not in out and "пауза" not in SD.view(path=db, now=tail_end + 2 * H + 60)

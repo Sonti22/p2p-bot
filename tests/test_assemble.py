@@ -1,11 +1,10 @@
 """p2p.scan = сбор по сети (collect) + чистая сборка снимка (assemble): сборка не ходит в сеть и не трогает
 TRAPS_LOG, тот же вход с другим cfg даёт другой снимок (для replay.py), scan ведёт себя как раньше."""
-import asyncio
 
 import pytest
 
 import p2p
-from helpers import make_ad
+from helpers import arun, make_ad
 
 
 def _cfg(**kw):
@@ -72,7 +71,7 @@ def test_scan_is_collect_plus_assemble(monkeypatch):
     monkeypatch.setattr(p2p.blacklist, "blocked", lambda: frozenset())
     monkeypatch.setattr(p2p.trades, "banks_over_limit", lambda banks: [])
     p2p.TRAPS_LOG.clear()
-    snap = asyncio.run(p2p.scan(None, _cfg()))
+    snap = arun(p2p.scan(None, _cfg()))
     assert _keys(snap) == _keys(p2p.assemble(_cfg(), **raw))
     assert [t["price"] for t in p2p.traps_log()] == [60.0]            # scan кладёт ловушки в /traps
     assert p2p.traps_log()[0]["ts"] == 2000.0
@@ -81,7 +80,7 @@ def test_scan_is_collect_plus_assemble(monkeypatch):
 def test_scan_offline_fixtures_unchanged(offline):
     """Скан по фикстурам: связки есть, сборка из тех же данных даёт их же."""
     cfg = _cfg(exchanges=["bybit", "htx", "kucoin", "mexc", "bitpapa"])
-    snap = asyncio.run(p2p.scan(None, cfg))
+    snap = arun(p2p.scan(None, cfg))
     assert snap.deals and snap.ts > 0
     again = p2p.assemble(cfg, snap.ads, ref=snap.ref, ref_src=snap.ref_src, spot=snap.spot, errors=snap.errors,
                          blocked=snap.blocked, over_banks=snap.over_banks, ts=snap.ts)

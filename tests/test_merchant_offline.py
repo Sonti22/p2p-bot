@@ -2,12 +2,11 @@
 tests/fixtures/lbank_ads*.json) и Ad.last_seen (в ответах из фикстур такого поля нет ни у одной площадки — только
 синтетика) → причина «мерчант офлайн» (MERCHANT_OFFLINE=reason, по умолчанию) или отсев объявления из стакана и
 сигналов (MERCHANT_OFFLINE=skip)."""
-import asyncio
 import logging
 
 import p2p
 import replay
-from helpers import make_ad
+from helpers import arun, make_ad
 
 LBANK_OPEN = p2p.parse_merchant_min("LBank:0/0")   # у мерчантов LBank в фикстуре 0–2 сделки — иначе их отсеет порог
 FETCHED = 10_000.0
@@ -18,7 +17,7 @@ def _cfg(mode="reason"):
 
 
 def _fixture_ads(cfg, fetchers=(p2p.lbank, p2p.bybit)):
-    return [a for fetch in fetchers for side in ("buy", "sell") for a in asyncio.run(fetch(None, cfg, side, "USDT"))]
+    return [a for fetch in fetchers for side in ("buy", "sell") for a in arun(fetch(None, cfg, side, "USDT"))]
 
 
 def test_only_lbank_reports_online(offline):

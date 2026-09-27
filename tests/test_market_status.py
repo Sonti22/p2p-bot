@@ -1,9 +1,8 @@
 """Закреплённое сообщение «Статус рынка»: ориентир, лучшая связка, площадки ок/недоступны, раз в минуту."""
-import asyncio
 
 import bot as B
 import p2p
-from helpers import make_ad
+from helpers import arun, make_ad
 
 
 class Stub(B.Bot):
@@ -51,19 +50,19 @@ def test_market_status_view_no_deals_and_all_ok():
 def test_update_market_status_sends_pins_and_edits(monkeypatch):
     monkeypatch.setattr(B.time, "time", lambda: 1000.0)
     bot = Stub(p2p.Config(exchanges=["bybit"]))
-    asyncio.run(bot.update_market_status(snapshot([deal()])))
+    arun(bot.update_market_status(snapshot([deal()])))
     assert len(calls(bot, "sendMessage")) == 1
     pins = calls(bot, "pinChatMessage")
     assert pins and pins[0]["message_id"] == bot.market_msg_id == 101
 
     # раньше MARKET_STATUS_INTERVAL — ничего не делаем
     monkeypatch.setattr(B.time, "time", lambda: 1030.0)
-    asyncio.run(bot.update_market_status(snapshot([deal()])))
+    arun(bot.update_market_status(snapshot([deal()])))
     assert len(calls(bot, "sendMessage")) == 1 and not calls(bot, "editMessageText")
 
     # прошла минута — правим сообщение на месте, новое не шлём
     monkeypatch.setattr(B.time, "time", lambda: 1061.0)
-    asyncio.run(bot.update_market_status(snapshot([deal()])))
+    arun(bot.update_market_status(snapshot([deal()])))
     assert len(calls(bot, "sendMessage")) == 1
     edits = calls(bot, "editMessageText")
     assert len(edits) == 1 and edits[0]["message_id"] == 101
@@ -72,7 +71,7 @@ def test_update_market_status_sends_pins_and_edits(monkeypatch):
 def test_update_market_status_without_chat_id_noop():
     bot = Stub(p2p.Config())
     bot.chat_id = ""
-    asyncio.run(bot.update_market_status(snapshot()))
+    arun(bot.update_market_status(snapshot()))
     assert bot.out == []
 
 
@@ -86,11 +85,11 @@ def test_update_market_status_recreates_after_edit_failure(monkeypatch):
 
     monkeypatch.setattr(B.time, "time", lambda: 2000.0)
     bot = FlakyStub(p2p.Config(exchanges=["bybit"]))
-    asyncio.run(bot.update_market_status(snapshot()))
+    arun(bot.update_market_status(snapshot()))
     first_id = bot.market_msg_id
 
     monkeypatch.setattr(B.time, "time", lambda: 2061.0)
-    asyncio.run(bot.update_market_status(snapshot()))
+    arun(bot.update_market_status(snapshot()))
     assert len(calls(bot, "editMessageText")) == 1
     assert len(calls(bot, "sendMessage")) == 2   # неудачный edit -> новое сообщение
     assert bot.market_msg_id != first_id

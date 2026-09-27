@@ -1,12 +1,12 @@
 """Подписанные GET Bybit/MEXC/HTX/KuCoin — только пути чтения из *_READ_PATHS (как BINGX_READ_PATHS): другой путь —
 ValueError до подписи и отправки. И каждый путь из списков кодом бота действительно используется, а каждый путь,
 который код запрашивает, в списке есть (иначе история или баланс тихо пропадали бы: ошибки там глотаются)."""
-import asyncio
 
 import pytest
 
 import accounts
 import netstatus
+from helpers import arun
 
 READ_LISTS = {"bybit_get": accounts.BYBIT_READ_PATHS, "mexc_get": accounts.MEXC_READ_PATHS,
               "htx_get": accounts.HTX_READ_PATHS, "kucoin_get": accounts.KUCOIN_READ_PATHS}
@@ -65,7 +65,7 @@ def test_signed_get_refuses_paths_outside_read_list_before_signing(monkeypatch, 
         monkeypatch.setattr(accounts, helper, lambda *a, **kw: signed.append(a) or {})
     s = _Session()
     with pytest.raises(ValueError, match="не входит в список чтения"):
-        asyncio.run(_call(getter, s, path))
+        arun(_call(getter, s, path))
     assert s.sent == [] and signed == []
 
 
@@ -73,7 +73,7 @@ def test_signed_get_refuses_paths_outside_read_list_before_signing(monkeypatch, 
 def test_signed_get_sends_every_listed_path(getter):
     s = _Session()
     for path in sorted(READ_LISTS[getter]):
-        assert asyncio.run(_call(getter, s, path, {"limit": 1})) == ({"code": 200, "data": 1}
+        assert arun(_call(getter, s, path, {"limit": 1})) == ({"code": 200, "data": 1}
                                                                      if path == "/v2/user/uid" else {})
     assert len(s.sent) == len(READ_LISTS[getter])
 
@@ -106,7 +106,7 @@ def test_read_lists_match_what_the_code_requests(monkeypatch):
         await accounts.bybit_balances(s, "key", "secret")
         await accounts.mexc_balances(s, "key", "secret")
         await netstatus.refresh(s, ["USDT"], ["bybit", "mexc"], fake_public)
-    asyncio.run(go())
+    arun(go())
     for getter, allowed in READ_LISTS.items():
         assert set(seen[getter]) <= allowed, (getter, sorted(set(seen[getter]) - allowed))
         assert set(seen[getter]) == allowed, (getter, "лишнее в списке:", sorted(allowed - set(seen[getter])))

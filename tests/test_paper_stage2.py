@@ -2,7 +2,6 @@
 неизвестный статус сети — риск, покупка у обменника — только по свежей котировке BestChange, время перевода по сетям,
 межмонетные «часть 2» п. 3–4 (выход по сохранённым хопам, перевод — по реальным хопам), перезапуск посреди круга,
 новые причины в отчёте. Без сети: снимки собираются руками, справочник сетей — netstatus._apply."""
-import asyncio
 import csv
 import dataclasses
 import json
@@ -15,6 +14,7 @@ import netstatus
 import p2p
 import paper
 from test_bot import Stub, texts
+from helpers import arun
 
 
 def ad(ex, side, price, nick=None, asset="USDT", avail=10000, max_amt=500000, min_amt=1000, net="", fetched=0.0):
@@ -102,10 +102,10 @@ def test_bot_records_network_risk_and_report_counts_it():
     cid = paper.start_cycle(10000, b, s, "r", 2.0, ts=time.time() - 2000, hops=hops, sell_qty=113.0)
     paper.set_stage(cid, "transfer", ts=time.time() - 2000)
     bot = Stub(_cfg(min_profit=2.0))
-    asyncio.run(bot.process_paper_cycles(snap({("Bybit", "sell", "USDT"): [s]})))
+    arun(bot.process_paper_cycles(snap({("Bybit", "sell", "USDT"): [s]})))
     c = paper.get_cycle(cid)
     assert c["stage"] == "sell" and "сеть не выбрана" in paper.cycle_risks(c)[0][1]
-    asyncio.run(bot.process_paper_cycles(snap({("Bybit", "sell", "USDT"): [s]})))
+    arun(bot.process_paper_cycles(snap({("Bybit", "sell", "USDT"): [s]})))
     assert paper.get_cycle(cid)["result"] == "done"
     (row,) = paper.report_rows()
     assert row["net_unknown"] == 1 and row["buy_from_book"] == 0
@@ -154,11 +154,11 @@ def test_bot_bestchange_buy_does_not_pass_on_cached_dump():
     cached = snap({("BestChange", "buy", "USDT"): [ad("BestChange", "buy", 87.0, "ex1 [TRC20]", net="TRC20",
                                                       fetched=t0 - 60)]})
     bot = Stub(_cfg(min_profit=2.0))
-    asyncio.run(bot.process_paper_cycles(cached))
+    arun(bot.process_paper_cycles(cached))
     assert paper.get_cycle(cid)["stage"] == "buy"                     # раньше прошла бы автоматически
     fresh = snap({("BestChange", "buy", "USDT"): [ad("BestChange", "buy", 87.0, "ex1 [TRC20]", net="TRC20",
                                                      fetched=time.time() - 30)]})
-    asyncio.run(bot.process_paper_cycles(fresh))
+    arun(bot.process_paper_cycles(fresh))
     assert paper.get_cycle(cid)["stage"] == "transfer"
 
 
@@ -310,7 +310,7 @@ def test_old_cycle_in_progress_finishes_after_upgrade(monkeypatch, tmp_path, sta
     book = snap({("HTX", "buy", "USDT"): [ad("HTX", "buy", 87.5, "m")],
                  ("KuCoin", "sell", "USDT"): [ad("KuCoin", "sell", 90.0, "k")]})
     for _ in range(3):
-        asyncio.run(Stub(_cfg(min_profit=2.0)).process_paper_cycles(book))   # каждый раз «новый процесс»
+        arun(Stub(_cfg(min_profit=2.0)).process_paper_cycles(book))   # каждый раз «новый процесс»
         c = paper.get_cycle(1, path=db)
         if c["result"]:
             break
@@ -332,14 +332,14 @@ def test_cycle_state_lives_in_db_between_bot_restarts():
     hops = {"venues": [], "hops": [_hop("HTX", "KuCoin", net="TRC20", fee=1.0)]}
     cid = paper.start_cycle(10000, b, s, "r", 3.0, ts=time.time() - 400, sell_qty=10000 / 87.5 - 1.0, hops=hops)
     first = Stub(_cfg(min_profit=2.0))
-    asyncio.run(first.process_paper_cycles(snap({("HTX", "buy", "USDT"): [ad("HTX", "buy", 87.8, "o")]})))
+    arun(first.process_paper_cycles(snap({("HTX", "buy", "USDT"): [ad("HTX", "buy", 87.8, "o")]})))
     c = paper.get_cycle(cid)
     assert c["stage"] == "transfer" and c["buy_fill_price"] == 87.8 and c["transfer_min"] == 3.0
     paper.set_stage(cid, "transfer", ts=time.time() - 200)
     second = Stub(_cfg(min_profit=2.0))                                   # новый процесс — памяти нет
     fresh = snap({("KuCoin", "sell", "USDT"): [ad("KuCoin", "sell", 91.0, "k")]})
-    asyncio.run(second.process_paper_cycles(fresh))
-    asyncio.run(second.process_paper_cycles(fresh))
+    arun(second.process_paper_cycles(fresh))
+    arun(second.process_paper_cycles(fresh))
     c = paper.get_cycle(cid)
     assert c["result"] == "done"
     assert c["realized_pct"] == pytest.approx(((10000 / 87.8 - 1.0) * 91.0 / 10000 - 1) * 100)

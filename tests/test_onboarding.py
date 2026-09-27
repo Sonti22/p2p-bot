@@ -1,8 +1,8 @@
 """Онбординг при первом /start: 3 шага кнопками — сумма круга -> банки -> порог сигнала."""
-import asyncio
 
 import bot as B
 import p2p
+from helpers import arun
 
 
 class Stub(B.Bot):
@@ -40,7 +40,7 @@ def test_first_message_starts_onboarding_not_plain_welcome(tmp_path, monkeypatch
     env.write_text("", encoding="utf-8")
     monkeypatch.setattr(B, "save_env", functools.partial(B.save_env, path=str(env)))
     bot = Stub(p2p.Config(), chat_id="")
-    asyncio.run(bot.on_update(msg_update()))
+    arun(bot.on_update(msg_update()))
     assert bot.chat_id == "1"
     assert bot.onboarding == {"step": "amount", "banks": set()}
     sent = texts(bot)
@@ -50,7 +50,7 @@ def test_first_message_starts_onboarding_not_plain_welcome(tmp_path, monkeypatch
 
 def test_second_start_skips_onboarding():
     bot = Stub(p2p.Config())
-    asyncio.run(bot.handle("/start"))
+    arun(bot.handle("/start"))
     assert bot.onboarding is None
     assert "Бот P2P-связок на связи" in texts(bot)[-1]
 
@@ -62,7 +62,7 @@ def test_amount_step_saves_amount_and_advances_to_banks(tmp_path, monkeypatch):
     monkeypatch.setattr(B, "save_env", functools.partial(B.save_env, path=str(env)))
     bot = Stub(p2p.Config())
     bot.onboarding = {"step": "amount", "banks": set()}
-    asyncio.run(bot.on_callback(cb("onb_amt:100000")))
+    arun(bot.on_callback(cb("onb_amt:100000")))
     assert bot.cfg.amount == 100000
     assert "AMOUNT=100000" in env.read_text(encoding="utf-8")
     assert bot.onboarding["step"] == "banks"
@@ -79,11 +79,11 @@ def test_forged_onboarding_amount_and_min_are_ignored(tmp_path, monkeypatch):
     bot = Stub(p2p.Config(amount=50000, min_profit=1.0))
     bot.onboarding = {"step": "amount", "banks": set()}
     for data in ("onb_amt:nan", "onb_amt:0", "onb_amt:-5", "onb_amt:inf"):
-        asyncio.run(bot.on_callback(cb(data)))
+        arun(bot.on_callback(cb(data)))
     assert bot.cfg.amount == 50000 and bot.onboarding["step"] == "amount"
     bot.onboarding["step"] = "min"
     for data in ("onb_min:nan", "onb_min:-5", "onb_min:1e308"):
-        asyncio.run(bot.on_callback(cb(data)))
+        arun(bot.on_callback(cb(data)))
     assert bot.cfg.min_profit == 1.0 and bot.onboarding["step"] == "min"
     assert env.read_text(encoding="utf-8") == ""
 
@@ -91,13 +91,13 @@ def test_forged_onboarding_amount_and_min_are_ignored(tmp_path, monkeypatch):
 def test_bank_toggle_marks_selected():
     bot = Stub(p2p.Config())
     bot.onboarding = {"step": "banks", "banks": set()}
-    asyncio.run(bot.on_callback(cb(f"onb_bank:{B.ONBOARD_BANKS[0]}")))
+    arun(bot.on_callback(cb(f"onb_bank:{B.ONBOARD_BANKS[0]}")))
     assert bot.onboarding["banks"] == {B.ONBOARD_BANKS[0]}
     buttons = edits(bot)[-1]["reply_markup"]["inline_keyboard"]
     label = next(b["text"] for row in buttons for b in row if b["callback_data"] == f"onb_bank:{B.ONBOARD_BANKS[0]}")
     assert label.startswith("✅")
     # повторный клик снимает выбор
-    asyncio.run(bot.on_callback(cb(f"onb_bank:{B.ONBOARD_BANKS[0]}")))
+    arun(bot.on_callback(cb(f"onb_bank:{B.ONBOARD_BANKS[0]}")))
     assert bot.onboarding["banks"] == set()
 
 
@@ -108,7 +108,7 @@ def test_bank_next_saves_include_pay_and_advances_to_min(tmp_path, monkeypatch):
     monkeypatch.setattr(B, "save_env", functools.partial(B.save_env, path=str(env)))
     bot = Stub(p2p.Config())
     bot.onboarding = {"step": "banks", "banks": {"T-Bank"}}
-    asyncio.run(bot.on_callback(cb("onb_bank_next")))
+    arun(bot.on_callback(cb("onb_bank_next")))
     assert bot.cfg.include_pay == ["t-bank"]
     assert "INCLUDE_PAY=t-bank" in env.read_text(encoding="utf-8")
     assert bot.onboarding["step"] == "min"
@@ -122,7 +122,7 @@ def test_bank_next_with_no_selection_leaves_include_pay_empty(tmp_path, monkeypa
     monkeypatch.setattr(B, "save_env", functools.partial(B.save_env, path=str(env)))
     bot = Stub(p2p.Config())
     bot.onboarding = {"step": "banks", "banks": set()}
-    asyncio.run(bot.on_callback(cb("onb_bank_next")))
+    arun(bot.on_callback(cb("onb_bank_next")))
     assert bot.cfg.include_pay == []
 
 
@@ -133,7 +133,7 @@ def test_min_step_finishes_onboarding_and_sends_welcome(tmp_path, monkeypatch):
     monkeypatch.setattr(B, "save_env", functools.partial(B.save_env, path=str(env)))
     bot = Stub(p2p.Config())
     bot.onboarding = {"step": "min", "banks": set()}
-    asyncio.run(bot.on_callback(cb("onb_min:2")))
+    arun(bot.on_callback(cb("onb_min:2")))
     assert bot.cfg.min_profit == 2
     assert "MIN_PROFIT=2" in env.read_text(encoding="utf-8")
     assert bot.onboarding is None
@@ -144,7 +144,7 @@ def test_min_step_finishes_onboarding_and_sends_welcome(tmp_path, monkeypatch):
 def test_stray_onboarding_click_after_finish_is_ignored():
     bot = Stub(p2p.Config())
     bot.onboarding = None
-    asyncio.run(bot.on_callback(cb("onb_min:5")))
+    arun(bot.on_callback(cb("onb_min:5")))
     assert bot.cfg.min_profit != 5
     assert not edits(bot)
 
@@ -152,6 +152,6 @@ def test_stray_onboarding_click_after_finish_is_ignored():
 def test_click_from_wrong_step_is_ignored():
     bot = Stub(p2p.Config())
     bot.onboarding = {"step": "banks", "banks": set()}
-    asyncio.run(bot.on_callback(cb("onb_min:5")))
+    arun(bot.on_callback(cb("onb_min:5")))
     assert bot.cfg.min_profit != 5
     assert bot.onboarding["step"] == "banks"

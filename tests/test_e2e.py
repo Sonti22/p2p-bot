@@ -1,11 +1,11 @@
 """Сквозной тест конвейера без сети: scan (реальные адаптеры на фикстурах) → _stack/reliability
 внутри scan → notify (реальная карточка отправляется Telegram-боту-заглушке). В отличие от
 test_bot.py, где сделки собраны вручную через make_ad, здесь связка целиком выходит из p2p.scan()."""
-import asyncio
 import html
 
 import bot as B
 import p2p
+from helpers import arun
 
 
 class Stub(B.Bot):
@@ -32,7 +32,7 @@ def _cfg():
 def _run_pipeline(offline, monkeypatch):
     monkeypatch.setattr(B, "deal_card", lambda d, c, a=None, r=None, breakdown=None: b"png")
     cfg = _cfg()
-    snap = asyncio.run(p2p.scan(None, cfg))
+    snap = arun(p2p.scan(None, cfg))
     assert snap.deals, "фикстуры должны давать хотя бы одну связку"
     bot = Stub(cfg)
     bot.live_scans = 1   # тест про сам конвейер, не про «живость» сигнала
@@ -43,7 +43,7 @@ def test_scan_stack_reliability_notify_pipeline(offline, monkeypatch):
     cfg, snap, bot = _run_pipeline(offline, monkeypatch)
     top = snap.deals[0]   # лучшая связка по прибыли с поправкой на надёжность (сортировка внутри scan())
 
-    asyncio.run(bot.notify(snap))
+    arun(bot.notify(snap))
 
     photos = [p for m, p in bot.out if m == "sendPhoto"]
     assert photos   # хотя бы топ-1 связка ушла сигналом (max_signals может прислать до 3)
@@ -53,7 +53,7 @@ def test_scan_stack_reliability_notify_pipeline(offline, monkeypatch):
     assert html.escape(p2p.fmt_reliability(label, reasons)) in caption
     assert f"{top[0]:+.2f}%" in caption
     # повторный вызов в пределах cooldown — те же связки не дублируются новыми сообщениями
-    asyncio.run(bot.notify(snap))
+    arun(bot.notify(snap))
     assert len([p for m, p in bot.out if m == "sendPhoto"]) == len(photos)
 
 
@@ -63,9 +63,9 @@ def test_scan_notify_pipeline_not_marked_sent_on_telegram_failure(offline, monke
     cfg, snap, bot = _run_pipeline(offline, monkeypatch)
     bot.ok = False
 
-    asyncio.run(bot.notify(snap))
+    arun(bot.notify(snap))
     assert not bot.sent   # доставка не подтверждена — связка не помечена отправленной
 
     bot.ok = True
-    asyncio.run(bot.notify(snap))
+    arun(bot.notify(snap))
     assert bot.sent   # тот же скан — сигнал ушёл и антидубль сработал
