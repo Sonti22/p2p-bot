@@ -32,6 +32,29 @@ def test_stranger_gets_id_and_owner_is_told_once(monkeypatch):
     assert not bot.guests
 
 
+def test_chat_that_wrote_before_owner_was_bound_still_reaches_owner(monkeypatch):
+    """TG_CHAT_ID пуст, первой пишет группа: ей один раз «владелец — только личный чат». Потом владелец привязывается
+    из лички, и та же группа пишет снова — это обычный чужой чат: ей id и /allow, владельцу — как дать доступ. Раньше
+    отметка «уже ответили» до привязки лежала в том же наборе, что у ask_access, и оба сообщения молча пропадали."""
+    monkeypatch.setattr(B, "save_env", lambda k, v, path=None: None)
+    bot = Stub(p2p.Config())
+    bot.chat_id = ""
+    for _ in range(2):
+        asyncio.run(bot.on_update(msg(-1001, "/start", ctype="supergroup", id=7)))
+    assert [p["text"] for p in sent(bot)] == [B.FIRST_CHAT_PRIVATE] and bot.chat_id == ""
+    asyncio.run(bot.on_update(msg(555, "/start")))                  # владелец — из личного чата
+    assert bot.chat_id == "555"
+    before = len(sent(bot))
+    asyncio.run(bot.on_update(msg(-1001, "привет", ctype="supergroup", id=7, username="vasya")))
+    new = sent(bot)[before:]
+    to_group = [p for p in new if p["chat_id"] == "-1001"]
+    to_owner = [p for p in new if p["chat_id"] == "555"]
+    assert len(to_group) == 1 and "/allow -1001" in to_group[0]["text"]
+    assert len(to_owner) == 1 and "@vasya" in to_owner[0]["text"] and "/allow -1001" in to_owner[0]["text"]
+    asyncio.run(bot.on_update(msg(-1001, "ещё", ctype="supergroup", id=7)))
+    assert len(sent(bot)) == before + 2                             # и дальше — раз за запуск, как у любого чужого
+
+
 def test_allow_and_deny(monkeypatch):
     saved = {}
     monkeypatch.setattr(B, "save_env", lambda k, v: saved.__setitem__(k, v))

@@ -28,7 +28,7 @@ import secrets
 import sqlite3
 import time
 from datetime import datetime, timedelta, timezone
-from decimal import ROUND_UP, Decimal, InvalidOperation
+from decimal import ROUND_UP, Decimal, DecimalException, InvalidOperation
 
 import accounts
 import jsonstore
@@ -200,6 +200,20 @@ def _dec(v):
     except InvalidOperation:
         return None
     return d if d.is_finite() else None
+
+
+def _usdt_value(debit, rate):
+    """USDT-оценка списания по курсу, вверх до цента; None — курс абсурдный и оценка не помещается в Decimal (Cryptomus
+    отдал, скажем, course "1e30"): это отказ с причиной, а не исключение посреди предпросмотра или отправки."""
+    try:
+        return (debit * rate).quantize(CENT, rounding=ROUND_UP)
+    except DecimalException:
+        return None
+
+
+def _rate_text(d):
+    """Курс для текста владельцу: абсурдно большой или малый — коротко, в научной записи (не тысячи нулей)."""
+    return fmt(d) if -12 <= d.adjusted() <= 15 else f"{d:.3E}"
 
 
 def _true(v):
@@ -658,7 +672,10 @@ async def quote(s, entry, amount, creds=None, now=None):
     rate = await usdt_rate(s, entry["currency"])
     if rate is None:
         return None, f"нет курса {entry['currency']}→USDT у Cryptomus — без него лимит не проверить"
-    usdt = (debit * rate).quantize(CENT, rounding=ROUND_UP)
+    usdt = _usdt_value(debit, rate)
+    if usdt is None:
+        return None, (f"курс {entry['currency']}→USDT у Cryptomus абсурдный ({_rate_text(rate)}) — оценка в USDT не "
+                      f"считается, без неё лимит не проверить")
     why = check_limits(usdt, now)
     if why:
         return None, why
@@ -782,20 +799,30 @@ def _result(state, row=None, reason="", event=None):
 
 def _fresh_value(entry, amount, fee, rate, q):
     """USDT-оценка выплаты по свежему курсу перед самой отправкой: (оценка для лимитов и журнала, None) или (None,
-    причина отказа). Лимиты — по бо́льшей из оценок (предпросмотр или свежая), с учётом всех выплат дня; курс сдвинулся
-    больше PAYOUT_RATE_DRIFT против предпросмотра — отказ: владелец подтверждал другую сумму в USDT."""
+    причина отказа). Сначала курс: сдвинулся больше PAYOUT_RATE_DRIFT против предпросмотра — отказ (владелец подтверждал
+    другую сумму в USDT); потом лимиты — по бо́льшей из оценок (предпросмотр или свежая), с учётом всех выплат дня."""
     cur, again = entry["currency"], "проверь выплату заново с новой оценкой: /payout"
     if rate is None:
         return None, f"нет курса {cur}→USDT у Cryptomus — без него лимит не проверить, {again}"
-    now = ((amount + fee) * rate).quantize(CENT, rounding=ROUND_UP)
+    # сначала сдвиг курса: абсурдный курс (скажем, "1e30") — это отказ «курс сдвинулся», а не исключение в оценке;
+    # арифметика, которая не помещается в Decimal, — тоже сдвиг (отказ, а не «сбой бота, исход неясен»)
+    was, drift = q.get("rate"), rate_drift()
+    now = _usdt_value(amount + fee, rate)
+    try:
+        moved = not isinstance(was, Decimal) or was <= 0 or abs(rate - was) > was * drift
+    except DecimalException:
+        moved = True
+    if moved:
+        value = "" if now is None else f", выплата теперь ≈{now} USDT"
+        return None, (f"курс {cur}→USDT сдвинулся с предпросмотра: "
+                      f"{_rate_text(was) if isinstance(was, Decimal) else '?'} → {_rate_text(rate)} "
+                      f"(допуск PAYOUT_RATE_DRIFT={_rate_text(drift * 100)}%){value} — {again}")
+    if now is None:
+        return None, f"оценка выплаты в USDT по курсу {_rate_text(rate)} не считается — {again}"
     usdt = max(q["usdt"], now)
     why = check_limits(usdt)
     if why:
         return None, f"{why} (по курсу на момент отправки) — {again}"
-    was, drift = q.get("rate"), rate_drift()
-    if not isinstance(was, Decimal) or was <= 0 or abs(rate - was) > was * drift:
-        return None, (f"курс {cur}→USDT сдвинулся с предпросмотра: {fmt(was) if isinstance(was, Decimal) else '?'} → "
-                      f"{fmt(rate)} (допуск PAYOUT_RATE_DRIFT={fmt(drift * 100)}%), выплата теперь ≈{now} USDT — {again}")
     return usdt, None
 
 
@@ -811,8 +838,8 @@ async def send(s, entry, amount, q, creds=None):
 
     Перед отправкой (под общим замком) заново: сервис Cryptomus доступен, сумма в его мин/макс, комиссия не выросла
     против предпросмотра, свежий курс монеты к USDT; затем без пауз до самого POST — выключатель и Стоп, запись белого
-    списка та же, лимиты по свежему курсу с учётом всех выплат дня, курс не ушёл дальше PAYOUT_RATE_DRIFT. Намерение —
-    в журнал (prepared), потом POST /v1/payout (sending):
+    списка та же, курс не ушёл дальше PAYOUT_RATE_DRIFT (абсурдный курс — тоже отказ), лимиты по свежему курсу с учётом
+    всех выплат дня. Намерение — в журнал (prepared), потом POST /v1/payout (sending):
     - HTTP 200, state 0, ответ совпал с заявкой — "sent" (или сразу итог); не совпал — "unknown" + тревога;
     - отказ — /v1/payout/info по order_id: «не найдено» — "rejected" (в лимит не идёт), нашлась — принимаем;
     - неясный исход — "unknown", пауза, /v1/payout/info: нашлась — принимаем; «не найдено» — повтор с тем же order_id
@@ -829,6 +856,8 @@ async def send(s, entry, amount, q, creds=None):
         if not creds:
             return _result("refused", reason="нет ключа выплат")
         svc, why = await service(s, creds, entry)
+        if _halted(gen):   # Стоп, пока шёл запрос сервисов, — и курс уже не запрашиваем
+            return _result("refused", reason=OFF)
         fee, why = (None, why) if why else service_fee(svc, entry, amount)
         if why:
             return _result("refused", reason=why)

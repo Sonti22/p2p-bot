@@ -954,8 +954,9 @@ def _withdraw(cfg, sender, asset, net="", receiver="", qty=None):
     if listed and not known and need and set(need) <= set(netstatus.KNOWN_NETS):
         return None   # справочник есть, а сети, которую принимает получатель (BitPapa — TRC20), в нём нет
     if receiver:   # про сети отправителя (BitPapa, LBank) не знаем — но у получателя ввод закрыт во всех сетях
-        rnets = [n for n in netstatus.known_nets(receiver, asset) if accepts(n)]
-        if rnets and all(netstatus.deposit_ok(receiver, asset, n) is False for n in rnets):
+        # полного справочника: в урезанном (netstatus.PARTIAL — HTX ETH/BTC) другие сети могут быть открыты
+        rnets = [n for n in netstatus.deposit_nets(receiver, asset) if accepts(n)]
+        if rnets and all(_deposit_ok(receiver, asset, n) is False for n in rnets):
             return None
     return cfg.transfer_fees.get(asset, 0), ""
 

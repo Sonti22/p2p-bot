@@ -530,3 +530,65 @@ def test_everything_rechecked_after_rate_refresh(change):
         return await asyncio.wait_for(task, 5)
     res = run(go())
     assert res["state"] == "refused" and not s.posts() and payouts.history() == []
+
+
+# --- ревью 2026-09-27, второй круг: абсурдный курс, Стоп во время запроса сервисов ---
+
+@pytest.mark.parametrize("course", ["1e30", "1e1000000", "1e-1000000"])
+def test_absurd_fresh_rate_is_a_refusal_not_a_crash(course):
+    """Предпросмотр 0.01 BTC по 60000, к отправке Cryptomus отдаёт абсурдный курс: оценка в USDT не помещается в
+    Decimal (quantize раньше бросал InvalidOperation из send, и бот писал «сбой, исход неясен, учтена в лимите»). Теперь
+    это отказ «курс сдвинулся» с короткой причиной: POST не уходит, в журнале и в лимите ничего."""
+    s = Session(routes())
+    q = quote(s, "w2", "0.01")
+    s.routes[RATE_BTC] = rate("BTC", course)
+    res = run(payouts.send(s, entry("w2"), Decimal("0.01"), q))
+    assert res["state"] == "refused" and "курс BTC→USDT сдвинулся" in res["reason"] and "/payout" in res["reason"]
+    assert len(res["reason"]) < 400                                 # не тысячи нулей в сообщении владельцу
+    assert not s.posts() and payouts.history() == [] and payouts.used_today() == 0
+
+
+def test_absurd_rate_in_preview_is_a_refusal_not_a_crash():
+    s = Session(routes({RATE_BTC: rate("BTC", "1e30")}))
+    q, why = run(payouts.quote(s, entry("w2"), Decimal("0.01")))
+    assert q is None and "абсурдный" in why and "1.000E+30" in why
+    s.routes[RATE_BTC] = rate("BTC", "60000")                       # нормальный курс — предпросмотр как раньше
+    assert run(payouts.quote(s, entry("w2"), Decimal("0.01")))[0]["usdt"] == Decimal("606.00")
+
+
+def test_absurd_fresh_rate_tells_owner_not_sent_instead_of_unclear():
+    """Через бота: владелец видит «⛔ Выплата не отправлена», а не ложное «сбой, исход неясен, учтена в лимите»."""
+    s = Session(routes())
+    bot = owner(s)
+    token = to_preview(bot, "0.01", "w2")
+    s.routes[RATE_BTC] = rate("BTC", "1e30")
+
+    async def go():
+        await bot.on_update(_cb(1, f"pay_ok:{token}"))
+        await bot.payout_task
+    run(go())
+    assert _texts(bot)[-1].startswith("⛔ Выплата не отправлена") and "курс" in _texts(bot)[-1]
+    assert not any("Сбой" in t for t in _texts(bot)) and not s.posts() and payouts.history() == []
+
+
+def test_stop_during_services_request_starts_no_rate_request():
+    """«⛔ Стоп», пока идёт POST /v1/payout/services, — после его ответа send не начинает ни одного запроса: ни GET
+    курса, ни тем более POST создания (выключатель и счётчик Стопа — после каждого await, как обещает докстринг)."""
+    s = Session(routes())
+    q = quote(s, "w2", "0.01")
+
+    async def go():
+        gate = asyncio.Event()
+        s.routes[SERVICES] = lambda call: GatedOK(gate, 200, {"state": 0, "result": SERVICE_LIST})
+        before = len(s.calls)
+        task = asyncio.create_task(payouts.send(s, entry("w2"), Decimal("0.01"), q))
+        for _ in range(50):
+            await asyncio.sleep(0)
+        assert [(c["method"], c["path"]) for c in s.calls[before:]] == [SERVICES]   # send ждёт ответа сервисов
+        payouts.disable()
+        gate.set()
+        return await asyncio.wait_for(task, 5), s.calls[before:]
+    res, calls = run(go())
+    assert res["state"] == "refused" and res["reason"] == payouts.OFF
+    assert [(c["method"], c["path"]) for c in calls] == [SERVICES]  # без исправления — ещё GET курса BTC
+    assert payouts.history() == []

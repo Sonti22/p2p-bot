@@ -61,6 +61,20 @@ def test_partial_receiver_directory_stays_unknown_status():
     assert p2p._withdraw(_cfg(), "Bybit", "ETH", "", "KuCoin") == (0.0015, "ERC20")
 
 
+@pytest.mark.parametrize("sender", ["LBank", "BitPapa", "Ghost"])
+def test_partial_receiver_directory_unknown_when_sender_has_no_directory(sender):
+    """У отправителя нет ни живого справочника, ни строки fees.json (LBank, BitPapa, Bybit без ключей) — работает
+    запасная проверка «у получателя ввод закрыт во всех сетях». В урезанном справочнике HTX по ETH есть только родная
+    ERC20, и ввод в ней закрыт — но HTX может принять ETH в ARBITRUM: это «неизвестно», запасная комиссия, а не отказ.
+    Полный справочник (KuCoin) с закрытым вводом во всех сетях по-прежнему отсекает перевод."""
+    cfg = _cfg()
+    netstatus._apply("HTX", "ETH", {"ERC20": {"dep": False, "wd": True, "fee": 0.002, "min": None}})
+    assert netstatus.known_nets("HTX", "ETH") == ["ERC20"] and netstatus.deposit_nets("HTX", "ETH") == []
+    assert p2p._withdraw(cfg, sender, "ETH", "", "HTX") == (cfg.transfer_fees["ETH"], "")
+    netstatus._apply("KuCoin", "ETH", {"ERC20": {"dep": False, "wd": True, "fee": 0.002, "min": None}})
+    assert p2p._withdraw(cfg, sender, "ETH", "", "KuCoin") is None
+
+
 @pytest.mark.parametrize("raw,want", [("Toncoin(TON)", "TON"), ("Bitcoin(BTC)", "BTC"), ("GRAM", "TON"),
                                       ("TON", "TON"), ("Asset Hub(Polkadot)", "ASSET HUB(POLKADOT)"),
                                       ("Tron(TRC20)", "TRC20"), ("AVAX C-Chain", "AVAX C-CHAIN")])

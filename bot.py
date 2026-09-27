@@ -1208,6 +1208,9 @@ class Bot:
         self.guests = {g for g in entries if not g.startswith("@")}          # id чатов гостей
         self.pending = {g.lower() for g in entries if g.startswith("@")}   # @ники: доступ откроется с первого сообщения
         self.asked = set()        # чужие чаты, которым уже ответили «бот приватный» (раз за запуск)
+        # чаты, которым до привязки владельца ответили «владелец — только личный чат» (раз за запуск). Отдельно от
+        # asked: иначе такой чат после привязки не дошёл бы до ask_access, и владелец не узнал бы о нём
+        self.unbound_asked = set()
         self.refused_at = {}      # чат TG_CHAT_ID не личный -> когда последний раз ответили «команды — только в личке»
         self.username = ""       # @ник бота из getMe — для подсказок
         self.repeat_step = float(os.getenv("REPEAT_STEP", 0.3))  # п.п. роста профита для досрочного повтора
@@ -2945,8 +2948,8 @@ class Bot:
             await self.start_onboarding()
             return
         if not self.chat_id:
-            if chat not in self.asked:   # группа, канал или чужой отправитель: владельцем не делаем, отвечаем раз
-                self.asked.add(chat)
+            if chat not in self.unbound_asked:   # группа, канал или чужой отправитель: владельцем не делаем, раз
+                self.unbound_asked.add(chat)
                 logger.warning("TG_CHAT_ID пуст: чат %s (%s) не личный — владельцем не назначен, жду /start в личке",
                                chat, msg.get("chat", {}).get("type"))
                 await self.send(FIRST_CHAT_PRIVATE, chat_id=chat)
