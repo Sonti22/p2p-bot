@@ -27,6 +27,7 @@ import paper
 import payouts
 import perp
 import presets
+import simdirectional
 import simfunding
 import simmaker
 import simperp
@@ -94,6 +95,7 @@ COMMANDS = [{"command": "best", "description": "Лучшая связка сей
             {"command": "export", "description": "Журнал сделок в CSV для банка и 3-НДФЛ: /export month|year"},
             {"command": "paper", "description": "Сухой прогон: круги, статистика, /paper on|off|amount|report|reset"},
             {"command": "funding", "description": "Арбитраж фандинга на бумаге: позиции, итог, ставки сейчас"},
+            {"command": "futures", "description": "Направленная стратегия на бумаге: сделки, PF, просадка, vs случайные"},
             {"command": "mybanks", "description": "Мои банки и бесплатные лимиты СБП"},
             {"command": "fav", "description": "Избранные маршруты"},
             {"command": "alert", "description": "Алерт на курс, напр. /alert USDT sell 92 7d"},
@@ -2126,7 +2128,7 @@ class Bot:
 
     def sim_tick(self):
         """Бумажные симуляции на свежих котировках перпов; сбой одной не мешает другой и опросу."""
-        for name, run in (("simfunding", simfunding.tick),):
+        for name, run in (("simfunding", simfunding.tick), ("simdirectional", simdirectional.tick)):
             try:
                 run()
             except Exception as e:
@@ -3180,6 +3182,8 @@ class Bot:
             await self.send(calibration.report_text())
         elif cmd == "/funding":
             await self.send(simfunding.view())
+        elif cmd == "/futures":   # и «/futures paper» — пока есть только бумага
+            await self.send(simdirectional.view())
         elif cmd == "/fav":
             text, kb = self.favorites_view()
             await self.send(text, markup=kb)
