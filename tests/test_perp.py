@@ -362,7 +362,7 @@ def test_klines_after_downtime_fill_the_whole_gap():
     series = _kline_series(start, 300)                  # у площадки — всё до текущего часа
     perp._klines[("Bybit", "BTCUSDT")] = series[:250]   # у нас — до 50 ч назад
     limits = []
-    asyncio.run(perp._bybit_klines(None, _kline_get(series, limits), "BTCUSDT", NOW))
+    arun(perp._bybit_klines(None, _kline_get(series, limits), "BTCUSDT", NOW))
     assert limits and limits[0] >= 51
     got = [k[0] for k in perp.klines("Bybit", "BTCUSDT")]
     assert got == [k[0] for k in series] and perp.kline_gap("Bybit", "BTCUSDT") is None
@@ -374,7 +374,7 @@ def test_klines_unrecoverable_gap_keeps_only_contiguous_tail():
     series = _kline_series(start, 3000)
     perp._klines[("Bybit", "BTCUSDT")] = series[:500]   # последней свече ~2500 ч
     limits = []
-    asyncio.run(perp._bybit_klines(None, _kline_get(series, limits), "BTCUSDT", NOW))
+    arun(perp._bybit_klines(None, _kline_get(series, limits), "BTCUSDT", NOW))
     assert limits == [perp.KLINE_FULL]
     got = perp.klines("Bybit", "BTCUSDT")
     assert [k[0] for k in got] == [k[0] for k in series[-perp.KLINE_FULL:]]
