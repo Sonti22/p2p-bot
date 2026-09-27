@@ -29,8 +29,24 @@ def cfg_of(scan):
     return p2p.Config(**{k: v for k, v in (scan.get("cfg") or {}).items() if k in names})
 
 
+def _dict_value(name, text):
+    """Словарь из строки: у поля свой разбор p2p.parse_<поле> (MERCHANT_MIN «Bybit:100/97,HTX:300/96») — им, иначе
+    «A:1,B:2» (p2p._fees). Часть не разобралась — ValueError с форматом, а не молча пустой или неполный словарь."""
+    parse = getattr(p2p, f"parse_{name}", None)
+    parts = [p for p in text.split(",") if p.strip()]
+    try:
+        got = parse(text) if callable(parse) else p2p._fees(text, upper=name != "spot_fees")
+    except ValueError:
+        got = {}
+    if len(got) < len(parts):
+        example = "Bybit:100/97,HTX:300/96" if callable(parse) else "USDT:0.2,BTC:0.5"
+        raise ValueError(f"не понял правку «{name}={text}»: нужен формат вида {example}")
+    return got
+
+
 def _value(name, text):
-    """Значение поля Config из строки — по типу поля (как в .env: списки через запятую, словари «A:1,B:2»)."""
+    """Значение поля Config из строки — по типу поля (как в .env: списки через запятую, словари «A:1,B:2» или со
+    своим разбором, см. _dict_value)."""
     kind = {f.name: getattr(f.type, "__name__", f.type) for f in dataclasses.fields(p2p.Config)}[name]
     text = text.strip()
     if kind == "bool":
@@ -40,7 +56,7 @@ def _value(name, text):
     if kind == "float":
         return float(text)
     if kind == "dict":
-        return p2p._fees(text, upper=name != "spot_fees")
+        return _dict_value(name, text)
     if kind == "list":
         items = [x.strip() for x in text.split(",") if x.strip()]
         return [x.upper() for x in items] if name == "assets" else items
