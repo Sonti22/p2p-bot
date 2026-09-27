@@ -316,8 +316,28 @@ def funding_profile(perp_segments, since_ms=None):
             "positive_share": round(sum(r > 0 for r in rates) / len(rates), 3)}
 
 
+def since(segments, start_ms):
+    """Отрезки, обрезанные слева по start_ms (для оценки последних 12 месяцев); пустые отбрасываются."""
+    out = []
+    for s in segments:
+        if s["end"] <= start_ms:
+            continue
+        cut = dict(s, start=max(s["start"], start_ms),
+                   klines=[k for k in s["klines"] if k[0] >= start_ms],
+                   funding=[f for f in s["funding"] if f[0] >= start_ms])
+        if cut["klines"]:
+            out.append(cut)
+    return out
+
+
+def _last12(r):
+    keys = ("net_apr_pct", "excess_vs_earn_pp", "max_dd_pct", "worst_day_pct", "entries", "settlements_in_position")
+    return {k: r.get(k) for k in keys} if r.get("ok") else {"ok": False, "reason": r.get("reason")}
+
+
 def run(dataset, p=None, log=print):
-    """Все варианты по всем монетам: основные правила (комиссии ×2), справочно — комиссии ×1 и «всегда в позиции»."""
+    """Все варианты по всем монетам: основные правила (комиссии ×2); справочно — комиссии ×1, «всегда в позиции»
+    и те же правила только на последних 12 месяцах (смена режима рынка)."""
     p = p or Params()
     p1 = dataclasses.replace(p, fee_mult=1.0)
     pon = dataclasses.replace(p, always_on=True)
@@ -325,16 +345,21 @@ def run(dataset, p=None, log=print):
     for coin, c in dataset["coins"].items():
         log(f"фандинг {coin}")
         out["profile"][coin] = {"bybit": funding_profile(c["perp"]), "bingx": funding_profile(c["bingx"])}
+        ends = [s["klines"][-1][0] for s in c["perp"] if s["klines"]]
+        cut = (max(ends) - YEAR_MS - p.lookback_h * H) if ends else 0
         if c["perp"] and c["spot"]["klines"]:
             r = spot_perp(coin, c["spot"]["klines"], c["perp"], p)
             r["fees_x1_apr_pct"] = spot_perp(coin, c["spot"]["klines"], c["perp"], p1).get("net_apr_pct")
             r["always_on_apr_pct"] = spot_perp(coin, c["spot"]["klines"], c["perp"], pon).get("net_apr_pct")
+            r["last_12m"] = _last12(spot_perp(coin, [k for k in c["spot"]["klines"] if k[0] >= cut],
+                                              since(c["perp"], cut), p))
             out["spot_perp"][coin] = r
         if c["perp"] and c["bingx"]:
             r = perp_perp(coin, c["perp"], c["bingx"], p)
             if r.get("ok"):
                 r["fees_x1_apr_pct"] = perp_perp(coin, c["perp"], c["bingx"], p1).get("net_apr_pct")
                 r["always_on_apr_pct"] = perp_perp(coin, c["perp"], c["bingx"], pon).get("net_apr_pct")
+                r["last_12m"] = _last12(perp_perp(coin, since(c["perp"], cut), since(c["bingx"], cut), p))
             out["perp_perp"][coin] = r
     return out
 

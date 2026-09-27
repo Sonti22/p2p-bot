@@ -138,3 +138,17 @@ def test_metrics_helpers():
     assert metrics.profit_factor([2, -1, 3, -1]) == 2.5
     d = metrics.daily_last([(0, 1), (3600_000, 2), (86_400_000, 3)])
     assert d == [(0, 2), (86_400_000, 3)]
+
+
+def test_since_cuts_segments_and_last_12m_matches_short_history():
+    a, b = seg("TONUSDT", T0, 100), seg("GRAMUSDT", T0 + 200 * H, 100)
+    cut = fb.since([a, b], T0 + 50 * H)
+    assert [s["symbol"] for s in cut] == ["TONUSDT", "GRAMUSDT"]
+    assert cut[0]["start"] == T0 + 50 * H and cut[0]["klines"][0][0] == T0 + 50 * H
+    assert all(f[0] >= T0 + 50 * H for f in cut[0]["funding"]) and cut[1] == b
+    assert [s["symbol"] for s in fb.since([a, b], T0 + 150 * H)] == ["GRAMUSDT"]
+    n = 24 * 40
+    ds = {"coins": {"BTC": {"spot": {"klines": kl(T0, n)}, "perp": [seg("BTCUSDT", T0, n, rate=0.0004)],
+                            "bingx": []}}}
+    r = fb.run(ds, log=lambda *a: None)["spot_perp"]["BTC"]
+    assert r["last_12m"]["net_apr_pct"] == r["net_apr_pct"]    # истории меньше года — те же числа
