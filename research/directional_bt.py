@@ -175,7 +175,7 @@ def walk_forward(segments, coin, p):
         oos_end = min(is_end + out_len, last + H)
         scores = {}
         for k in p.k_grid:
-            is_tr = [t for t in by_k[k] if start <= t["entry_ts"] < is_end]
+            is_tr = [t for t in by_k[k] if start <= t["entry_ts"] and t["exit_ts"] < is_end]   # без заглядывания в OOS
             scores[k] = _score(is_tr) if len(is_tr) >= p.min_is_trades else -math.inf
         best = max(p.k_grid, key=lambda k: (scores[k], -abs(k - p.stop_k)))
         if scores[best] == -math.inf:
