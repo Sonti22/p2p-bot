@@ -217,13 +217,15 @@ def apply_result(realized_pct, amount, path=DB_PATH, ts=None):
     не заведён — считается от 0 (не должно происходить в обычном режиме: круг стартует только
     после init_balance)."""
     con = _connect(path)
-    delta = amount * realized_pct / 100
     with con:
-        con.execute("INSERT OR IGNORE INTO balance (id, amount, updated_ts) VALUES (1, 0, ?)",
-                    (ts if ts is not None else time.time(),))
-        con.execute("UPDATE balance SET amount = amount + ?, updated_ts = ? WHERE id = 1",
-                    (delta, ts if ts is not None else time.time()))
+        _add_balance(con, amount * realized_pct / 100, ts if ts is not None else time.time())
     con.close()
+
+
+def _add_balance(con, delta, ts):
+    """Изменить баланс на delta ₽ в открытой транзакции con (баланса нет — от 0)."""
+    con.execute("INSERT OR IGNORE INTO balance (id, amount, updated_ts) VALUES (1, 0, ?)", (ts,))
+    con.execute("UPDATE balance SET amount = amount + ?, updated_ts = ? WHERE id = 1", (delta, ts))
 
 
 def start_cycle(amount, buy, sell, route, planned_pct, path=DB_PATH, ts=None, label="", sell_qty=None, pay_fee=0.0,
@@ -813,23 +815,30 @@ def realized_pct(cycle, sell_price, qty=None):
 def finish_cycle(cycle_id, result, realized_pct=0.0, note="", path=DB_PATH, ts=None, sell_fact=None):
     """Завершить круг: result — 'done' (успех) или 'failed_buy'/'failed_transfer'/'failed_sell'
     (срыв на соответствующей стадии). Обновляет виртуальный баланс на realized_pct (для срыва —
-    обычно 0, круг не состоялся); sell_fact — фактическая цена продажи. Круга с таким id нет —
-    возвращает False, баланс не трогает."""
+    обычно 0, круг не состоялся); sell_fact — фактическая цена продажи. Итог круга и баланс — одной
+    транзакцией: сбой посередине откатывает оба (круг остаётся открытым, следующий скан завершит его снова).
+    Круга с таким id нет или он уже завершён — возвращает False, баланс не трогает (иначе повторный вызов
+    начислил бы прибыль дважды)."""
     ts = ts if ts is not None else time.time()
     con = _connect(path)
-    row = con.execute("SELECT amount, stage FROM cycles WHERE id = ?", (cycle_id,)).fetchone()
-    if row is None:
+    try:
+        with con:
+            row = con.execute("SELECT amount, stage FROM cycles WHERE id = ? AND result IS NULL",
+                              (cycle_id,)).fetchone()
+            if row is None:
+                return False
+            amount, stage = row
+            # result IS NULL и в самом UPDATE: круг, который успел завершить другой вызов, второй раз не начисляем
+            cur = con.execute("UPDATE cycles SET result = ?, ts_stage = ?, realized_pct = ?, note = ?, sell_fact = ? "
+                              "WHERE id = ? AND result IS NULL", (result, ts, realized_pct, note, sell_fact, cycle_id))
+            if cur.rowcount != 1:
+                return False
+            if stage in STAGES:   # стадия, на которой круг закончился (исполнился или сорвался), — её время окончания
+                con.execute(f"UPDATE cycles SET ts_{stage}_done = COALESCE(ts_{stage}_done, ?) WHERE id = ?",
+                            (ts, cycle_id))
+            _add_balance(con, amount * realized_pct / 100, ts)
+    finally:
         con.close()
-        return False
-    amount, stage = row
-    with con:
-        con.execute("UPDATE cycles SET result = ?, ts_stage = ?, realized_pct = ?, note = ?, sell_fact = ? "
-                    "WHERE id = ?", (result, ts, realized_pct, note, sell_fact, cycle_id))
-        if stage in STAGES:   # стадия, на которой круг закончился (исполнился или сорвался), — её время окончания
-            con.execute(f"UPDATE cycles SET ts_{stage}_done = COALESCE(ts_{stage}_done, ?) WHERE id = ?",
-                        (ts, cycle_id))
-    con.close()
-    apply_result(realized_pct, amount, path=path, ts=ts)
     return True
 
 
