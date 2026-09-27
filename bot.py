@@ -1108,10 +1108,11 @@ def apply_mybanks(data):
 
 
 def _lean(snap):
-    """Снимок без полного стакана (Snapshot.book) и всех объявлений скана (Snapshot.ads): они нужны только /maker
-    и записи снимка (snapshots.py) по свежему скану — запомненные сделки (до 200) и живые карточки их не держат."""
-    if snap is not None and (snap.book or snap.ads or snap.jobs):
-        return dataclasses.replace(snap, book={}, ads=[], jobs=[])
+    """Снимок без полного стакана (Snapshot.book), всех объявлений скана (Snapshot.ads) и котировок перпов
+    (Snapshot.perps): они нужны только /maker и записи снимка (snapshots.py) по свежему скану — запомненные сделки
+    (до 200) и живые карточки их не держат."""
+    if snap is not None and (snap.book or snap.ads or snap.jobs or snap.perps):
+        return dataclasses.replace(snap, book={}, ads=[], jobs=[], perps={})
     return snap
 
 

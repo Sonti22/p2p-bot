@@ -188,6 +188,14 @@ def test_scan_attaches_perps(offline):
     assert ("Bybit", "BTCUSDT") in snap.perps and snap.perps[("Bybit", "BTCUSDT")].mid == 84000.0
 
 
+def test_assemble_never_reads_live_perps(offline):
+    """Живые котировки кладёт только scan() после сборки: assemble чистая — replay старого снимка их не подмешивает."""
+    install(quote())
+    cfg = p2p.Config(assets=["USDT"], exchanges=["bybit"])
+    raw = asyncio.run(p2p.collect(None, cfg))
+    assert p2p.assemble(cfg, **raw).perps == {}
+
+
 def test_public_get_only():
     src = inspect.getsource(perp)
     assert ".post(" not in src and "order/create" not in src and "X-BAPI-SIGN" not in src
