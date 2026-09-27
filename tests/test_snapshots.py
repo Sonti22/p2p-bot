@@ -1,11 +1,15 @@
 """Снимки сканов (snapshots.py) и замеры запросов скана: время получения объявлений, «из кэша», id объявлений,
-запись/чтение снимка, дедупликация групп, срок хранения и потолок размера, запись из scan_loop после сигналов."""
+запись/чтение снимка, пакеты групп и дедупликация, срок хранения и потолок размера (14 дней при настройках
+.env.example), испорченная база, запись из scan_loop после сигналов — каждый SNAPSHOT_EVERY-й скан
+и скан старта круга."""
 import asyncio
+import json
 import logging
 import os
 import sqlite3
 import threading
 import time
+import zlib
 
 import pytest
 
@@ -26,6 +30,7 @@ def _cfg(**kw):
 @pytest.fixture(autouse=True)
 def _fresh_prune(monkeypatch):
     monkeypatch.setitem(snapshots._state, "pruned", 0.0)
+    monkeypatch.setattr(snapshots, "_seen", {})
 
 
 def _count(path, table):
@@ -201,32 +206,58 @@ def _data(ts, prices, net_status=None):
     return snapshots.collect(snap, p2p.Config())
 
 
+def _pack_items(path):
+    con = sqlite3.connect(path)
+    rows = con.execute("SELECT id, blob FROM packs ORDER BY id").fetchall()
+    con.close()
+    return {pid: json.loads(zlib.decompress(blob)) for pid, blob in rows}
+
+
 def test_unchanged_groups_not_rewritten(_isolated_data):
     path = snapshots.DB_PATH
     snapshots.write(_data(1000.0, [85.0, 86.0]), now=1000.0)
-    blobs = _count(path, "blobs")
-    assert blobs == 2                                                    # группа + справочник сетей
+    assert [len(v) for v in _pack_items(path).values()] == [2]          # группа + справочник сетей одним пакетом
     snapshots.write(_data(1020.0, [85.0, 86.0]), now=1020.0)             # то же содержимое, другое время
-    assert _count(path, "blobs") == blobs and _count(path, "scans") == 2
+    assert _count(path, "packs") == 1 and _count(path, "scans") == 2
     first, second = snapshots.load(1000000), snapshots.load(1020000)
-    assert first["groups"][0]["h"] == second["groups"][0]["h"]
+    assert (first["groups"][0]["p"], first["groups"][0]["i"]) == (second["groups"][0]["p"], second["groups"][0]["i"])
+    assert second["groups"][0]["ads"] == first["groups"][0]["ads"] and second["net"] == first["net"]
     assert second["groups"][0]["ft"] == 1020.0                           # время получения — своё у скана
     snapshots.write(_data(1040.0, [85.0, 87.0]), now=1040.0)             # цена сменилась — новая группа
-    assert _count(path, "blobs") == blobs + 1
+    packs = _pack_items(path)
+    assert len(packs) == 2 and len(packs[max(packs)]) == 1               # в новом пакете только она, сети — старые
+    third = snapshots.load(1040000)
+    assert [r[0] for r in third["groups"][0]["ads"]] == [85.0, 87.0] and third["net"] == first["net"]
 
 
 def test_retention_drops_old_scans_and_orphan_groups(_isolated_data):
     path = snapshots.DB_PATH
     now = 100 * 86400.0
     old = now - snapshots.RETENTION - 3600
-    snapshots.write(_data(old, [70.0]), now=old)                         # группа только у старого скана
+    snapshots.write(_data(old, [70.0]), now=old)                         # группа 70.0 и сети — только у старого скана
+    netstatus.STATUS[("HTX", "USDT")] = {"TRC20": {"dep": True, "wd": True, "fee": 1.0, "min": 10.0}}
     snapshots.write(_data(old + 10, [85.0]), now=old + 10)
     snapshots._state["pruned"] = 0.0
-    snapshots.write(_data(now, [85.0]), now=now)                         # та же группа 85.0 — жива
+    snapshots.write(_data(now, [85.0]), now=now)                         # та же группа 85.0 и сети — живы
     assert snapshots.ids() == [int(now * 1000)]
     got = snapshots.load(int(now * 1000))
-    assert got["groups"][0]["ads"] and got["groups"][0]["ads"][0][0] == 85.0
-    assert _count(path, "blobs") == 2                                    # группа 70.0 удалена, 85.0 и сети остались
+    assert got["groups"][0]["ads"] and got["groups"][0]["ads"][0][0] == 85.0 and got["net"][0][:2] == ["HTX", "USDT"]
+    assert _count(path, "packs") == 1                                    # пакет старого скана удалён, 85.0 остался
+
+
+def test_group_reused_after_restart_is_stored_again(_isolated_data, monkeypatch):
+    """После рестарта бота (память о записанном пуста) или пропажи старого пакета группа пишется заново."""
+    path = snapshots.DB_PATH
+    snapshots.write(_data(1000.0, [85.0]), now=1000.0)
+    monkeypatch.setattr(snapshots, "_seen", {})
+    snapshots.write(_data(1020.0, [85.0]), now=1020.0)
+    assert _count(path, "packs") == 2 and snapshots.load(1020000)["groups"][0]["ads"][0][0] == 85.0
+    con = sqlite3.connect(path)
+    con.execute("DELETE FROM packs")                                    # пакета, на который ссылается память, нет
+    con.commit()
+    con.close()
+    snapshots.write(_data(1040.0, [85.0]), now=1040.0)
+    assert snapshots.load(1040000)["groups"][0]["ads"][0][0] == 85.0
 
 
 def test_size_cap_drops_oldest_scans(_isolated_data, monkeypatch):
@@ -257,6 +288,108 @@ def test_netstatus_stored_and_deduped(_isolated_data):
 def test_db_path_is_isolated(_isolated_data):
     assert snapshots.DB_PATH == str(_isolated_data / "snapshots.db")
     assert snapshots.write.__defaults__[0] == str(_isolated_data / "snapshots.db")
+
+
+def test_snapshot_every_setting(monkeypatch):
+    monkeypatch.delenv("SNAPSHOT_EVERY", raising=False)
+    assert snapshots.every() == snapshots.DEFAULT_EVERY == 3
+    for raw, want in (("1", 1), ("6", 6), ("0", 3), ("-2", 3), ("abc", 3)):
+        monkeypatch.setenv("SNAPSHOT_EVERY", raw)
+        assert snapshots.every() == want
+
+
+# --- испорченная база ---
+
+def _junk_db(path, junk):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as f:
+        f.write(junk)
+
+
+def test_corrupt_db_set_aside_and_new_one_written(_isolated_data, caplog):
+    """«file is not a database» — раньше каждый скан писал эту ошибку в лог и снимков не было до ручной чистки."""
+    path = snapshots.DB_PATH
+    junk = b"this is not a database " * 200
+    _junk_db(path, junk)
+    with caplog.at_level(logging.WARNING, logger="snapshots"):
+        assert snapshots.write(_data(1000.0, [85.0]), now=1000.0) == 1000000
+    with open(path + ".corrupt-1000", "rb") as f:
+        assert f.read() == junk                                          # испорченный файл отложен как есть
+    assert "snapshots.db.corrupt-1000" in caplog.text
+    assert snapshots.write(_data(1020.0, [85.0]), now=1020.0) == 1020000 # следующие сканы — в новую базу
+    assert snapshots.ids() == [1000000, 1020000] and snapshots.load(1020000)["groups"][0]["ads"]
+
+
+def test_malformed_db_pages_set_aside(_isolated_data):
+    path = snapshots.DB_PATH
+    for i in range(30):
+        snapshots.write(_data(1000.0 + i, [50.0 + i + k / 100 for k in range(20)]), now=1000.0 + i)
+    with open(path, "rb") as f:
+        raw = f.read()
+    _junk_db(path, raw[:4096] + b"\x5a" * (len(raw) - 4096))            # заголовок цел, страницы данных — мусор
+    snapshots._seen.clear()
+    assert snapshots.write(_data(2000.0, [1.0]), now=2000.0) == 2000000
+    assert os.path.exists(path + ".corrupt-2000") and snapshots.ids() == [2000000]
+
+
+def test_busy_or_io_errors_do_not_set_db_aside(_isolated_data, monkeypatch):
+    path = snapshots.DB_PATH
+    snapshots.write(_data(1000.0, [85.0]), now=1000.0)
+
+    def locked(*a, **k):
+        raise sqlite3.OperationalError("database is locked")
+    monkeypatch.setattr(snapshots, "_write", locked)
+    with pytest.raises(sqlite3.OperationalError):
+        snapshots.write(_data(1020.0, [85.0]), now=1020.0)
+    assert os.listdir(os.path.dirname(path)) == ["snapshots.db"]
+
+
+# --- объём: 14 дней при настройках по умолчанию ---
+
+def _changed_series(data, n, t0, step):
+    """n снимков подряд, где каждая группа каждый раз новая (цены сдвинуты на копейку) — худший случай для базы:
+    в жизни группы монет кроме USDT и BestChange обновляются раз в ALT_INTERVAL/BC_REFRESH и заново не пишутся."""
+    out = []
+    for i in range(n):
+        ts = t0 + i * step
+        groups = [(key, ts, total, [[round(r[0] + 0.01 * (i + 1), 2)] + r[1:] for r in rows])
+                  for key, _ft, total, rows in data["groups"]]
+        out.append({"id": int(ts * 1000), "ts": ts, "scan": dict(data["scan"], ts=ts), "groups": groups,
+                    "net": data["net"]})
+    return out
+
+
+def _example():
+    """Настройки из .env.example — то, с чем бот работает «по умолчанию» у владельца."""
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env.example")
+    out = {}
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            name, sep, value = line.strip().partition("=")
+            if sep and not name.startswith("#"):
+                out[name] = value
+    return out
+
+
+def test_default_cap_holds_14_days_at_default_interval(offline, monkeypatch):
+    example = _example()
+    assert int(example["SNAPSHOT_EVERY"]) == snapshots.DEFAULT_EVERY
+    assert float(example["SNAPSHOT_MAX_MB"]) == snapshots.DEFAULT_MAX_MB
+    interval = int(example["INTERVAL"])                                  # 10 с (у p2p.Config — 20, запас вдвое)
+    assert interval <= p2p.Config().interval
+    monkeypatch.delenv("SNAPSHOT_MAX_MB", raising=False)
+    monkeypatch.delenv("SNAPSHOT_EVERY", raising=False)
+    cfg = p2p.Config()                                                   # все площадки и монеты фикстур
+    data = snapshots.collect(asyncio.run(p2p.scan(None, cfg)), cfg)
+    assert len(data["groups"]) > 50
+    step = interval * snapshots.every()
+    n = 12
+    for d in _changed_series(data, n, 1_000_000.0, step):
+        snapshots.write(d, now=d["ts"])
+    per_scan = snapshots.stats()["bytes"] / n                            # ~26 КБ на фикстуре
+    days = snapshots.max_bytes() / (per_scan * 86400 / step)
+    assert days >= 14, f"{per_scan:.0f} байт на снимок — {days:.1f} дней в лимите"
+    assert snapshots.RETENTION == 14 * 86400
 
 
 # --- запись из цикла бота ---
@@ -338,6 +471,21 @@ def test_failed_scan_writes_no_snapshot(monkeypatch):
     bot.chat_id = ""
     _loop_once(bot, monkeypatch, fake_scan)
     assert not calls
+
+
+def test_save_snapshot_every_nth_scan_and_paper_start_scan(monkeypatch):
+    monkeypatch.setenv("SNAPSHOT_EVERY", "3")
+    bot = Stub(p2p.Config())
+    t0 = float(int(time.time()) - 100)
+    snaps = [p2p.Snapshot(88.0, "t", {}, {}, [], {}, {}, {}, ts=t0 + 10 * i) for i in range(8)]
+    sid = [snapshots.scan_id(s) for s in snaps]
+    got = []
+    for i, s in enumerate(snaps):
+        if i in (4, 6):                                                  # на этих сканах стартовал круг сухого прогона
+            bot.snapshot_keep.add(sid[i])
+        got.append(asyncio.run(bot.save_snapshot(s)))
+    assert snapshots.ids() == [sid[0], sid[3], sid[4], sid[6]]           # 0, 3, 6 — по очереди; 4 — ради круга
+    assert got == [sid[0], None, None, sid[3], sid[4], None, sid[6], None] and not bot.snapshot_keep
 
 
 def test_lean_snapshot_drops_ads_and_jobs():

@@ -1195,6 +1195,8 @@ class Bot:
         self.onboarding = None   # {"step": "amount"/"banks"/"min", "banks": set()} — мастер первого /start
         self.sent = {}
         self.signal_rows = {}   # (ex,asset,ex,asset) -> id открытого эпизода в history.signals (связка выше порога)
+        self.snapshot_scans = 0      # сканов с запуска — снимок пишется каждый SNAPSHOT_EVERY-й
+        self.snapshot_keep = set()   # id сканов, на которых стартовал круг сухого прогона: их снимок пишется всегда
         self.live_msg = {}   # (ex,asset,ex,asset) -> последнее сообщение сигнала для «живой карточки» (editMessage)
         self.live = {}                                            # (ex,asset,ex,asset) -> {"first": ts, "streak": n}
         self.live_scans = int(os.getenv("LIVE_SCANS", 2))        # сигнал, только если связка держится ≥ N сканов
@@ -2087,8 +2089,16 @@ class Bot:
             await asyncio.sleep(self.cfg.interval)
 
     async def save_snapshot(self, snap):
-        """Снимок скана в data/snapshots.db (snapshots.py): данные собираем здесь, пишем в отдельном потоке —
-        цикл событий не ждёт диск. Ошибка записи скан не ломает — строка в логе. Возвращает id снимка или None."""
+        """Снимок скана в data/snapshots.db (snapshots.py): каждый SNAPSHOT_EVERY-й скан (первый после запуска —
+        всегда) и скан, на котором стартовал круг сухого прогона (snapshot_id круга должен найтись). Данные собираем
+        здесь, пишем в отдельном потоке — цикл событий не ждёт диск. Ошибка записи скан не ломает — строка в логе.
+        Возвращает id снимка или None (скан не пишется или ошибка)."""
+        keep = snapshots.scan_id(snap) in self.snapshot_keep
+        self.snapshot_keep.clear()   # круг стартует только в текущем скане — старые отметки не нужны
+        due = self.snapshot_scans % snapshots.every() == 0
+        self.snapshot_scans += 1
+        if not (due or keep):
+            return None
         try:
             data = snapshots.collect(snap, self.cfg, self.live)
             return await asyncio.to_thread(snapshots.write, data)
@@ -2392,6 +2402,8 @@ class Bot:
                     "streak": self.live.get(self._deal_key(d), {}).get("streak", 0),
                     "depth": paper.depth_margin(psnap, b, s, settings["amount"], qty or s.avail),
                     "snapshot_id": snapshots.scan_id(snap)}
+        if measures["snapshot_id"] is not None:   # снимок этого скана запишется, даже если он не SNAPSHOT_EVERY-й
+            self.snapshot_keep.add(measures["snapshot_id"])
         # over — тот же, что в плане и qty: банк оплаты и комиссия СБП в круге совпадут с планом
         cycle = paper.get_cycle(paper.start_cycle(settings["amount"], b, s, route, profit, label=label,
                                                   sell_qty=qty or s.avail, pay_fee=self.cfg.pay_fee, over=over,

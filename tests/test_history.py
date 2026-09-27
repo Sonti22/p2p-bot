@@ -176,9 +176,11 @@ def test_signal_stats_missed_share(tmp_path):
     # k4: 5 минут под антидублем (сигнал по ней был раньше, за окном) — не пропуск
     k3, k4 = ("KuCoin", "USDT", "MEXC", "USDT"), ("MEXC", "USDT", "HTX", "USDT")
     ids = history.track_signals([(K1, 1.5, False, "unconfirmed"), (K2, 2.0, False, "unconfirmed"),
-                                 (k3, 1.2, False, "unconfirmed"), (k4, 1.1, False, "cooldown")], now - 300, ids, path=db)
+                                 (k3, 1.2, False, "unconfirmed"), (k4, 1.1, False, "cooldown")],
+                                now - 300, ids, path=db)
     ids = history.track_signals([(K1, 1.6, True, None), (K2, 2.0, False, "max_signals"),
-                                 (k3, 1.2, False, "unconfirmed"), (k4, 1.1, False, "cooldown")], now - 240, ids, path=db)
+                                 (k3, 1.2, False, "unconfirmed"), (k4, 1.1, False, "cooldown")],
+                                now - 240, ids, path=db)
     ids = history.track_signals([(K1, 1.6, False, "cooldown"), (K2, 2.1, False, "max_signals"),
                                  (k4, 1.1, False, "cooldown")], now, ids, path=db)
     st = history.signal_stats(path=db, now=now)

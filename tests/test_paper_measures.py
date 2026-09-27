@@ -211,6 +211,7 @@ def test_bot_paper_start_records_measures(monkeypatch):
     assert c["label"] == label and json.loads(c["reasons_start"]) == reasons
     assert c["index_start"] == p2p.reliability_index(d, bot.cfg, snap)
     assert c["streak_start"] == bot.live_scans and c["snapshot_id"] == snapshots.scan_id(snap)
+    assert c["snapshot_id"] in bot.snapshot_keep                          # снимок этого скана запишется вне очереди
     assert c["depth_margin"] and c["depth_margin"] > 1
     assert c["buy_orders"] == 200 and c["sell_rate"] == 100.0
 

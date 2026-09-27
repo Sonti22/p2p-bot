@@ -142,7 +142,8 @@ def _pct(part, whole):
 
 def fmt_summary(res):
     if not res["scans"]:
-        return "Перепрогон: снимков за этот период нет (data/snapshots.db пишет бот после каждого скана)."
+        return ("Перепрогон: снимков за этот период нет (data/snapshots.db пишет бот каждый SNAPSHOT_EVERY-й "
+                "скан).")
     a, b = res["a"], res["b"]
     lines = [f"Перепрогон снимков: {res['scans']}, {_when(res['first'])} — {_when(res['last'])} МСК",
              "Правки B: " + (", ".join(res["specs"]) or "нет (B = A)"),
