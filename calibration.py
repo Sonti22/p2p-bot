@@ -124,8 +124,9 @@ def _ro(path):
     return sqlite3.connect(pathlib.Path(path).resolve().as_uri() + "?mode=ro", uri=True)
 
 
-def _read(path, table, wanted, where=""):
-    """Строки таблицы словарями; нет базы/таблицы — []; нет колонки — None (кроме колонок из where)."""
+def _read(path, table, wanted, where="", distinct=False):
+    """Строки таблицы словарями; нет базы/таблицы — []; нет колонки — None (кроме колонок из where).
+    distinct — только разные строки (SELECT DISTINCT)."""
     if not path or not os.path.exists(path):
         return []
     try:
@@ -138,7 +139,8 @@ def _read(path, table, wanted, where=""):
             return []
         exprs = ", ".join(c if c in have else f"NULL AS {c}" for c in wanted)
         con.row_factory = sqlite3.Row
-        return [dict(r) for r in con.execute(f"SELECT {exprs} FROM {table} {where}")]
+        select = "SELECT DISTINCT" if distinct else "SELECT"
+        return [dict(r) for r in con.execute(f"{select} {exprs} FROM {table} {where}")]
     except sqlite3.Error:
         return []   # битая база или нет колонки из where — как пустая
     finally:
@@ -306,8 +308,9 @@ def rank_deals(cal, deals, labels=None):
 
 
 def usdt_rub_series(path=None):
-    """Ряд ориентира USDT/RUB [(ts, цена)] из data/history.db (snap.ref, раз в 5 мин); нет базы — []."""
-    rows = _read(path or history.DB_PATH, "history", ("ts", "ref"), "WHERE ref > 0 ORDER BY ts")
+    """Ряд ориентира USDT/RUB [(ts, цена)] из data/history.db (snap.ref, раз в 5 мин); нет базы — [].
+    Ориентир один на запись, а строк в записи — по паре площадок: читаем только разные (ts, ref)."""
+    rows = _read(path or history.DB_PATH, "history", ("ts", "ref"), "WHERE ref > 0 ORDER BY ts", distinct=True)
     return [(r["ts"], r["ref"]) for r in rows if r["ts"] is not None]
 
 

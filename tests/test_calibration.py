@@ -316,8 +316,9 @@ def test_usdt_rub_series(tmp_path):
     path = str(tmp_path / "history.db")
     assert C.usdt_rub_series(path) == [] and not os.path.exists(path)
     history._insert([(200.0, "Bybit", "MEXC", "USDT", "USDT", 1.0, 81.5), (100.0, "HTX", "MEXC", "USDT", "USDT", 1.0, 81.0),
+                     (200.0, "HTX", "KuCoin", "USDT", "USDT", 2.0, 81.5),   # та же запись, другая пара площадок
                      (300.0, "HTX", "MEXC", "USDT", "USDT", 1.0, None)], path)
-    assert C.usdt_rub_series(path) == [(100.0, 81.0), (200.0, 81.5)]
+    assert C.usdt_rub_series(path) == [(100.0, 81.0), (200.0, 81.5)]              # точка на запись, без повторов
 
 
 def test_report_text_content():

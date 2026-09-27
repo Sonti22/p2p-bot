@@ -1,3 +1,5 @@
+import asyncio
+import dataclasses
 import datetime
 import sqlite3
 
@@ -20,7 +22,14 @@ def reset(monkeypatch, t):
     return clock
 
 
-def test_record_writes_best_profit_per_deal_key_with_coins(tmp_path, monkeypatch):
+def _table(db, sql):
+    con = sqlite3.connect(db)
+    rows = con.execute(sql).fetchall()
+    con.close()
+    return rows
+
+
+def test_record_best_per_exchange_pair_and_routes_with_coins_apart(tmp_path, monkeypatch):
     db = str(tmp_path / "history.db")
     reset(monkeypatch, BASE)
     deals = [
@@ -30,28 +39,83 @@ def test_record_writes_best_profit_per_deal_key_with_coins(tmp_path, monkeypatch
         (1.0, make_ad("Bybit", "buy", 86.0), make_ad("MEXC", "sell", 89.0), "route4"),   # та же связка хуже
     ]
     assert history.record(snap(deals), path=db) is True
-    con = sqlite3.connect(db)
-    rows = con.execute("SELECT buy_ex, asset_buy, sell_ex, asset_sell, profit, ref FROM history "
-                       "ORDER BY sell_ex, asset_sell").fetchall()
-    con.close()
-    assert rows == [("HTX", "USDT", "BestChange", "USDT", 2.0, 88.0), ("Bybit", "USDT", "MEXC", "USDC", 5.0, 88.0),
-                    ("Bybit", "USDT", "MEXC", "USDT", 3.0, 88.0)]                    # лучший на каждую связку
+    rows = _table(db, "SELECT buy_ex, asset_buy, sell_ex, asset_sell, profit, ref FROM history ORDER BY id")
+    assert rows == [("Bybit", "USDT", "MEXC", "USDC", 5.0, 88.0),                  # пара площадок — лучшая из монет
+                    ("HTX", "USDT", "BestChange", "USDT", 2.0, 88.0)]
+    routes = _table(db, "SELECT ts, buy_ex, asset_buy, sell_ex, asset_sell, profit FROM history_routes ORDER BY id")
+    assert routes == [(BASE, "Bybit", "USDT", "MEXC", "USDT", 3.0), (BASE, "Bybit", "USDT", "MEXC", "USDC", 5.0),
+                      (BASE, "HTX", "USDT", "BestChange", "USDT", 2.0)]              # лучший на каждую связку
 
 
-def test_aggregations_take_best_coin_per_exchange_pair(tmp_path, monkeypatch):
-    """Строк на пару площадок в одну запись теперь несколько (по монетам) — агрегации считают, как раньше, по лучшей."""
+_FIXTURE = {}
+
+
+def _fixture_snap():
+    """Живой скан на фикстурах площадок (все монеты по умолчанию) — один на модуль: скан долгий."""
+    if "snap" not in _FIXTURE:
+        _FIXTURE["snap"] = asyncio.run(p2p.scan(None, p2p.Config()))
+    return _FIXTURE["snap"]
+
+
+def test_record_one_scan_writes_one_row_per_exchange_pair(tmp_path, monkeypatch, offline):
     db = str(tmp_path / "history.db")
+    one = _fixture_snap()
+    routes = {(b.ex, b.asset, s.ex, s.asset) for _p, b, s, _r in one.deals}
+    pairs = {(b.ex, s.ex) for _p, b, s, _r in one.deals}
+    assert len(routes) > 5 * len(pairs)          # на фикстуре связок с монетами в разы больше, чем пар площадок
     reset(monkeypatch, BASE)
-    deals = [(3.0, make_ad("Bybit", "buy", 85.0), make_ad("MEXC", "sell", 90.0), "r"),
-             (5.0, make_ad("Bybit", "buy", 85.0), make_ad("MEXC", "sell", 92.0, asset="USDC"), "r")]
-    assert history.record(snap(deals), 50000, path=db) is True
-    history._insert([(BASE - 3600, "Bybit", "MEXC", "USDT", "USDT", 1.0, 88.0)], db)   # старая запись: пара одной строкой
-    assert history.hourly_avg(path=db, now=BASE + 60)[10] == 5.0
-    assert history.hourly_avg(path=db, now=BASE + 60)[9] == 1.0
-    bt = history.backtest(2.0, 50000, path=db, now=BASE + 60)[7]
-    assert [(r["buy_ex"], r["sell_ex"], r["hits"], r["total"], r["avg"]) for r in bt] == [("Bybit", "MEXC", 1, 2, 5.0)]
-    _labels, p2p_med, _bc = history.median_vs_bestchange(path=db, now=BASE + 60)
-    assert p2p_med == [3.0]                                                          # медиана из 1.0 и 5.0
+    assert history.record(one, 50000, path=db) is True
+    assert _table(db, "SELECT COUNT(*) FROM history") == [(len(pairs),)]
+    assert _table(db, "SELECT COUNT(*) FROM history_routes") == [(len(routes),)]
+
+
+def _main_record(one, now, amount):
+    """Эталон: record() до этапа 1 (main) — строка на пару площадок, лучшая из монет пары, в порядке первой встречи."""
+    best = {}
+    for profit, b, s, _route in one.deals:
+        key = (b.ex, s.ex)
+        if key not in best or profit > best[key][0]:
+            best[key] = (profit, b.asset, s.asset)
+    return [(now, be, se, ab, sa, p, one.ref, amount) for (be, se), (p, ab, sa) in best.items()]
+
+
+MAIN_ROWS_SQL = "SELECT ts, buy_ex, sell_ex, profit, amount FROM history WHERE ts >= ? ORDER BY ts"   # _rows в main
+
+
+def test_history_and_aggregates_match_pre_change_behaviour_on_fixture(tmp_path, monkeypatch, offline):
+    """history, _rows и все агрегации /history и /backtest (включая порядок пар с равным числом попаданий) — как у
+    записи до этапа 1: эталонная база записана прежним алгоритмом record, _rows сверяется с прежним запросом."""
+    base = _fixture_snap()
+    new, ref = str(tmp_path / "new.db"), str(tmp_path / "ref.db")
+    clock = reset(monkeypatch, BASE)
+    for i in range(10):   # 10 записей за ~9 дней, прибыль по связкам «гуляет» — лучшая монета пары меняется
+        clock["t"] = BASE + i * (0.9 * 86400 + 3 * 3600)
+        deals = [(p + ((j * 7 + i * 3) % 11 - 5) * 0.37, b, s, r) for j, (p, b, s, r) in enumerate(base.deals)]
+        one = dataclasses.replace(base, deals=deals)
+        assert history.record(one, 50000 + i, path=new) is True
+        history._insert(_main_record(one, clock["t"], 50000 + i), ref)
+    cols = "SELECT ts, buy_ex, sell_ex, asset_buy, asset_sell, profit, ref, amount FROM history ORDER BY id"
+    assert _table(new, cols) == _table(ref, cols)
+    con = sqlite3.connect(ref)
+    main_rows = con.execute(MAIN_ROWS_SQL, (0,)).fetchall()
+    con.close()
+    assert history._rows(new, 0) == main_rows
+    now = BASE + 10 * 86400
+    for fn in (history.hourly_avg, history.heatmap):
+        assert fn(new, now=now) == fn(ref, now=now)
+    assert history.median_vs_bestchange(new, now=now) == history.median_vs_bestchange(ref, now=now)
+    for threshold in (-50.0, 0.0, 1.0):   # низкие пороги — много пар с равным числом попаданий
+        assert history.backtest(threshold, 50000, new, now=now) == history.backtest(threshold, 50000, ref, now=now)
+
+
+def test_backtest_ties_keep_insertion_order(tmp_path):
+    """Пары с равным числом попаданий — в порядке записи (как в main), а не по алфавиту площадок."""
+    db = str(tmp_path / "history.db")
+    now = BASE + 40 * 86400
+    history._insert([(now - 86400, "MEXC", "Bybit", "USDT", "USDT", 3.0, 88.0),
+                     (now - 86400, "Bybit", "HTX", "USDT", "USDT", 3.0, 88.0)], db)
+    assert [(r["buy_ex"], r["sell_ex"]) for r in history.backtest(2.0, 50000, db, now=now)[7]] == [
+        ("MEXC", "Bybit"), ("Bybit", "HTX")]
 
 
 # --- signals: эпизоды связок выше порога ---
@@ -165,13 +229,13 @@ def test_cleanup_deletes_older_than_30_days(tmp_path):
     db = str(tmp_path / "history.db")
     now = BASE + 40 * 86400
     history._insert([(now - 31 * 86400, "Bybit", "MEXC", "USDT", "USDT", 3.0, 88.0),
-                     (now - 1 * 86400, "Bybit", "MEXC", "USDT", "USDT", 4.0, 88.0)], db)
+                     (now - 1 * 86400, "Bybit", "MEXC", "USDT", "USDT", 4.0, 88.0)], db,
+                    routes=[(now - 31 * 86400, "Bybit", "USDT", "MEXC", "USDT", 3.0),
+                            (now - 1 * 86400, "Bybit", "USDT", "MEXC", "USDT", 4.0)])
     removed = history.cleanup(db, now=now)
     assert removed == 1
-    con = sqlite3.connect(db)
-    left = con.execute("SELECT profit FROM history").fetchall()
-    con.close()
-    assert left == [(4.0,)]
+    assert _table(db, "SELECT profit FROM history") == [(4.0,)]
+    assert _table(db, "SELECT profit FROM history_routes") == [(4.0,)]   # тот же срок хранения
 
 
 def test_cleanup_missing_file_is_noop():
