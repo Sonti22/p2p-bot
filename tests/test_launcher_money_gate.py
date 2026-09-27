@@ -29,14 +29,16 @@ def _load_guard():
 @pytest.fixture
 def gate(monkeypatch, tmp_path):
     """try_update на модели репозитория: st.head — HEAD папки бота, st.github — main на GitHub (fetch делает его
-    origin/main), merge/reset — ровно названный sha, st.files — вывод git diff --no-renames -z, st.smokes — ответы
+    origin/main), merge/reset — ровно названный sha, st.files — вывод git diff --no-renames -z, st.commits — файлы
+    каждого коммита диапазона (git log --name-only -z; по умолчанию один коммит с st.files), st.smokes — ответы
     smoke() (по умолчанию — прошёл). .env и logs/approved_shas — в tmp_path."""
     paths = {"HERE": tmp_path, "LOG_PATH": tmp_path / "launcher.log", "LAST_GOOD": tmp_path / ".last_good",
              "APPROVED_PATH": tmp_path / "logs" / "approved_shas"}
     for name, value in paths.items():
         monkeypatch.setattr(launcher, name, str(value))
-    st = SimpleNamespace(head=HEAD, github=R1, origin=None, files=["bot.py"], smokes=[], smoked=0, git=[], notes=[],
-                         diff_error=None, diverged=False, env=tmp_path / ".env", approved=paths["APPROVED_PATH"])
+    st = SimpleNamespace(head=HEAD, github=R1, origin=None, files=["bot.py"], commits=None, smokes=[], smoked=0, git=[],
+                         notes=[], diff_error=None, log_error=None, diverged=False, env=tmp_path / ".env",
+                         approved=paths["APPROVED_PATH"])
 
     def git(*args, check=True):
         st.git.append(" ".join(args))
@@ -51,6 +53,11 @@ def gate(monkeypatch, tmp_path):
             if st.diff_error:
                 raise RuntimeError(st.diff_error)
             return "".join(n + "\0" for n in st.files)
+        elif args[0] == "log" and "--name-only" in args:
+            if st.log_error:
+                raise RuntimeError(st.log_error)
+            # как настоящий git: файлы коммитов подряд через \0, между коммитами — лишний \0
+            return "\0".join("".join(n + "\0" for n in c) for c in (st.commits or [st.files]))
         elif args[0] == "merge-base":
             if st.diverged:   # в папке бота свой коммит: HEAD не предок origin/main
                 raise RuntimeError("git merge-base --is-ancestor: exit 1")
@@ -452,11 +459,15 @@ PROTECTED = [".github/workflows/ci.yml", "launcher.py", "LAUNCHER.PY", "run.bat"
              "requirements.txt", "tools/requirements.txt", ".env", "data/keys.json", "logs/approved_shas",
              ".last_good", ".dev_status.json", "git.exe", "tools/Evil.DLL", "x.pyd", "__pycache__/bot.cpython-310.pyc",
              "lib/x.so", "update.bat", "tools/x.CMD", "x.ps1", "json.py", "Hashlib.py", "hashlib/__init__.py",
-             "email/x.py"]
+             "email/x.py", "json.pyw",
+             # установленные пакеты: pytest.py в корне заменил бы pytest в смоуке
+             "pytest.py", "_pytest/python.py", "PIL/Image.py", "aiohttp/__init__.py", "Pluggy.py", "iniconfig.pyw",
+             "packaging/version.py"]
 NOT_PROTECTED = ["bot.py", "p2p.py", "accounts.py", "jsonstore.py", "tests/test_bot.py", "tests/helpers.py",
                  "README.md", "ROADMAP.md", ".env.example", "scripts/tool.py", "requirements-dev.md", "docs/data/x.md",
                  "tests/fixtures/bybit_ads.json", "trades.py", "cards.py", "scripts/json.py", "tests/test_json.py",
-                 "docs/token.md", "calibration.py", "snapshots.py", "replay.py", "perp.py", "simmaker.py"]
+                 "docs/token.md", "calibration.py", "snapshots.py", "replay.py", "perp.py", "simmaker.py",
+                 "scripts/pytest.py", "tests/test_pytest.py", "research/data.py", "docs/aiohttp.md", "pytest.md"]
 
 
 def test_protected_paths_list():
@@ -509,6 +520,55 @@ def test_diff_failure_not_applied(gate):
     assert launcher.Launcher().try_update() is False
     assert not gate.merged() and gate.smoked == 0 and gate.head == HEAD
     assert "bad object" in (gate.env.parent / "launcher.log").read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("path", [".github/workflows/ci.yml", "scripts/guard.py", "tests/conftest.py", "pytest.py"])
+def test_protected_path_touched_in_one_commit_blocks(gate, path):
+    """Итоговый diff чистый (bot.py), но один коммит диапазона менял защищённый путь, а следующий вернул его как было:
+    автомерж между ними шёл по ослабленным правилам. Такое обновление — тоже только после --approve."""
+    gate.files = ["bot.py"]
+    gate.commits = [["bot.py", path], [path], ["README.md"]]
+    gate.env.write_bytes(b"PAYOUTS=1\n")
+    lau = launcher.Launcher()
+    assert lau.try_update() is False and not gate.merged() and gate.smoked == 0 and R1 not in lau.bad
+    assert len(gate.notes) == 1 and gate.notes[0].startswith("🔐") and f"• {path}" in gate.notes[0]
+    assert "• bot.py" not in gate.notes[0] and gate.env.read_bytes() == b"PAYOUTS=1\n"
+    assert f"log --no-renames -m --name-only -z --format= {HEAD}..{R1}" in gate.git
+    gate.approved.parent.mkdir()
+    gate.approved.write_text(R1 + "\n", encoding="utf-8")
+    assert lau.try_update() is True and gate.head == R1 and gate.smoked == 1
+
+
+def test_commit_log_failure_not_applied(gate):
+    """Файлы коммитов не получены — не проверить, не трогал ли какой-то коммит защищённый путь: не ставим."""
+    gate.log_error = "git log: fatal: bad revision"
+    assert launcher.Launcher().try_update() is False
+    assert not gate.merged() and gate.smoked == 0 and gate.head == HEAD
+    assert "bad revision" in (gate.env.parent / "launcher.log").read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("err, pause", [
+    ("FAILED tests/test_x.py::test_a - OSError: [WinError 10055] нет буфера", True),
+    ("[WinError 10055] E   OSError: ... 1 failed", True),
+    ("FAILED tests/test_x.py::test_a - PermissionError: [WinError 32] файл занят", False)])
+def test_socket_exhaustion_waits_before_retry(gate, monkeypatch, err, pause):
+    """Смоук упал, потому что у Windows кончились сокеты (WinError 10055: на ПК много процессов с сетью), — повтор
+    сразу упал бы так же: сначала пауза SOCKET_COOLDOWN. Другой сбой ОС — повтор без паузы, как раньше."""
+    slept = []
+    monkeypatch.setattr(launcher.time, "sleep", slept.append)
+    gate.smokes = [(False, err, True), (True, "5 passed", False)]
+    assert launcher.Launcher().try_update() is True and gate.smoked == 2 and gate.head == R1
+    assert slept == ([launcher.SOCKET_COOLDOWN] if pause else [])
+    assert launcher.SOCKET_COOLDOWN == 90
+
+
+def test_smoke_tail_keeps_socket_exhaustion_mark():
+    """Нехватка сокетов выше последних 500 символов вывода — метка в начале хвоста, иначе паузы бы не было."""
+    out = "E   OSError: [WinError 10055] нет буфера\n" + "x" * 600 + "\n1 failed in 2.0s"
+    tail = launcher._tail(out)
+    assert tail.startswith("[WinError 10055] ") and tail.endswith("1 failed in 2.0s")
+    assert launcher._tail("1 failed, WinError 10055") == "1 failed, WinError 10055"
+    assert launcher._tail("x" * 700) == "x" * 500
 
 
 # --- python launcher.py --approve <sha> ---
@@ -607,8 +667,37 @@ def _samples(prefixes, basenames, exact, names):
     слова в пути, *.pth — и всё то же ЗАГЛАВНЫМИ (Windows запишет LAUNCHER.PY поверх launcher.py)."""
     out = (list(prefixes) + [p + "x.py" for p in prefixes if p.endswith("/")] + [f"deep/dir/{b}" for b in basenames]
            + list(exact) + [f"x/my_{n}_notes.txt" for n in names] + ["a/b/x.pth"]
-           + [f"a/b/x{s}" for s in launcher.PROTECTED_SUFFIXES] + ["json.py", "hashlib/x.py", "a/__pycache__/x.pyc"])
+           + [f"a/b/x{s}" for s in launcher.PROTECTED_SUFFIXES] + ["json.py", "hashlib/x.py", "a/__pycache__/x.pyc"]
+           + [f"{n}.py" for n in launcher.INSTALLED_FALLBACK] + [f"{n}/x.py" for n in launcher.INSTALLED_FALLBACK])
     return out + [s.upper() for s in out]
+
+
+def test_launcher_and_guard_same_installed_module_rule():
+    """Подмена установленного пакета в корне: те же запасной список, свои папки и то же множество имён в обоих."""
+    guard = _load_guard()
+    assert guard.INSTALLED_FALLBACK == launcher.INSTALLED_FALLBACK
+    assert guard.OWN_ROOT == launcher.OWN_ROOT
+    assert guard.installed_names() == launcher.installed_names() >= set(launcher.INSTALLED_FALLBACK)
+    for own in launcher.OWN_ROOT:                                   # свои папки — не подмена, даже если пакет «tests» есть
+        assert not guard.protected(f"{own}/x.py") and not launcher.protected_paths([f"{own}/x.py"])
+    assert launcher.protected_paths(["pytest.py", "a/pytest.py", "pytest.md"]) == ["pytest.py"]
+
+
+def test_installed_names_cached_and_refreshed(monkeypatch):
+    """Список пакетов не читается на каждый путь (packages_distributions — сотни метаданных), но раз в час — заново:
+    пакет, поставленный без перезапуска launcher, тоже защищён."""
+    calls = []
+
+    def fake():
+        calls.append(1)
+        return {"Fresh_Pkg": ["x"], "win32\\lib\\x": ["y"]} if len(calls) > 1 else {}
+    monkeypatch.setattr(launcher.importlib.metadata, "packages_distributions", fake)
+    monkeypatch.setattr(launcher, "_installed", {"at": None, "names": frozenset()})
+    assert not launcher.protected_paths(["fresh_pkg.py"]) and launcher.protected_paths(["pytest.py"])
+    assert not launcher.protected_paths(["fresh_pkg/x.py"]) and len(calls) == 1
+    launcher._installed["at"] -= launcher.INSTALLED_TTL + 1
+    assert launcher.protected_paths(["Fresh_Pkg/x.py"]) and len(calls) == 2
+    assert "win32\\lib\\x" not in launcher.installed_names()
 
 
 def test_launcher_list_covers_guard():

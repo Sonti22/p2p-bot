@@ -3,6 +3,7 @@
 Код выхода 1 = автомерж запрещён, нужна ручная проверка. Защищённый файл: правится только вручную.
 Запуск: python scripts/guard.py [база]   (по умолчанию origin/main)
 """
+import importlib.metadata
 import re
 import subprocess
 import sys
@@ -30,6 +31,25 @@ PROTECTED_BASENAMES = ("conftest.py", "pytest.ini", "pyproject.toml", "setup.cfg
 # настоящего git) — только вручную
 PROTECTED_SUFFIXES = (".pth", ".exe", ".dll", ".pyd", ".pyc", ".so", ".bat", ".cmd", ".ps1")
 STDLIB_NAMES = frozenset(n.lower() for n in sys.stdlib_module_names)
+# и установленные пакеты: pytest.py в корне заменил бы pytest и в CI, и в смоуке launcher. Имена — из importlib.metadata
+# (на ПК владельца их сотни) плюс то, без чего не работают бот и тесты, даже если метаданных нет
+INSTALLED_FALLBACK = ("pytest", "_pytest", "pluggy", "aiohttp", "pil", "iniconfig", "packaging")
+# свои папки проекта: пакет с мусорным верхним модулем «tests» на ПК есть — это не подмена, бот их не импортирует
+OWN_ROOT = ("tests", "scripts", "research")
+_INSTALLED = []   # кэш на запуск: packages_distributions() читает метаданные всех пакетов
+
+
+def installed_names():
+    """Имена верхнего уровня установленных пакетов (нижний регистр) + INSTALLED_FALLBACK."""
+    if not _INSTALLED:
+        try:
+            found = importlib.metadata.packages_distributions()
+        except Exception:   # битые метаданные пакета — не повод пропустить проверку: остаётся запасной список
+            found = {}
+        _INSTALLED.append(frozenset(n.lower() for n in found if n.isidentifier()) | frozenset(INSTALLED_FALLBACK))
+    return _INSTALLED[0]
+
+
 # код выплат в остальных файлах (bot.py: /payout, кнопки pay_*, PAYOUTS; accounts.py, .env.example…): любая добавленная
 # или удалённая строка — ручная проверка владельца. Документацию (.md) не проверяем.
 PAYOUT_CODE = r"payout|\bpay_(?:to|ok|no|hist|stop)\b"
@@ -53,12 +73,17 @@ def git(*args):
     return subprocess.run(["git", *args], capture_output=True, text=True, encoding="utf-8", check=True).stdout
 
 
-def shadows_stdlib(low):
-    """Файл или папка в корне с именем модуля стандартной библиотеки (json.py, hashlib/…): Python возьмёт его вместо
-    настоящего модуля — подмена поведения без единого слова «payout»."""
+def shadows_module(low):
+    """Файл или папка в корне с именем модуля стандартной библиотеки или установленного пакета (json.py, hashlib/…,
+    pytest.py, aiohttp/…; .pyw Windows тоже импортирует): Python возьмёт его вместо настоящего модуля — подмена
+    поведения без единого слова «payout»."""
     first = low.split("/", 1)[0]
-    stem = first[:-3] if first.endswith(".py") else first
-    return ("/" in low or first.endswith(".py")) and stem in STDLIB_NAMES
+    stem = next((first[:-len(ext)] for ext in (".py", ".pyw") if first.endswith(ext)), None)
+    if stem is None:
+        if "/" not in low:
+            return False
+        stem = first
+    return stem in STDLIB_NAMES or stem not in OWN_ROOT and stem in installed_names()
 
 
 def protected(path):
@@ -66,7 +91,7 @@ def protected(path):
     base = low.rsplit("/", 1)[-1]
     return (low.startswith(tuple(p.lower() for p in PROTECTED)) or low in PROTECTED_EXACT
             or any(n in low for n in PROTECTED_NAMES) or base in PROTECTED_BASENAMES
-            or base.endswith(PROTECTED_SUFFIXES) or shadows_stdlib(low))
+            or base.endswith(PROTECTED_SUFFIXES) or shadows_module(low))
 
 
 GIT_RAW = ("-c", "core.quotepath=false", "--literal-pathspecs")   # пути как есть: не-ASCII без кавычек, «:(…)» не магия

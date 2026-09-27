@@ -5,7 +5,8 @@
   полученный sha → смоук-тест
   (компиляция + pytest; нет pytest — ставит его, не вышло или тестов нет — провал) →
   перезапуск бота и сообщение в Telegram; смоук не прошёл → возврат на прежний коммит (сбой ОС под нагрузкой —
-  после одного повтора); изменились только .md — переход без смоука и без перезапуска бота;
+  после одного повтора, при нехватке сокетов Windows — через SOCKET_COOLDOWN сек); изменились только .md — переход без
+  смоука и без перезапуска бота;
 - раз в сутки: минуты GitHub Actions за месяц (приватные репозитории), предупреждение на 80% и 95% квоты;
 - все уведомления дублируются в logs/launcher.log (без токена бота и паролей из ссылок);
 - бот падает быстрее CRASH_WINDOW сек CRASH_LIMIT раза подряд → откат на последнюю рабочую версию;
@@ -14,7 +15,8 @@
   завершается при следующем старте — иначе два экземпляра делят один токен.
 
 Локальный барьер (решение владельца 2026-09-26; CI на GitHub запускает ci.yml из самой ветки, ему верить нельзя):
-- обновление, меняющее защищённые пути (список PROTECTED_* зашит здесь, из репозитория не читается), не ставится,
+- обновление, меняющее защищённые пути (список PROTECTED_* зашит здесь, из репозитория не читается) в итоге или хотя
+  бы в одном своём коммите, не ставится,
   пока владелец не подтвердит ровно этот коммит на ПК: python launcher.py --approve <sha> (sha → logs/approved_shas);
   до того работает прежняя версия, уведомление — один раз на sha;
 - при каждом обновлении кода (не только .md) PAYOUTS и TRADING в .env переписываются в 0 — деньги включает снова
@@ -25,6 +27,7 @@
 - подтверждённое обновление launcher.py: launcher останавливает бота и выходит, run.bat через 15 с поднимает новый —
   иначе новые правила барьера работали бы только после ручного перезапуска.
 """
+import importlib.metadata
 import json
 import os
 import re
@@ -57,6 +60,9 @@ PID_FILE = os.path.join(HERE, "logs", "bot.pid")
 LOCK_PATH = os.path.join(HERE, "logs", "launcher.lock")
 NO_PYTEST = "pytest не установлен и не ставится сам — выполните вручную: pip install -r requirements.txt"
 TRANSIENT = ("WinError", "PermissionError", "OSError")   # в выводе смоука: сбой ОС под нагрузкой, а не ошибка кода
+# кончились сокеты/буферы Windows (много процессов с сетью на ПК): сразу повторять бесполезно — пауза перед повтором
+SOCKET_EXHAUSTED = ("WinError 10055", "WinError 10048", "No buffer space available", "ENOBUFS")
+SOCKET_COOLDOWN = 90   # сек
 _lock_fd = None   # дескриптор замка держим открытым до конца процесса
 
 # Защищённые пути: без --approve владельца обновление с ними не ставится. Сравнение без учёта регистра (на Windows
@@ -74,6 +80,12 @@ PROTECTED_BASENAMES = ("conftest.py", "pytest.ini", "pyproject.toml", "setup.cfg
 # исполняемое и то, что Windows/Python запустят мимо .py-исходника (git.exe в папке бота вызвался бы вместо git)
 PROTECTED_SUFFIXES = (".pth", ".exe", ".dll", ".pyd", ".pyc", ".so", ".bat", ".cmd", ".ps1")
 STDLIB_NAMES = frozenset(n.lower() for n in sys.stdlib_module_names)   # json.py/hashlib/ в корне — подмена модуля
+# и установленные пакеты (pytest.py в корне заменил бы pytest в смоуке): importlib.metadata + запасной список; свои
+# папки проекта — не подмена (на ПК есть пакет с мусорным модулем «tests»). Как в scripts/guard.py
+INSTALLED_FALLBACK = ("pytest", "_pytest", "pluggy", "aiohttp", "pil", "iniconfig", "packaging")
+OWN_ROOT = ("tests", "scripts", "research")
+INSTALLED_TTL = 3600          # сек: список установленных пакетов перечитывается раз в час (pip install без перезапуска)
+_installed = {"at": None, "names": frozenset()}
 PROTECTED_EXACT = (".env", ".last_good", ".dev_status.json")
 APPROVED_PATH = os.path.join(HERE, "logs", "approved_shas")   # sha, подтверждённые владельцем: по одному в строке
 MONEY_KEYS = ("PAYOUTS", "TRADING")
@@ -159,15 +171,39 @@ def clean_tree():
     return git("status", "--porcelain", "--untracked-files=no") == ""
 
 
+def installed_names():
+    """Имена верхнего уровня установленных пакетов (нижний регистр) + INSTALLED_FALLBACK; раз в INSTALLED_TTL сек
+    перечитываются (packages_distributions() читает метаданные всех пакетов — не на каждый путь)."""
+    now = time.time()
+    if _installed["at"] is None or now - _installed["at"] > INSTALLED_TTL:
+        try:
+            found = importlib.metadata.packages_distributions()
+        except Exception:   # битые метаданные пакета — не повод пропустить проверку: остаётся запасной список
+            found = {}
+        names = frozenset(n.lower() for n in found if n.isidentifier()) | frozenset(INSTALLED_FALLBACK)
+        _installed.update(at=now, names=names)
+    return _installed["names"]
+
+
+def shadows_module(low):
+    """Файл или папка в корне с именем модуля stdlib или установленного пакета (json.py, hashlib/, pytest.py, PIL/;
+    .pyw Windows тоже импортирует): Python возьмёт его вместо настоящего модуля. Как shadows_module в guard."""
+    first = low.split("/", 1)[0]
+    stem = next((first[:-len(ext)] for ext in (".py", ".pyw") if first.endswith(ext)), None)
+    if stem is None:
+        if "/" not in low:
+            return False
+        stem = first
+    return stem in STDLIB_NAMES or stem not in OWN_ROOT and stem in installed_names()
+
+
 def protected_paths(files):
     """Какие из путей (как их пишет git diff) защищены — см. PROTECTED_*."""
     out = []
     for f in files:
         low = f.lower()
         base = low.rsplit("/", 1)[-1]
-        first = low.split("/", 1)[0]
-        stem = first[:-3] if first.endswith(".py") else first
-        shadows = ("/" in low or first.endswith(".py")) and stem in STDLIB_NAMES   # Python возьмёт его вместо модуля
+        shadows = shadows_module(low)   # Python возьмёт его вместо модуля
         if (low.startswith(PROTECTED_PREFIXES) or any(n in low for n in PROTECTED_NAMES) or low in PROTECTED_EXACT
                 or base in PROTECTED_BASENAMES or base.endswith(PROTECTED_SUFFIXES) or shadows):
             out.append(f)
@@ -311,7 +347,7 @@ def smoke():
         tests = ["pytest", "-q", "-x", "-p", "no:cacheprovider", f"--basetemp={tmp}"]
         r = _run(["py_compile", *files], 120)
         if r.returncode:   # SyntaxError — ошибка кода; PermissionError при записи .pyc под нагрузкой — сбой ОС
-            return False, r.stderr[-500:], any(m in r.stderr for m in TRANSIENT)
+            return False, _tail(r.stderr), any(m in r.stderr for m in TRANSIENT)
         r = _run(tests, 600)
         if "No module named pytest" in r.stderr:   # ставим только сам pytest и повторяем один раз
             log("pytest не установлен — ставлю")
@@ -331,7 +367,15 @@ def smoke():
     if r.returncode == 5:
         return False, "pytest не нашёл ни одного теста (tests/ удалён или пуст?)", False
     out = r.stdout + r.stderr
-    return r.returncode == 0, out[-500:], r.returncode != 0 and any(m in out for m in TRANSIENT)
+    return r.returncode == 0, _tail(out), r.returncode != 0 and any(m in out for m in TRANSIENT)
+
+
+def _tail(out):
+    """Хвост вывода смоука (500 символов). Нехватка сокетов Windows где-то выше хвоста — её метка в начале: по ней
+    try_update ждёт SOCKET_COOLDOWN перед повтором."""
+    tail = out[-500:]
+    lost = [m for m in SOCKET_EXHAUSTED if m in out and m not in tail]
+    return (f"[{lost[0]}] " + tail) if lost and not any(m in tail for m in SOCKET_EXHAUSTED) else tail
 
 
 def bot_env():
@@ -539,13 +583,18 @@ class Launcher:
         self.warned_dirty = False
         changes = git("log", "--pretty=format:• %s", f"{head}..{remote}", check=False).splitlines()[:10]
         # --no-renames: иначе helper.py → HELPER.md выглядит как «изменён только .md»; -z — пути без кавычек.
+        # Защищённые пути — по КАЖДОМУ коммиту диапазона, а не только по итогу: коммит, который ослабил ci.yml или
+        # guard и следующим коммитом вернул их как было, в итоговом diff не виден, а автомерж между ними уже прошёл по
+        # ослабленным правилам (-m — и слияния: их правка против каждого родителя).
         # Без списка файлов не узнать, тронуты ли защищённые пути, — тогда не ставим (до следующей проверки)
         try:
             files = [f for f in git("diff", "--no-renames", "--name-only", "-z", head, remote).split("\0") if f]
+            touched = [f for f in git("log", "--no-renames", "-m", "--name-only", "-z", "--format=",
+                                      f"{head}..{remote}").split("\0") if f.strip()]
         except RuntimeError as e:
             log(e)
             return False
-        blocked = protected_paths(files)
+        blocked = protected_paths(list(dict.fromkeys(files + [f.strip("\n") for f in touched])))
         if blocked and not approved(remote):   # защищённые пути — только после --approve ровно этого sha на ПК
             if remote not in self.asked_approval:
                 self.asked_approval.add(remote)
@@ -589,7 +638,12 @@ class Launcher:
             return False
         ok, err, transient = smoke()
         if not ok and transient:   # сбой ОС под нагрузкой (WinError) — повтор, а не брак хорошего коммита навсегда
-            log(f"смоук {remote[:7]}: сбой ОС, повторяю: " + " ⏎ ".join(err.strip().splitlines())[-300:])
+            cooldown = any(m in err for m in SOCKET_EXHAUSTED)   # кончились сокеты — сразу повторять бесполезно
+            log(f"смоук {remote[:7]}: сбой ОС, повторяю" + (f" через {SOCKET_COOLDOWN} с (нет свободных сокетов)"
+                                                            if cooldown else "")
+                + ": " + " ⏎ ".join(err.strip().splitlines())[-300:])
+            if cooldown:
+                time.sleep(SOCKET_COOLDOWN)
             ok, err, _ = smoke()
         if not ok:
             git("reset", "--hard", head)
