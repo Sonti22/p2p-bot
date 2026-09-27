@@ -13,9 +13,12 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(HERE, "data", "trades.db")
 EXPORT_CSV_PATH = os.path.join(HERE, "data", "trades_export.csv")
-# Колонки выгрузки /export; ники мерчантов — только если в базе уже есть buy_nick/sell_nick.
+# Колонки выгрузки /export; ники мерчантов — только если в базе уже есть buy_nick/sell_nick. Факт с кнопок «как
+# расчёт»/«±0.5 п.п.» (PLAN_SOURCES) — оценка, а не факт: он в колонке «Оценка (не факт), %», а «Факт, %» и
+# «Результат по факту, ₽» у такой сделки пустые.
 EXPORT_COLUMNS = ("Дата и время (МСК)", "Площадка покупки", "Монета покупки", "Площадка продажи", "Монета продажи",
-                  "Сумма, ₽", "Расчёт, %", "Факт, %", "Результат по факту, ₽", "Банк", "Как платили")
+                  "Сумма, ₽", "Расчёт, %", "Факт, %", "Результат по факту, ₽", "Оценка (не факт), %", "Банк",
+                  "Как платили")
 EXPORT_NICK_COLUMNS = ("Мерчант покупки", "Мерчант продажи")
 KIND_NAMES = {"intra": "внутри банка", "sbp": "СБП"}
 PERIODS = {"day": 86400, "week": 7 * 86400, "month": 30 * 86400}
@@ -475,16 +478,23 @@ def export_rows(since, path=DB_PATH, until=None):
     return [dict(r) for r in rows]
 
 
+def is_estimate(row):
+    """Факт сделки — оценка с кнопок «как расчёт»/«±0.5 п.п.» (fact_source в PLAN_SOURCES), а не её результат."""
+    return row.get("fact") is not None and row.get("fact_source") in PLAN_SOURCES
+
+
 def fact_rub(row):
-    """Результат сделки по факту в ₽ (сумма × факт %); None — факт не введён."""
-    return None if row.get("fact") is None else row["amount"] * row["fact"] / 100
+    """Результат сделки по факту в ₽ (сумма × факт %); None — факт не введён или это оценка (is_estimate)."""
+    return None if row.get("fact") is None or is_estimate(row) else row["amount"] * row["fact"] / 100
 
 
 def export_summary(rows):
-    """Сводка выгрузки: {"count", "amount" (оборот ₽), "result" (сумма результатов по факту, ₽), "no_fact"}."""
+    """Сводка выгрузки: {"count", "amount" (оборот ₽), "result" (сумма результатов по факту, ₽), "no_fact" (без
+    настоящего факта — и с оценкой «как расчёт»), "estimated" (из них с оценкой)}."""
     results = [fact_rub(r) for r in rows]
     return {"count": len(rows), "amount": sum(r["amount"] or 0 for r in rows),
-            "result": sum(x for x in results if x is not None), "no_fact": results.count(None)}
+            "result": sum(x for x in results if x is not None), "no_fact": results.count(None),
+            "estimated": sum(1 for r in rows if is_estimate(r))}
 
 
 def _csv_text(value):
@@ -501,19 +511,21 @@ def _num(x):
 
 def write_export_csv(rows, path=EXPORT_CSV_PATH):
     """Выгрузка сделок (export_rows) в CSV для банка (запрос документов по 115-ФЗ) и для 3-НДФЛ: «;» и UTF-8 с BOM —
-    так файл сразу открывается по колонкам в русском Excel."""
+    так файл сразу открывается по колонкам в русском Excel. Оценка «как расчёт» (is_estimate) — не в «Факт, %»,
+    а в «Оценка (не факт), %»: в сумму результата по факту она не попадёт и за факт не сойдёт."""
     nicks = bool(rows) and "buy_nick" in rows[0] and "sell_nick" in rows[0]
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with open(path, "w", newline="", encoding="utf-8-sig") as f:
         w = csv.writer(f, delimiter=";")
         w.writerow(EXPORT_COLUMNS + (EXPORT_NICK_COLUMNS if nicks else ()) + ("Маршрут",))
         for r in rows:
-            fact, rub = r.get("fact"), fact_rub(r)
+            estimate = is_estimate(r)
+            fact, rub = (None if estimate else r.get("fact")), fact_rub(r)
             bank, kind = r.get("bank") or "", r.get("kind") or ""
             line = [datetime.datetime.fromtimestamp(r["ts"], MSK).strftime("%Y-%m-%d %H:%M"),
                     r["buy_ex"], r["buy_asset"], r["sell_ex"], r["sell_asset"], _num(r["amount"]),
                     _num(r["profit"]), "" if fact is None else _num(fact), "" if rub is None else _num(rub),
-                    BANK_NAMES.get(bank, bank), KIND_NAMES.get(kind, kind)]
+                    _num(r["fact"]) if estimate else "", BANK_NAMES.get(bank, bank), KIND_NAMES.get(kind, kind)]
             if nicks:
                 line += [_csv_text(r.get("buy_nick")), _csv_text(r.get("sell_nick"))]
             w.writerow(line + [r.get("route") or ""])

@@ -36,7 +36,7 @@ import trades
 from cards import deal_card, history_card, history_compare_card, portfolio_card, top_chart
 from p2p import ALL_EXCHANGES, AMOUNT_MAX, AMOUNT_MIN, DEFAULT_ASSETS, ENV_PATH, LOG_PATH, MIN_PROFIT_MAX, \
     MIN_PROFIT_MIN, TRAP, Config, fmt_signal, sell_step_number, _money, _price, _route_qty, bank_liquidity, book_spread, deal_amounts, \
-    deal_for_amount, fmt_ad, fmt_breakeven, fmt_deal, fmt_top, load_env, maker_neighbors, maker_place, maker_quote, \
+    deal_for_amount, deal_fresh, fmt_ad, fmt_breakeven, fmt_deal, fmt_top, load_env, maker_neighbors, maker_place, maker_quote, \
     maker_round_fee, parse_amount, parse_min_profit, profit_breakdown, reliability, reliability_index, route_hops, scan, \
     score, setup_logging, spot_url, traps_log, venue_url
 
@@ -1797,11 +1797,13 @@ class Bot:
         await self.send_document(trades.write_export_csv(rows), f"Журнал сделок {span} (МСК), CSV")
         s = trades.export_summary(rows)
         result = f"{s['result']:+,.0f}".replace(",", " ")
+        estimated = (f" Из них {s['estimated']} — с оценкой «как расчёт» (не факт): в CSV она в колонке "
+                     f"«Оценка (не факт), %», а не в «Факт, %»." if s["estimated"] else "")
         lines = [f"📤 <b>Выгрузка журнала</b> {span} (МСК)",
                  f"Сделок: {s['count']}, оборот {_money(s['amount'])} ₽",
                  f"Результат по факту: {result} ₽",
-                 (f"Без факта: {s['no_fact']} из {s['count']} — их результат в сумму не вошёл." if s["no_fact"]
-                  else "Факт указан у всех сделок."),
+                 (f"Без факта: {s['no_fact']} из {s['count']} — их результат в сумму не вошёл.{estimated}"
+                  if s["no_fact"] else "Факт указан у всех сделок."),
                  "", EXPORT_NOTE]
         await self.send("\n".join(lines))
 
@@ -2356,17 +2358,26 @@ class Bot:
                 and (traps or reliability(d, self.cfg, snap)[0] != TRAP)][:self.max_signals]
 
     def track_liveness(self, snap, now=None):
-        """Сколько сканов подряд связка держится выше порога: минутный выброс не сигналим, устойчивую — да."""
+        """Сколько сканов подряд связка держится выше порога: минутный выброс не сигналим, устойчивую — да.
+        Серия растёт, только если обе стороны связки получены в этом скане (p2p.deal_fresh): сторона из кэша монет
+        (ALT_INTERVAL) или выгрузки BestChange (BC_REFRESH) — те же данные, что скан назад, не новое подтверждение;
+        такой скан серию не продлевает и не сбрасывает (новая связка начинает с 0). Упала ниже порога — сброс."""
         now = now or time.time()
         favs, fav_min = favorites.keys(), favorites.fav_min_profit()
-        alive = {self._deal_key(d) for d in snap.deals
-                 if d[0] >= self.cfg.min_profit or (d[0] >= fav_min and favorites.key_str(self._deal_key(d)) in favs)}
-        for key in alive:
+        alive = {}
+        for d in snap.deals:
+            key = self._deal_key(d)
+            if key not in alive and (d[0] >= self.cfg.min_profit
+                                     or (d[0] >= fav_min and favorites.key_str(key) in favs)):
+                alive[key] = d
+        for key, d in alive.items():
+            fresh = deal_fresh(d, snap)
             rec = self.live.get(key)
             if rec:
-                rec["streak"] += 1
+                if fresh:
+                    rec["streak"] += 1
             else:
-                self.live[key] = {"first": now, "streak": 1}
+                self.live[key] = {"first": now, "streak": 1 if fresh else 0}
         for key in list(self.live):
             if key not in alive:
                 del self.live[key]

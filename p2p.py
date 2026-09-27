@@ -212,6 +212,36 @@ def parse_merchant_min(spec):
     return out
 
 
+# Мерчант офлайн (merchant_offline): MERCHANT_OFFLINE=skip — такие объявления не берём ни в стакан, ни в сигналы;
+# иначе (по умолчанию reason) — только причина риска «мерчант офлайн» в метке надёжности и карточке.
+MERCHANT_OFFLINE_MODES = ("reason", "skip")
+MERCHANT_OFFLINE_MIN_DEFAULT = 15.0   # мин: был на площадке раньше — офлайн (если площадка отдаёт это время)
+
+
+def parse_offline_mode(text):
+    """MERCHANT_OFFLINE → reason / skip (регистр не важен); другое — None."""
+    value = (text or "").strip().lower()
+    return value if value in MERCHANT_OFFLINE_MODES else None
+
+
+def parse_offline_min(text):
+    """MERCHANT_OFFLINE_MIN → минуты больше нуля (можно дробные, «7,5»); мусор, 0, минус, nan/inf — None."""
+    try:
+        value = float(str(text).strip().replace(",", "."))
+    except ValueError:
+        return None
+    return value if math.isfinite(value) and value > 0 else None
+
+
+def _offline_mode_env():
+    raw = os.getenv("MERCHANT_OFFLINE", "")
+    mode = parse_offline_mode(raw) if raw.strip() else "reason"
+    if mode is None:
+        logger.warning("MERCHANT_OFFLINE=%s в .env не подходит (reason или skip), использую reason", raw)
+        return "reason"
+    return mode
+
+
 @dataclass
 class Config:
     fiat: str = "RUB"
@@ -234,6 +264,8 @@ class Config:
     exclude_pay: list = field(default_factory=lambda: DEFAULT_EXCLUDE.split(","))
     same_venue_only: bool = False  # True — только связки внутри одной площадки (пресет «USDT без переводов»)
     merchant_min: dict = field(default_factory=dict)   # MERCHANT_MIN: {Ad.ex: (сделок|None, %|None)}
+    merchant_offline: str = "reason"   # MERCHANT_OFFLINE: skip — объявления мерчантов офлайн не берём, reason — причина
+    merchant_offline_min: float = MERCHANT_OFFLINE_MIN_DEFAULT   # MERCHANT_OFFLINE_MIN: мин с last_seen до «офлайн»
 
     def merchant_thresholds(self, ex):
         """(мин. сделок, мин. %) мерчанта площадки ex (как в Ad.ex): из MERCHANT_MIN, иначе MIN_ORDERS/MIN_RATE."""
@@ -266,6 +298,8 @@ class Config:
             exclude_pay=_list("EXCLUDE_PAY", DEFAULT_EXCLUDE),
             same_venue_only=os.getenv("SAME_VENUE_ONLY", "0").strip().lower() in ("1", "true", "yes", "on"),
             merchant_min=parse_merchant_min(os.getenv("MERCHANT_MIN", "")),
+            merchant_offline=_offline_mode_env(),
+            merchant_offline_min=_env_parsed("MERCHANT_OFFLINE_MIN", parse_offline_min, MERCHANT_OFFLINE_MIN_DEFAULT),
         )
 
 
@@ -293,6 +327,9 @@ class Ad:
     fetched_ts: float = field(default=0.0, compare=False)
     ad_id: str = field(default="", compare=False)
     online: bool = field(default=None, compare=False)
+    # когда мерчант последний раз был на площадке (unix-время), 0 — площадка не отдаёт (в ответах из tests/fixtures
+    # такого поля нет ни у одной) — для причины «мерчант офлайн» (merchant_offline, MERCHANT_OFFLINE_MIN)
+    last_seen: float = field(default=0.0, compare=False)
 
 
 async def _json(s, method, url, body=None):
@@ -651,11 +688,25 @@ def terms_flags(text):
     return blocked, notes
 
 
+def merchant_offline(a, cfg):
+    """Мерчант объявления офлайн: площадка так и отдаёт (Ad.online is False — сейчас только LBank) или последний раз
+    был на площадке раньше MERCHANT_OFFLINE_MIN минут до получения объявления (Ad.last_seen — если площадка отдаёт
+    это время). Не знаем (None / 0) — не офлайн. У стека (_combined) — офлайн хоть один из его мерчантов."""
+    if a.online is False:
+        return True
+    return bool(a.last_seen) and (a.fetched_ts or time.time()) - a.last_seen > cfg.merchant_offline_min * 60
+
+
+def _offline_skip(cfg, a):
+    """MERCHANT_OFFLINE=skip и мерчант офлайн — объявление в стакан и сигналы не берём."""
+    return str(cfg.merchant_offline).strip().lower() == "skip" and merchant_offline(a, cfg)
+
+
 def usable(a, cfg, blocked=frozenset()):
     min_orders, min_rate = cfg.merchant_thresholds(a.ex)   # MERCHANT_MIN площадки, иначе общие
     return bool(_pays(a, cfg)) and a.min_amt <= cfg.amount <= a.max_amt and a.avail * a.price >= cfg.amount \
         and a.orders >= min_orders and a.rate >= min_rate and (a.ex, a.nick) not in blocked \
-        and not terms_flags(a.terms)[0]
+        and not terms_flags(a.terms)[0] and not _offline_skip(cfg, a)
 
 
 def _signal_ok(a, cfg, blocked=frozenset()):
@@ -664,7 +715,7 @@ def _signal_ok(a, cfg, blocked=frozenset()):
     выход монеты маршрута), складывая несколько объявлений."""
     min_orders, min_rate = cfg.merchant_thresholds(a.ex)
     return bool(_pays(a, cfg)) and a.orders >= min_orders and a.rate >= min_rate \
-        and (a.ex, a.nick) not in blocked and not terms_flags(a.terms)[0]
+        and (a.ex, a.nick) not in blocked and not terms_flags(a.terms)[0] and not _offline_skip(cfg, a)
 
 
 def _stack(ads, amount):
@@ -731,13 +782,15 @@ def _combined(used, price, total, qty):
     one = len(used) == 1
     nets = {a.net for a in used}
     terms = "; ".join(dict.fromkeys(a.terms.strip() for a in used if a.terms and a.terms.strip()))
+    # онлайн стека — худший из мерчантов: офлайн хоть один → False, все онлайн → True, иначе не знаем (None)
+    online = False if any(a.online is False for a in used) else True if all(a.online for a in used) else None
     return Ad(used[0].ex, used[0].side, price, total, sum(a.max_amt for a in used), qty,
               sorted(set(p for a in used for p in a.pays)), used[0].nick if one else f"{len(used)} объявл.",
               min(a.orders for a in used), min(a.rate for a in used), used[0].url if one else "",
               used[0].asset, nets.pop() if len(nets) == 1 else "", terms=terms, parts=len(used),
               nicks=tuple(n for a in used for n in (a.nicks or (a.nick,))),
               fetched_ts=min(a.fetched_ts for a in used), ad_id=used[0].ad_id if one else "",
-              online=used[0].online if one else None)
+              online=online, last_seen=min((a.last_seen for a in used if a.last_seen), default=0.0))
 
 
 def _net_parts(grp):
@@ -1422,6 +1475,20 @@ def _job_done(rec, ads, data_ts=0.0):
     rec.update(n=len(ads), cached=ts < rec["t0"], age=round(rec["t1"] - ts, 1))
 
 
+def ad_fresh(a, since):
+    """Объявление получено с площадки в этом скане (не раньше его начала since): не из кэша монет `_alt` и не из
+    выгрузки BestChange, скачанной раньше. Время неизвестно (0 — объявление собрано не сканом) или у скана нет
+    времени — считаем свежим, как раньше."""
+    return not since or not a.fetched_ts or a.fetched_ts >= since
+
+
+def deal_fresh(deal, snap):
+    """Обе стороны связки получены в этом скане (у стека _combined время — самое старое из его объявлений):
+    только такой скан продлевает серию «живости» LIVE_SCANS (bot.track_liveness)."""
+    _, b, s, _ = deal
+    return ad_fresh(b, snap.ts) and ad_fresh(s, snap.ts)
+
+
 async def collect(s, cfg, force_alt=False):
     """Сбор данных скана по сети: объявления площадок (с кэшами _alt и BestChange, бэкоффом площадок), ориентир
     Rapira, спот, справочник сетей, замеры запросов. Возвращает словарь аргументов assemble(): ts, ads, ref (None —
@@ -1661,11 +1728,18 @@ RELIABLE, RISKY, TRAP = "✅ надёжно", "⚠️ риск", "🪤 лову�
 
 def _risks(deal, cfg, snap):
     """Риски связки: [(вес, причина)] — отклонение цены от ориентира (ближе к отсеву — тяжелее), мерчант у
-    порога фильтра по сделкам/отзывам, рискованные условия, число переводов/конвертаций, волатильная монета,
-    спред ≥5% и «обменник → обменник» (оба конца на BestChange: курсы с условиями, AML-проверки и заморозки)."""
+    порога фильтра по сделкам/отзывам, рискованные условия, мерчант офлайн (merchant_offline), число
+    переводов/конвертаций, волатильная монета, спред ≥5% и «обменник → обменник» (оба конца на BestChange: курсы
+    с условиями, AML-проверки и заморозки)."""
     profit, b, s, route = deal
     risks = []
     for ad, side in ((b, "покупка"), (s, "продажа")):
+        # MERCHANT_OFFLINE=skip такие объявления в связку не пускает, здесь — режим reason; первой у стороны, чтобы
+        # попала в две причины подписи сигнала (fmt_signal)
+        if merchant_offline(ad, cfg):
+            ago = "" if ad.online is False else \
+                f" (был {int(((ad.fetched_ts or time.time()) - ad.last_seen) // 60)} мин назад)"
+            risks.append((1, f"{side}: мерчант офлайн{ago}"))
         ref = snap.refs.get(ad.asset)
         if ref:
             dev = abs(ad.price / ref - 1) * 100
