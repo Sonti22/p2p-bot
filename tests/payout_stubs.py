@@ -25,5 +25,7 @@ def sent(bot, method="sendMessage"):
     return [p for m, p in bot.out if m == method]
 
 
-def msg(chat, text, **sender):
-    return {"message": {"chat": {"id": chat}, "text": text, "from": {"first_name": "Вася", **sender}}}
+def msg(chat, text, ctype="private", **sender):
+    """Сообщение из чата chat; по умолчанию — личный чат, где id отправителя равен id чата (как в Telegram)."""
+    return {"message": {"chat": {"id": chat, "type": ctype}, "text": text,
+                        "from": {"id": chat, "first_name": "Вася", **sender}}}

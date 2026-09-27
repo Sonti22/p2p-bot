@@ -170,12 +170,14 @@ def test_paper_reset_asks_then_archives_and_keeps_settings():
     ask = sent(bot)[-1]
     assert [b["callback_data"] for b in buttons(ask["reply_markup"])] == ["paper_reset:yes", "paper_reset:no"]
     assert paper.stats()["all"]["total"] == 1 and not _archives()          # только вопрос — ничего не тронуто
-    cq = {"id": "7", "data": "paper_reset:no", "message": {"chat": {"id": 1}, "message_id": bot.paper_reset_ask}}
+    cq = {"id": "7", "data": "paper_reset:no", "from": {"id": 1},
+          "message": {"chat": {"id": 1, "type": "private"}, "message_id": bot.paper_reset_ask}}
     asyncio.run(bot.on_update({"callback_query": cq}))
     assert "отменено" in sent(bot, "editMessageText")[-1]["text"]
     assert paper.stats()["all"]["total"] == 1 and not _archives()
     asyncio.run(bot.handle("/paper reset"))
-    cq = {"id": "8", "data": "paper_reset:yes", "message": {"chat": {"id": 1}, "message_id": bot.paper_reset_ask}}
+    cq = {"id": "8", "data": "paper_reset:yes", "from": {"id": 1},
+          "message": {"chat": {"id": 1, "type": "private"}, "message_id": bot.paper_reset_ask}}
     asyncio.run(bot.on_update({"callback_query": cq}))
     text = sent(bot, "editMessageText")[-1]["text"]
     assert "кругов 1" in text and "+150 ₽" in text and "с нуля" in text and "paper-archive-" in text
@@ -191,7 +193,8 @@ def test_paper_reset_button_after_restart_is_stale():
     cid = paper.start_cycle(10000, ad("Bybit", "buy", 87.0), ad("MEXC", "sell", 90.0), "r", 3.0)
     paper.finish_cycle(cid, "done", 1.5)
     bot = Stub(p2p.Config())                             # вопрос задавал прошлый процесс бота
-    cq = {"id": "9", "data": "paper_reset:yes", "message": {"chat": {"id": 1}, "message_id": 77}}
+    cq = {"id": "9", "data": "paper_reset:yes", "from": {"id": 1},
+          "message": {"chat": {"id": 1, "type": "private"}, "message_id": 77}}
     asyncio.run(bot.on_update({"callback_query": cq}))
     assert "устарела" in sent(bot, "editMessageText")[-1]["text"]
     assert paper.stats()["all"]["total"] == 1 and not _archives()

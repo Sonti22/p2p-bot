@@ -25,7 +25,9 @@ def edits(bot):
 
 
 def msg_update(chat_id="1", text="/start"):
-    return {"message": {"chat": {"id": chat_id}, "text": text, "message_id": 5}}
+    """Сообщение из личного чата: id отправителя равен id чата (владельцем становится только личный чат)."""
+    return {"message": {"chat": {"id": chat_id, "type": "private"}, "from": {"id": chat_id}, "text": text,
+                        "message_id": 5}}
 
 
 def cb(data, message_id=1):
