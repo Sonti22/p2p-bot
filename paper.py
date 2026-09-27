@@ -10,6 +10,11 @@ SQLite data/paper.db, таблицы:
             intra — внутри банка, sbp — по СБП со своего банка, trades.pay_plan) и банк (bank) — для учёта
             виртуального оборота по бесплатному лимиту СБП. planned_pct — план с запасом на курс (его видит
             владелец), planned_raw — тот же план без запаса: с ним сравнивается факт (в факте запаса нет).
+            Для разбора (этап 1 «измерения»): время окончания каждой стадии (ts_buy_done/ts_transfer_done/
+            ts_sell_done — при переходе дальше или завершении круга на ней), на старте — индекс, причины
+            надёжности и серия «живости» связки, сделки/% успешных мерчантов покупки и продажи, запас глубины
+            стакана (depth_margin) и id снимка скана (snapshot_id, snapshots.py); на проверке покупки — лучшая
+            цена и доступный объём у мерчантов покупки (buy_check_price/buy_check_avail). У старых кругов — NULL.
   balance — один виртуальный баланс: старт = PAPER_AMOUNT, меняется на realized_pct каждого
             завершённого круга.
 """
@@ -29,7 +34,9 @@ DB_PATH = os.path.join(HERE, "data", "paper.db")
 REPORT_CSV_PATH = os.path.join(HERE, "data", "paper_report.csv")
 REPORT_COLUMNS = ("buy_ex", "buy_asset", "sell_ex", "sell_asset", "total", "done", "failed",
                    "depth_shortfall", "avg_planned_pct", "avg_realized_pct", "avg_duration_min",
-                   "failed_by_reason")
+                   "avg_buy_min", "avg_transfer_min", "avg_sell_min", "avg_index_start", "avg_streak_start",
+                   "avg_depth_margin", "avg_buy_orders", "avg_buy_rate", "avg_sell_orders", "avg_sell_rate",
+                   "avg_buy_check_drift_pct", "avg_buy_check_cover", "failed_by_reason")
 
 STAGES = ("buy", "transfer", "sell")
 RESULTS = ("done", "failed_buy", "failed_transfer", "failed_sell")
@@ -50,7 +57,17 @@ _COLUMNS = ("id", "ts_start", "amount", "buy_ex", "buy_asset", "buy_price", "buy
             "sell_ex", "sell_asset", "sell_price", "sell_nick", "route", "planned_pct",
             "stage", "ts_stage", "realized_pct", "result", "note", "bank", "label", "sell_fact", "pay_kind",
             "sell_qty", "sell_net", "buy_nicks", "buy_net", "buy_pays", "sell_parts", "pay_fee_used",
-            "planned_raw", "route_hops")
+            "planned_raw", "route_hops", "ts_buy_done", "ts_transfer_done", "ts_sell_done", "index_start",
+            "reasons_start", "streak_start", "buy_orders", "buy_rate", "sell_orders", "sell_rate", "depth_margin",
+            "buy_check_price", "buy_check_avail", "snapshot_id")
+# колонки разбора (этап 1 «измерения») — в конце таблицы, в этом порядке и у новой базы, и у старой после миграции
+_MEASURE_DDL = (("ts_buy_done", "REAL DEFAULT NULL"), ("ts_transfer_done", "REAL DEFAULT NULL"),
+                ("ts_sell_done", "REAL DEFAULT NULL"), ("index_start", "INTEGER DEFAULT NULL"),
+                ("reasons_start", "TEXT DEFAULT NULL"), ("streak_start", "INTEGER DEFAULT NULL"),
+                ("buy_orders", "INTEGER DEFAULT NULL"), ("buy_rate", "REAL DEFAULT NULL"),
+                ("sell_orders", "INTEGER DEFAULT NULL"), ("sell_rate", "REAL DEFAULT NULL"),
+                ("depth_margin", "REAL DEFAULT NULL"), ("buy_check_price", "REAL DEFAULT NULL"),
+                ("buy_check_avail", "REAL DEFAULT NULL"), ("snapshot_id", "INTEGER DEFAULT NULL"))
 # план для сравнения с фактом: без запаса на курс; у кругов до planned_raw — план с запасом, как раньше
 _PLAN_CMP = "COALESCE(planned_raw, planned_pct)"
 
@@ -83,14 +100,15 @@ def _connect(path):
                 "bank TEXT DEFAULT '', label TEXT DEFAULT '', sell_fact REAL DEFAULT NULL, pay_kind TEXT DEFAULT '', "
                 "sell_qty REAL DEFAULT NULL, sell_net TEXT DEFAULT '', buy_nicks TEXT DEFAULT '', "
                 "buy_net TEXT DEFAULT '', buy_pays TEXT DEFAULT '[]', sell_parts INTEGER DEFAULT 1, "
-                "pay_fee_used REAL DEFAULT 0, planned_raw REAL DEFAULT NULL, route_hops TEXT DEFAULT '')")
+                "pay_fee_used REAL DEFAULT 0, planned_raw REAL DEFAULT NULL, route_hops TEXT DEFAULT '', "
+                + ", ".join(f"{col} {ddl}" for col, ddl in _MEASURE_DDL) + ")")
     cols = [r[1] for r in con.execute("PRAGMA table_info(cycles)")]
     for col, ddl in (("bank", "TEXT DEFAULT ''"), ("label", "TEXT DEFAULT ''"), ("sell_fact", "REAL DEFAULT NULL"),
                      ("pay_kind", "TEXT DEFAULT ''"), ("sell_qty", "REAL DEFAULT NULL"), ("sell_net", "TEXT DEFAULT ''"),
                      ("buy_nicks", "TEXT DEFAULT ''"), ("buy_net", "TEXT DEFAULT ''"),
                      ("buy_pays", "TEXT DEFAULT '[]'"), ("sell_parts", "INTEGER DEFAULT 1"),
                      ("pay_fee_used", "REAL DEFAULT 0"), ("planned_raw", "REAL DEFAULT NULL"),
-                     ("route_hops", "TEXT DEFAULT ''")):
+                     ("route_hops", "TEXT DEFAULT ''"), *_MEASURE_DDL):
         if col not in cols:   # база от прошлой версии — добавляем колонку, данные не трогаем
             con.execute(f"ALTER TABLE cycles ADD COLUMN {col} {ddl}")
     con.execute("CREATE TABLE IF NOT EXISTS balance (id INTEGER PRIMARY KEY CHECK (id = 1), "
@@ -133,7 +151,8 @@ def apply_result(realized_pct, amount, path=DB_PATH, ts=None):
 
 
 def start_cycle(amount, buy, sell, route, planned_pct, path=DB_PATH, ts=None, label="", sell_qty=None, pay_fee=0.0,
-                over=None, planned_raw=None, hops=None):
+                over=None, planned_raw=None, hops=None, index=None, reasons=None, streak=None, depth=None,
+                snapshot_id=None):
     """Завести новый виртуальный круг со стадией buy. buy/sell — объявления покупки/продажи
     (p2p.Ad) на момент старта. Как платим (trades.pay_plan: внутри банка или по СБП со своего банка, у
     которого виртуальный лимит ещё есть) пишется сразу — в реальности рубли уходят в момент оплаты, до
@@ -152,6 +171,9 @@ def start_cycle(amount, buy, sell, route, planned_pct, path=DB_PATH, ts=None, la
     hops — p2p.route_hops(buy, sell, ...) (площадки конвертации и сеть/комиссия каждого хопа маршрута на
     момент старта) — не передан, пишем пустой маршрут; для стадий transfer/sell позже (ROADMAP «межмонетные,
     часть 2») — в этой задаче только сохраняем, не используем.
+    Для разбора: index/reasons — индекс и причины надёжности связки на старте (p2p.reliability_index/reliability),
+    streak — сколько сканов подряд она держалась (Bot.live), depth — запас глубины (depth_margin), snapshot_id —
+    id снимка скана (snapshots.scan_id); сделки/% успешных мерчантов берём из buy/sell.
     Возвращает id круга."""
     ts = ts if ts is not None else time.time()
     if over is None:
@@ -164,13 +186,17 @@ def start_cycle(amount, buy, sell, route, planned_pct, path=DB_PATH, ts=None, la
         cur = con.execute(
             "INSERT INTO cycles (ts_start, amount, buy_ex, buy_asset, buy_price, buy_nick, sell_ex, sell_asset, "
             "sell_price, sell_nick, route, planned_pct, stage, ts_stage, bank, label, pay_kind, sell_qty, sell_net, "
-            "buy_nicks, buy_net, buy_pays, sell_parts, pay_fee_used, planned_raw, route_hops) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'buy', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "buy_nicks, buy_net, buy_pays, sell_parts, pay_fee_used, planned_raw, route_hops, index_start, "
+            "reasons_start, streak_start, buy_orders, buy_rate, sell_orders, sell_rate, depth_margin, snapshot_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'buy', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+            "?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (ts, amount, buy.ex, buy.asset, buy.price, buy.nick,
              sell.ex, sell.asset, sell.price, sell.nick, route, planned_pct, ts, bank, label, kind,
              sell_qty, sell.net or "", json.dumps(list(buy.nicks or (buy.nick,)), ensure_ascii=False),
              buy.net or "", json.dumps(list(buy.pays or []), ensure_ascii=False), sell.parts or 1, pay_fee_used,
-             planned_raw, json.dumps(hops, ensure_ascii=False) if hops else ""))
+             planned_raw, json.dumps(hops, ensure_ascii=False) if hops else "",
+             index, json.dumps(list(reasons), ensure_ascii=False) if reasons is not None else None, streak,
+             buy.orders, buy.rate, sell.orders, sell.rate, depth, snapshot_id))
         cycle_id = cur.lastrowid
     con.close()
     return cycle_id
@@ -180,14 +206,21 @@ def _row_to_dict(row):
     return dict(zip(_COLUMNS, row))
 
 
+def _dicts(cur):
+    """Строки SELECT * — словари по именам колонок из курсора: порядок колонок в базе зависит от порядка миграций
+    (у каждой ветки свои ALTER TABLE) и не обязан совпадать с _COLUMNS."""
+    names = [d[0] for d in cur.description]
+    return [dict(zip(names, r)) for r in cur.fetchall()]
+
+
 def get_cycle(cycle_id, path=DB_PATH):
     """Круг по id — словарь со всеми колонками, None — не найден."""
     if not os.path.exists(path):
         return None
     con = _connect(path)
-    row = con.execute("SELECT * FROM cycles WHERE id = ?", (cycle_id,)).fetchone()
+    rows = _dicts(con.execute("SELECT * FROM cycles WHERE id = ?", (cycle_id,)))
     con.close()
-    return _row_to_dict(row) if row else None
+    return rows[0] if rows else None
 
 
 def open_cycles(path=DB_PATH):
@@ -196,17 +229,52 @@ def open_cycles(path=DB_PATH):
     if not os.path.exists(path):
         return []
     con = _connect(path)
-    rows = con.execute("SELECT * FROM cycles WHERE result IS NULL ORDER BY id").fetchall()
+    rows = _dicts(con.execute("SELECT * FROM cycles WHERE result IS NULL ORDER BY id"))
     con.close()
-    return [_row_to_dict(r) for r in rows]
+    return rows
 
 
 def set_stage(cycle_id, stage, path=DB_PATH, ts=None):
-    """Перевести открытый круг на следующую стадию (buy → transfer → sell)."""
+    """Перевести открытый круг на следующую стадию (buy → transfer → sell); время окончания прошлой стадии —
+    в ts_<стадия>_done (уже записанное не трогаем)."""
+    ts = ts if ts is not None else time.time()
+    prev = STAGES[STAGES.index(stage) - 1] if stage in STAGES[1:] else None
     con = _connect(path)
     with con:
-        con.execute("UPDATE cycles SET stage = ?, ts_stage = ? WHERE id = ?",
-                    (stage, ts if ts is not None else time.time(), cycle_id))
+        con.execute("UPDATE cycles SET stage = ?, ts_stage = ? WHERE id = ?", (stage, ts, cycle_id))
+        if prev:
+            con.execute(f"UPDATE cycles SET ts_{prev}_done = COALESCE(ts_{prev}_done, ?) WHERE id = ?", (ts, cycle_id))
+    con.close()
+
+
+def depth_margin(snap, buy, sell, amount, qty):
+    """Запас глубины на старте круга: во сколько раз стакан (snap.groups, у обменника — той же сети) покрывает
+    круг — покупка: объём в фиате к сумме круга, продажа: монета к выходу маршрута qty; меньшее из двух.
+    None — стакана одной из сторон нет или объём круга не задан."""
+    buy_ads = p2p._same_net(snap.groups.get((buy.ex, "buy", buy.asset), []), buy)
+    sell_ads = p2p._same_net(snap.groups.get((sell.ex, "sell", sell.asset), []), sell)
+    if not buy_ads or not sell_ads or not amount or not qty or amount <= 0 or qty <= 0:
+        return None
+    fiat = sum(min(a.max_amt, a.avail * a.price) for a in buy_ads if a.avail > 0)
+    coin = sum(min(a.avail, a.max_amt / a.price) for a in sell_ads if a.avail > 0 and a.price > 0)
+    return round(min(fiat / amount, coin / qty), 3)
+
+
+def buy_observed(cycle, snap):
+    """Что видно на проверке покупки: (лучшая цена, доступный объём в фиате) у мерчантов покупки круга в свежем
+    стакане — (None, 0.0), если их там нет."""
+    nicks = set(json.loads(cycle.get("buy_nicks") or "[]") or [cycle["buy_nick"]])
+    left = [a for a in snap.groups.get((cycle["buy_ex"], "buy", cycle["buy_asset"]), []) if a.nick in nicks]
+    if not left:
+        return None, 0.0
+    return min(a.price for a in left), sum(min(a.max_amt, a.avail * a.price) for a in left if a.avail > 0)
+
+
+def set_buy_check(cycle_id, price, avail, path=DB_PATH):
+    """Запомнить итог проверки покупки (buy_observed) — цену и объём, с которыми круг прошёл или сорвался."""
+    con = _connect(path)
+    with con:
+        con.execute("UPDATE cycles SET buy_check_price = ?, buy_check_avail = ? WHERE id = ?", (price, avail, cycle_id))
     con.close()
 
 
@@ -387,14 +455,17 @@ def finish_cycle(cycle_id, result, realized_pct=0.0, note="", path=DB_PATH, ts=N
     возвращает False, баланс не трогает."""
     ts = ts if ts is not None else time.time()
     con = _connect(path)
-    row = con.execute("SELECT amount FROM cycles WHERE id = ?", (cycle_id,)).fetchone()
+    row = con.execute("SELECT amount, stage FROM cycles WHERE id = ?", (cycle_id,)).fetchone()
     if row is None:
         con.close()
         return False
-    amount = row[0]
+    amount, stage = row
     with con:
         con.execute("UPDATE cycles SET result = ?, ts_stage = ?, realized_pct = ?, note = ?, sell_fact = ? "
                     "WHERE id = ?", (result, ts, realized_pct, note, sell_fact, cycle_id))
+        if stage in STAGES:   # стадия, на которой круг закончился (исполнился или сорвался), — её время окончания
+            con.execute(f"UPDATE cycles SET ts_{stage}_done = COALESCE(ts_{stage}_done, ?) WHERE id = ?",
+                        (ts, cycle_id))
     con.close()
     apply_result(realized_pct, amount, path=path, ts=ts)
     return True
@@ -511,26 +582,56 @@ def ladder_suggestion(path=DB_PATH, now=None):
     return None
 
 
+_MEASURE_SQL = ("amount, buy_price, ts_buy_done, ts_transfer_done, ts_sell_done, index_start, streak_start, "
+                "depth_margin, buy_orders, buy_rate, sell_orders, sell_rate, buy_check_price, buy_check_avail")
+
+
+def _measures(ts_start, amount, buy_price, t_buy, t_transfer, t_sell, index, streak, depth, buy_orders, buy_rate,
+              sell_orders, sell_rate, check_price, check_avail):
+    """Поля разбора одного круга: длительность стадий (мин; нет отметки — None), значения на старте, на проверке
+    покупки — сдвиг цены к плану (%) и объём у мерчантов к сумме круга (ушли все — 0)."""
+    def minutes(a, b):
+        return (b - a) / 60 if a is not None and b is not None else None
+    return {"buy_min": minutes(ts_start, t_buy), "transfer_min": minutes(t_buy, t_transfer),
+            "sell_min": minutes(t_transfer, t_sell), "index_start": index, "streak_start": streak,
+            "depth_margin": depth, "buy_orders": buy_orders, "buy_rate": buy_rate, "sell_orders": sell_orders,
+            "sell_rate": sell_rate,
+            "buy_check_drift_pct": (check_price / buy_price - 1) * 100 if check_price and buy_price else None,
+            "buy_check_cover": check_avail / amount if check_avail is not None and amount else None}
+
+
+def _measure_avgs(items):
+    """{"avg_<поле>": среднее по кругам, где поле есть (None — ни у одного)} для списка _measures."""
+    out = {}
+    for key in (items[0] if items else {}):
+        vals = [m[key] for m in items if m[key] is not None]
+        out[f"avg_{key}"] = sum(vals) / len(vals) if vals else None
+    return out
+
+
 def report_rows(path=DB_PATH):
     """План/факт, срывы по причинам, средняя длительность круга и нехватка глубины стакана —
     по каждой связке площадка/монета покупки → площадка/монета продажи (для `/paper report` и
     экспорта CSV). Только завершённые круги (result IS NOT NULL); depth_shortfall считает срывы
     на продаже с причиной «не хватает глубины стакана продажи» (текст из check_sell_stage). План — без запаса
-    на курс (_PLAN_CMP), чтобы сравнивался с фактом."""
+    на курс (_PLAN_CMP), чтобы сравнивался с фактом. Поля разбора (_measures) — средние по кругам, где они
+    записаны: длительность стадий (мин), индекс/серия/запас глубины на старте, сделки и % мерчантов, на проверке
+    покупки — сдвиг цены (%) и объём к сумме круга; у старых кругов их нет — None."""
     if not os.path.exists(path):
         return []
     con = _connect(path)
     rows = con.execute(
         f"SELECT buy_ex, buy_asset, sell_ex, sell_asset, result, {_PLAN_CMP}, realized_pct, "
-        "ts_start, ts_stage, note FROM cycles WHERE result IS NOT NULL").fetchall()
+        f"ts_start, ts_stage, note, {_MEASURE_SQL} FROM cycles WHERE result IS NOT NULL").fetchall()
     con.close()
     groups = {}
-    for buy_ex, buy_asset, sell_ex, sell_asset, result, planned, realized, ts_start, ts_stage, note in rows:
+    for buy_ex, buy_asset, sell_ex, sell_asset, result, planned, realized, ts_start, ts_stage, note, *m in rows:
         g = groups.setdefault((buy_ex, buy_asset, sell_ex, sell_asset), {
             "total": 0, "done": 0, "failed_by_reason": {}, "depth_shortfall": 0,
-            "planned": [], "realized_done": [], "duration_done": []})
+            "planned": [], "realized_done": [], "duration_done": [], "measures": []})
         g["total"] += 1
         g["planned"].append(planned)
+        g["measures"].append(_measures(ts_start, *m))
         if result == "done":
             g["done"] += 1
             g["realized_done"].append(realized)
@@ -549,6 +650,7 @@ def report_rows(path=DB_PATH):
             "avg_realized_pct": sum(g["realized_done"]) / len(g["realized_done"]) if g["realized_done"] else None,
             "avg_duration_min": (sum(g["duration_done"]) / len(g["duration_done"]) / 60)
                                  if g["duration_done"] else None,
+            **_measure_avgs(g["measures"]),
         })
     return out
 
@@ -566,24 +668,29 @@ def first_start(path=DB_PATH):
 def label_stats(path=DB_PATH):
     """Итоги завершённых кругов по метке надёжности на старте (✅/⚠️/🪤, p2p.reliability): сколько
     кругов, сколько исполнилось, средний план (без запаса на курс) и факт исполнившихся — видно, оправдывает
-    ли себя метка."""
+    ли себя метка; срывы по стадиям и средние полей разбора (avg_<поле> как в report_rows)."""
     if not os.path.exists(path):
         return {}
     con = _connect(path)
-    rows = con.execute(f"SELECT label, result, {_PLAN_CMP}, realized_pct FROM cycles "
+    rows = con.execute(f"SELECT label, result, {_PLAN_CMP}, realized_pct, ts_start, {_MEASURE_SQL} FROM cycles "
                        "WHERE result IS NOT NULL").fetchall()
     con.close()
     out = {}
-    for label, result, planned, realized in rows:
-        g = out.setdefault(label or "—", {"total": 0, "done": 0, "planned": [], "realized": []})
+    for label, result, planned, realized, ts_start, *m in rows:
+        g = out.setdefault(label or "—", {"total": 0, "done": 0, "planned": [], "realized": [],
+                                          "failed_by_reason": {}, "measures": []})
         g["total"] += 1
         g["planned"].append(planned)
+        g["measures"].append(_measures(ts_start, *m))
         if result == "done":
             g["done"] += 1
             g["realized"].append(realized)
+        else:
+            g["failed_by_reason"][result] = g["failed_by_reason"].get(result, 0) + 1
     return {k: {"total": g["total"], "done": g["done"],
                 "avg_planned_pct": sum(g["planned"]) / len(g["planned"]),
-                "avg_realized_pct": sum(g["realized"]) / len(g["realized"]) if g["realized"] else None}
+                "avg_realized_pct": sum(g["realized"]) / len(g["realized"]) if g["realized"] else None,
+                "failed_by_reason": g["failed_by_reason"], **_measure_avgs(g["measures"])}
             for k, g in out.items()}
 
 
@@ -595,7 +702,7 @@ def write_report_csv(rows, path=REPORT_CSV_PATH):
         w.writerow(REPORT_COLUMNS)
         for r in rows:
             reasons = ";".join(f"{FAIL_LABELS.get(k, k)}:{v}" for k, v in r["failed_by_reason"].items())
-            w.writerow([r[c] for c in REPORT_COLUMNS[:-1]] + [reasons])
+            w.writerow([r.get(c) for c in REPORT_COLUMNS[:-1]] + [reasons])   # нет поля — пустая ячейка
     return path
 
 

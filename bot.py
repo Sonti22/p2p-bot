@@ -27,6 +27,7 @@ import paper
 import payouts
 import presets
 import simmaker
+import snapshots
 import trades
 from cards import deal_card, history_card, history_compare_card, portfolio_card, top_chart
 from p2p import ALL_EXCHANGES, AMOUNT_MAX, AMOUNT_MIN, DEFAULT_ASSETS, ENV_PATH, LOG_PATH, MIN_PROFIT_MAX, \
@@ -1100,9 +1101,11 @@ def apply_mybanks(data):
 
 
 def _lean(snap):
-    """Снимок без полного стакана (Snapshot.book): он нужен только /maker по свежему снимку — запомненные сделки
-    (до 200) и живые карточки его не держат."""
-    return dataclasses.replace(snap, book={}) if snap is not None and snap.book else snap
+    """Снимок без полного стакана (Snapshot.book) и всех объявлений скана (Snapshot.ads): они нужны только /maker
+    и записи снимка (snapshots.py) по свежему скану — запомненные сделки (до 200) и живые карточки их не держат."""
+    if snap is not None and (snap.book or snap.ads or snap.jobs):
+        return dataclasses.replace(snap, book={}, ads=[], jobs=[])
+    return snap
 
 
 def fact_markup(trade_id):
@@ -1191,6 +1194,9 @@ class Bot:
         self.payout_task = None       # фоновая отправка подтверждённой выплаты: command_loop тем временем принимает «⛔ Стоп»
         self.onboarding = None   # {"step": "amount"/"banks"/"min", "banks": set()} — мастер первого /start
         self.sent = {}
+        self.signal_rows = {}   # (ex,asset,ex,asset) -> id открытого эпизода в history.signals (связка выше порога)
+        self.snapshot_scans = 0      # сканов с запуска — снимок пишется каждый SNAPSHOT_EVERY-й
+        self.snapshot_keep = set()   # id сканов, на которых стартовал круг сухого прогона: их снимок пишется всегда
         self.live_msg = {}   # (ex,asset,ex,asset) -> последнее сообщение сигнала для «живой карточки» (editMessage)
         self.live = {}                                            # (ex,asset,ex,asset) -> {"first": ts, "streak": n}
         self.live_scans = int(os.getenv("LIVE_SCANS", 2))        # сигнал, только если связка держится ≥ N сканов
@@ -2053,9 +2059,10 @@ class Bot:
 
     async def scan_loop(self):
         while True:
+            snap = None
             try:
                 t0 = time.time()
-                self.last = await scan(self.s, self.cfg)
+                snap = self.last = await scan(self.s, self.cfg)
                 self.last_scan_ts, self.last_scan_duration = time.time(), time.time() - t0
                 self.track_liveness(self.last)
                 if history.record(self.last, self.cfg.amount):   # не чаще раза в 5 минут, независимо от чата
@@ -2077,7 +2084,27 @@ class Bot:
                     await self.update_market_status(self.last)
             except Exception as e:
                 logger.error("scan error: %s", e)
+            if snap is not None:   # после сигналов: снимок для разбора не задерживает их
+                await self.save_snapshot(snap)
             await asyncio.sleep(self.cfg.interval)
+
+    async def save_snapshot(self, snap):
+        """Снимок скана в data/snapshots.db (snapshots.py): каждый SNAPSHOT_EVERY-й скан (первый после запуска —
+        всегда) и скан, на котором стартовал круг сухого прогона (snapshot_id круга должен найтись). Данные собираем
+        здесь, пишем в отдельном потоке — цикл событий не ждёт диск. Ошибка записи скан не ломает — строка в логе.
+        Возвращает id снимка или None (скан не пишется или ошибка)."""
+        keep = snapshots.scan_id(snap) in self.snapshot_keep
+        self.snapshot_keep.clear()   # круг стартует только в текущем скане — старые отметки не нужны
+        due = self.snapshot_scans % snapshots.every() == 0
+        self.snapshot_scans += 1
+        if not (due or keep):
+            return None
+        try:
+            data = snapshots.collect(snap, self.cfg, self.live)
+            return await asyncio.to_thread(snapshots.write, data)
+        except Exception as e:
+            logger.warning("snapshot: %s", e)
+            return None
 
     def status_view(self, status_path=DEV_STATUS):
         """Текст «/status»: версия, аптайм, время/длительность последнего скана, ошибки площадок,
@@ -2194,8 +2221,52 @@ class Bot:
             await self.send_paper_digest()
         self._was_quiet = quiet
         paused = self.paused or (self.pause_until and time.time() < self.pause_until)
+        since = time.time()   # отправленное notify в этом скане отмечено в self.sent не раньше
         if not quiet and not paused:
             await self.notify(snap)
+        await self.record_signals(snap, since, quiet, bool(paused))
+
+    def signal_reasons(self, snap, since, quiet=False, paused=False):
+        """Связки выше порога и почему по каждой не ушёл сигнал в этом скане: [(ключ, связка, причина)], причина
+        None — сигнал ушёл (антидубль отмечен не раньше since). Иначе — первая преграда в порядке notify: quiet /
+        paused → trap (🪤 не шлём, SIGNAL_TRAPS=0) → max_signals (вне топ-N и не ⭐ избранная) → unconfirmed
+        (держится меньше LIVE_SCANS сканов) → cooldown (антидубль) → unsent (не доставлено)."""
+        top = {self._deal_key(d) for d in self._signal_deals(snap)}
+        favs, fav_min = favorites.keys(), favorites.fav_min_profit()
+        traps = signal_traps()
+        out = []
+        for d in snap.deals:
+            if d[0] < self.cfg.min_profit:
+                continue
+            key = self._deal_key(d)
+            prev = self.sent.get(key)
+            if prev and prev[0] >= since:
+                reason = None
+            elif quiet or paused:
+                reason = "quiet" if quiet else "paused"
+            elif not traps and reliability(d, self.cfg, snap)[0] == TRAP:
+                reason = "trap"
+            elif key not in top and not (favorites.key_str(key) in favs and d[0] >= fav_min):
+                reason = "max_signals"
+            elif not self.is_confirmed(d):
+                reason = "unconfirmed"
+            elif prev and since - prev[0] < self.cooldown and d[0] < prev[1] + self.repeat_step:
+                reason = "cooldown"
+            else:
+                reason = "unsent"
+            out.append((key, d, reason))
+        return out
+
+    async def record_signals(self, snap, since, quiet=False, paused=False):
+        """Эпизоды связок выше порога в history.signals (этап 1 «измерения»): был ли сигнал и почему нет — для доли
+        пропущенных связок (history.signal_stats). Пишем в отдельном потоке; ошибка — строка в логе, сигналы не ломает."""
+        try:
+            rows = [(key, d[0], reason is None, reason)
+                    for key, d, reason in self.signal_reasons(snap, since, quiet, paused)]
+            self.signal_rows = await asyncio.to_thread(history.track_signals, rows, snap.ts or since, self.signal_rows,
+                                                       self.cfg.amount, self.cfg.min_profit)
+        except Exception as e:
+            logger.warning("signals: %s", e)
 
     async def cmd_pause(self, arg):
         """/pause [30m|1h|3h|до утра] — пауза сигналов; без аргумента — бессрочно, как кнопка «⏸ Пауза»."""
@@ -2325,10 +2396,18 @@ class Bot:
         # межмонетных связок позже (ROADMAP «межмонетные, часть 2»); сейчас связка простая (paper.simple_route)
         # — venues пусто, один хоп, но сохраняем и для неё, чтобы данные были у всех кругов подряд
         hops = route_hops(b, s, route_cfg, psnap.spot, over)
+        # для разбора (этап 1 «измерения»): индекс и причины надёжности, серия «живости», запас глубины и id снимка
+        # скана — снимок пишется после сигналов, но id (время начала скана) известен уже сейчас
+        measures = {"index": reliability_index(d, self.cfg, snap), "reasons": reasons,
+                    "streak": self.live.get(self._deal_key(d), {}).get("streak", 0),
+                    "depth": paper.depth_margin(psnap, b, s, settings["amount"], qty or s.avail),
+                    "snapshot_id": snapshots.scan_id(snap)}
+        if measures["snapshot_id"] is not None:   # снимок этого скана запишется, даже если он не SNAPSHOT_EVERY-й
+            self.snapshot_keep.add(measures["snapshot_id"])
         # over — тот же, что в плане и qty: банк оплаты и комиссия СБП в круге совпадут с планом
         cycle = paper.get_cycle(paper.start_cycle(settings["amount"], b, s, route, profit, label=label,
                                                   sell_qty=qty or s.avail, pay_fee=self.cfg.pay_fee, over=over,
-                                                  planned_raw=raw, hops=hops)) or {}
+                                                  planned_raw=raw, hops=hops, **measures)) or {}
         pay = trades.pay_label(cycle.get("pay_kind", ""), cycle.get("bank", ""), b.pays)
         qty = settings["amount"] / b.price
         text = (f"🧪 <b>Сухой прогон</b>: купил бы {_money(qty)} {b.asset} у {html.escape(b.nick)} "
@@ -2354,6 +2433,7 @@ class Bot:
                                                      stale_minutes=settings["stale_minutes"])
                 if action == "wait":
                     continue
+                paper.set_buy_check(cycle["id"], *paper.buy_observed(cycle, snap))   # цена и объём на проверке
                 if action == "fail":
                     if not paper.finish_cycle(cycle["id"], "failed_buy", 0.0, note):
                         continue   # круга уже нет (/paper reset посреди обработки)

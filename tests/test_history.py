@@ -1,3 +1,5 @@
+import asyncio
+import dataclasses
 import datetime
 import sqlite3
 
@@ -20,19 +22,219 @@ def reset(monkeypatch, t):
     return clock
 
 
-def test_record_writes_best_profit_per_exchange_pair(tmp_path, monkeypatch):
+def _table(db, sql):
+    con = sqlite3.connect(db)
+    rows = con.execute(sql).fetchall()
+    con.close()
+    return rows
+
+
+def test_record_best_per_exchange_pair_and_routes_with_coins_apart(tmp_path, monkeypatch):
     db = str(tmp_path / "history.db")
     reset(monkeypatch, BASE)
     deals = [
         (3.0, make_ad("Bybit", "buy", 85.0), make_ad("MEXC", "sell", 90.0), "route1"),
         (5.0, make_ad("Bybit", "buy", 85.0), make_ad("MEXC", "sell", 92.0, asset="USDC"), "route2"),
         (2.0, make_ad("HTX", "buy", 80.0), make_ad("BestChange", "sell", 95.0), "route3"),
+        (1.0, make_ad("Bybit", "buy", 86.0), make_ad("MEXC", "sell", 89.0), "route4"),   # та же связка хуже
     ]
     assert history.record(snap(deals), path=db) is True
-    con = sqlite3.connect(db)
-    rows = con.execute("SELECT buy_ex, sell_ex, profit, ref FROM history ORDER BY sell_ex").fetchall()
+    rows = _table(db, "SELECT buy_ex, asset_buy, sell_ex, asset_sell, profit, ref FROM history ORDER BY id")
+    assert rows == [("Bybit", "USDT", "MEXC", "USDC", 5.0, 88.0),                  # пара площадок — лучшая из монет
+                    ("HTX", "USDT", "BestChange", "USDT", 2.0, 88.0)]
+    routes = _table(db, "SELECT ts, buy_ex, asset_buy, sell_ex, asset_sell, profit FROM history_routes ORDER BY id")
+    assert routes == [(BASE, "Bybit", "USDT", "MEXC", "USDT", 3.0), (BASE, "Bybit", "USDT", "MEXC", "USDC", 5.0),
+                      (BASE, "HTX", "USDT", "BestChange", "USDT", 2.0)]              # лучший на каждую связку
+
+
+_FIXTURE = {}
+
+
+def _fixture_snap():
+    """Живой скан на фикстурах площадок (все монеты по умолчанию) — один на модуль: скан долгий."""
+    if "snap" not in _FIXTURE:
+        _FIXTURE["snap"] = asyncio.run(p2p.scan(None, p2p.Config()))
+    return _FIXTURE["snap"]
+
+
+def test_record_one_scan_writes_one_row_per_exchange_pair(tmp_path, monkeypatch, offline):
+    db = str(tmp_path / "history.db")
+    one = _fixture_snap()
+    routes = {(b.ex, b.asset, s.ex, s.asset) for _p, b, s, _r in one.deals}
+    pairs = {(b.ex, s.ex) for _p, b, s, _r in one.deals}
+    assert len(routes) > 5 * len(pairs)          # на фикстуре связок с монетами в разы больше, чем пар площадок
+    reset(monkeypatch, BASE)
+    assert history.record(one, 50000, path=db) is True
+    assert _table(db, "SELECT COUNT(*) FROM history") == [(len(pairs),)]
+    assert _table(db, "SELECT COUNT(*) FROM history_routes") == [(len(routes),)]
+
+
+def _main_record(one, now, amount):
+    """Эталон: record() до этапа 1 (main) — строка на пару площадок, лучшая из монет пары, в порядке первой встречи."""
+    best = {}
+    for profit, b, s, _route in one.deals:
+        key = (b.ex, s.ex)
+        if key not in best or profit > best[key][0]:
+            best[key] = (profit, b.asset, s.asset)
+    return [(now, be, se, ab, sa, p, one.ref, amount) for (be, se), (p, ab, sa) in best.items()]
+
+
+MAIN_ROWS_SQL = "SELECT ts, buy_ex, sell_ex, profit, amount FROM history WHERE ts >= ? ORDER BY ts"   # _rows в main
+
+
+def test_history_and_aggregates_match_pre_change_behaviour_on_fixture(tmp_path, monkeypatch, offline):
+    """history, _rows и все агрегации /history и /backtest (включая порядок пар с равным числом попаданий) — как у
+    записи до этапа 1: эталонная база записана прежним алгоритмом record, _rows сверяется с прежним запросом."""
+    base = _fixture_snap()
+    new, ref = str(tmp_path / "new.db"), str(tmp_path / "ref.db")
+    clock = reset(monkeypatch, BASE)
+    for i in range(10):   # 10 записей за ~9 дней, прибыль по связкам «гуляет» — лучшая монета пары меняется
+        clock["t"] = BASE + i * (0.9 * 86400 + 3 * 3600)
+        deals = [(p + ((j * 7 + i * 3) % 11 - 5) * 0.37, b, s, r) for j, (p, b, s, r) in enumerate(base.deals)]
+        one = dataclasses.replace(base, deals=deals)
+        assert history.record(one, 50000 + i, path=new) is True
+        history._insert(_main_record(one, clock["t"], 50000 + i), ref)
+    cols = "SELECT ts, buy_ex, sell_ex, asset_buy, asset_sell, profit, ref, amount FROM history ORDER BY id"
+    assert _table(new, cols) == _table(ref, cols)
+    con = sqlite3.connect(ref)
+    main_rows = con.execute(MAIN_ROWS_SQL, (0,)).fetchall()
     con.close()
-    assert rows == [("HTX", "BestChange", 2.0, 88.0), ("Bybit", "MEXC", 5.0, 88.0)]   # выбран лучший из пары
+    assert history._rows(new, 0) == main_rows
+    now = BASE + 10 * 86400
+    for fn in (history.hourly_avg, history.heatmap):
+        assert fn(new, now=now) == fn(ref, now=now)
+    assert history.median_vs_bestchange(new, now=now) == history.median_vs_bestchange(ref, now=now)
+    for threshold in (-50.0, 0.0, 1.0):   # низкие пороги — много пар с равным числом попаданий
+        assert history.backtest(threshold, 50000, new, now=now) == history.backtest(threshold, 50000, ref, now=now)
+
+
+def test_backtest_ties_keep_insertion_order(tmp_path):
+    """Пары с равным числом попаданий — в порядке записи (как в main), а не по алфавиту площадок."""
+    db = str(tmp_path / "history.db")
+    now = BASE + 40 * 86400
+    history._insert([(now - 86400, "MEXC", "Bybit", "USDT", "USDT", 3.0, 88.0),
+                     (now - 86400, "Bybit", "HTX", "USDT", "USDT", 3.0, 88.0)], db)
+    assert [(r["buy_ex"], r["sell_ex"]) for r in history.backtest(2.0, 50000, db, now=now)[7]] == [
+        ("MEXC", "Bybit"), ("Bybit", "HTX")]
+
+
+# --- signals: эпизоды связок выше порога ---
+
+K1 = ("Bybit", "USDT", "MEXC", "USDT")
+K2 = ("HTX", "USDT", "BestChange", "USDT")
+
+
+def _signals(db):
+    con = sqlite3.connect(db)
+    rows = con.execute("SELECT buy_ex, buy_asset, sell_ex, sell_asset, first_seen, last_seen, scans, max_profit, "
+                       "signalled, signal_ts, reason_not_signalled, amount, min_profit FROM signals ORDER BY id").fetchall()
+    con.close()
+    return rows
+
+
+def test_track_signals_episode_lifecycle(tmp_path):
+    db = str(tmp_path / "history.db")
+    open_ids = history.track_signals([(K1, 1.5, False, "unconfirmed"), (K2, 2.0, False, "max_signals")], 100.0, {},
+                                     amount=50000, min_profit=1.0, path=db)
+    assert set(open_ids) == {K1, K2}
+    open_ids = history.track_signals([(K1, 2.5, True, None), (K2, 1.8, False, "cooldown")], 120.0, open_ids,
+                                     amount=50000, min_profit=1.0, path=db)
+    open_ids = history.track_signals([(K1, 2.0, False, "cooldown")], 140.0, open_ids, amount=50000, min_profit=1.0,
+                                     path=db)
+    assert set(open_ids) == {K1}                                                     # K2 ушла под порог — эпизод закрыт
+    rows = _signals(db)
+    assert rows == [(*K1, 100.0, 140.0, 3, 2.5, 1, 120.0, None, 50000.0, 1.0),     # сигнал был — причины нет
+                    (*K2, 100.0, 120.0, 2, 2.0, 0, None, "cooldown", 50000.0, 1.0)]   # последняя преграда
+    history.track_signals([(K2, 1.1, False, "quiet")], 160.0, open_ids, path=db)     # вернулась — новый эпизод
+    rows = _signals(db)
+    assert len(rows) == 3 and rows[2][:7] == (*K2, 160.0, 160.0, 1) and rows[2][10] == "quiet"
+
+
+def test_track_signals_row_gone_starts_new_episode(tmp_path):
+    db = str(tmp_path / "history.db")
+    open_ids = history.track_signals([(K1, 1.5, False, "unconfirmed")], 100.0, {}, path=db)
+    history.cleanup(path=db, now=100.0 + history.RETENTION + 1)                     # строку удалила очистка
+    open_ids = history.track_signals([(K1, 1.7, True, None)], 120.0, open_ids, path=db)
+    rows = _signals(db)
+    assert len(rows) == 1 and rows[0][4:11] == (120.0, 120.0, 1, 1.7, 1, 120.0, None)
+
+
+def test_cleanup_drops_old_signal_episodes(tmp_path):
+    db = str(tmp_path / "history.db")
+    now = BASE + 40 * 86400
+    history.track_signals([(K1, 1.5, False, "paused")], now - 31 * 86400, {}, path=db)
+    history.track_signals([(K2, 1.5, False, "paused")], now - 1 * 86400, {}, path=db)
+    history.cleanup(path=db, now=now)
+    assert [r[:4] for r in _signals(db)] == [K2]
+
+
+def test_signal_stats_missed_share(tmp_path):
+    db = str(tmp_path / "history.db")
+    now = BASE
+    ids = {}
+    # K1: 5 минут выше порога, сигнал был; K2: 5 минут вне топ-N — пропуск; k3: минута — не в счёт;
+    # k4: 5 минут под антидублем (сигнал по ней был раньше, за окном) — не пропуск
+    k3, k4 = ("KuCoin", "USDT", "MEXC", "USDT"), ("MEXC", "USDT", "HTX", "USDT")
+    ids = history.track_signals([(K1, 1.5, False, "unconfirmed"), (K2, 2.0, False, "unconfirmed"),
+                                 (k3, 1.2, False, "unconfirmed"), (k4, 1.1, False, "cooldown")],
+                                now - 300, ids, path=db)
+    ids = history.track_signals([(K1, 1.6, True, None), (K2, 2.0, False, "max_signals"),
+                                 (k3, 1.2, False, "unconfirmed"), (k4, 1.1, False, "cooldown")],
+                                now - 240, ids, path=db)
+    ids = history.track_signals([(K1, 1.6, False, "cooldown"), (K2, 2.1, False, "max_signals"),
+                                 (k4, 1.1, False, "cooldown")], now, ids, path=db)
+    st = history.signal_stats(path=db, now=now)
+    assert st == {"episodes": 4, "signalled": 1, "long": 3, "missed": 1, "missed_share": 0.5,
+                  "reasons": {"max_signals": 1}, "excluded": 1, "excluded_reasons": {"cooldown": 1}}
+    empty = history.signal_stats(path=str(tmp_path / "none.db"), now=now)
+    assert empty["episodes"] == 0 and empty["missed_share"] is None
+
+
+def _scans(db, key, ts_list, reason_at, ids=None):
+    """Связка key выше порога на сканах ts_list; reason_at(ts) — (сигнал ушёл, причина) на скане."""
+    ids = dict(ids or {})
+    for ts in ts_list:
+        sent, reason = reason_at(ts)
+        ids = history.track_signals([(key, 1.5, sent, reason)], ts, ids, path=db)
+    return ids
+
+
+def test_signal_stats_dip_during_cooldown_is_not_missed(tmp_path):
+    """Сигнал ушёл, связка на один скан ушла под порог и вернулась под антидублем — это та же возможность: не пропуск
+    (раньше — два эпизода и доля пропущенных 0.5)."""
+    db = str(tmp_path / "history.db")
+    t0 = BASE
+    _scans(db, K1, [t0 + 20 * i for i in range(16)], lambda ts: (ts == t0 + 20, None if ts == t0 + 20 else "cooldown"))
+    history.track_signals([], t0 + 320, {}, path=db)                                 # скан без неё — эпизод закрыт
+    _scans(db, K1, [t0 + 340 + 20 * i for i in range(14)], lambda ts: (False, "cooldown"))
+    assert len(_signals(db)) == 2
+    st = history.signal_stats(path=db, now=t0 + 700, cooldown=600)
+    assert (st["episodes"], st["long"], st["signalled"], st["missed"], st["missed_share"]) == (1, 1, 1, 0, 0.0)
+    # вернулась и держится вне топ-N (последняя причина — не антидубль): всё равно один эпизод с сигналом
+    db2 = str(tmp_path / "history2.db")
+    _scans(db2, K1, [t0 + 20 * i for i in range(16)], lambda ts: (ts == t0 + 20, None if ts == t0 + 20 else "cooldown"))
+    _scans(db2, K1, [t0 + 340 + 20 * i for i in range(14)], lambda ts: (False, "max_signals"))
+    assert history.signal_stats(path=db2, now=t0 + 700, cooldown=600)["missed_share"] == 0.0
+    assert history.signal_stats(path=db2, now=t0 + 700, cooldown=0)["missed_share"] == 0.5   # без склейки — пропуск
+
+
+def test_signal_stats_quiet_hours_not_missed(tmp_path):
+    """7 часов тихих часов: связка держится, сигналов нет по выбору владельца — не пропуск (раньше доля была 1.0)."""
+    db = str(tmp_path / "history.db")
+    t0 = BASE
+    _scans(db, K1, [t0 + 600 * i for i in range(43)], lambda ts: (False, "quiet"))   # 7 ч, скан раз в 10 минут
+    st = history.signal_stats(path=db, now=t0 + 7 * 3600)
+    assert (st["long"], st["missed"], st["excluded"], st["missed_share"]) == (1, 0, 1, None)
+    assert st["excluded_reasons"] == {"quiet": 1} and st["reasons"] == {}
+    _scans(db, K2, [t0 + 60 * i for i in range(6)], lambda ts: (ts == t0, None if ts == t0 else "cooldown"))
+    st = history.signal_stats(path=db, now=t0 + 7 * 3600)
+    assert (st["long"], st["missed"], st["missed_share"]) == (2, 0, 0.0)
+    # ловушки при SIGNAL_TRAPS=0 и пауза — тоже не пропуск
+    for key, why in ((("KuCoin", "USDT", "MEXC", "USDT"), "trap"), (("MEXC", "USDT", "HTX", "USDT"), "paused")):
+        _scans(db, key, [t0 + 60 * i for i in range(6)], lambda ts, why=why: (False, why))
+    st = history.signal_stats(path=db, now=t0 + 7 * 3600)
+    assert (st["missed"], st["excluded"], st["missed_share"]) == (0, 3, 0.0)
+    assert st["excluded_reasons"] == {"quiet": 1, "trap": 1, "paused": 1}
 
 
 def test_record_stores_amount_next_to_profit(tmp_path, monkeypatch):
@@ -78,13 +280,13 @@ def test_cleanup_deletes_older_than_30_days(tmp_path):
     db = str(tmp_path / "history.db")
     now = BASE + 40 * 86400
     history._insert([(now - 31 * 86400, "Bybit", "MEXC", "USDT", "USDT", 3.0, 88.0),
-                     (now - 1 * 86400, "Bybit", "MEXC", "USDT", "USDT", 4.0, 88.0)], db)
+                     (now - 1 * 86400, "Bybit", "MEXC", "USDT", "USDT", 4.0, 88.0)], db,
+                    routes=[(now - 31 * 86400, "Bybit", "USDT", "MEXC", "USDT", 3.0),
+                            (now - 1 * 86400, "Bybit", "USDT", "MEXC", "USDT", 4.0)])
     removed = history.cleanup(db, now=now)
     assert removed == 1
-    con = sqlite3.connect(db)
-    left = con.execute("SELECT profit FROM history").fetchall()
-    con.close()
-    assert left == [(4.0,)]
+    assert _table(db, "SELECT profit FROM history") == [(4.0,)]
+    assert _table(db, "SELECT profit FROM history_routes") == [(4.0,)]   # тот же срок хранения
 
 
 def test_cleanup_missing_file_is_noop():

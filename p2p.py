@@ -287,6 +287,11 @@ class Ad:
     all_pays: list = None  # исходные способы оплаты до фильтра _pays (объявление живёт в кэше _alt несколько сканов)
     parts: int = 1   # из скольких объявлений стакана собрано (_combined) — обменникам нужен свой перевод на каждого
     nicks: tuple = ()  # ники всех объявлений, из которых собрано (_combined); у обычного объявления — пусто
+    # служебное для снимков (snapshots.py), в сравнение объявлений не входит: когда данные получены с площадки
+    # (кэш _alt/_bc хранит время исходного запроса), id объявления и «мерчант онлайн» — где площадка их отдаёт
+    fetched_ts: float = field(default=0.0, compare=False)
+    ad_id: str = field(default="", compare=False)
+    online: bool = field(default=None, compare=False)
 
 
 async def _json(s, method, url, body=None):
@@ -419,7 +424,8 @@ async def lbank(s, cfg, side, asset):
                           [LBANK_PAY_FIX.get(p["name"], p["name"]) for p in i.get("payMethods") or []],
                           i.get("nickName") or "?", int(i.get("dealOrderTotal") or 0),
                           float(str(i.get("turnoverRateTotal") or "0").rstrip("%") or 0), asset=asset,
-                          terms=(i.get("adRemark") or "").strip()))
+                          terms=(i.get("adRemark") or "").strip(), ad_id=str(i.get("uuid") or ""),
+                          online=i.get("online") if isinstance(i.get("online"), bool) else None))
         except (KeyError, TypeError, ValueError):
             continue
     return out
@@ -525,7 +531,11 @@ async def bestchange(s, cfg, side, asset):
         if now - _bc["t"] > cfg.bc_refresh and now - _bc.get("tried", 0) > 60:
             _bc["tried"] = now
             data = await _bc_fetch(s)
-            _bc["ads"] = await asyncio.to_thread(_bc_parse, data)
+            got = time.time()
+            ads = await asyncio.to_thread(_bc_parse, data)
+            for a in ads:   # время скачивания выгрузки: следующие сканы берут эти же объявления из кэша
+                a.fetched_ts = got
+            _bc["ads"] = ads
             _bc["t"] = time.time()
     return [a for a in _bc["ads"] if a.side == side and a.asset == asset]
 
@@ -724,7 +734,9 @@ def _combined(used, price, total, qty):
               sorted(set(p for a in used for p in a.pays)), used[0].nick if one else f"{len(used)} объявл.",
               min(a.orders for a in used), min(a.rate for a in used), used[0].url if one else "",
               used[0].asset, nets.pop() if len(nets) == 1 else "", terms=terms, parts=len(used),
-              nicks=tuple(n for a in used for n in (a.nicks or (a.nick,))))
+              nicks=tuple(n for a in used for n in (a.nicks or (a.nick,))),
+              fetched_ts=min(a.fetched_ts for a in used), ad_id=used[0].ad_id if one else "",
+              online=used[0].online if one else None)
 
 
 def _net_parts(grp):
@@ -1320,9 +1332,15 @@ class Snapshot:
     spot: dict = field(default_factory=dict)        # для deal_amounts: те же спот-цены, что использовал _route
     over_banks: frozenset = field(default_factory=frozenset)
     book: dict = field(default_factory=dict)        # (ex, side, asset) -> вся выдача площадки до фильтров (/maker)
+    ts: float = 0.0                                 # unix-время начала скана (id снимка в snapshots.py)
+    jobs: list = field(default_factory=list)        # замеры запросов скана (_timed): время, «из кэша», ошибки
+    ads: list = field(default_factory=list)         # все объявления скана до фильтров — для снимков (snapshots.py)
+    blocked: frozenset = field(default_factory=frozenset)   # блэклист (ex, nick), с которым собран снимок
+    traps: list = field(default_factory=list)       # ловушки, отсеянные в этом скане (_trap_entry)
 
 
-_alt = {"t": 0.0, "ads": [], "errors": {}, "key": None}   # key — (монеты, площадки, сумма круга), под которые собран кэш
+# key — (монеты, площадки, сумма круга), под которые собран кэш; jobs — замеры запросов, которыми он собран
+_alt = {"t": 0.0, "ads": [], "errors": {}, "key": None, "jobs": []}
 
 VENUE_BACKOFF_BASE = 30    # сек: первая пауза площадки после ошибки
 VENUE_BACKOFF_MAX = 600    # сек: потолок паузы (10 мин)
@@ -1355,11 +1373,12 @@ TRAPS_LOG_SIZE = 30
 TRAPS_LOG = deque(maxlen=TRAPS_LOG_SIZE)   # последние отсеянные «ловушки» — для /traps, обучение без риска
 
 
-def _trap_entry(a, ref, cfg):
+def _trap_entry(a, ref, cfg, ts=0.0):
     """Объявление отсеяно фильтром аномалий (usable/_signal_ok прошли, но цена далеко от рынка).
     Возвращает запись для /traps, только если отклонение делает объявление привлекательным
     (дешевле рынка на покупку / дороже рынка на продажу) — это и есть типичная ловушка;
-    невыгодные для нас аномалии в другую сторону никого не заманивают, их не показываем."""
+    невыгодные для нас аномалии в другую сторону никого не заманивают, их не показываем.
+    ts — время скана (0 — текущее)."""
     dev = (a.price / ref - 1) * 100
     attractive = dev < 0 if a.side == "buy" else dev > 0
     if not attractive:
@@ -1368,7 +1387,7 @@ def _trap_entry(a, ref, cfg):
     word = "ниже" if a.side == "buy" else "выше"
     reason = (f"{action} {a.asset} на {a.ex} по {_price(a.price)} ₽ — на {abs(dev):.1f}% {word} рынка "
               f"(ориентир {_price(ref)} ₽, отсев >{cfg.max_dev:g}%)")
-    return {"ts": time.time(), "ex": a.ex, "side": a.side, "asset": a.asset, "price": a.price,
+    return {"ts": ts or time.time(), "ex": a.ex, "side": a.side, "asset": a.asset, "price": a.price,
             "ref": ref, "dev": dev, "reason": reason}
 
 
@@ -1377,13 +1396,39 @@ def traps_log():
     return list(reversed(TRAPS_LOG))
 
 
-async def scan(s, cfg, force_alt=False):
-    """force_alt — разовый скан под свою сумму (`/calc`, «своя сумма»): всегда опросить не-USDT монеты
-    заново и не трогать общий кэш _alt, потому что лимиты объявлений зависят от cfg.amount."""
+async def _timed(coro, rec):
+    """Замер одного запроса скана: rec получает t0/t1 (unix-время начала и конца) и err — текст ошибки;
+    исключение идёт дальше, как без замера."""
+    rec["t0"] = time.time()
+    try:
+        return await coro
+    except Exception as e:
+        rec["err"] = f"{type(e).__name__}: {e}"[:120]
+        raise
+    finally:
+        rec["t1"] = time.time()
+
+
+def _job_done(rec, ads, data_ts=0.0):
+    """Итог запроса площадки в замере: объявлениям без времени получения ставим конец запроса (кэш BestChange
+    проставил своё при скачивании). «Из кэша» — данные старше начала запроса; data_ts — время данных, если
+    объявлений нет (выгрузка BestChange)."""
+    for a in ads:
+        if not a.fetched_ts:
+            a.fetched_ts = rec["t1"]
+    ts = min((a.fetched_ts for a in ads), default=0.0) or data_ts or rec["t1"]
+    rec.update(n=len(ads), cached=ts < rec["t0"], age=round(rec["t1"] - ts, 1))
+
+
+async def collect(s, cfg, force_alt=False):
+    """Сбор данных скана по сети: объявления площадок (с кэшами _alt и BestChange, бэкоффом площадок), ориентир
+    Rapira, спот, справочник сетей, замеры запросов. Возвращает словарь аргументов assemble(): ts, ads, ref (None —
+    Rapira не ответила), ref_src, spot, errors, jobs. force_alt — как у scan()."""
+    t_scan = time.time()
     names_all = [n for n in cfg.exchanges if n in FETCHERS]
     key = (tuple(cfg.assets), tuple(names_all), cfg.amount)   # площадки фильтруют объявления по сумме
     if not force_alt and _alt["key"] != key:   # сменили монеты/площадки/сумму — старый кэш не годится, опросить заново
-        _alt.update(t=0.0, ads=[], errors={}, key=key)
+        _alt.update(t=0.0, ads=[], errors={}, key=key, jobs=[])
     paused = {n: u for n in names_all if (u := _venue_paused_until(n))}   # площадки на паузе после ошибок
     names = [n for n in names_all if n not in paused]
     alts = [a for a in cfg.assets if a != "USDT"]
@@ -1391,31 +1436,42 @@ async def scan(s, cfg, force_alt=False):
     jobs = [(n, side, asset) for n in names
             for asset in (["USDT"] if "USDT" in cfg.assets else []) + (alts if alt_due or n == "bestchange" else [])
             for side in ("buy", "sell")]
-    ref_task = asyncio.ensure_future(rapira_mid(s)) if cfg.fiat == "RUB" else None
-    spot_task = asyncio.ensure_future(spot_prices(s, cfg.assets))
-    net_task = asyncio.ensure_future(netstatus.refresh_if_due(s, cfg.assets, cfg.exchanges, _json))
-    res = await asyncio.gather(*(FETCHERS[n](s, cfg, side, asset) for n, side, asset in jobs), return_exceptions=True)
+    recs = [{"ex": n, "side": side, "asset": asset} for n, side, asset in jobs]   # замеры запросов (Snapshot.jobs)
+    ref_rec, spot_rec, net_rec = {"ex": "rapira"}, {"ex": "spot"}, {"ex": "networks"}
+    ref_task = asyncio.ensure_future(_timed(rapira_mid(s), ref_rec)) if cfg.fiat == "RUB" else None
+    spot_task = asyncio.ensure_future(_timed(spot_prices(s, cfg.assets), spot_rec))
+    net_task = asyncio.ensure_future(_timed(netstatus.refresh_if_due(s, cfg.assets, cfg.exchanges, _json), net_rec))
+    res = await asyncio.gather(*(_timed(FETCHERS[n](s, cfg, side, asset), rec)
+                                 for (n, side, asset), rec in zip(jobs, recs)), return_exceptions=True)
     try:
-        net_errors = await net_task or {}
+        net_res = await net_task
+        net_rec["cached"] = net_res is None   # справочник сетей обновляется раз в netstatus.TTL
+        net_errors = net_res or {}
     except Exception as e:
         net_errors = {"сети": f"{type(e).__name__}: {e}"[:80]}
 
     ads, errors, alt_ads, alt_errors = [], {}, [], {}
     venue_seen, venue_failed = set(), set()
-    for (n, _, asset), r in zip(jobs, res):
+    for (n, _, asset), r, rec in zip(jobs, res, recs):
         venue_seen.add(n)
         cached = asset != "USDT" and n != "bestchange"   # не-USDT монеты кэшируем на alt_interval
         if isinstance(r, Exception):
             venue_failed.add(n)
+            rec.update(n=0, cached=False, age=None)
             (alt_errors if cached else errors)[f"{n}/{asset}"] = f"{type(r).__name__}: {r}"[:120]
         else:
+            _job_done(rec, r, _bc["t"] if n == "bestchange" else 0.0)
             (alt_ads if cached else ads).extend(r)
     for n in venue_seen:   # бэкофф по площадке: сбрасываем на успехе, растим паузу на ошибке
         (_venue_backoff_fail if n in venue_failed else _venue_backoff_ok)(n)
     for n, until in paused.items():
         errors[n] = f"пауза до {time.strftime('%H:%M', time.localtime(until))}"
+    alt_recs = [r for r in recs if r["asset"] != "USDT" and r["ex"] != "bestchange"]
     if alt_due and not force_alt:
-        _alt.update(t=time.time(), ads=alt_ads, errors=alt_errors)
+        _alt.update(t=time.time(), ads=alt_ads, errors=alt_errors, jobs=alt_recs)
+    elif not force_alt:   # монеты из кэша _alt: замеры тех запросов, которыми он собран, с пометкой и возрастом
+        now = time.time()
+        recs += [dict(r, cached=True, age=round(now - r.get("t1", _alt["t"]), 1)) for r in _alt.get("jobs", [])]
     ads += alt_ads if force_alt else _alt["ads"]
     errors.update(alt_errors if force_alt else _alt["errors"])
 
@@ -1425,15 +1481,27 @@ async def scan(s, cfg, force_alt=False):
             ref, ref_src = await ref_task, "Rapira USDT/RUB"
         except Exception:
             pass
-    if ref is None:
-        usdt = [a.price for a in ads if a.asset == "USDT"]
-        ref, ref_src = (statistics.median(usdt), "медиана P2P") if usdt else (None, "-")
     try:
         spot = await spot_task
     except Exception as e:
         spot = {"Bybit": {"USDT": (1.0, 1.0)}}
         errors["spot"] = f"{type(e).__name__}: {e}"[:120]
+    recs += ([ref_rec] if ref_task else []) + [spot_rec, net_rec]
     errors.update({f"сети/{k}": v for k, v in net_errors.items()})
+    return {"ts": t_scan, "ads": ads, "ref": ref, "ref_src": ref_src, "spot": spot, "errors": errors, "jobs": recs}
+
+
+def assemble(cfg, ads, ref=None, ref_src="-", spot=None, errors=None, blocked=frozenset(), over_banks=frozenset(),
+             ts=0.0, jobs=()):
+    """Сборка снимка из данных скана без сети и файлов: ориентиры (ref None — медиана P2P USDT), фильтры и отсев
+    аномалий, стаканы, связки, сортировка «прибыль × надёжность». blocked — блэклист (ex, nick), over_banks — свои
+    банки за лимитом СБП; отсеянные ловушки — в snap.traps (в TRAPS_LOG их кладёт scan). Справочник сетей —
+    живой netstatus (replay.py подставляет сохранённый в снимке). Тот же вход с другим cfg — replay.py."""
+    spot = spot if spot is not None else {"Bybit": {"USDT": (1.0, 1.0)}}
+    errors = dict(errors or {})
+    if ref is None:
+        usdt = [a.price for a in ads if a.asset == "USDT"]
+        ref, ref_src = (statistics.median(usdt), "медиана P2P") if usdt else (None, "-")
     refs = {}
     for a in cfg.assets:
         mid = _mid(spot, a)
@@ -1444,17 +1512,16 @@ async def scan(s, cfg, force_alt=False):
             if p:
                 refs[a] = statistics.median(p)
 
-    blocked = blacklist.blocked()
-    best, dropped, networks = {}, {}, {}
+    best, dropped, networks, traps = {}, {}, {}, []
     for a in ads:
         if not usable(a, cfg, blocked):
             continue
         r = refs.get(a.asset)
         if r and abs(a.price / r - 1) * 100 > cfg.max_dev:
             dropped[a.ex] = dropped.get(a.ex, 0) + 1
-            trap = _trap_entry(a, r, cfg)
+            trap = _trap_entry(a, r, cfg, ts)
             if trap:
-                TRAPS_LOG.append(trap)
+                traps.append(trap)
             continue
         better = (lambda cur: cur is None or (a.price < cur.price if a.side == "buy" else a.price > cur.price))
         if better(best.get((a.ex, a.side, a.asset))):
@@ -1494,7 +1561,7 @@ async def scan(s, cfg, force_alt=False):
     for key, grp in book.items():
         grp.sort(key=lambda a: a.price, reverse=(key[1] == "sell"))
 
-    over_banks = frozenset(trades.banks_over_limit(trades.own_banks()[0]))   # свои банки, у которых лимит СБП исчерпан
+    over_banks = frozenset(over_banks)
     deals = []
     for b in buys:
         for sl in sells:
@@ -1503,7 +1570,8 @@ async def scan(s, cfg, force_alt=False):
             d = _match(b, sl, cfg, spot, over_banks)
             if d:
                 deals.append(d)
-    snap = Snapshot(ref or 0, ref_src, refs, best, [], networks, dropped, errors, groups, spot, over_banks, book)
+    snap = Snapshot(ref or 0, ref_src, refs, best, [], networks, dropped, errors, groups, spot, over_banks, book,
+                    ts=ts, jobs=list(jobs), ads=ads, blocked=frozenset(blocked), traps=traps)
     # сортировка «прибыль × надёжность» — score(): каждая единица веса риска снимает risk_penalty п.п. с профита
     deals.sort(key=lambda d: score(d, cfg, snap), reverse=True)
     # обменники разных сетей дают по связке на одну и ту же пару площадок; бот сигналит по паре
@@ -1514,6 +1582,18 @@ async def scan(s, cfg, force_alt=False):
         if key not in seen:
             seen.add(key)
             snap.deals.append(d)
+    return snap
+
+
+async def scan(s, cfg, force_alt=False):
+    """Скан: сбор по сети (collect) и сборка снимка (assemble) с текущим блэклистом и банками за лимитом СБП.
+    force_alt — разовый скан под свою сумму (`/calc`, «своя сумма»): всегда опросить не-USDT монеты
+    заново и не трогать общий кэш _alt, потому что лимиты объявлений зависят от cfg.amount."""
+    raw = await collect(s, cfg, force_alt)
+    snap = assemble(cfg, blocked=blacklist.blocked(),
+                    over_banks=trades.banks_over_limit(trades.own_banks()[0]),   # свои банки, у которых лимит СБП исчерпан
+                    **raw)
+    TRAPS_LOG.extend(snap.traps)
     return snap
 
 
