@@ -433,6 +433,160 @@
   "retExtInfo": {},
   "time": 1790494000000
  },
+ "bybit_instr_GRAMUSDT": {
+  "retCode": 0,
+  "retMsg": "OK",
+  "result": {
+   "category": "linear",
+   "list": [
+    {
+     "symbol": "GRAMUSDT",
+     "contractType": "LinearPerpetual",
+     "status": "Trading",
+     "baseCoin": "GRAM",
+     "quoteCoin": "USDT",
+     "priceScale": "2",
+     "priceFilter": {
+      "minPrice": "0.10",
+      "maxPrice": "1999999.80",
+      "tickSize": "0.10"
+     },
+     "lotSizeFilter": {
+      "maxOrderQty": "1500.000",
+      "minOrderQty": "0.1",
+      "qtyStep": "0.1",
+      "postOnlyMaxOrderQty": "1500.000",
+      "maxMktOrderQty": "150.000",
+      "minNotionalValue": "5"
+     },
+     "unifiedMarginTrade": true,
+     "fundingInterval": 240,
+     "settleCoin": "USDT"
+    }
+   ],
+   "nextPageCursor": ""
+  },
+  "retExtInfo": {},
+  "time": 1790494000000
+ },
+ "bybit_ticker_GRAMUSDT": {
+  "retCode": 0,
+  "retMsg": "OK",
+  "result": {
+   "category": "linear",
+   "list": [
+    {
+     "symbol": "GRAMUSDT",
+     "lastPrice": "1.5930",
+     "indexPrice": "1.5920",
+     "markPrice": "1.5930",
+     "fundingRate": "0.00005",
+     "nextFundingTime": "1790496000000",
+     "bid1Price": "1.5930",
+     "bid1Size": "1775.0",
+     "ask1Price": "1.5940",
+     "ask1Size": "514.9",
+     "fundingIntervalHour": "4",
+     "fundingCap": "0.008",
+     "deliveryTime": "0"
+    }
+   ]
+  },
+  "retExtInfo": {},
+  "time": 1790494000000
+ },
+ "bybit_book_GRAMUSDT": {
+  "retCode": 0,
+  "retMsg": "OK",
+  "result": {
+   "s": "GRAMUSDT",
+   "b": [
+    [
+     "1.5930",
+     "1775.0"
+    ],
+    [
+     "1.5920",
+     "3000"
+    ]
+   ],
+   "a": [
+    [
+     "1.5940",
+     "514.9"
+    ],
+    [
+     "1.5950",
+     "4000"
+    ]
+   ],
+   "ts": 1790494000000,
+   "u": 1,
+   "seq": 1,
+   "cts": 1790494000000
+  },
+  "retExtInfo": {},
+  "time": 1790494000000
+ },
+ "bybit_spot_GRAMUSDT": {
+  "retCode": 0,
+  "retMsg": "OK",
+  "result": {
+   "s": "GRAMUSDT",
+   "b": [
+    [
+     "1.594",
+     "900"
+    ],
+    [
+     "1.593",
+     "5000"
+    ]
+   ],
+   "a": [
+    [
+     "1.595",
+     "800"
+    ],
+    [
+     "1.596",
+     "6000"
+    ]
+   ],
+   "ts": 1790494000000,
+   "u": 1,
+   "seq": 1,
+   "cts": 1790494000000
+  },
+  "retExtInfo": {},
+  "time": 1790494000000
+ },
+ "bybit_kline_GRAMUSDT": {
+  "retCode": 0,
+  "retMsg": "OK",
+  "result": {
+   "symbol": "GRAMUSDT",
+   "category": "linear",
+   "list": [
+    [
+     "1790492400000",
+     "1.582",
+     "1.598",
+     "1.580",
+     "1.593",
+     "1000",
+     "1590"
+    ]
+   ]
+  },
+  "retExtInfo": {},
+  "time": 1790494000000
+ },
+ "bybit_spot_TONUSDT_error": {
+  "retCode": 10001,
+  "retMsg": "Not supported symbols",
+  "result": {}
+ },
  "bingx_time": {
   "code": 0,
   "msg": "",

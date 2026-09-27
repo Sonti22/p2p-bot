@@ -78,12 +78,29 @@ def test_refresh_builds_quotes_and_skips_closed_symbols():
     bx = perp._quotes[("BingX", "BTCUSDT")]
     assert bx.funding_rate == pytest.approx(0.000024) and bx.lot == 0.0001 and bx.taker_fee == pytest.approx(0.05)
     assert bx.bids[0] == (84474.5, 0.001)
-    assert ("Bybit", "TONUSDT") not in perp._quotes and ("BingX", "TONUSDT") not in perp._quotes
-    assert not any("TON" in u and ("tickers" in u or "premiumIndex" in u) for u in calls)   # закрытый не опрашиваем
+    gram = perp._quotes[("Bybit", "GRAMUSDT")]   # бывший TON: фандинг раз в 4 ч, лот 0.1
+    assert gram.interval_h == 4 and gram.lot == 0.1 and perp.asset_symbol("TON") == "GRAMUSDT"
+    assert ("BingX", "GRAMUSDT") not in perp._quotes                                  # на BingX его нет
+    assert not any("GRAM" in u and "premiumIndex" in u for u in calls)                 # не торгуется — не опрашиваем
     assert perp._spot[("Bybit", "BTCUSDT")].kind == "spot"
     assert perp.klines("Bybit", "BTCUSDT")[0][0] < perp.klines("Bybit", "BTCUSDT")[-1][0]
     assert all(u.split("/")[2] in perp.HOSTS for u in calls)
-    assert "TONUSDT" in str(perp.status()["closed"])
+    assert "нет в списке" in perp.status()["closed"][("BingX", "GRAMUSDT")]
+
+
+def test_closed_symbol_is_skipped_not_an_error(monkeypatch):
+    """TONUSDT на Bybit закрыт (Closed): тикер и стакан не запрашиваем, спот TON площадка не знает — ошибка только
+    спота, котировки BTC и пауза площадки не страдают."""
+    monkeypatch.setenv("PERP_SYMBOLS", "BTCUSDT,TONUSDT")
+    calls = []
+    j = api()
+    errors = asyncio.run(perp.refresh(None, make_get({"bybit_spot_TONUSDT": j["bybit_spot_TONUSDT_error"]},
+                                                     calls=calls), now=NOW))
+    assert set(errors) == {"Bybit/spot/TONUSDT"} and "Not supported" in errors["Bybit/spot/TONUSDT"]
+    assert ("Bybit", "TONUSDT") not in perp._quotes and ("Bybit", "BTCUSDT") in perp._quotes
+    assert not any("TON" in u and ("tickers" in u or "category=linear&symbol=TON" in u and "orderbook" in u)
+                   for u in calls)
+    assert "Bybit" not in perp._backoff and "Closed" in perp.status()["closed"][("Bybit", "TONUSDT")]
 
 
 def test_backoff_per_venue_and_recovery():

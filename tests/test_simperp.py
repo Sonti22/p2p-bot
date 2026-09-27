@@ -61,10 +61,9 @@ def test_choose_picks_cheaper_venue_and_counts_funding():
 
 
 def test_choose_without_quotes_explains_why():
-    perp._instr[("Bybit", "TONUSDT")] = perp.Instrument("Bybit", "TONUSDT", False, note="статус Closed")
-    perp._instr[("BingX", "TONUSDT")] = perp.Instrument("BingX", "TONUSDT", False, note="нет в списке контрактов")
-    plan, note = simperp.choose("TON", 100, 10000, RUB, 110, now=NOW)
-    assert plan is None and "не торгуется" in note and "Closed" in note
+    perp._instr[("BingX", "GRAMUSDT")] = perp.Instrument("BingX", "GRAMUSDT", False, note="нет в списке контрактов")
+    plan, note = simperp.choose("TON", 100, 10000, RUB, 110, now=NOW)   # TON → перп GRAMUSDT
+    assert plan is None and "BingX: GRAMUSDT не торгуется" in note and "Bybit: нет свежей котировки" in note
     assert simperp.choose("USDT", 100, 10000, RUB, 90, now=NOW) == (None, "")   # стейблкоин не хеджируем
 
 

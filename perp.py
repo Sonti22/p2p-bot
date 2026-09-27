@@ -9,10 +9,11 @@
              /openApi/swap/v2/quote/contracts (шаг лота, минимумы, комиссия), /openApi/swap/v2/quote/depth,
              /openApi/swap/v2/server/time.
 Только GET без редиректов и только на два хоста. Опрос раз в PERP_INTERVAL секунд (по умолчанию 30), у каждой
-площадки свой бэкофф после ошибки (как у P2P-площадок: 30 с → 60 → … до 10 мин). Символ не торгуется (TON снят
-с перпов Bybit, на BingX его нет) — котировки нет, это не ошибка площадки.
+площадки свой бэкофф после ошибки (как у P2P-площадок: 30 с → 60 → … до 10 мин). Символ не торгуется — котировки
+нет, это не ошибка площадки. TON с 15.06.2026 называется GRAM (1:1): перп TONUSDT на Bybit закрыт, торгуется
+GRAMUSDT (фандинг раз в 4 ч); на BingX нет ни TON, ни GRAM.
 
-Настройки .env: PERPS=0 — не опрашивать; PERP_INTERVAL; PERP_SYMBOLS (BTCUSDT,ETHUSDT,TONUSDT);
+Настройки .env: PERPS=0 — не опрашивать; PERP_INTERVAL; PERP_SYMBOLS (BTCUSDT,ETHUSDT,GRAMUSDT);
 PERP_TAKER_FEES (Bybit:0.055,BingX:0.05 — % тейкера; у BingX по умолчанию берётся из справочника контрактов);
 PERP_MAX_AGE — сколько секунд котировка считается свежей (90).
 """
@@ -28,7 +29,9 @@ BYBIT = "https://api.bybit.com"
 BINGX = "https://open-api.bingx.com"
 HOSTS = ("api.bybit.com", "open-api.bingx.com")
 VENUES = ("Bybit", "BingX")
-DEFAULT_SYMBOLS = "BTCUSDT,ETHUSDT,TONUSDT"
+DEFAULT_SYMBOLS = "BTCUSDT,ETHUSDT,GRAMUSDT"
+# монета P2P → базовый актив перпа: TON переименован в GRAM 1:1 (15.06.2026), перп TONUSDT на Bybit закрыт
+ASSET_ALIASES = {"TON": "GRAM"}
 DEFAULT_TAKER = {"Bybit": 0.055, "BingX": 0.05}   # % тейкера перпа без VIP-уровня
 DEPTH = 50            # уровней стакана
 INFO_TTL = 6 * 3600   # справочник контрактов
@@ -66,7 +69,9 @@ def bingx_symbol(symbol):
 
 
 def asset_symbol(asset):
-    return asset.upper() + "USDT"
+    """Монета P2P → символ перпа: BTC → BTCUSDT, TON → GRAMUSDT (ASSET_ALIASES)."""
+    a = asset.upper()
+    return ASSET_ALIASES.get(a, a) + "USDT"
 
 
 @dataclass
