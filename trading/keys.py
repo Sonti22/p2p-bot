@@ -3,18 +3,28 @@
 - Хранятся как остальные ключи бота: accounts.keys(имя) — data/keys.json (DPAPI) или .env
   (BYBIT_TRADE_API_KEY/…_SECRET, BINGX_TRADE_API_KEY/…_SECRET). Вводит их только владелец на ПК:
   scripts/trading_keys.py (getpass), не Telegram. В accounts.CONNECTABLE их нет — кнопки бота их не видят.
-- При старте (`check`) права ключа берутся у самой биржи; торговля по ключу разрешена, только если права — ровно из
-  списка нужных (ALLOWED_*), а вывода, переводов, субаккаунтов, P2P, earn и прочего нет. Не удалось проверить,
-  незнакомая форма ответа, незнакомое право — отказ (fail closed, в отличие от accounts.api_permissions).
+- Права ключа берутся у самой биржи (`check`); торговля по ключу разрешена, только если права — ровно из списка нужных
+  (ALLOWED_*), а вывода, переводов, субаккаунтов, P2P, earn и прочего нет. Не удалось проверить, незнакомая форма
+  ответа, незнакомое право — отказ (fail closed, в отличие от accounts.api_permissions).
+- Итог проверки сохраняется рядом с ключом (data/trading_keycheck.json: отпечаток ключа, итог, время — без ключа и
+  секрета) и повторяется при старте (`startup_check`). `credentials` отдаёт ключ, только если последняя проверка ЭТОГО
+  ключа прошла и не старше CHECK_TTL; не было проверки, провалилась, ключ заменили — None (торговли нет).
 Bybit: GET /v5/user/query-api (readOnly 0/1, permissions {группа: [права]}, ips). BingX: GET
 /openApi/v1/account/apiPermissions — две документированные формы (коды permissions или флаги enable*/permits*), как в
 accounts.bingx_key_safety.
 """
+import hashlib
+import os
+import time
 from collections import namedtuple
 
 import accounts
+import jsonstore
 from trading import venues
 
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+CHECK_PATH = os.path.join(ROOT, "data", "trading_keycheck.json")
+CHECK_TTL = 24 * 3600          # сек: столько действует проверка прав; дольше — перепроверить (startup_check)
 KEY_NAMES = {venues.BYBIT: "bybit_trade", venues.BINGX: "bingx_trade"}
 # Bybit: разрешённые права по группам. Всё остальное непустое — отказ.
 BYBIT_ALLOWED = {"ContractTrade": {"Order", "Position"}, "Derivatives": {"DerivativesTrade"}, "Spot": {"SpotTrade"},
@@ -27,9 +37,59 @@ BINGX_ALLOWED_FLAGS = {"enableReading", "enableFutures", "enableSpotAndMarginTra
 KeyCheck = namedtuple("KeyCheck", "ok state detail ip_bound")   # state: ok / unsafe / unusable / unknown / none
 
 
-def credentials(venue):
-    """(api_key, api_secret) торгового ключа биржи или None."""
+def raw_credentials(venue):
+    """(api_key, api_secret) торгового ключа как сохранён — БЕЗ проверки прав (только для самой проверки)."""
     return accounts.keys(KEY_NAMES[venue])
+
+
+def fingerprint(creds):
+    """Отпечаток ключа для записи итога проверки: sha256 от api key (не секрета), 16 hex — по нему видно, что проверяли
+    именно этот ключ; сам ключ по отпечатку не восстановить."""
+    return hashlib.sha256(("trading-key:" + str(creds[0])).encode("utf-8")).hexdigest()[:16]
+
+
+def _load(path=None):
+    data = jsonstore.read_dict(path or CHECK_PATH)
+    return data if isinstance(data, dict) else {}
+
+
+def save_check(venue, creds, res, now=None, path=None):
+    """Записать итог проверки прав ключа (без ключа и секрета)."""
+    data = _load(path)
+    data[venue] = {"fp": fingerprint(creds), "ok": bool(res.ok), "state": str(res.state), "detail": str(res.detail),
+                   "ip_bound": res.ip_bound if isinstance(res.ip_bound, bool) else None,
+                   "ts": time.time() if now is None else now}
+    jsonstore.write_dict(path or CHECK_PATH, data)
+
+
+def check_status(venue, creds, now=None, path=None):
+    """("", запись) — ключ проверен и годится; (причина, запись или None) — нет."""
+    if not creds or not isinstance(creds, (tuple, list)) or len(creds) != 2 or not all(creds):
+        return "торговый ключ не сохранён", None
+    rec = _load(path).get(venue)
+    now = time.time() if now is None else now
+    if not isinstance(rec, dict):
+        return "права торгового ключа ещё не проверены (scripts/trading_keys.py check или проверка при старте)", None
+    if rec.get("fp") != fingerprint(creds):
+        return "ключ заменён после проверки прав — нужна новая проверка", rec
+    if rec.get("ok") is not True:
+        return f"проверка прав ключа не пройдена ({rec.get('state')}): {rec.get('detail')}", rec
+    ts = rec.get("ts")
+    if not isinstance(ts, (int, float)) or isinstance(ts, bool) or not 0 <= now - ts <= CHECK_TTL:
+        return "проверка прав ключа устарела — нужна новая (startup_check)", rec
+    return "", rec
+
+
+def approved(venue, creds, now=None, path=None):
+    """Этот ключ прошёл проверку прав и она свежая."""
+    return check_status(venue, creds, now, path)[0] == ""
+
+
+def credentials(venue, now=None, path=None):
+    """(api_key, api_secret) торгового ключа, только если последняя проверка прав именно этого ключа прошла и свежая;
+    иначе None — торговли по ключу нет."""
+    creds = raw_credentials(venue)
+    return creds if creds and approved(venue, creds, now, path) else None
 
 
 def bybit_rights(result):
@@ -91,11 +151,7 @@ def bingx_rights(data):
     return KeyCheck(True, "ok", "" if ip_bound else "ключ без привязки к IP", ip_bound)
 
 
-async def check(s, venue, creds=None):
-    """Права торгового ключа по данным биржи → KeyCheck. Любой сбой — отказ."""
-    creds = creds or credentials(venue)
-    if not creds:
-        return KeyCheck(False, "none", "торговый ключ не сохранён", None)
+async def _ask(s, venue, creds):
     path = "/v5/user/query-api" if venue == venues.BYBIT else "/openApi/v1/account/apiPermissions"
     try:
         status, j = await venues.call(s, venue, "GET", path, {}, creds)
@@ -109,6 +165,18 @@ async def check(s, venue, creds=None):
     return bybit_rights(data) if venue == venues.BYBIT else bingx_rights(data)
 
 
-async def startup_check(s):
-    """{биржа: KeyCheck} для всех бирж ядра. Торговать можно только там, где ok."""
-    return {v: await check(s, v) for v in venues.VENUES}
+async def check(s, venue, creds=None, path=None):
+    """Права торгового ключа по данным биржи → KeyCheck; итог (и провал) сохраняется с отпечатком ключа — по нему
+    `credentials` решает, отдавать ли ключ. Любой сбой — отказ."""
+    creds = creds or raw_credentials(venue)
+    if not creds:
+        return KeyCheck(False, "none", "торговый ключ не сохранён", None)
+    res = await _ask(s, venue, creds)
+    save_check(venue, creds, res, path=path)
+    return res
+
+
+async def startup_check(s, path=None):
+    """При старте бота (и раз в CHECK_TTL): {биржа: KeyCheck} для всех бирж ядра, итог — в data/trading_keycheck.json.
+    Торговать можно только там, где ok."""
+    return {v: await check(s, v, path=path) for v in venues.VENUES}
