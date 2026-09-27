@@ -2789,7 +2789,8 @@ class Bot:
                     f"сигнал будет приходить от {favorites.fav_min_profit():g}% (FAV_MIN_PROFIT), даже вне топа."), None
         lines = [f"⭐ <b>Избранные маршруты</b> — сигнал от {favorites.fav_min_profit():g}%:", ""]
         lines += [f"{i}. {html.escape(favorites.label(k))}" for i, k in enumerate(favs, 1)]
-        kb = [[{"text": f"✖ {i}. {favorites.label(k)}"[:60], "callback_data": f"favdel:{i}"}] for i, k in enumerate(favs, 1)]
+        # в кнопке — сам маршрут, а не номер: список мог смениться, пока сообщение висит в чате
+        kb = [[{"text": f"✖ {i}. {favorites.label(k)}"[:60], "callback_data": f"favdel:{k}"}] for i, k in enumerate(favs, 1)]
         return "\n".join(lines), {"inline_keyboard": kb}
 
     async def update_live_card(self, key, d, snap, now):
@@ -3273,11 +3274,11 @@ class Bot:
             await self.send(f"Введи сумму круга текстом, например 20000 или 1,5 млн "
                             f"(от {_money(AMOUNT_MIN)} до {_money(AMOUNT_MAX)} ₽).")
         elif data.startswith("favdel:"):
-            favs = sorted(favorites.keys())
-            i = int(data[7:]) if data[7:].isdigit() else 0
-            if 1 <= i <= len(favs):
-                favorites.remove(favs[i - 1])
+            # маршрут из кнопки; его уже нет (удалён раньше, кнопка из старого списка с номером) — ничего не трогаем
+            gone = not favorites.remove(data[7:])
             text, kb = self.favorites_view()
+            if gone:
+                text = "Этого маршрута уже нет в избранном — список обновлён.\n\n" + text
             await self.call("editMessageText", chat_id=self.chat_id, message_id=cq["message"]["message_id"],
                             text=text, parse_mode="HTML", reply_markup=kb)
         elif data == "mybanks":
