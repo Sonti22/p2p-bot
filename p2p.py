@@ -9,6 +9,7 @@ import html
 import io
 import json
 import logging
+import math
 import os
 import re
 import socket
@@ -164,6 +165,52 @@ def _env_parsed(name, parse, default):
     return value
 
 
+# Пороги мерчантов по площадкам: MERCHANT_MIN="Bybit:100/97,HTX:300/96" — «площадка:сделок/%» (имя как в Ad.ex,
+# регистр не важен; «Bybit:100» или «Bybit:/97» — вторая часть общая). Не задана площадка — общие MIN_ORDERS/MIN_RATE;
+# пусто (по умолчанию) — как раньше. Счётчики разные: Bybit — недавние (recentOrderNum), HTX/MEXC — за месяц,
+# KuCoin/BitPapa/LBank — за всё время, BestChange — положительные отзывы.
+# Предложение по tests/fixtures (уникальные мерчанты USDT/BTC/ETH обеих сторон, выборки малые): сделок — p25,
+# вниз до 1 значащей цифры; % — p10 без выбросов <90%, вниз до целого; предложение не мягче общих 100/95 (CLAUDE.md:
+# фильтры мерчантов не ослаблять). Мягче общих (MEXC:20 — счётчик за месяц) может задать только владелец в .env:
+#   Bybit   n=8  сделок p25 77, p50 201;    % p10 97.8          → 70/97 → 100/97
+#   HTX     n=7  сделок p25 308, p50 592;   % p10 96.5 (без 25) → 300/96
+#   KuCoin  n=6  сделок min 980, p25 1732;  % p10 97.7          → 1000/97
+#   MEXC    n=6  сделок p25 22, p50 66;     % p10 98.5          → 20/98 → 100/98
+#   BitPapa n=6  сделок p25 18, p50 43;     % p10 97.1 (без 0)  → 10/97 → 100/97
+#   LBank   n=5  сделок 0–2 у всех; BestChange — снимка нет: общий порог.
+MERCHANT_MIN_SUGGESTED = "Bybit:100/97,HTX:300/96,KuCoin:1000/97,MEXC:100/98,BitPapa:100/97"
+MERCHANT_VENUES = {"bybit": "Bybit", "htx": "HTX", "kucoin": "KuCoin", "mexc": "MEXC", "bitpapa": "BitPapa",
+                   "lbank": "LBank", "bestchange": "BestChange"}   # ключ FETCHERS → Ad.ex
+MERCHANT_ORDERS_MAX = 1_000_000
+
+
+def parse_merchant_min(spec):
+    """MERCHANT_MIN → {Ad.ex: (сделок | None, % | None)}; None — общий порог. Кривая часть пропускается
+    с warning в лог; числа зажимаются в 0–MERCHANT_ORDERS_MAX сделок и 0–100%."""
+    out = {}
+    for part in (spec or "").split(","):
+        if not part.strip():
+            continue
+        name, colon, val = part.partition(":")
+        venue = MERCHANT_VENUES.get(name.strip().lower())
+        orders, _, rate = val.partition("/")
+        try:
+            o = float(orders) if orders.strip() else None
+            r = float(rate) if rate.strip() else None
+        except ValueError:
+            o = r = None
+        if not venue or not colon or (o is None and r is None) \
+                or any(x is not None and not math.isfinite(x) for x in (o, r)):
+            logger.warning("MERCHANT_MIN: «%s» не разобрано, пропускаю (формат Bybit:100/95)", part.strip())
+            continue
+        clamped = (None if o is None else int(min(max(o, 0), MERCHANT_ORDERS_MAX)),
+                   None if r is None else min(max(r, 0.0), 100.0))
+        if clamped != (None if o is None else int(o), r):
+            logger.warning("MERCHANT_MIN: «%s» вне диапазона, беру %s", part.strip(), clamped)
+        out[venue] = clamped
+    return out
+
+
 @dataclass
 class Config:
     fiat: str = "RUB"
@@ -185,6 +232,12 @@ class Config:
     include_pay: list = field(default_factory=list)
     exclude_pay: list = field(default_factory=lambda: DEFAULT_EXCLUDE.split(","))
     same_venue_only: bool = False  # True — только связки внутри одной площадки (пресет «USDT без переводов»)
+    merchant_min: dict = field(default_factory=dict)   # MERCHANT_MIN: {Ad.ex: (сделок|None, %|None)}
+
+    def merchant_thresholds(self, ex):
+        """(мин. сделок, мин. %) мерчанта площадки ex (как в Ad.ex): из MERCHANT_MIN, иначе MIN_ORDERS/MIN_RATE."""
+        orders, rate = self.merchant_min.get(ex, (None, None))
+        return (self.min_orders if orders is None else orders), (self.min_rate if rate is None else rate)
 
     @classmethod
     def from_env(cls):
@@ -211,6 +264,7 @@ class Config:
             include_pay=_list("INCLUDE_PAY"),
             exclude_pay=_list("EXCLUDE_PAY", DEFAULT_EXCLUDE),
             same_venue_only=os.getenv("SAME_VENUE_ONLY", "0").strip().lower() in ("1", "true", "yes", "on"),
+            merchant_min=parse_merchant_min(os.getenv("MERCHANT_MIN", "")),
         )
 
 
@@ -587,8 +641,9 @@ def terms_flags(text):
 
 
 def usable(a, cfg, blocked=frozenset()):
+    min_orders, min_rate = cfg.merchant_thresholds(a.ex)   # MERCHANT_MIN площадки, иначе общие
     return bool(_pays(a, cfg)) and a.min_amt <= cfg.amount <= a.max_amt and a.avail * a.price >= cfg.amount \
-        and a.orders >= cfg.min_orders and a.rate >= cfg.min_rate and (a.ex, a.nick) not in blocked \
+        and a.orders >= min_orders and a.rate >= min_rate and (a.ex, a.nick) not in blocked \
         and not terms_flags(a.terms)[0]
 
 
@@ -596,7 +651,8 @@ def _signal_ok(a, cfg, blocked=frozenset()):
     """Фильтр объявления для стакана глубины: мерчант/способ оплаты/условия, без требования, что объём
     покрывает всю сумму в одиночку — это делают _stack (покупка) и _stack_qty (продажа, под фактический
     выход монеты маршрута), складывая несколько объявлений."""
-    return bool(_pays(a, cfg)) and a.orders >= cfg.min_orders and a.rate >= cfg.min_rate \
+    min_orders, min_rate = cfg.merchant_thresholds(a.ex)
+    return bool(_pays(a, cfg)) and a.orders >= min_orders and a.rate >= min_rate \
         and (a.ex, a.nick) not in blocked and not terms_flags(a.terms)[0]
 
 
@@ -1531,7 +1587,8 @@ def _risks(deal, cfg, snap):
             if dev >= cfg.max_dev * 0.6:
                 risks.append((2 if dev >= cfg.max_dev * 0.8 else 1,
                               f"{side}: цена {dev:.1f}% от ориентира (отсев >{cfg.max_dev:g}%)"))
-        if ad.orders < cfg.min_orders * 1.5 or ad.rate < cfg.min_rate + 1:
+        min_orders, min_rate = cfg.merchant_thresholds(ad.ex)
+        if ad.orders < min_orders * 1.5 or ad.rate < min_rate + 1:
             risks.append((1, f"{side}: мерчант у порога фильтра ({ad.orders} сделок/{ad.rate:.0f}%)"))
         risky = [n for n in terms_flags(ad.terms)[1] if n in TERMS_RISKY]
         if risky:
