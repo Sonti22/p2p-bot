@@ -47,7 +47,7 @@ jobs:
           if echo "$last" | grep -qiE '\b(failed|errors?)\b'; then exit 1; fi
           n=$(echo "$last" | grep -oE '^[0-9]+ passed' | cut -d' ' -f1 || true)
           echo "trading tests passed: ${n:-0}"
-          test "${n:-0}" -ge 169
+          test "${n:-0}" -ge 173
       - name: Guard (защищённые файлы, домены, опасные вызовы, секреты) — скрипт из main, а не из ветки
         run: git show origin/main:scripts/guard.py > "$RUNNER_TEMP/guard.py" && python "$RUNNER_TEMP/guard.py" origin/main
 
