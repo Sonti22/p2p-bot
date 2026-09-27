@@ -11,7 +11,7 @@
   (scripts/payout_whitelist.py); записи с ошибкой в адресе/сети пропускаются;
 - лимиты PAYOUT_MAX_ONE и PAYOUT_DAILY_LIMIT в USDT (календарный день МСК, списание = сумма + комиссия) — при
   предпросмотре и ещё раз перед отправкой по свежему курсу; курс сдвинулся больше PAYOUT_RATE_DRIFT — отказ,
-  подтвердить заново; нет курса — отказ;
+  подтвердить заново; нет курса или он вне полосы правдоподобия PAYOUT_RATE_BANDS (в коде, не в .env) — отказ;
 - выключатель: выплаты идут только при PAYOUTS=1 (.env на ПК); из Telegram их можно только выключить. «⛔ Стоп»
   проверяется сразу перед каждым POST создания (после каждого await) и будит отправку, спящую перед повтором;
 - журнал data/payouts.db: намерение с новым order_id пишется до любого запроса. Неясный исход (таймаут, 5xx) — не
@@ -57,6 +57,17 @@ PAYOUT_CALLS = frozenset({
     ("POST", "/v1/payout/list"),       # история выплат (сверка)
 })
 RATE_CALLS = frozenset(("GET", f"/v1/exchange-rate/{CODES.get(c, c)}/list") for c in RATE_COINS)   # без ключа и подписи
+# Правдоподобный курс монеты к USDT, [мин, макс] включительно — в предпросмотре и перед самой отправкой. Крошечный, но
+# «честный» курс (1e-30) оценил бы выплату в ≈0 USDT и выключил бы лимиты в USDT; вне полосы или монеты нет — отказ.
+# Только здесь, не из .env: подменённый .env полосу не расширит. GRAM — код TON у Cryptomus (CODES), полоса та же.
+PAYOUT_RATE_BANDS = {
+    "USDT": (Decimal("0.95"), Decimal("1.05")),
+    "USDC": (Decimal("0.95"), Decimal("1.05")),
+    "BTC": (Decimal("1000"), Decimal("10000000")),
+    "ETH": (Decimal("10"), Decimal("1000000")),
+    "TON": (Decimal("0.01"), Decimal("1000")),
+    "GRAM": (Decimal("0.01"), Decimal("1000")),
+}
 
 STATES = ("prepared", "sending", "sent", "unknown", "final_paid", "final_failed", "rejected")
 COUNTED = ("prepared", "sending", "sent", "unknown", "final_paid")   # идут в дневной лимит
@@ -203,8 +214,8 @@ def _dec(v):
 
 
 def _usdt_value(debit, rate):
-    """USDT-оценка списания по курсу, вверх до цента; None — курс абсурдный и оценка не помещается в Decimal (Cryptomus
-    отдал, скажем, course "1e30"): это отказ с причиной, а не исключение посреди предпросмотра или отправки."""
+    """USDT-оценка списания по курсу, вверх до цента; None — оценка не помещается в Decimal: это отказ с причиной, а не
+    исключение посреди предпросмотра или отправки (абсурдный курс вроде "1e30" раньше отсекает _rate_band_error)."""
     try:
         return (debit * rate).quantize(CENT, rounding=ROUND_UP)
     except DecimalException:
@@ -214,6 +225,18 @@ def _usdt_value(debit, rate):
 def _rate_text(d):
     """Курс для текста владельцу: абсурдно большой или малый — коротко, в научной записи (не тысячи нулей)."""
     return fmt(d) if -12 <= d.adjusted() <= 15 else f"{d:.3E}"
+
+
+def _rate_band_error(coin, rate):
+    """Причина отказа, если курс coin к USDT вне PAYOUT_RATE_BANDS или полосы для монеты нет, иначе None: по
+    неправдоподобному курсу оценка в USDT ничего не значит, и лимиты не проверить."""
+    band = PAYOUT_RATE_BANDS.get(coin)
+    if band is None:
+        return f"нет полосы правдоподобного курса {coin} к USDT — лимит не проверить, выплату не отправляю"
+    if not (isinstance(rate, Decimal) and rate.is_finite() and band[0] <= rate <= band[1]):
+        shown = _rate_text(rate) if isinstance(rate, Decimal) else "?"
+        return f"курс {coin} к USDT неправдоподобен ({shown}) — лимит не проверить, выплату не отправляю"
+    return None
 
 
 def _true(v):
@@ -672,10 +695,12 @@ async def quote(s, entry, amount, creds=None, now=None):
     rate = await usdt_rate(s, entry["currency"])
     if rate is None:
         return None, f"нет курса {entry['currency']}→USDT у Cryptomus — без него лимит не проверить"
+    why = _rate_band_error(entry["currency"], rate)
+    if why:
+        return None, why
     usdt = _usdt_value(debit, rate)
     if usdt is None:
-        return None, (f"курс {entry['currency']}→USDT у Cryptomus абсурдный ({_rate_text(rate)}) — оценка в USDT не "
-                      f"считается, без неё лимит не проверить")
+        return None, f"оценка выплаты в USDT по курсу {_rate_text(rate)} не считается — без неё лимит не проверить"
     why = check_limits(usdt, now)
     if why:
         return None, why
@@ -799,13 +824,17 @@ def _result(state, row=None, reason="", event=None):
 
 def _fresh_value(entry, amount, fee, rate, q):
     """USDT-оценка выплаты по свежему курсу перед самой отправкой: (оценка для лимитов и журнала, None) или (None,
-    причина отказа). Сначала курс: сдвинулся больше PAYOUT_RATE_DRIFT против предпросмотра — отказ (владелец подтверждал
-    другую сумму в USDT); потом лимиты — по бо́льшей из оценок (предпросмотр или свежая), с учётом всех выплат дня."""
+    причина отказа). Сначала курс: вне полосы PAYOUT_RATE_BANDS — отказ (крошечный курс, одинаковый в предпросмотре и
+    сейчас, иначе прошёл бы проверку сдвига с оценкой ≈0 USDT); сдвинулся больше PAYOUT_RATE_DRIFT против
+    предпросмотра — отказ (владелец подтверждал другую сумму в USDT); потом лимиты — по бо́льшей из оценок (предпросмотр
+    или свежая), с учётом всех выплат дня."""
     cur, again = entry["currency"], "проверь выплату заново с новой оценкой: /payout"
     if rate is None:
         return None, f"нет курса {cur}→USDT у Cryptomus — без него лимит не проверить, {again}"
-    # сначала сдвиг курса: абсурдный курс (скажем, "1e30") — это отказ «курс сдвинулся», а не исключение в оценке;
-    # арифметика, которая не помещается в Decimal, — тоже сдвиг (отказ, а не «сбой бота, исход неясен»)
+    why = _rate_band_error(cur, rate)
+    if why:
+        return None, why
+    # арифметика, которая не помещается в Decimal, — это сдвиг курса (отказ, а не «сбой бота, исход неясен»)
     was, drift = q.get("rate"), rate_drift()
     now = _usdt_value(amount + fee, rate)
     try:
@@ -838,7 +867,7 @@ async def send(s, entry, amount, q, creds=None):
 
     Перед отправкой (под общим замком) заново: сервис Cryptomus доступен, сумма в его мин/макс, комиссия не выросла
     против предпросмотра, свежий курс монеты к USDT; затем без пауз до самого POST — выключатель и Стоп, запись белого
-    списка та же, курс не ушёл дальше PAYOUT_RATE_DRIFT (абсурдный курс — тоже отказ), лимиты по свежему курсу с учётом
+    списка та же, курс в полосе PAYOUT_RATE_BANDS и не ушёл дальше PAYOUT_RATE_DRIFT, лимиты по свежему курсу с учётом
     всех выплат дня. Намерение — в журнал (prepared), потом POST /v1/payout (sending):
     - HTTP 200, state 0, ответ совпал с заявкой — "sent" (или сразу итог); не совпал — "unknown" + тревога;
     - отказ — /v1/payout/info по order_id: «не найдено» — "rejected" (в лимит не идёт), нашлась — принимаем;

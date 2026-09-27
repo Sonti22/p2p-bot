@@ -1,6 +1,8 @@
 """Выплаты Cryptomus, финальная проверка: «⛔ Стоп» во время перезапроса сервисов, «не найдено» при известном uuid,
 база первой версии без create_kind, разделители строк в .env, поддельные кнопки мастера первого запуска."""
+import ast
 import asyncio
+import inspect
 import os
 import sqlite3
 from decimal import Decimal
@@ -9,9 +11,9 @@ import pytest
 
 import bot as B
 import payouts
-from test_payouts import (ENTRIES, INFO, PAY, SERVICE_LIST, SERVICES, TRON2, Resp, Session,  # noqa: F401
-                          _payout_env, _sent_row, echo, entry, info_for, owner, quote, rate, routes, run, to_preview,
-                          write_whitelist)
+from test_payouts import (ENTRIES, EVM, INFO, PAY, SERVICE_LIST, SERVICES, TRON2, Resp, Session,  # noqa: F401
+                          _payout_env, _sent_row, echo, entry, info_for, owner, quote, rate, routes, run, svc,
+                          to_preview, write_whitelist)
 
 
 class GatedOK(Resp):
@@ -538,12 +540,13 @@ def test_everything_rechecked_after_rate_refresh(change):
 def test_absurd_fresh_rate_is_a_refusal_not_a_crash(course):
     """Предпросмотр 0.01 BTC по 60000, к отправке Cryptomus отдаёт абсурдный курс: оценка в USDT не помещается в
     Decimal (quantize раньше бросал InvalidOperation из send, и бот писал «сбой, исход неясен, учтена в лимите»). Теперь
-    это отказ «курс сдвинулся» с короткой причиной: POST не уходит, в журнале и в лимите ничего."""
+    это отказ «курс неправдоподобен» (полоса PAYOUT_RATE_BANDS) с короткой причиной: POST не уходит, в журнале и в
+    лимите ничего."""
     s = Session(routes())
     q = quote(s, "w2", "0.01")
     s.routes[RATE_BTC] = rate("BTC", course)
     res = run(payouts.send(s, entry("w2"), Decimal("0.01"), q))
-    assert res["state"] == "refused" and "курс BTC→USDT сдвинулся" in res["reason"] and "/payout" in res["reason"]
+    assert res["state"] == "refused" and "курс BTC к USDT неправдоподобен" in res["reason"]
     assert len(res["reason"]) < 400                                 # не тысячи нулей в сообщении владельцу
     assert not s.posts() and payouts.history() == [] and payouts.used_today() == 0
 
@@ -551,7 +554,7 @@ def test_absurd_fresh_rate_is_a_refusal_not_a_crash(course):
 def test_absurd_rate_in_preview_is_a_refusal_not_a_crash():
     s = Session(routes({RATE_BTC: rate("BTC", "1e30")}))
     q, why = run(payouts.quote(s, entry("w2"), Decimal("0.01")))
-    assert q is None and "абсурдный" in why and "1.000E+30" in why
+    assert q is None and "неправдоподобен" in why and "1.000E+30" in why
     s.routes[RATE_BTC] = rate("BTC", "60000")                       # нормальный курс — предпросмотр как раньше
     assert run(payouts.quote(s, entry("w2"), Decimal("0.01")))[0]["usdt"] == Decimal("606.00")
 
@@ -592,3 +595,146 @@ def test_stop_during_services_request_starts_no_rate_request():
     assert res["state"] == "refused" and res["reason"] == payouts.OFF
     assert [(c["method"], c["path"]) for c in calls] == [SERVICES]  # без исправления — ещё GET курса BTC
     assert payouts.history() == []
+
+
+# --- полоса правдоподобного курса к USDT (PAYOUT_RATE_BANDS): крошечный курс не выключает лимиты ---
+
+IMPLAUSIBLE = "к USDT неправдоподобен"
+USDC_ENTRY = {"id": "w5", "name": "USDC в BSC", "currency": "USDC", "network": "bsc", "address": EVM}
+
+
+def test_rate_bands_cover_every_whitelist_coin_and_live_only_in_code():
+    """Полоса есть у каждой монеты белого списка (GRAM — код TON у Cryptomus — та же, что у TON). Таблица — одна
+    константа из литералов Decimal("…"), связана один раз и не читается из .env: подменённый .env её не расширит."""
+    bands = payouts.PAYOUT_RATE_BANDS
+    assert set(bands) == set(payouts.COINS) | {"GRAM"} and bands["GRAM"] == bands["TON"]
+    assert bands["USDT"] == bands["USDC"] == (Decimal("0.95"), Decimal("1.05"))
+    assert bands["BTC"] == (Decimal(1000), Decimal(10000000)) and bands["ETH"] == (Decimal(10), Decimal(1000000))
+    assert bands["TON"] == (Decimal("0.01"), Decimal(1000))
+    assert all(isinstance(lo, Decimal) and isinstance(hi, Decimal) and 0 < lo < hi for lo, hi in bands.values())
+    tree = ast.parse(inspect.getsource(payouts))
+    binds = [n for n in ast.walk(tree) if isinstance(n, (ast.Name, ast.Attribute, ast.Subscript))
+             and isinstance(n.ctx, (ast.Store, ast.Del))
+             and "PAYOUT_RATE_BANDS" in ast.unparse(n)]
+    assert len(binds) == 1                                          # только само присваивание таблицы
+    table = next(n for n in tree.body if isinstance(n, ast.Assign) and ast.unparse(n.targets[0]) == "PAYOUT_RATE_BANDS")
+    calls = [c for c in ast.walk(table.value) if isinstance(c, ast.Call)]
+    assert len(calls) == 12 and all(ast.unparse(c.func) == "Decimal" and not c.keywords and len(c.args) == 1
+                                    and isinstance(c.args[0], ast.Constant) and isinstance(c.args[0].value, str)
+                                    for c in calls)
+    check = inspect.getsource(payouts._rate_band_error)
+    assert "getenv" not in check and "environ" not in check
+
+
+@pytest.mark.parametrize("coin,course,ok", [
+    ("USDT", "1", True), ("USDT", "0.95", True), ("USDC", "1.05", True), ("USDT", "0.9", False),
+    ("USDC", "0.9499", False), ("USDT", "1.0501", False),
+    ("BTC", "1000", True), ("BTC", "10000000", True), ("BTC", "999.99", False), ("BTC", "10000000.01", False),
+    ("ETH", "10", True), ("ETH", "1000000", True), ("ETH", "9.99", False), ("ETH", "1000000.01", False),
+    ("TON", "0.01", True), ("TON", "1000", True), ("GRAM", "5", True), ("TON", "0.0099", False),
+    ("GRAM", "1000.01", False),
+    ("BTC", "1e-30", False), ("BTC", "1e30", False), ("TON", "1e-1000000", False), ("ETH", "0", False),
+    ("DOGE", "1", False), ("", "1", False)])
+def test_rate_band_edges_are_inclusive_and_unknown_coin_is_refused(coin, course, ok):
+    why = payouts._rate_band_error(coin, Decimal(course))
+    assert (why is None) is ok, why
+    if not ok and coin in payouts.PAYOUT_RATE_BANDS:
+        assert why == (f"курс {coin} к USDT неправдоподобен ({payouts._rate_text(Decimal(course))}) — "
+                       f"лимит не проверить, выплату не отправляю")
+    if not ok and coin not in payouts.PAYOUT_RATE_BANDS:
+        assert "нет полосы" in why and "выплату не отправляю" in why
+
+
+def test_rate_band_refuses_non_numbers_without_crashing():
+    for bad in (None, Decimal("NaN"), Decimal("Infinity"), Decimal("-60000"), 60000.0, "60000"):
+        assert IMPLAUSIBLE in payouts._rate_band_error("BTC", bad), bad
+
+
+@pytest.mark.parametrize("course", ["1e-30", "0.000001", "999", "10000001", "1e30"])
+def test_implausible_rate_in_preview_is_refused(course):
+    """Предпросмотр по курсу вне полосы BTC [1000, 10 000 000] — отказ с курсом в причине: ни кнопки, ни журнала.
+    До исправления 1e-30 давал оценку 0.01 USDT за 0.01 BTC, и лимиты в 2000 USDT её пропускали."""
+    s = Session(routes({RATE_BTC: rate("BTC", course)}))
+    q, why = run(payouts.quote(s, entry("w2"), Decimal("0.01")))
+    shown = payouts._rate_text(Decimal(course))
+    assert q is None and why == f"курс BTC к USDT неправдоподобен ({shown}) — лимит не проверить, выплату не отправляю"
+    assert not s.posts() and payouts.history() == [] and payouts.used_today() == 0
+
+
+@pytest.mark.parametrize("course", ["1e-30", "999", "10000001", "1e30"])
+def test_implausible_rate_only_at_send_refused_before_post_and_counts_nothing(course):
+    """Предпросмотр 0.03 BTC по 60000 (≈1806 USDT из 2000), к отправке курс вне полосы — отказ до POST. Ничего не
+    засчитано: следующая выплата по нормальному курсу проходит на ту же сумму почти во весь дневной лимит."""
+    s = Session(routes())
+    q = quote(s, "w2", "0.03")
+    s.routes[RATE_BTC] = rate("BTC", course)
+    res = run(payouts.send(s, entry("w2"), Decimal("0.03"), q))
+    assert res["state"] == "refused" and res["reason"].startswith(f"курс BTC {IMPLAUSIBLE} (")
+    assert not s.posts() and payouts.history() == [] and payouts.used_today() == 0
+    s.routes[RATE_BTC] = rate("BTC", "60000")
+    res = run(payouts.send(s, entry("w2"), Decimal("0.03"), q))
+    assert res["state"] == "sent" and len(s.posts()) == 1 and payouts.used_today() == Decimal("1806.00")
+
+
+def test_same_tiny_rate_at_preview_and_send_no_longer_disables_limits():
+    """Сама дыра: Cryptomus отдаёт 1e-30 и в предпросмотре, и перед отправкой. Сдвига курса нет, 1 BTC ≈ 0.01 USDT —
+    лимиты 2000 USDT не держат. Теперь отказ и в quote, и в send — даже с оценкой, сделанной до исправления."""
+    s = Session(routes({RATE_BTC: rate("BTC", "1e-30")}))
+    q, why = run(payouts.quote(s, entry("w2"), Decimal("1")))
+    assert q is None and IMPLAUSIBLE in why
+    stale = {"fee": Decimal("0.0001"), "debit": Decimal("1.0001"), "rate": Decimal("1e-30"), "usdt": Decimal("0.01")}
+    res = run(payouts.send(s, entry("w2"), Decimal("1"), stale))
+    assert res["state"] == "refused" and IMPLAUSIBLE in res["reason"]
+    assert not s.posts() and payouts.history() == [] and payouts.used_today() == 0
+
+
+@pytest.mark.parametrize("course", ["0.9", "1.06"])
+def test_stable_coin_off_peg_rate_is_refused(monkeypatch, course):
+    """USDT/USDC к USDT — 1:1 (±5 %). Курс стейблкоина вне [0.95, 1.05] — отказ и в предпросмотре, и перед отправкой."""
+    s = Session(routes())
+    q = quote(s, "w1", "25")
+
+    async def off_peg(session, coin):
+        return Decimal(course)
+    monkeypatch.setattr(payouts, "usdt_rate", off_peg)
+    q2, why = run(payouts.quote(s, entry("w1"), Decimal("25")))
+    assert q2 is None and why == f"курс USDT {IMPLAUSIBLE} ({course}) — лимит не проверить, выплату не отправляю"
+    res = run(payouts.send(s, entry("w1"), Decimal("25"), q))
+    assert res["state"] == "refused" and res["reason"] == why
+    assert not s.posts() and payouts.history() == [] and payouts.used_today() == 0
+
+
+@pytest.mark.parametrize("eid,amount,course", [
+    ("w1", "25", None), ("w5", "25", None),
+    ("w2", "0.001", "1000"), ("w2", "0.001", "60000"), ("w2", "0.0001", "10000000"),
+    ("w4", "0.001", "10"), ("w4", "0.001", "3000"), ("w4", "0.001", "1000000"),
+    ("w3", "1.5", "0.01"), ("w3", "1.5", "5"), ("w3", "1.5", "1000")])
+def test_in_band_rates_pass_for_every_coin(monkeypatch, eid, amount, course):
+    """Курс в полосе (включая границы) — предпросмотр и отправка как раньше, для каждой монеты белого списка."""
+    monkeypatch.setenv("PAYOUT_MAX_ONE", "100000")
+    monkeypatch.setenv("PAYOUT_DAILY_LIMIT", "100000")
+    write_whitelist(ENTRIES + [USDC_ENTRY])
+    over = {SERVICES: Resp(200, {"state": 0, "result": SERVICE_LIST + [svc("USDC", "BSC")]})}
+    cur = entry(eid)["currency"]
+    if course:
+        code = payouts.CODES.get(cur, cur)
+        over[("GET", f"/v1/exchange-rate/{code}/list")] = rate(code, course)
+    s = Session(routes(over))
+    q = quote(s, eid, amount)
+    assert q["rate"] == Decimal(course or 1)
+    res = run(payouts.send(s, entry(eid), Decimal(amount), q))
+    assert res["state"] == "sent" and len(s.posts()) == 1 and payouts.used_today() == q["usdt"]
+
+
+def test_implausible_rate_through_bot_shows_reason_and_no_send_button():
+    """Через бота: сумма введена, курс BTC 1e-30 — «⛔ Выплата не готова» с причиной, кнопки «✅ Отправить» нет."""
+    s = Session(routes({RATE_BTC: rate("BTC", "1e-30")}))
+    bot = owner(s)
+
+    async def go():
+        await bot.on_update(_msg(1, "/payout"))
+        await bot.on_update(_cb(1, "pay_to:w2"))
+        await bot.on_update(_msg(1, "0.01"))
+    run(go())
+    assert _texts(bot)[-1].startswith("⛔ Выплата не готова: курс BTC к USDT неправдоподобен (1.000E-30)")
+    assert bot.payout_preview is None and not s.posts() and payouts.history() == []
