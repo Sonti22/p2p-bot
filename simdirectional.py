@@ -172,8 +172,10 @@ def _funding(con, p, q_last, now):
 
 
 def tick(now=None, path=DB_PATH):
-    """После каждого опроса перпов: фандинг и стопы открытых позиций по котировке, затем новые закрытые свечи —
-    стоп по high/low, выход по обратному пересечению, входы стратегии и случайной базы. Возвращает события."""
+    """После каждого опроса перпов, по времени событий: сначала стопы по high/low новых закрытых свечей (пропущенные,
+    пока бот не работал: фандинг — только до свечи стопа, закрытие — её временем), затем фандинг до «сейчас» и стопы
+    открытых позиций по котировке, затем выход по обратному пересечению, входы стратегии и случайной базы.
+    Возвращает события."""
     cfg = settings()
     out = {"opened": [], "closed": []}
     if not cfg["on"]:
@@ -189,6 +191,26 @@ def tick(now=None, path=DB_PATH):
             q = perp.quote_for(VENUE, asset, now)
             last = perp.last_for(VENUE, asset)
             hold_h = _avg_hold_h(con, cfg["random_hold_h"])
+            candles = perp.klines(VENUE, sym)
+            skew = last.skew if last else 0.0
+            server_now = now - skew
+            # закрытая свеча — только если свечи загружены после её закрытия: иначе в кеше её неполная версия
+            # (докачка раз в минуту), а решение по ней не пересматривается
+            seen = min(server_now, perp.kline_time(VENUE, sym) or 0.0) - perp.KLINE_GRACE
+            closed = [k for k in candles if k[0] + HOUR <= seen]
+            key = f"last:{asset}"
+            last_ts = _get_state(con, key)
+            # стоп, пропущенный между опросами (бот не работал), — по времени, до всего, что случилось позже: фандинг
+            # начисляем только до свечи стопа, время закрытия — время этой свечи (по часам бота), а не «сейчас»
+            for start, _, high, low, _ in ([] if last_ts is None else [k for k in closed if k[0] > last_ts]):
+                for p in _open_positions(con, asset=asset):
+                    if p["ts_open"] > start:
+                        continue
+                    if (p["side"] > 0 and low <= p["stop"]) or (p["side"] < 0 and high >= p["stop"]):
+                        t_stop = start + skew
+                        _funding(con, p, None, t_stop)
+                        px = p["stop"] * (1 - p["side"] * cfg["stop_slip"] / 100)
+                        out["closed"].append(_close(con, p, px, t_stop, "стоп (по свече)"))
             for p in _open_positions(con, asset=asset):
                 _funding(con, p, last, now)
                 if q is None:
@@ -201,16 +223,24 @@ def tick(now=None, path=DB_PATH):
                     px = px if px is not None else (q.bid if p["side"] > 0 else q.ask)
                     reason = "стоп" if hit else pending or f"срок {hold_h:.0f} ч"
                     out["closed"].append(_close(con, p, px, now, reason, q.taker_fee))
-            candles = perp.klines(VENUE, sym)
-            server_now = now - (last.skew if last else 0.0)
-            # закрытая свеча — только если свечи загружены после её закрытия: иначе в кеше её неполная версия
-            # (докачка раз в минуту), а решение по ней не пересматривается
-            seen = min(server_now, perp.kline_time(VENUE, sym) or 0.0) - perp.KLINE_GRACE
-            closed = [k for k in candles if k[0] + HOUR <= seen]
+            # невосстановимый разрыв свечей (perp.kline_gap: бот стоял дольше, чем можно догрузить) — явная пауза:
+            # часы после last_ts пропущены, по ним не торгуем; ждём непрерывной истории на прогрев EMA и начинаем
+            # с последней свечи заново (как на первой встрече), позиции ведём дальше по котировке
+            pause = None
             if len(closed) < SLOW + 1:
+                if last_ts is None or perp.kline_gap(VENUE, sym) is None:
+                    continue
+                pause = f"разрыв свечей — ждём {SLOW + 1} ч непрерывной истории"
+            elif last_ts is not None and closed[0][0] > last_ts + HOUR:
+                pause = "разрыв свечей после простоя — пропущенные часы не торгуем"
+            if pause:
+                if _get_state(con, f"pause:{asset}") is None:
+                    out.setdefault("paused", []).append({"asset": asset, "reason": pause})
+                _set_state(con, f"pause:{asset}", pause)
+                if len(closed) >= SLOW + 1:
+                    _set_state(con, key, closed[-1][0])
                 continue
-            key = f"last:{asset}"
-            last_ts = _get_state(con, key)
+            con.execute("DELETE FROM state WHERE key = ?", (f"pause:{asset}",))
             if last_ts is None:   # первая встреча: прошлое не торгуем, запоминаем старт для «держать»
                 _set_state(con, key, closed[-1][0])
                 _set_state(con, f"hold:{asset}", closed[-1][4])
@@ -222,13 +252,7 @@ def tick(now=None, path=DB_PATH):
             for i, k in enumerate(closed):
                 if k[0] <= last_ts:
                     continue
-                start, _, high, low, _ = k
-                for p in _open_positions(con, asset=asset):   # стоп, пропущенный между опросами
-                    if p["ts_open"] > start:
-                        continue
-                    if (p["side"] > 0 and low <= p["stop"]) or (p["side"] < 0 and high >= p["stop"]):
-                        px = p["stop"] * (1 - p["side"] * cfg["stop_slip"] / 100)
-                        out["closed"].append(_close(con, p, px, now, "стоп (по свече)"))
+                start = k[0]
                 live = i == len(closed) - 1 and server_now - (start + HOUR) <= cfg["entry_lag"] and q is not None
                 if cross[i]:
                     for p in _open_positions(con, "ema", asset):
@@ -331,6 +355,12 @@ def view(path=DB_PATH, now=None):
     e1, r1 = books_x1["ema"], books_x1["random"]
     if e1["trades"] or r1["trades"]:
         lines.append(f"При комиссиях ×1: стратегия {e1['pnl']:+.2f} USDT, случайные {r1['pnl']:+.2f} USDT")
+    for asset in cfg["assets"]:
+        con = _connect(path)
+        pause = _get_state(con, f"pause:{asset}")
+        con.close()
+        if pause:
+            lines.append(f"⏸ {asset}: пауза стратегии — {pause}")
     for asset, start in sorted(hold.items()):
         q = perp.quote_for(VENUE, asset, now)
         if q is not None and start:

@@ -173,3 +173,16 @@ def test_perp_loop_refreshes_then_ticks_sims(monkeypatch):
     with pytest.raises(asyncio.CancelledError):
         asyncio.run(bot.perp_loop())
     assert calls == ["refresh", "tick"]
+
+
+def test_leg_below_min_notional_after_lot_rounding_is_rejected(tmp_path):
+    """FUND_NOTIONAL 1000, но после округления до лота нога ~924 USDT, а минимум ордера BingX 950 — кандидат не
+    проходит, причина понятна; позиция не открывается."""
+    import dataclasses
+    _market(0.0, 0.0005)
+    q = perp._quotes[("BingX", "BTCUSDT")]
+    perp._quotes[("BingX", "BTCUSDT")] = dataclasses.replace(q, min_notional=950.0)
+    pp = next(c for c in SF.candidates(NOW) if c["scheme"] == "perp_perp")
+    assert pp["qty"] == pytest.approx(0.011)
+    assert not pp["ok"] and "шорт BingX" in pp["why"] and "минимума ордера 950" in pp["why"]
+    assert SF.tick(now=NOW, path=str(tmp_path / "f.db"))["opened"] == []   # спот–перп тоже нет: ставка Bybit 0
