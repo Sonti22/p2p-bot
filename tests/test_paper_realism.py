@@ -1,12 +1,12 @@
 """Сухой прогон повторяет сигналы владельца: только подтверждённые связки, без «🪤 ловушек» (по умолчанию),
 с меткой надёжности в круге и фактом продажи по реальной цене стакана."""
-import asyncio
 import time
 
 import bot as B
 import p2p
 import paper
 from test_bot import Stub, texts
+from helpers import arun
 
 
 def ad(ex, side, price, orders=1000, avail=10000):
@@ -54,10 +54,10 @@ def test_unconfirmed_deal_is_not_taken_until_signal(monkeypatch):
     bot.live_scans = 2
     s = snap_of([good_deal()])
     bot.track_liveness(s)
-    asyncio.run(bot.notify(s))                      # первый скан — сигнала ещё нет, круга тоже
+    arun(bot.notify(s))                      # первый скан — сигнала ещё нет, круга тоже
     assert not paper.open_cycles()
     bot.track_liveness(s)
-    asyncio.run(bot.notify(s))                      # держится 2 скана — сигнал и круг
+    arun(bot.notify(s))                      # держится 2 скана — сигнал и круг
     cycles = paper.open_cycles()
     assert len(cycles) == 1 and cycles[0]["buy_ex"] == "HTX"
 
@@ -66,7 +66,7 @@ def test_trap_is_skipped_by_default_and_next_deal_taken(monkeypatch):
     _on(monkeypatch)
     bot = Stub(p2p.Config(min_profit=2.0))
     bot.live_scans = 1
-    asyncio.run(bot.notify(snap_of([trap_deal(), good_deal()])))
+    arun(bot.notify(snap_of([trap_deal(), good_deal()])))
     (c,) = paper.open_cycles()
     assert c["buy_ex"] == "HTX" and c["label"] != p2p.TRAP
     card = [t for t in texts(bot) if "Сухой прогон" in t][0]
@@ -78,7 +78,7 @@ def test_trap_taken_when_owner_allows_and_reasons_shown(monkeypatch):
     monkeypatch.delenv("SIGNAL_TRAPS", raising=False)
     bot = Stub(p2p.Config(min_profit=2.0))
     bot.live_scans = 1
-    asyncio.run(bot.notify(snap_of([trap_deal()])))   # единственная связка — у ловушки оценка хуже любой чистой
+    arun(bot.notify(snap_of([trap_deal()])))   # единственная связка — у ловушки оценка хуже любой чистой
     (c,) = paper.open_cycles()
     assert c["buy_ex"] == "Bybit" and c["label"] == p2p.TRAP
     card = [t for t in texts(bot) if "Сухой прогон" in t][0]
@@ -95,7 +95,7 @@ def test_paper_picks_best_score_not_first_in_list(monkeypatch):
     s = snap_of([trap_deal(), good_deal()])
     trap, good = (p2p.deal_for_amount(d, bot.cfg, s, 10000) for d in (trap_deal(), good_deal()))
     assert trap[0] > good[0] and p2p.score(trap, bot.cfg, s) < p2p.score(good, bot.cfg, s)
-    asyncio.run(bot.notify(s))
+    arun(bot.notify(s))
     (c,) = paper.open_cycles()
     assert c["buy_ex"] == "HTX"
     card = [t for t in texts(bot) if "Сухой прогон" in t][0]
@@ -109,7 +109,7 @@ def test_sell_stage_records_fact_price_and_note(monkeypatch):
     bot = Stub(p2p.Config(min_profit=2.0))
     lower = ad("MEXC", "sell", 89.0)
     snap = p2p.Snapshot(88.0, "test", {}, {}, [], {}, {}, {}, groups={("MEXC", "sell", "USDT"): [lower]})
-    asyncio.run(bot.process_paper_cycles(snap))
+    arun(bot.process_paper_cycles(snap))
     c = paper.get_cycle(cid)
     assert c["result"] == "done" and c["sell_fact"] == 89.0 and 0 < c["realized_pct"] < 2.0
     assert "вместо 90" in c["note"]
@@ -144,5 +144,5 @@ def test_old_paper_db_gets_new_columns(tmp_path):
 
 def test_ladder_button_answers_callback_once(monkeypatch):
     bot = Stub(p2p.Config())
-    asyncio.run(bot.on_callback({"id": "1", "data": "paper_ladder:20000", "message": {"message_id": 9}}))
+    arun(bot.on_callback({"id": "1", "data": "paper_ladder:20000", "message": {"message_id": 9}}))
     assert [m for m, _ in bot.out].count("answerCallbackQuery") == 1

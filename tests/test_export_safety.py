@@ -1,6 +1,5 @@
 """/export (выгрузка журнала в CSV), /safety («🛡 Безопасность») и «Сухой прогон vs реальные сделки» в /paper report.
 Всё без сети: сделки и круги пишутся во временную data/ (tests/conftest.py)."""
-import asyncio
 import csv
 import os
 import re
@@ -11,7 +10,7 @@ import bot as B
 import p2p
 import paper
 import trades
-from helpers import make_ad
+from helpers import arun, make_ad
 
 NOW = datetime(2026, 9, 26, 12, 0, tzinfo=trades.MSK).timestamp()
 
@@ -174,7 +173,7 @@ def test_export_command_marks_estimates():
     log(month + 60, 50000, fact=2.0)                                  # введён числом до колонки источника
     _log_sourced(month + 120, 30000, 3.0, trades.FACT_PLAN)           # «как расчёт»
     bot = Stub(p2p.Config())
-    asyncio.run(bot.handle("/export"))
+    arun(bot.handle("/export"))
     header, *rows = read_csv(docs(bot)[-1]["path"])
     est = header.index("Оценка (не факт), %")
     assert [r[est] for r in rows] == ["", "3,00"] and rows[1][header.index("Факт, %")] == ""
@@ -189,7 +188,7 @@ def test_export_command_sends_csv_then_summary():
     log(month + 180, 20000)
     log(trades.period_start("year") - 86400, 90000, fact=5.0)   # прошлый год — не в выгрузке
     bot = Stub(p2p.Config())
-    asyncio.run(bot.handle("/export"))
+    arun(bot.handle("/export"))
     methods = [m for m, _ in bot.out]
     assert methods == ["sendDocument", "sendMessage"]            # сначала файл, потом сводка
     doc = docs(bot)[0]
@@ -208,7 +207,7 @@ def test_export_year_includes_earlier_months():
     log(month - 86400, 40000, fact=1.0)                         # прошлый месяц (в январе — уже прошлый год)
     log(year - 86400, 90000, fact=1.0)                          # прошлый год
     bot = Stub(p2p.Config())
-    asyncio.run(bot.handle("/export year"))
+    arun(bot.handle("/export year"))
     expected = 2 if month > year else 1
     assert len(read_csv(docs(bot)[-1]["path"])) == 1 + expected
     assert f"Сделок: {expected}," in texts(bot)[-1] and "Факт указан у всех сделок." in texts(bot)[-1]
@@ -217,9 +216,9 @@ def test_export_year_includes_earlier_months():
 
 def test_export_empty_period_and_bad_arg():
     bot = Stub(p2p.Config())
-    asyncio.run(bot.handle("/export"))
+    arun(bot.handle("/export"))
     assert "сделок в журнале нет" in texts(bot)[-1] and not docs(bot)
-    asyncio.run(bot.handle("/export week"))
+    arun(bot.handle("/export week"))
     assert texts(bot)[-1] == B.EXPORT_HELP and not docs(bot)
 
 
@@ -227,7 +226,7 @@ def test_export_denied_to_guest():
     log(trades.period_start("month") + 60, 50000, fact=2.0)
     bot = Stub(p2p.Config(), guests=["42"])
     for cmd in ("/export", "/export year"):
-        asyncio.run(bot.on_update(msg(42, cmd)))
+        arun(bot.on_update(msg(42, cmd)))
         last = [p for m, p in bot.out if m == "sendMessage"][-1]
         assert last["chat_id"] == "42" and last["text"] == B.GUEST_DENIED, cmd
     assert not docs(bot) and "/export" not in B.GUEST_CMDS
@@ -248,9 +247,9 @@ def test_safety_text_markers_and_length():
 
 def test_safety_for_owner_by_command_and_menu_button():
     bot = Stub(p2p.Config())
-    asyncio.run(bot.handle("/safety"))
+    arun(bot.handle("/safety"))
     assert texts(bot)[-1] == B.SAFETY
-    asyncio.run(bot.handle("🛡 Безопасность"))
+    arun(bot.handle("🛡 Безопасность"))
     assert texts(bot)[-1] == B.SAFETY
     menu = [b["text"] for row in B.MENU["keyboard"] for b in row]
     assert "🛡 Безопасность" in menu and B.BUTTONS["🛡 Безопасность"] == "/safety"
@@ -260,7 +259,7 @@ def test_safety_for_owner_by_command_and_menu_button():
 def test_safety_for_guest():
     bot = Stub(p2p.Config(), guests=["42"])
     for text in ("/safety", "🛡 Безопасность"):
-        asyncio.run(bot.on_update(msg(42, text)))
+        arun(bot.on_update(msg(42, text)))
         last = [p for m, p in bot.out if m == "sendMessage"][-1]
         assert last["chat_id"] == "42" and last["text"] == B.SAFETY, text
     assert "/safety" in B.GUEST_CMDS and "/safety" in B.GUEST_DENIED
@@ -330,6 +329,6 @@ def test_paper_report_real_trades_only_on_other_pairs():
 
 def test_paper_report_command_still_owner_only():
     bot = Stub(p2p.Config(), guests=["42"])
-    asyncio.run(bot.on_update(msg(42, "/paper report")))
+    arun(bot.on_update(msg(42, "/paper report")))
     assert texts(bot)[-1] == B.GUEST_DENIED and not docs(bot)
     assert "paper_report" not in B.GUEST_CALLBACKS

@@ -1,5 +1,4 @@
 """«🏦 Мои банки»: свои банки, «остальные тоже мои», тарифы с бесплатным лимитом СБП; только владельцу."""
-import asyncio
 import functools
 
 import bot as B
@@ -8,6 +7,7 @@ import paper
 import trades
 from test_bot import Stub, texts
 from test_guests import Stub as GuestStub, msg
+from helpers import arun
 
 
 def _env(monkeypatch, tmp_path):
@@ -21,7 +21,7 @@ def _buttons(kb):
 
 
 def _press(bot, data):
-    asyncio.run(bot.on_callback({"id": "1", "data": data, "message": {"message_id": 5}}))
+    arun(bot.on_callback({"id": "1", "data": data, "message": {"message_id": 5}}))
     return [p for m, p in bot.out if m == "editMessageText"][-1]
 
 
@@ -67,7 +67,7 @@ def test_settings_has_button_and_command_works(monkeypatch, tmp_path):
     _env(monkeypatch, tmp_path)
     bot = Stub(p2p.Config())
     assert "mybanks" in _buttons(bot.settings_view()[1])
-    asyncio.run(bot.dispatch("/mybanks", ""))
+    arun(bot.dispatch("/mybanks", ""))
     assert "Мои банки и лимиты СБП" in texts(bot)[-1]
 
 
@@ -77,9 +77,9 @@ def test_guest_cannot_see_or_change_banks(monkeypatch, tmp_path):
     for data in ("mybanks", "ownbank:Ozon Bank", "ownbank:*", "sbplim:T-Bank:300000"):
         before = len(bot.out)
         cq = {"id": "1", "data": data, "message": {"chat": {"id": 42}, "message_id": 5}}
-        asyncio.run(bot.on_update({"callback_query": cq}))
+        arun(bot.on_update({"callback_query": cq}))
         assert [m for m, _ in bot.out[before:]] == ["answerCallbackQuery"], data
-    asyncio.run(bot.on_update(msg(42, "/mybanks")))
+    arun(bot.on_update(msg(42, "/mybanks")))
     assert bot.out[-1][1]["text"] == B.GUEST_DENIED
     assert trades.own_banks() == trades.own_banks() and "Ozon Bank" not in trades.own_banks()[0]
     assert trades.free_limit("T-Bank") == 100000
@@ -99,6 +99,6 @@ def test_paper_card_says_how_owner_pays(monkeypatch, tmp_path):
                             groups={("HTX", "buy", "USDT"): [b], ("KuCoin", "sell", "USDT"): [s]})
         bot = Stub(p2p.Config(min_profit=2.0))
         bot.live_scans = 1
-        asyncio.run(bot.notify(snap))
+        arun(bot.notify(snap))
         card = [t for t in texts(bot) if "Сухой прогон" in t][-1]
         assert f"оплата: {expect}" in card, card

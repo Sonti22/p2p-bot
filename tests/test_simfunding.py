@@ -10,6 +10,7 @@ import perp
 import simfunding as SF
 import test_bot as TB
 from perpfx import install, quote
+from helpers import arun
 
 NOW = 1790494000.0
 
@@ -139,12 +140,12 @@ def test_funding_command_owner_only(monkeypatch, tmp_path):
     orig = SF.view
     monkeypatch.setattr(B.simfunding, "view", lambda: orig(db))
     bot = TB.Stub(p2p.Config())
-    asyncio.run(bot.dispatch("/funding", ""))
+    arun(bot.dispatch("/funding", ""))
     assert "Арбитраж фандинга" in TB.texts(bot)[-1]
     bot.out.clear()
     token = B.REPLY_CHAT.set("999")   # гость
     try:
-        asyncio.run(bot.dispatch("/funding", ""))
+        arun(bot.dispatch("/funding", ""))
     finally:
         B.REPLY_CHAT.reset(token)
     assert "Арбитраж" not in TB.texts(bot)[-1] and "только для владельца" in TB.texts(bot)[-1]
@@ -171,5 +172,5 @@ def test_perp_loop_refreshes_then_ticks_sims(monkeypatch):
     monkeypatch.setattr(bot, "sim_tick", lambda: calls.append("tick"))
     monkeypatch.setattr(B.asyncio, "sleep", stop)
     with pytest.raises(asyncio.CancelledError):
-        asyncio.run(bot.perp_loop())
+        arun(bot.perp_loop())
     assert calls == ["refresh", "tick"]

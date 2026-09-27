@@ -1,7 +1,6 @@
 """Калибровка (план 2.6): тип маршрута, сжатие поправки к классу грубее, Beta(1,1) и переход к грубой корзине,
 активность EV, знак EV, цена срыва, запас на курс из данных, устойчивость к пустым базам и старым схемам,
 отчёт /calibration — только владельцу и только за флагом."""
-import asyncio
 import os
 import pathlib
 import sqlite3
@@ -14,7 +13,7 @@ import history
 import p2p
 import paper
 import trades
-from helpers import make_ad
+from helpers import arun, make_ad
 
 
 def S(diff=0.0, done=True, bex="MEXC", sex="BestChange", rel="⚠️", depth="d?", realized=None, rtype="same",
@@ -389,9 +388,9 @@ def test_calibration_command_owner_only(monkeypatch):
     monkeypatch.setattr(C, "report_text", lambda *a, **k: "CAL-REPORT")
     monkeypatch.setenv("CALIBRATION", "1")
     bot = Stub(guests=["42"])
-    asyncio.run(bot.on_update(msg(42, "/calibration")))
+    arun(bot.on_update(msg(42, "/calibration")))
     assert texts(bot) == [("42", B.GUEST_DENIED)]                                # гостю — отказ, отчёта нет
-    asyncio.run(bot.handle("/calibration"))
+    arun(bot.handle("/calibration"))
     assert texts(bot)[-1] == ("1", "CAL-REPORT")
     assert "/calibration" not in B.GUEST_CMDS
 
@@ -401,5 +400,5 @@ def test_calibration_command_off_by_default(monkeypatch):
     monkeypatch.delenv("CALIBRATION", raising=False)
     assert not C.enabled()
     bot = Stub()
-    asyncio.run(bot.handle("/calibration"))
+    arun(bot.handle("/calibration"))
     assert texts(bot) and all(t != "CAL-REPORT" for _, t in texts(bot))

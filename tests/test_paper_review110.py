@@ -1,7 +1,6 @@
 """Разбор #110 (2026-09-26): комиссия СБП в круге — как в плане (лимит, исчерпанный реальными сделками), план без
 запаса на курс (planned_raw) для сравнения с фактом, /paper reset — база в архив, только владельцу. Что межмонетные
 связки снова не берутся в прогон — test_spot_routes_are_not_taken_into_dry_run в test_paper_accuracy.py."""
-import asyncio
 import dataclasses
 import datetime
 import os
@@ -13,6 +12,7 @@ import p2p
 import paper
 import trades
 from test_guests import Stub, buttons, msg, sent
+from helpers import arun
 
 
 def ad(ex, side, price, nick=None, asset="USDT", avail=10000):
@@ -27,7 +27,7 @@ def start(monkeypatch, deal, sn):
     monkeypatch.setenv("PAPER_TRAPS", "1")   # тест не про метку надёжности
     bot = Stub(p2p.Config(min_profit=2.0))
     bot.live_scans = 1
-    asyncio.run(bot.maybe_start_paper_cycle([deal], sn))
+    arun(bot.maybe_start_paper_cycle([deal], sn))
     return bot
 
 
@@ -78,7 +78,7 @@ def test_fact_is_compared_with_plan_without_risk_buffer(monkeypatch):
     assert abs((1 + c["planned_raw"] / 100) * (1 - vol / 100) - (1 + c["planned_pct"] / 100)) < 1e-9
     assert f"план {c['planned_pct']:.2f}%" in sent(bot)[-1]["text"]      # в сообщении о старте — план с запасом
     paper.set_stage(c["id"], "sell")
-    asyncio.run(bot.process_paper_cycles(sn))                             # тот же стакан на продаже
+    arun(bot.process_paper_cycles(sn))                             # тот же стакан на продаже
     done = paper.get_cycle(c["id"])
     assert done["result"] == "done" and abs(done["realized_pct"] - done["planned_raw"]) < 1e-9
     assert abs(paper.stats()["all"]["avg_diff"]) < 1e-9
@@ -166,26 +166,26 @@ def test_paper_reset_asks_then_archives_and_keeps_settings():
     cid = paper.start_cycle(10000, ad("Bybit", "buy", 87.0), ad("MEXC", "sell", 90.0), "r", 3.0)
     paper.finish_cycle(cid, "done", 1.5)
     bot = Stub(p2p.Config())
-    asyncio.run(bot.handle("/paper reset"))
+    arun(bot.handle("/paper reset"))
     ask = sent(bot)[-1]
     assert [b["callback_data"] for b in buttons(ask["reply_markup"])] == ["paper_reset:yes", "paper_reset:no"]
     assert paper.stats()["all"]["total"] == 1 and not _archives()          # только вопрос — ничего не тронуто
     cq = {"id": "7", "data": "paper_reset:no", "from": {"id": 1},
           "message": {"chat": {"id": 1, "type": "private"}, "message_id": bot.paper_reset_ask}}
-    asyncio.run(bot.on_update({"callback_query": cq}))
+    arun(bot.on_update({"callback_query": cq}))
     assert "отменено" in sent(bot, "editMessageText")[-1]["text"]
     assert paper.stats()["all"]["total"] == 1 and not _archives()
-    asyncio.run(bot.handle("/paper reset"))
+    arun(bot.handle("/paper reset"))
     cq = {"id": "8", "data": "paper_reset:yes", "from": {"id": 1},
           "message": {"chat": {"id": 1, "type": "private"}, "message_id": bot.paper_reset_ask}}
-    asyncio.run(bot.on_update({"callback_query": cq}))
+    arun(bot.on_update({"callback_query": cq}))
     text = sent(bot, "editMessageText")[-1]["text"]
     assert "кругов 1" in text and "+150 ₽" in text and "с нуля" in text and "paper-archive-" in text
     assert paper.stats()["all"]["total"] == 0 and len(_archives()) == 1
     assert open(B.ENV_PATH, encoding="utf-8").read() == env_before
     assert paper.settings()["on"] and paper.settings()["amount"] == 20000
     edits = len(sent(bot, "editMessageText"))
-    asyncio.run(bot.on_update({"callback_query": cq}))     # двойное нажатие «Да» — итог обнуления не затирается
+    arun(bot.on_update({"callback_query": cq}))     # двойное нажатие «Да» — итог обнуления не затирается
     assert len(sent(bot, "editMessageText")) == edits and len(_archives()) == 1
 
 
@@ -195,7 +195,7 @@ def test_paper_reset_button_after_restart_is_stale():
     bot = Stub(p2p.Config())                             # вопрос задавал прошлый процесс бота
     cq = {"id": "9", "data": "paper_reset:yes", "from": {"id": 1},
           "message": {"chat": {"id": 1, "type": "private"}, "message_id": 77}}
-    asyncio.run(bot.on_update({"callback_query": cq}))
+    arun(bot.on_update({"callback_query": cq}))
     assert "устарела" in sent(bot, "editMessageText")[-1]["text"]
     assert paper.stats()["all"]["total"] == 1 and not _archives()
 
@@ -207,7 +207,7 @@ def test_cycle_gone_after_reset_is_not_reported(monkeypatch):
     paper.reset()                                        # владелец обнулил, пока цикл обработки шёл
     monkeypatch.setattr(paper, "open_cycles", lambda: cycles)
     monkeypatch.setattr(paper, "check_buy_stage", lambda *a, **k: ("fail", "мерчант ушёл"))
-    asyncio.run(bot.process_paper_cycles(p2p.Snapshot(88.0, "t", {}, {}, [], {}, {}, {})))
+    arun(bot.process_paper_cycles(p2p.Snapshot(88.0, "t", {}, {}, [], {}, {}, {})))
     assert not [p for m, p in bot.out if m == "sendMessage" and f"круг #{cid}" in p["text"]]
 
 
@@ -215,10 +215,10 @@ def test_guest_cannot_reset_paper():
     cid = paper.start_cycle(10000, ad("Bybit", "buy", 87.0), ad("MEXC", "sell", 90.0), "r", 3.0)
     paper.finish_cycle(cid, "done", 1.5)
     bot = Stub(p2p.Config(), guests=["42"])
-    asyncio.run(bot.on_update(msg(42, "/paper reset")))
+    arun(bot.on_update(msg(42, "/paper reset")))
     assert sent(bot)[-1]["chat_id"] == "42" and sent(bot)[-1]["text"] == B.GUEST_DENIED
     cq = {"id": "8", "data": "paper_reset:yes", "message": {"chat": {"id": 42}, "message_id": 5}}
-    asyncio.run(bot.on_update({"callback_query": cq}))
+    arun(bot.on_update({"callback_query": cq}))
     assert "владельца" in sent(bot, "answerCallbackQuery")[-1]["text"]
     assert not sent(bot, "editMessageText")
     assert paper.stats()["all"]["total"] == 1 and not _archives()

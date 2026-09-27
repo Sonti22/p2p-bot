@@ -1,12 +1,11 @@
 """Понятная карточка сигнала: одни и те же номера шагов на картинке, в подписи и на кнопках (1 купить → 2… перевод,
 спот → N продать), без эмодзи на картинке (в шрифте их нет — были квадраты) и без общих кнопок «Топ/Лучшая» под
 сигналами (из-за них соседние карточки сливались в одну ленту)."""
-import asyncio
 
 import bot as B
 import cards
 import p2p
-from helpers import make_ad
+from helpers import arun, make_ad
 from test_bot import Stub
 
 PNG = b"\x89PNG\r\n\x1a\n"
@@ -82,8 +81,8 @@ def test_notify_signal_card_without_nav_best_with_nav(monkeypatch):
     bot = Stub(p2p.Config(min_profit=1.0))
     bot.live_scans = 1
     d = deal()
-    asyncio.run(bot.notify(snap([d])))
-    asyncio.run(bot.send_deal(d, snap=snap([d])))            # /best — тут общие кнопки к месту
+    arun(bot.notify(snap([d])))
+    arun(bot.send_deal(d, snap=snap([d])))            # /best — тут общие кнопки к месту
     marks = [p["markup"] for m, p in bot.out if m == "sendPhoto"]
     cbs = [{b.get("callback_data") for b in buttons(kb)} for kb in marks]
     assert len(cbs) == 2 and "top" not in cbs[0] and "top" in cbs[1]

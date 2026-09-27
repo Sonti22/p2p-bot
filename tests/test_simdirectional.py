@@ -1,6 +1,5 @@
 """simdirectional.py: EMA(20/100) 1ч на бумаге — индикаторы, вход только по живой свече, стоп ATR (по котировке и по
 свече), разворот, одна позиция, случайная база, фандинг, итоги /futures; команда только владельцу."""
-import asyncio
 
 import pytest
 
@@ -10,6 +9,7 @@ import perp
 import simdirectional as SD
 import test_bot as TB
 from perpfx import install, quote
+from helpers import arun
 
 H = 3600
 L0 = 1790488800.0   # начало последней «ровной» свечи (кратно часу)
@@ -198,11 +198,11 @@ def test_view_and_owner_only_command(tmp_path, monkeypatch):
     orig = SD.view
     monkeypatch.setattr(B.simdirectional, "view", lambda: orig(db, now=t))
     bot = TB.Stub(p2p.Config())
-    asyncio.run(bot.dispatch("/futures", "paper"))
+    arun(bot.dispatch("/futures", "paper"))
     assert "Направленная стратегия" in TB.texts(bot)[-1]
     token = B.REPLY_CHAT.set("999")
     try:
-        asyncio.run(bot.dispatch("/futures", ""))
+        arun(bot.dispatch("/futures", ""))
     finally:
         B.REPLY_CHAT.reset(token)
     assert "только для владельца" in TB.texts(bot)[-1]

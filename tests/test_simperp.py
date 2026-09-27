@@ -1,5 +1,4 @@
 """simperp.py: бумажный хедж кругов шортом перпа — выбор площадки, лот, фандинг в окне, закрытие, отчёт, HEDGE_PLAN."""
-import asyncio
 import functools
 import json
 import sqlite3
@@ -12,7 +11,7 @@ import paper
 import perp
 import simperp
 import test_bot as TB
-from helpers import make_ad
+from helpers import arun, make_ad
 from perpfx import install, quote
 
 NOW = 1790494000.0
@@ -235,7 +234,7 @@ def test_bot_starts_cycle_with_hedge_plan(monkeypatch, tmp_path):
     d = _btc_deal()
     snap = TB.snap_groups([d])
     snap.ref = RUB
-    asyncio.run(bot.maybe_start_paper_cycle([d], snap))
+    arun(bot.maybe_start_paper_cycle([d], snap))
     c = paper.open_cycles(path=db)[0]
     assert c["hedge_venue"] == "BingX" and c["buy_asset"] == "BTC"
     st = json.loads(c["hedge_state"])
@@ -255,7 +254,7 @@ def test_bot_hedge_failure_does_not_block_cycle(monkeypatch, tmp_path):
     bot = TB.Stub(p2p.Config(min_profit=2.0))
     bot.live_scans = 1
     d = _btc_deal()
-    asyncio.run(bot.maybe_start_paper_cycle([d], TB.snap_groups([d])))
+    arun(bot.maybe_start_paper_cycle([d], TB.snap_groups([d])))
     assert len(paper.open_cycles(path=db)) == 1
 
 
@@ -278,7 +277,7 @@ def test_bot_hedge_error_after_choose_does_not_block_cycle_or_signal(monkeypatch
     d = _btc_deal()
     snap = TB.snap_groups([d])
     snap.ref = RUB
-    asyncio.run(bot.maybe_start_paper_cycle([d], snap))
+    arun(bot.maybe_start_paper_cycle([d], snap))
     c = paper.open_cycles(path=db)[0]
     assert c["hedge_state"] == "" and any("Сухой прогон" in t for t in TB.texts(bot))
 
@@ -308,7 +307,7 @@ def test_bot_hedges_bought_coins_when_route_qty_missing(monkeypatch, tmp_path):
     d = _btc_deal()
     snap = TB.snap_groups([d])
     snap.ref = RUB
-    asyncio.run(bot.maybe_start_paper_cycle([d], snap))
+    arun(bot.maybe_start_paper_cycle([d], snap))
     c = paper.open_cycles(path=db)[0]
     st = json.loads(c["hedge_state"])
     assert st["coin_qty"] == pytest.approx(10000 / 7_000_000.0) and c["hedge_qty"] == pytest.approx(0.0014)

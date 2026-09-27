@@ -1,6 +1,5 @@
 """Сухой прогон — поля разбора (этап 1 «измерения»): время каждой стадии, индекс/причины/серия, мерчанты, запас
 глубины и id снимка на старте, цена и объём на проверке покупки; миграция старой базы, отчёты и CSV."""
-import asyncio
 import csv
 import json
 import sqlite3
@@ -10,7 +9,7 @@ import bot as B
 import p2p
 import paper
 import snapshots
-from helpers import make_ad
+from helpers import arun, make_ad
 
 
 class Stub(B.Bot):
@@ -234,7 +233,7 @@ def test_bot_paper_start_records_measures(monkeypatch):
     snap = _snap(ds, ts=time.time())
     for _ in range(bot.live_scans):
         bot.track_liveness(snap)                                          # связка держится N сканов
-    asyncio.run(bot.notify(snap))
+    arun(bot.notify(snap))
     (c,) = paper.open_cycles()
     d = p2p.deal_for_amount(ds[0], bot.cfg, snap, 10000)
     label, reasons = p2p.reliability(d, bot.cfg, snap)
@@ -251,15 +250,15 @@ def test_bot_buy_check_recorded_on_advance_and_fail(monkeypatch):
     buy, sell = make_ad("Bybit", "buy", 85.0), make_ad("MEXC", "sell", 90.0)
     ok = paper.start_cycle(10000, buy, sell, "r", 2.0, ts=time.time() - 400)
     bot = Stub(p2p.Config(min_profit=2.0))
-    asyncio.run(bot.process_paper_cycles(_snap([_deal()])))
+    arun(bot.process_paper_cycles(_snap([_deal()])))
     c = paper.get_cycle(ok)
     assert c["stage"] == "transfer" and c["buy_check_price"] == 85.0 and c["buy_check_avail"] == 500000
     assert c["ts_buy_done"] is not None
     gone = paper.start_cycle(10000, buy, sell, "r", 2.0, ts=time.time() - 400)
     s = p2p.Snapshot(88.0, "t", {}, {}, [], {}, {}, {}, groups={("Bybit", "buy", "USDT"): []})
-    asyncio.run(bot.process_paper_cycles(s))
+    arun(bot.process_paper_cycles(s))
     g = paper.get_cycle(gone)
     assert g["result"] == "failed_buy" and g["buy_check_price"] is None and g["buy_check_avail"] == 0.0
     early = paper.start_cycle(10000, buy, sell, "r", 2.0, ts=time.time())
-    asyncio.run(bot.process_paper_cycles(_snap([_deal()])))
+    arun(bot.process_paper_cycles(_snap([_deal()])))
     assert paper.get_cycle(early)["buy_check_avail"] is None               # рано — проверки не было

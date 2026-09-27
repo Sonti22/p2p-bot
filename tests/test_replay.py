@@ -1,5 +1,4 @@
 """replay.py: снимки из data/snapshots.db заново собираются p2p.assemble при других настройках — A/B-сводка."""
-import asyncio
 
 import pytest
 
@@ -7,7 +6,7 @@ import netstatus
 import p2p
 import replay
 import snapshots
-from helpers import make_ad
+from helpers import arun, make_ad
 
 
 def _cfg(**kw):
@@ -18,7 +17,7 @@ def _cfg(**kw):
 
 
 def _saved_scan(cfg):
-    snap = asyncio.run(p2p.scan(None, cfg))
+    snap = arun(p2p.scan(None, cfg))
     assert snap.deals
     return snapshots.load(snapshots.save(snap, cfg)), snap
 

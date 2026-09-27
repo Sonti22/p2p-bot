@@ -1,6 +1,5 @@
 """Исправления по проверке 26.09: /export за прошлые периоды, /blacklist в лимите Telegram, один обменник — один
 контрагент, неотправленное сообщение — в логе."""
-import asyncio
 import datetime
 import logging
 import time
@@ -10,6 +9,7 @@ import bot as B
 import p2p
 import trades
 from test_bot import Stub
+from helpers import arun
 
 MSK = trades.MSK
 
@@ -41,9 +41,9 @@ def test_export_rows_respects_until(tmp_path):
 def test_export_command_accepts_year_and_prev(monkeypatch):
     bot = Stub(p2p.Config())
     for arg in ("2026", "prev", "прошлый", "prevyear"):
-        asyncio.run(bot.cmd_export(arg))
+        arun(bot.cmd_export(arg))
         assert "Формат:" not in bot.out[-1][1].get("text", ""), arg
-    asyncio.run(bot.cmd_export("1999"))
+    arun(bot.cmd_export("1999"))
     assert "Формат:" in bot.out[-1][1]["text"]
 
 
@@ -75,5 +75,5 @@ def test_failed_send_is_logged(caplog):
             return {"ok": False, "description": "Bad Request: message is too long"}
     bot = Fail(p2p.Config())
     with caplog.at_level(logging.WARNING):
-        asyncio.run(bot.send("x" * 5000))
+        arun(bot.send("x" * 5000))
     assert "message is too long" in caplog.text

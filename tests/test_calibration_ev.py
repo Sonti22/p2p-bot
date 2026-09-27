@@ -21,7 +21,7 @@ import paper
 import replay
 import simperp
 import snapshots
-from helpers import make_ad
+from helpers import arun, make_ad
 from test_bot import Stub
 from test_replay import _cfg, _saved_scan
 
@@ -182,9 +182,9 @@ def _bot(monkeypatch, ev_rank=False, calls=None):
 
 def _outputs(bot, snap):
     bot.next_deal_id = 1   # id кнопок — от времени запуска бота; у обоих ботов одинаковые
-    asyncio.run(bot.notify(snap))
-    asyncio.run(bot.show_top(snap))
-    asyncio.run(bot.show_best(snap))
+    arun(bot.notify(snap))
+    arun(bot.show_top(snap))
+    arun(bot.show_best(snap))
     return bot.out
 
 
@@ -198,7 +198,7 @@ def test_ev_rank_off_output_identical_and_no_db_reads(monkeypatch):
     calls = []
     baseline = _outputs(_bot(monkeypatch, calls=calls), snap_xy())
     bot = _bot(monkeypatch, calls=calls)
-    snap = asyncio.run(bot.fresh_scan())
+    snap = arun(bot.fresh_scan())
     assert snap.deals == snap_xy().deals and snap.ev == {}
     assert _outputs(bot, snap) == baseline and baseline
     assert p2p.fmt_top(snap, bot.cfg) == p2p.fmt_top(snap_xy(), bot.cfg)
@@ -210,21 +210,21 @@ def test_ev_rank_on_orders_signals_top_and_card(monkeypatch):
     calls = []
     bot = _bot(monkeypatch, ev_rank=True, calls=calls)
     bot.max_signals = 1
-    snap = asyncio.run(bot.fresh_scan())
+    snap = arun(bot.fresh_scan())
     assert [d[1].ex for d in snap.deals] == ["HTX", "Bybit"]
     assert calls and calls[0] != threading.get_ident()                 # базы читаются не в цикле событий
-    asyncio.run(bot.notify(snap))
+    arun(bot.notify(snap))
     (cap,) = captions(bot)                                             # единственный слот — лучшей по EV, не по оценке
     assert "HTX → KuCoin" in cap and "📐 " + p2p.fmt_ev(snap.ev[KY]) in cap
-    asyncio.run(bot.show_best(snap))
+    arun(bot.show_best(snap))
     assert "HTX → KuCoin" in captions(bot)[-1]
     top = p2p.fmt_top(snap, bot.cfg)
     assert top.index("HTX") < top.index("Bybit") and top.count("📐 EV") == 2
     # второй скан в пределах calibration.REFRESH — калибровка из памяти; позже — пересборка
-    asyncio.run(bot.fresh_scan())
+    arun(bot.fresh_scan())
     assert len(calls) == 1
     bot.cal_ts -= C.REFRESH
-    asyncio.run(bot.fresh_scan())
+    arun(bot.fresh_scan())
     assert len(calls) == 2
 
 
@@ -232,7 +232,7 @@ def test_ev_rank_failure_keeps_scan_order(monkeypatch, caplog):
     bot = _bot(monkeypatch, ev_rank=True)
     monkeypatch.setattr(C, "build", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("database is locked")))
     with caplog.at_level(logging.WARNING):
-        snap = asyncio.run(bot.fresh_scan())
+        snap = arun(bot.fresh_scan())
     assert [d[1].ex for d in snap.deals] == ["Bybit", "HTX"] and snap.ev == {}
     assert "ev rank" in caplog.text
 
@@ -246,7 +246,7 @@ def test_scan_loop_and_calc_rank_before_use(monkeypatch):
         raise asyncio.CancelledError
     monkeypatch.setattr(B.asyncio, "sleep", stop)
     with pytest.raises(asyncio.CancelledError):
-        asyncio.run(bot.scan_loop())
+        arun(bot.scan_loop())
     assert [d[1].ex for d in bot.last.deals] == ["HTX", "Bybit"] and KY in bot.last.ev
     seen = []
 
@@ -255,7 +255,7 @@ def test_scan_loop_and_calc_rank_before_use(monkeypatch):
         return snap_xy()
     monkeypatch.setattr(B, "scan", calc_scan)
     bot.chat_id = "1"
-    asyncio.run(bot.calc("20000"))
+    arun(bot.calc("20000"))
     assert seen == [(20000, True)] and "HTX → KuCoin" in captions(bot)[-1]
 
 
@@ -269,7 +269,7 @@ def test_calibration_command_in_thread_with_ev_rank(monkeypatch):
     monkeypatch.setenv("CALIBRATION", "1")
     bot = _bot(monkeypatch, ev_rank=True)
     bot.last = snap_xy()
-    asyncio.run(bot.handle("/calibration"))
+    arun(bot.handle("/calibration"))
     assert seen["ev_rank"] is True and seen["snap"] is bot.last and seen["thread"] != threading.get_ident()
     assert ("1", "CAL-REPORT") in [(p["chat_id"], p["text"]) for m, p in bot.out if m == "sendMessage"]
 
