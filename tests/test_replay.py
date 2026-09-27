@@ -1,6 +1,5 @@
 """replay.py: снимки из data/snapshots.db заново собираются p2p.assemble при других настройках — A/B-сводка."""
 import asyncio
-import dataclasses
 
 import pytest
 
@@ -98,28 +97,16 @@ def test_override_dict_bad_format_rejected_clearly():
     assert replay.override(cfg, ["risk_buffer=usdt:0.2,btc:0.5"]).risk_buffer == {"USDT": 0.2, "BTC": 0.5}
 
 
-def test_override_dict_uses_field_parser(monkeypatch):
-    """У словаря свой формат (MERCHANT_MIN «Bybit:100/97,HTX:300/96» — p2p.parse_merchant_min) — берётся разбор поля;
-    не разобралась хоть одна часть — понятная ошибка, а не молча пустой словарь."""
-    def parse(spec):
-        out = {}
-        for part in spec.split(","):
-            venue, _, val = part.partition(":")
-            orders, _, rate = val.partition("/")
-            if venue.strip() in ("Bybit", "HTX") and orders.isdigit():
-                out[venue.strip()] = (int(orders), float(rate) if rate else None)
-        return out
-    monkeypatch.setattr(p2p, "parse_transfer_fees", parse, raising=False)
-    got = replay.override(p2p.Config(), ["transfer_fees=Bybit:100/97,HTX:300/96"])
-    assert got.transfer_fees == {"Bybit": (100, 97.0), "HTX": (300, 96.0)}
+def test_override_dict_uses_field_parser():
+    """У словаря свой формат (MERCHANT_MIN «Bybit:100/97,HTX:300/96» — p2p.parse_merchant_min) — берётся разбор поля
+    из replay.DICT_PARSERS; не разобралась хоть одна часть — понятная ошибка, а не молча неполный словарь."""
+    assert replay.DICT_PARSERS["merchant_min"] is p2p.parse_merchant_min
+    got = replay.override(p2p.Config(), ["merchant_min=Bybit:100/97,HTX:300/96"])
+    assert got.merchant_min == {"Bybit": (100, 97.0), "HTX": (300, 96.0)}
     with pytest.raises(ValueError, match="нужен формат вида Bybit:100/97,HTX:300/96"):
-        replay.override(p2p.Config(), ["transfer_fees=Bybit:100/97,Nowhere:5/5"])
-    if "merchant_min" in {f.name for f in dataclasses.fields(p2p.Config)}:   # после слияния с MERCHANT_MIN
-        got = replay.override(p2p.Config(), ["merchant_min=Bybit:100/97,HTX:300/96"])
-        assert got.merchant_min == {"Bybit": (100, 97.0), "HTX": (300, 96.0)}
-    else:
-        with pytest.raises(ValueError, match="не понял правку"):
-            replay.override(p2p.Config(), ["merchant_min=Bybit:100/97,HTX:300/96"])
+        replay.override(p2p.Config(), ["merchant_min=Bybit:100/97,Nowhere:5/5"])
+    with pytest.raises(ValueError, match="нужен формат вида USDT:0.2,BTC:0.5"):   # без своего разбора — формат _fees
+        replay.override(p2p.Config(), ["transfer_fees=Bybit:100/97,HTX:300/96"])
 
 
 def test_cfg_of_skips_unknown_fields():
