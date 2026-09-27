@@ -39,6 +39,7 @@ from p2p import ALL_EXCHANGES, AMOUNT_MAX, AMOUNT_MIN, DEFAULT_ASSETS, ENV_PATH,
     deal_for_amount, deal_fresh, fmt_ad, fmt_breakeven, fmt_deal, fmt_top, load_env, maker_neighbors, maker_place, maker_quote, \
     maker_round_fee, parse_amount, parse_min_profit, profit_breakdown, reliability, reliability_index, route_hops, scan, \
     score, setup_logging, spot_url, traps_log, venue_url
+from p2p import depth_for_deal, depth_settings
 
 logger = logging.getLogger(__name__)
 
@@ -1107,6 +1108,25 @@ def apply_mybanks(data):
         save_env("SBP_FREE_LIMITS", ",".join(f"{k}:{v}" for k, v in limits.items()))
 
 
+STALE_MARK = "\n\n⌛ <i>связка устарела</i>"   # пометка последнего сигнала по связке, ушедшей из топа
+CHIP_DEPTH_TIMEOUT = 4.0   # сек: фоновое уточнение фишек сумм карточки не дольше (CHIP_DEPTH_TIMEOUT в .env)
+
+
+def chip_depth_timeout():
+    """CHIP_DEPTH_TIMEOUT из .env (сек); пусто, не число или не больше нуля — по умолчанию."""
+    try:
+        v = float(os.getenv("CHIP_DEPTH_TIMEOUT", CHIP_DEPTH_TIMEOUT))
+    except ValueError:
+        return CHIP_DEPTH_TIMEOUT
+    return v if 0 < v < 600 else CHIP_DEPTH_TIMEOUT
+
+
+def chips_line(amounts):
+    """Фишки сумм строкой для подписи карточки — те же, что на картинке (cards._amounts_chips)."""
+    parts = [f"{_money(a)} ₽ {v:+.2f}%" if v is not None else f"{_money(a)} ₽ нет объёма" for a, v in amounts.items()]
+    return "📏 На другую сумму: " + " · ".join(parts)
+
+
 def _lean(snap):
     """Снимок без полного стакана (Snapshot.book), всех объявлений скана (Snapshot.ads) и котировок перпов
     (Snapshot.perps): они нужны только /maker и записи снимка (snapshots.py) по свежему скану — запомненные сделки
@@ -1208,6 +1228,7 @@ class Bot:
         self.cal = None              # EV_RANK=1: калибровка (calibration.build) и когда собрана — пересборка раз в
         self.cal_ts = 0.0            # calibration.REFRESH сек, в отдельном потоке
         self.live_msg = {}   # (ex,asset,ex,asset) -> последнее сообщение сигнала для «живой карточки» (editMessage)
+        self.chip_tasks = set()   # фоновые уточнения фишек сумм у отправленных карточек (ссылки держим до конца)
         self.live = {}                                            # (ex,asset,ex,asset) -> {"first": ts, "streak": n}
         self.live_scans = int(os.getenv("LIVE_SCANS", 2))        # сигнал, только если связка держится ≥ N сканов
         self.venue = {}   # ex -> {"streak": сканов подряд с ошибкой, "down_since": ts, "alerted_at": ts}
@@ -1389,18 +1410,73 @@ class Bot:
         snap = snap if snap is not None else self.last
         guest = self.is_guest(self.chat_for(chat_id))
         deal_id = None if guest else self.remember_deal(d, cfg, snap)   # у гостя нет «✅ Сделал»/«📝 Инструкция»/«🚫»
+        # фишки сумм — по стакану скана: карточка уходит сразу, уточнение под каждую сумму (chip_refresh) — потом, фоном
         amounts = deal_amounts(d, cfg, snap) if snap else None
         rel = (*reliability(d, cfg, snap), reliability_index(d, cfg, snap)) if snap else None
         caption = prefix + fmt_signal(d, cfg, snap)
-        r, is_photo = await self.photo_or_text(lambda: deal_card(d, cfg, amounts, rel), caption,
-                                               deal_markup(d, deal_id, cfg, snap, nav), topic,
+        markup = deal_markup(d, deal_id, cfg, snap, nav)
+        r, is_photo = await self.photo_or_text(lambda: deal_card(d, cfg, amounts, rel), caption, markup, topic,
                                                chat_id)
         message_id = (r.get("result") or {}).get("message_id") if r.get("ok") else None
         if topic == "signals" and message_id is not None and not guest:
             key = self._deal_key(d)
             self.live_msg[key] = {"message_id": message_id, "photo": is_photo, "deal_id": deal_id,
                                   "last_edit": time.time(), "caption": caption, "stale": False}
+        if message_id is not None and snap is not None and not guest and self.s is not None:
+            card = {"message_id": message_id, "photo": is_photo, "caption": caption, "chat_id": self.chat_for(chat_id),
+                    "markup": markup, "deal_id": deal_id, "nav": nav}
+            task = asyncio.ensure_future(self.chip_refresh(d, cfg, snap, amounts, card))
+            self.chip_tasks.add(task)
+            task.add_done_callback(self.chip_tasks.discard)
         return r
+
+    async def chip_depth(self, d, cfg, snap):
+        """Снимок со стаканом связки под фишки сумм карточки (p2p.depth_for_deal), не дольше CHIP_DEPTH_TIMEOUT;
+        сбой или таймаут — стакан скана как есть."""
+        try:
+            return await asyncio.wait_for(depth_for_deal(self.s, cfg, snap, d), chip_depth_timeout())
+        except Exception as e:
+            logger.warning("глубина под суммы: %s: %s", type(e).__name__, e)
+            return snap
+
+    async def chip_refresh(self, d, cfg, snap, amounts, card):
+        """Фоном после отправки карточки: фишки 50/100/300 тыс. по запросам под каждую сумму (chip_depth). Изменилась
+        хоть одна — строка фишек дописывается в подпись/текст отправленного сообщения (Bot.call editMessageCaption/
+        editMessageText: картинку без новой загрузки не поменять) и остаётся при правках «живой карточки». Текст — тот,
+        что на карточке к моменту правки (живая правка могла его сменить), «⌛ связка устарела» сохраняется; кнопки —
+        те же (без reply_markup Telegram их снял бы; после «✅ Сделал» — уже без кнопок журнала). Не изменилось, сбой
+        или таймаут — карточка как была. Исключения только в лог. card — message_id, photo, caption, chat_id, markup,
+        deal_id, nav отправленной карточки."""
+        try:
+            fresh = deal_amounts(d, cfg, await self.chip_depth(d, cfg, snap))
+            if not fresh or fresh == amounts:
+                return
+            line = chips_line(fresh)
+            live = self.live_msg.get(self._deal_key(d))
+            live = live if live and live["message_id"] == card["message_id"] else None
+            base = live["caption"] if live else card["caption"]
+            text = base + "\n" + line + (STALE_MARK if live and live["stale"] else "")
+            if len(text) > (1024 if card["photo"] else 4096):
+                return
+            markup = card["markup"]
+            if card["deal_id"] is not None and card["deal_id"] not in self.deals_by_id:   # «✅ Сделал» уже нажали
+                markup = deal_markup(d, None, cfg, snap, False)
+            kw = {"chat_id": card["chat_id"], "message_id": card["message_id"], "parse_mode": "HTML"}
+            for mk in (self.markup(markup), plain_markup(markup)):
+                if card["photo"]:
+                    r = await self.call("editMessageCaption", caption=text, reply_markup=mk, **kw)
+                else:
+                    r = await self.call("editMessageText", text=text, reply_markup=mk, disable_web_page_preview=True,
+                                        **kw)
+                if not self._fancy_failed(r, mk):
+                    break
+            if not r.get("ok"):
+                logger.warning("фишки сумм: правка карточки не прошла: %s", r.get("description"))
+                return
+            if live:   # живые правки и «⌛ устарел» строку фишек не теряют
+                live["chips"], live["caption"] = line, base + "\n" + line
+        except Exception as e:
+            logger.warning("фишки сумм: %s: %s", type(e).__name__, e)
 
     async def show_steps(self, cq, deal_id):
         """Кнопка «📝 Инструкция»: отдельным сообщением пошаговый чек-лист маршрута."""
@@ -1684,6 +1760,15 @@ class Bot:
                 line += f", не хватило глубины {r['depth_shortfall']}×"
             if r["avg_duration_min"] is not None:
                 line += f", среднее время круга {r['avg_duration_min']:.0f} мин"
+            if r.get("avg_buy_slip_pct") is not None:
+                line += f", покупка к плану {r['avg_buy_slip_pct']:+.2f}%"
+            if r.get("buy_from_book"):
+                line += f", у других мерчантов {r['buy_from_book']}×"
+            if r.get("net_unknown"):
+                line += f", статус сети неизвестен {r['net_unknown']}×"
+            if r.get("fail_reasons"):
+                line += " · причины срывов: " + ", ".join(
+                    f"{paper.REASON_LABELS.get(k, k)} {v}" for k, v in r["fail_reasons"].items())
             lines.append(line)
         by_label = paper.label_stats()
         if by_label:
@@ -2184,6 +2269,9 @@ class Bot:
             return "\n".join(lines)
         above = sum(1 for d in snap.deals if d[0] >= self.cfg.min_profit)
         lines.append(f"Связок выше порога {self.cfg.min_profit:g}%: {above}")
+        extra, lim = snap.extra, depth_settings()
+        lines.append(f"Доп. запросы глубины в скане: вторые страницы {extra.get('page2', 0)} (лимит "
+                     f"{lim['page2_max']}), под суммы {extra.get('amounts', 0)} (лимит {lim['chips_max']})")
         if snap.errors:
             lines += ["", "<b>Ошибки площадок:</b>"]
             lines += [f"• {html.escape(k)}: {html.escape(e)}" for k, e in snap.errors.items()]
@@ -2461,9 +2549,9 @@ class Bot:
         route_cfg = dataclasses.replace(self.cfg, amount=settings["amount"])
         qty = _route_qty(b, s, route_cfg, psnap.spot, over, disable=frozenset({"risk"}))
         raw = (qty * s.price / settings["amount"] - 1) * 100 if qty else profit
-        # площадки конвертации и сеть/комиссия каждого хопа на момент старта — для стадий transfer/sell
-        # межмонетных связок позже (ROADMAP «межмонетные, часть 2»); сейчас связка простая (paper.simple_route)
-        # — venues пусто, один хоп, но сохраняем и для неё, чтобы данные были у всех кругов подряд
+        # площадки конвертации и сеть/комиссия каждого хопа на момент старта: стадия transfer проверяет именно эти
+        # переводы, sell считает выход по их комиссиям, время перевода круга — по их сетям (paper.start_cycle);
+        # межмонетные связки фильтр paper.simple_route пока не пускает (снятие — шаг владельца)
         hops = route_hops(b, s, route_cfg, psnap.spot, over)
         # для разбора (этап 1 «измерения»): индекс и причины надёжности, серия «живости», запас глубины и id снимка
         # скана — снимок пишется после сигналов, но id (время начала скана) известен уже сейчас
@@ -2500,11 +2588,13 @@ class Bot:
 
     async def process_paper_cycles(self, snap):
         """Сухой прогон: стадии открытых виртуальных кругов по свежему снимку/справочникам, без сети.
-        buy — через PAPER_PAY_MINUTES объявление покупки ещё на месте (цена ордера зафиксирована при
-        создании); transfer — через PAPER_TRANSFER_MINUTES вывод всё ещё возможен (fees/netstatus); sell —
-        продаём лучшим объявлениям стакана на весь объём, прибыль — по фактической цене (может быть ниже
-        плана и в минус). Срыв (failed_buy/failed_transfer/failed_sell): мерчант покупки ушёл, вывод
-        закрыт, покупателей на весь объём нет."""
+        buy — через PAPER_PAY_MINUTES покупка по свежему стакану (мерчанты круга, не хватило — другие по цене;
+        цена хуже плана больше PAPER_BUY_SLIP_MAX — срыв; у обменника — только по свежей котировке BestChange),
+        цена покупки пишется в круг; transfer — через время перевода по сетям круга переводы маршрута ещё возможны
+        (fees/netstatus), неизвестный статус сети — риск в круге; sell — продаём лучшим объявлениям стакана на весь
+        объём, прибыль — по фактическим ценам покупки и продажи (может быть ниже плана и в минус). Срыв
+        (failed_buy/failed_transfer/failed_sell): стакана покупки не хватило или цена ушла, перевод закрыт,
+        покупателей на весь объём нет. Всё состояние круга — в data/paper.db: перезапуск бота круг продолжает."""
         if not self.chat_id:
             return
         settings = paper.settings()
@@ -2521,6 +2611,8 @@ class Bot:
                     await self.send(f"🧪 Сухой прогон: круг #{cycle['id']} сорвался на покупке — {note}",
                                     topic="signals")
                 else:
+                    # цена покупки по свежему стакану (проскальзывание, другие мерчанты) — для факта на продаже
+                    paper.set_buy_fill(cycle["id"], paper.buy_fill(cycle, snap))
                     paper.set_stage(cycle["id"], "transfer")
             elif cycle["stage"] == "transfer":
                 action, note = paper.check_transfer_stage(cycle, self.cfg, settings["transfer_minutes"])
@@ -2532,6 +2624,7 @@ class Bot:
                     await self.send(f"🧪 Сухой прогон: круг #{cycle['id']} сорвался на переводе — {note}",
                                     topic="signals")
                 else:
+                    paper.add_risks(cycle["id"], paper.transfer_risks(cycle, self.cfg))   # неизвестный статус сети — риск
                     paper.set_stage(cycle["id"], "sell")
             elif cycle["stage"] == "sell":
                 action, note, price = paper.check_sell_stage(cycle, snap, cfg=self.cfg,
@@ -2683,6 +2776,9 @@ class Bot:
         if not live or live["stale"] or now - live["last_edit"] < LIVE_EDIT_INTERVAL:
             return
         caption = "🔔 " + self.held_label(d, now) + fmt_signal(d, self.cfg, snap)
+        chips = live.get("chips")   # строка уточнённых фишек сумм (chip_refresh) при живых правках остаётся
+        if chips and len(caption) + len(chips) + 1 <= (1024 if live["photo"] else 4096):
+            caption += "\n" + chips
         live["last_edit"], live["caption"] = now, caption
         try:
             if live["photo"]:
@@ -2701,12 +2797,11 @@ class Bot:
 
     async def mark_stale_deals(self, active):
         """Связка пропала из топа — один раз пометить последний сигнал по ней «⌛ устарел»."""
-        stale_mark = "\n\n⌛ <i>связка устарела</i>"
         for key, live in self.live_msg.items():
             if key in active or live["stale"]:
                 continue
             live["stale"] = True
-            text = live["caption"] + stale_mark
+            text = live["caption"] + STALE_MARK
             try:
                 if live["photo"]:
                     await self.call("editMessageCaption", chat_id=self.chat_id, message_id=live["message_id"],

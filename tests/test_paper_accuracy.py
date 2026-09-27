@@ -46,8 +46,13 @@ def test_composite_buy_fails_only_when_all_merchants_are_gone():
     assert action == "fail" and "не покрывают" in note
     b_big = ad("HTX", "buy", 87.6, "merchB", max_amt=20000)   # тот же мерчант поднял лимит — остаток покрывает
     assert paper.check_buy_stage(c, snap({("HTX", "buy", "USDT"): [b_big]}), pay_minutes=5, now=1400.0)[0] == "advance"
+    # этап 2.4: наши мерчанты ушли — покупка у других по стакану (+0,5% к плану — в допуске), а не срыв
     nobody = snap({("HTX", "buy", "USDT"): [ad("HTX", "buy", 88.0, "other")]})
-    assert paper.check_buy_stage(c, nobody, pay_minutes=5, now=1400.0) == ("fail", "объявление покупки исчезло")
+    assert paper.check_buy_stage(c, nobody, pay_minutes=5, now=1400.0) == ("advance", "")
+    pricey = snap({("HTX", "buy", "USDT"): [ad("HTX", "buy", 89.0, "other")]})   # +1,7% — дальше допуска
+    assert paper.check_buy_stage(c, pricey, pay_minutes=5, now=1400.0)[1].startswith("цена ушла")
+    assert paper.check_buy_stage(c, snap({("HTX", "buy", "USDT"): []}), pay_minutes=5,
+                                 now=1400.0) == ("fail", "объявление покупки исчезло")
 
 
 def test_unchanged_book_gives_fact_equal_route_output_not_more_volume():

@@ -392,31 +392,35 @@ async def _json(s, method, url, body=None):
 _bybit_pay = {}
 
 
-async def bybit(s, cfg, side, asset):
+async def bybit(s, cfg, side, asset, page=1):
     if not _bybit_pay:
         j = await _json(s, "POST", "https://api2.bybit.com/fiat/otc/configuration/queryAllPaymentList", {})
         _bybit_pay.update({str(p["paymentType"]): p["paymentName"] for p in j["result"]["paymentConfigVo"]})
     body = {"userId": "", "tokenId": asset, "currencyId": cfg.fiat, "payment": [], "side": "1" if side == "buy" else "0",
-            "size": "20", "page": "1", "amount": str(int(cfg.amount)), "authMaker": False, "canTrade": False}
+            "size": "20", "page": str(page), "amount": str(int(cfg.amount)), "authMaker": False, "canTrade": False}
     j = await _json(s, "POST", "https://api2.bybit.com/fiat/otc/item/online", body)
+    items = j["result"]["items"] or []
+    _note_page("bybit", side, asset, page, cfg.amount, len(items))
     return [Ad("Bybit", side, float(i["price"]), float(i["minAmount"]), float(i["maxAmount"]), float(i["lastQuantity"]),
                [_bybit_pay.get(p, p) for p in i["payments"]], i["nickName"], int(i["recentOrderNum"]),
                float(i["recentExecuteRate"]), asset=asset, terms=i.get("remark") or "")
-            for i in j["result"]["items"] or []]
+            for i in items]
 
 
-async def htx(s, cfg, side, asset):
+async def htx(s, cfg, side, asset, page=1):
     cur, coin = HTX_FIAT.get(cfg.fiat), HTX_COIN.get(asset)
     if cur is None or coin is None:
         return []
-    url = ("https://www.htx.com/-/x/otc/v1/data/trade-market?coinId=%d&currency=%d&tradeType=%s&currPage=1&payMethod=0"
+    url = ("https://www.htx.com/-/x/otc/v1/data/trade-market?coinId=%d&currency=%d&tradeType=%s&currPage=%d&payMethod=0"
            "&acceptOrder=0&blockType=general&online=1&range=0&amount=%d&onlyTradable=false&isFollowed=false"
-           % (coin, cur, "sell" if side == "buy" else "buy", cfg.amount))
+           % (coin, cur, "sell" if side == "buy" else "buy", page, cfg.amount))
     j = await _json(s, "GET", url)
+    items = j.get("data") or []
+    _note_page("htx", side, asset, page, cfg.amount, len(items))
     return [Ad("HTX", side, float(i["price"]), float(i["minTradeLimit"]), float(i["maxTradeLimit"]), float(i["tradeCount"]),
                [p["name"] for p in i["payMethods"]], i["userName"], int(i["tradeMonthTimes"]),
                float(i["orderCompleteRate"] or 0), asset=asset)
-            for i in j.get("data") or []]
+            for i in items]
 
 
 def _kucoin_pay(p):
@@ -425,22 +429,24 @@ def _kucoin_pay(p):
     return p["payTypeNameEn"]
 
 
-async def kucoin(s, cfg, side, asset):
+async def kucoin(s, cfg, side, asset, page=1):
     url = (f"https://www.kucoin.com/_api/otc/ad/list?currency={asset}&side={'SELL' if side == 'buy' else 'BUY'}"
-           f"&legal={cfg.fiat}&page=1&pageSize=20&status=PUTUP&lang=en_US")
+           f"&legal={cfg.fiat}&page={int(page)}&pageSize=20&status=PUTUP&lang=en_US")
     j = await _json(s, "GET", url)
+    items = j.get("items") or []
+    _note_page("kucoin", side, asset, page, cfg.amount, len(items))
     return [Ad("KuCoin", side, float(i["floatPrice"]), float(i["limitMinQuote"]), float(i["limitMaxQuote"]),
                float(i["currencyBalanceQuantity"]), [_kucoin_pay(p) for p in i["adPayTypes"]], i["nickName"],
                int(i.get("dealOrderNum") or 0), float((i.get("dealOrderRate") or "0").rstrip("%")), asset=asset,
                terms=i.get("remarks") or "")
-            for i in j.get("items") or []]
+            for i in items]
 
 
 _mexc_pay = {}
 _mexc_coins = {}
 
 
-async def mexc(s, cfg, side, asset):
+async def mexc(s, cfg, side, asset, page=1):
     if not _mexc_pay:
         j = await _json(s, "GET", f"https://www.mexc.com/api/platform/p2p/api/payment/method?currency={cfg.fiat}")
         _mexc_pay.update({str(p["id"]): p["name"] for p in j["data"]})
@@ -451,11 +457,13 @@ async def mexc(s, cfg, side, asset):
     if not coin:
         return []
     url = ("https://p2p.mexc.com/api/market?adsType=1&allowTrade=false&blockTrade=false&countryCode=&follow=false"
-           f"&haveTrade=false&payMethod=&coinId={coin}&currency={cfg.fiat}&amount={int(cfg.amount)}&page=1&pageSize=50"
+           f"&haveTrade=false&payMethod=&coinId={coin}&currency={cfg.fiat}&amount={int(cfg.amount)}&page={int(page)}&pageSize=50"
            + ("&tradeType=SELL&adOrderSortField=price&adOrderSort=0" if side == "buy" else "&tradeType=BUY"))
     j = await _json(s, "GET", url)
+    items = j.get("data") or []
+    _note_page("mexc", side, asset, page, cfg.amount, len(items))
     out = []
-    for i in j.get("data") or []:
+    for i in items:
         st = i.get("merchantStatistics") or {}
         out.append(Ad("MEXC", side, float(i["price"]), float(i["minTradeLimit"]), float(i["maxTradeLimit"]),
                       float(i["availableQuantity"]), [_mexc_pay.get(p, f"pm{p}") for p in str(i["payMethod"]).split(",")],
@@ -464,12 +472,14 @@ async def mexc(s, cfg, side, asset):
     return out
 
 
-async def bitpapa(s, cfg, side, asset):
-    url = ("https://bitpapa.com/api/v1/pro/search?crypto_currency_code=%s&currency_code=%s&page=1&limit=50&type=%s&sort=%s"
-           % (asset, cfg.fiat, "sell" if side == "buy" else "buy", "price" if side == "buy" else "-price"))
+async def bitpapa(s, cfg, side, asset, page=1):
+    url = ("https://bitpapa.com/api/v1/pro/search?crypto_currency_code=%s&currency_code=%s&page=%d&limit=50&type=%s&sort=%s"
+           % (asset, cfg.fiat, page, "sell" if side == "buy" else "buy", "price" if side == "buy" else "-price"))
     j = await _json(s, "GET", url)
+    items = j.get("ads") or []
+    _note_page("bitpapa", side, asset, page, cfg.amount, len(items))
     out = []
-    for a in j.get("ads") or []:
+    for a in items:
         u = a.get("user") or {}
         if u.get("is_suspicious"):
             continue
@@ -487,7 +497,7 @@ LBANK_ASSETS = ("USDT", "USDC")   # монеты P2P LBank (справочник
 LBANK_PAY_FIX = {"AIfa-bank": "Alfa-bank"}   # LBank пишет Альфу с заглавной I вместо l — иначе банк не узнать
 
 
-async def lbank(s, cfg, side, asset):
+async def lbank(s, cfg, side, asset, page=1):
     """P2P LBank. В стакане и свои объявления (source=LBANK), и объявления MEXC, которые LBank показывает у себя
     (source=MEXC): сделка идёт через LBank, но счётчика сделок у таких мерчантов LBank не отдаёт — orders=0, и
     фильтр MIN_ORDERS их отсеет. Сделки и % завершения — dealOrderTotal/turnoverRateTotal: их LBank и показывает
@@ -496,13 +506,17 @@ async def lbank(s, cfg, side, asset):
     if asset not in LBANK_ASSETS:
         return []
     url = ("https://www.lbank.com/lbk-api/otc-trade-center/fiat/p2p/adv/advertisementList?tradeType=%s&assetCode=%s"
-           "&currencyCode=%s&showOnlyPurchasable=false&certifiedOnly=false&isFollow=false&pageNo=1&pageSize=20"
-           "&sortByPrice=0&sortByOrderCount=0&sortByCompletionRate=0" % (side, asset, cfg.fiat))
+           "&currencyCode=%s&showOnlyPurchasable=false&certifiedOnly=false&isFollow=false&pageNo=%d&pageSize=20"
+           "&sortByPrice=0&sortByOrderCount=0&sortByCompletionRate=0" % (side, asset, cfg.fiat, page))
     j = await _json(s, "GET", url)
     if j.get("code") != 200:
         raise ValueError(f"LBank: {j.get('code')} {j.get('message')}")
+    data = j.get("data") or {}
+    items = data.get("resultList") or []
+    more = data.get("hasNext")
+    _note_page("lbank", side, asset, page, cfg.amount, len(items), more if isinstance(more, bool) else None)
     out = []
-    for i in (j.get("data") or {}).get("resultList") or []:
+    for i in items:
         if i.get("topTag") or i.get("templateCode") or i.get("enable") is False:
             continue
         if i.get("source") not in (None, "LBANK"):
@@ -1446,6 +1460,8 @@ class Snapshot:
     # EV_RANK=1: (ex покупки, монета, ex продажи, монета) -> (EV п.п., p исполнения) — calibration.rank_snapshot;
     # пусто — EV в карточке не показываем
     ev: dict = field(default_factory=dict)
+    # доп. запросы глубины этого скана: {"page2": вторые страницы (collect), "amounts": под фишки сумм (depth_for_deal)}
+    extra: dict = field(default_factory=dict)
 
 
 # key — (монеты, площадки, сумма круга), под которые собран кэш; jobs — замеры запросов, которыми он собран
@@ -1543,10 +1559,235 @@ def deal_fresh(deal, snap):
     return ad_fresh(b, snap.ts) and ad_fresh(s, snap.ts)
 
 
-async def collect(s, cfg, force_alt=False):
+# Глубина стакана (план, этап 2.3). Номер страницы уже есть в публичном запросе этих площадок (page/currPage/pageNo) —
+# вторую страницу берём тем же запросом; у BestChange страниц нет (вся выгрузка сразу).
+PAGED = ("bybit", "htx", "kucoin", "mexc", "bitpapa", "lbank")
+# Площадка сама отбирает выдачу под сумму запроса (amount в запросе): для других сумм (фишки 50/100/300 тыс. в
+# карточке) нужен свой запрос — только для связок, которые уходят сигналом, не для всех.
+AMOUNT_PARAM = ("bybit", "htx", "mexc")
+FETCHER_KEY = {v: k for k, v in MERCHANT_VENUES.items()}   # Ad.ex → ключ FETCHERS
+DEPTH_PAGE2_RETRY = 600   # сек: вторая страница ничего не дала (пусто, одни негодные, ошибка, таймаут) — не просим
+DEPTH_PAGE2_MIN_GAIN = 0.1   # доля суммы круга: вторая страница добавила годного объёма меньше — «ничего не дала»
+DEPTH_TIMEOUT = 5         # сек: раунд вторых страниц скана и запрос под фишку суммы — не дольше
+# Размер страницы в запросе (size/pageSize/limit); у HTX его в запросе нет — берём 10 (меньший из вероятных: лишняя
+# вторая страница лучше пропущенной). Первая страница короче — второй нет, не просим.
+PAGE_SIZE = {"bybit": 20, "htx": 10, "kucoin": 20, "mexc": 50, "bitpapa": 50, "lbank": 20}
+_page2_skip = {}          # (ключ площадки, сторона, монета) -> unix-время, до которого вторую страницу не просим
+_amount_cache = {}        # (ключ площадки, сторона, монета, сумма) -> (время запроса, объявления)
+_ORIG_FETCHERS = {n: FETCHERS[n] for n in PAGED}   # подменённый адаптер (тесты, 4 аргумента) доп. запросов не получает
+
+
+def depth_settings():
+    """Настройки доп. запросов глубины из .env (читаются при каждом скане): DEPTH_PAGE2 — во сколько раз стек годных
+    объявлений стороны должен покрывать сумму круга, иначе просим вторую страницу (0 — выкл.); DEPTH_PAGE2_MAX — не
+    больше стольких вторых страниц за скан; DEPTH_CHIPS_MAX — отдельный бюджет запросов под фишки сумм карточек на
+    скан. Кривое значение — по умолчанию."""
+    def num(name, default):
+        try:
+            v = float(os.getenv(name, default))
+        except ValueError:
+            return default
+        return v if math.isfinite(v) and v >= 0 else default
+    return {"page2": num("DEPTH_PAGE2", 1.5), "page2_max": int(num("DEPTH_PAGE2_MAX", 4)),
+            "chips_max": int(num("DEPTH_CHIPS_MAX", 6))}
+
+
+def _refs(cfg, ads, ref, spot):
+    """Ориентиры по монетам: ref (USDT/RUB) × спот монеты к USDT, без спота — медиана P2P этой монеты."""
+    refs = {}
+    for a in cfg.assets:
+        mid = _mid(spot, a)
+        if ref and mid:
+            refs[a] = ref * mid
+        else:
+            p = [x.price for x in ads if x.asset == a]
+            if p:
+                refs[a] = statistics.median(p)
+    return refs
+
+
+def _fits(a, cfg, refs, blocked=frozenset()):
+    """Объявление годится в стакан связки: фильтры мерчанта/оплаты/условий и цена в пределах MAX_DEV (как в assemble)."""
+    r = refs.get(a.asset)
+    return _signal_ok(a, cfg, blocked) and not (r and abs(a.price / r - 1) * 100 > cfg.max_dev)
+
+
+def usable_depth(ads, cfg, refs, blocked=frozenset()):
+    """Стек годных объявлений стороны в фиате: сумма min(лимит, доступно × цена) по объявлениям, прошедшим фильтры, с
+    ценой в пределах MAX_DEV от ориентира."""
+    return sum(min(a.max_amt, a.avail * a.price) for a in ads if a.avail > 0 and _fits(a, cfg, refs, blocked))
+
+
+def _ad_key(a):
+    """Одно и то же объявление в двух ответах. Без цены и объёма: объявление с плавающей ценой переезжает на вторую
+    страницу как раз потому, что цена сменилась, — иначе его объём посчитался бы дважды. id — где площадка его отдаёт."""
+    if a.ad_id:
+        return (a.ex, a.side, a.asset, a.ad_id)
+    pays = a.all_pays if a.all_pays is not None else a.pays
+    return (a.ex, a.side, a.asset, a.nick, a.net, a.min_amt, a.max_amt, tuple(pays or ()))
+
+
+def _dedup(ads):
+    """Без повторов (_ad_key); из копий одного объявления — полученная позже (fetched_ts), на месте первой."""
+    out, pos = [], {}
+    for a in ads:
+        k = _ad_key(a)
+        if k not in pos:
+            pos[k] = len(out)
+            out.append(a)
+        elif a.fetched_ts > out[pos[k]].fetched_ts:
+            out[pos[k]] = a
+    return out
+
+
+_page_raw = {}   # (ключ площадки, сторона, монета, страница, сумма) -> (объявлений в ответе до своих отсевов, есть ли ещё)
+
+
+def _note_page(n, side, asset, page, amount, raw, more=None):
+    """Адаптер отмечает, сколько объявлений пришло в ответе (до своих отсевов) и сказала ли площадка, что есть ещё."""
+    _page_raw[(n, side, asset, page, amount)] = (raw, more)
+
+
+def _page_full(n, side, asset, amount):
+    """Первая страница полная — вторая может быть: площадка сказала «есть ещё» или в ответе не меньше PAGE_SIZE."""
+    raw, more = _page_raw.get((n, side, asset, 1, amount), (0, None))
+    return more if isinstance(more, bool) else raw >= PAGE_SIZE.get(n, 20)
+
+
+def _page2_wanted(results, cfg, refs, blocked, now, failed=frozenset()):
+    """Стороны (ключ площадки, сторона, монета), где стек годных объявлений первой страницы меньше DEPTH_PAGE2 × сумма
+    круга, — самые короткие первыми. Только площадки PAGED с исходным адаптером; первая страница полная (_page_full);
+    площадка в этом скане не падала (failed — ошибка первой страницы другой стороны); вторая страница этой стороны не
+    «ничего не дала» последние DEPTH_PAGE2_RETRY сек."""
+    factor = depth_settings()["page2"]
+    if factor <= 0:
+        return []
+    out = []
+    for (n, side, asset), ads in results.items():
+        if n not in PAGED or FETCHERS.get(n) is not _ORIG_FETCHERS.get(n) or not ads or n in failed:
+            continue
+        if _page2_skip.get((n, side, asset), 0) > now or not _page_full(n, side, asset, cfg.amount):
+            continue
+        depth = usable_depth(ads, cfg, refs, blocked)
+        if depth < factor * cfg.amount:
+            out.append((depth / cfg.amount, (n, side, asset)))
+    return [key for _, key in sorted(out)]
+
+
+async def _fetch_page2(s, cfg, wanted, results, recs, refs, blocked=frozenset()):
+    """Вторые страницы для wanted, весь раунд — не дольше DEPTH_TIMEOUT: новые объявления (без дублей первой страницы,
+    из копий — свежая) добавляются в results, замеры — в recs (page=2). Вторая страница, которая ничего не дала (ошибка,
+    таймаут, годного объёма меньше DEPTH_PAGE2_MIN_GAIN × сумма круга), этой стороной DEPTH_PAGE2_RETRY сек не
+    запрашивается. Бэкоффа площадки из-за второй страницы нет — первая ответила, связки по ней считаются, в
+    snap.errors не идёт. Возвращает (число запросов, площадки с ответом 403/429 — им одна пауза без роста)."""
+    if not wanted:
+        return 0, set()
+    new_recs = [{"ex": n, "side": side, "asset": asset, "page": 2} for n, side, asset in wanted]
+    tasks = [asyncio.ensure_future(_timed(FETCHERS[n](s, cfg, side, asset, page=2), rec))
+             for (n, side, asset), rec in zip(wanted, new_recs)]
+    _done, pending = await asyncio.wait(tasks, timeout=DEPTH_TIMEOUT)
+    for t in pending:
+        t.cancel()
+    await asyncio.gather(*pending, return_exceptions=True)
+    now, limited = time.time(), set()
+    for key, t, rec in zip(wanted, tasks, new_recs):
+        err = None if t in pending else t.exception()
+        if t in pending or err is not None:
+            _page2_skip[key] = now + DEPTH_PAGE2_RETRY
+            rec.update(n=0, cached=False, age=None, err=rec.get("err") or f"таймаут {DEPTH_TIMEOUT} с")
+            if getattr(err, "status", None) in (403, 429):
+                limited.add(key[0])
+            logger.warning("%s/%s/%s: вторая страница не пришла (%s), не прошу %d мин", *key, rec["err"],
+                           DEPTH_PAGE2_RETRY // 60)
+            continue
+        r = t.result()
+        _job_done(rec, r)
+        have = {_ad_key(a) for a in results[key]}
+        merged = _dedup(results[key] + list(r))
+        fresh = [a for a in merged if _ad_key(a) not in have]
+        gain = usable_depth(fresh, cfg, refs, blocked)
+        if gain < DEPTH_PAGE2_MIN_GAIN * cfg.amount:
+            _page2_skip[key] = now + DEPTH_PAGE2_RETRY
+        rec["new"], rec["gain"] = len(fresh), round(gain)
+        results[key] = merged
+    recs.extend(new_recs)
+    return len(wanted), limited
+
+
+def _venue_pause(ex):
+    """Площадка ответила 403/429 на вторую страницу: одна пауза VENUE_BACKOFF_BASE без роста следующих пауз."""
+    st = _venue_backoff.setdefault(ex, {"delay": 0, "until": 0.0})
+    st["until"] = max(st["until"], time.time() + VENUE_BACKOFF_BASE)
+    logger.warning("%s: 403/429 на второй странице — пауза %d с", ex, VENUE_BACKOFF_BASE)
+
+
+async def depth_for_deal(s, cfg, snap, deal, amounts=None):
+    """Стакан связки для фишек сумм в карточке (deal_amounts): площадки из AMOUNT_PARAM сами отбирают выдачу под сумму
+    запроса, поэтому под каждую сумму фишки, кроме cfg.amount, — свой запрос той же стороны. Только для связок, которые
+    уходят сигналом/карточкой; площадка на паузе — без запроса; ответ (и ошибка) кэшируется на INTERVAL (USDT) /
+    ALT_INTERVAL; свой бюджет DEPTH_CHIPS_MAX на скан (счётчик snap.extra["amounts"]); ошибка площадку не
+    останавливает, 403/429 — одна пауза без роста. Возвращает снимок с дополненными snap.groups (новые годные
+    объявления без дублей, из копий — свежая) или snap как есть."""
+    if s is None or snap is None:
+        return snap
+    amounts = DEPTH_AMOUNTS if amounts is None else amounts
+    _, b, sl, _ = deal
+    now = time.time()
+    wanted = []
+    for ad in (b, sl):
+        n = FETCHER_KEY.get(ad.ex)
+        if n not in AMOUNT_PARAM or n not in cfg.exchanges or FETCHERS.get(n) is not _ORIG_FETCHERS.get(n) \
+                or _venue_paused_until(n):
+            continue
+        wanted += [(n, ad.side, ad.asset, float(x)) for x in amounts if float(x) != float(cfg.amount)]
+    got, todo = {}, []
+    for w in dict.fromkeys(wanted):
+        ttl = cfg.interval if w[2] == "USDT" else cfg.alt_interval
+        hit = _amount_cache.get(w)
+        if hit and now - hit[0] < ttl:
+            got[w] = hit[1]
+        else:
+            todo.append(w)
+    left = depth_settings()["chips_max"] - snap.extra.get("amounts", 0)   # свой бюджет, вторые страницы его не едят
+    todo = todo[:max(0, left)]
+    if todo:
+        snap.extra["amounts"] = snap.extra.get("amounts", 0) + len(todo)
+        res = await asyncio.gather(*(asyncio.wait_for(FETCHERS[n](s, dataclasses.replace(cfg, amount=x), side, asset),
+                                                      DEPTH_TIMEOUT) for n, side, asset, x in todo),
+                                   return_exceptions=True)
+        for w, r in zip(todo, res):
+            got_at = time.time()
+            if isinstance(r, Exception):
+                # доп. запрос: площадку целиком не останавливаем (скан по ней идёт), сторону не повторяем до конца
+                # кэша; 403/429 — одна пауза без роста следующих
+                logger.warning("%s/%s/%s: запрос под сумму %g не пришёл: %s", *w, type(r).__name__)
+                _amount_cache[w] = (got_at, [])
+                if getattr(r, "status", None) in (403, 429):
+                    _venue_pause(w[0])
+                continue
+            for a in r:
+                a.fetched_ts = a.fetched_ts or got_at
+            _amount_cache[w] = (got_at, r)
+            got[w] = r
+    if not got:
+        return snap
+    groups = dict(snap.groups)
+    for (n, side, asset, _x), ads in got.items():
+        key = (MERCHANT_VENUES[n], side, asset)
+        extra = [a for a in ads if _fits(a, cfg, snap.refs, snap.blocked)]
+        if extra:
+            groups[key] = sorted(_dedup(list(groups.get(key, [])) + extra), key=lambda a: a.price,
+                                 reverse=(side == "sell"))
+    return dataclasses.replace(snap, groups=groups)
+
+
+async def collect(s, cfg, force_alt=False, blocked=frozenset()):
     """Сбор данных скана по сети: объявления площадок (с кэшами _alt и BestChange, бэкоффом площадок), ориентир
     Rapira, спот, справочник сетей, замеры запросов. Возвращает словарь аргументов assemble(): ts, ads, ref (None —
-    Rapira не ответила), ref_src, spot, errors, jobs. force_alt — как у scan()."""
+    Rapira не ответила), ref_src, spot, errors, jobs, extra (доп. запросы глубины). force_alt — как у scan().
+    Сторона, где стек годных объявлений полной первой страницы меньше DEPTH_PAGE2 × сумма круга, получает вторую
+    страницу (не больше DEPTH_PAGE2_MAX за скан, раунд — не дольше DEPTH_TIMEOUT; монеты кроме USDT — только когда их
+    опрос по ALT_INTERVAL и так идёт; площадка, упавшая в этом скане, — нет); blocked — блэклист для этой оценки."""
     t_scan = time.time()
     names_all = [n for n in cfg.exchanges if n in FETCHERS]
     key = (tuple(cfg.assets), tuple(names_all), cfg.amount)   # площадки фильтруют объявления по сумме
@@ -1575,7 +1816,8 @@ async def collect(s, cfg, force_alt=False):
 
     ads, errors, alt_ads, alt_errors = [], {}, [], {}
     venue_seen, venue_failed = set(), set()
-    for (n, _, asset), r, rec in zip(jobs, res, recs):
+    results = {}   # (площадка, сторона, монета) -> объявления первой страницы (ответившие запросы этого скана)
+    for (n, side, asset), r, rec in zip(jobs, res, recs):
         venue_seen.add(n)
         cached = asset != "USDT" and n != "bestchange"   # не-USDT монеты кэшируем на alt_interval
         if isinstance(r, Exception):
@@ -1584,9 +1826,39 @@ async def collect(s, cfg, force_alt=False):
             (alt_errors if cached else errors)[f"{n}/{asset}"] = f"{type(r).__name__}: {r}"[:120]
         else:
             _job_done(rec, r, _bc["t"] if n == "bestchange" else 0.0)
-            (alt_ads if cached else ads).extend(r)
+            results[(n, side, asset)] = list(r)
+
+    ref, ref_src = None, "-"
+    if ref_task:
+        try:
+            ref, ref_src = await ref_task, "Rapira USDT/RUB"
+        except Exception:
+            pass
+    try:
+        spot = await spot_task
+        spot_err = None
+    except Exception as e:
+        spot = {"Bybit": {"USDT": (1.0, 1.0)}}
+        spot_err = f"{type(e).__name__}: {e}"[:120]
+
+    # глубина: вторая страница там, где годных объявлений первой меньше DEPTH_PAGE2 × сумма круга (бюджет на скан)
+    first = [a for rs in results.values() for a in rs]
+    if ref is None:
+        usdt = [a.price for a in first if a.asset == "USDT"]
+        ref_est = statistics.median(usdt) if usdt else None
+    else:
+        ref_est = ref
+    refs = _refs(cfg, first, ref_est, spot)
+    wanted = _page2_wanted(results, cfg, refs, blocked, time.time(), failed=venue_failed)
+    page2, limited = await _fetch_page2(s, cfg, wanted[:max(0, depth_settings()["page2_max"])], results, recs, refs,
+                                        blocked)
+
+    for (n, side, asset), r in results.items():
+        (alt_ads if asset != "USDT" and n != "bestchange" else ads).extend(r)
     for n in venue_seen:   # бэкофф по площадке: сбрасываем на успехе, растим паузу на ошибке
         (_venue_backoff_fail if n in venue_failed else _venue_backoff_ok)(n)
+    for n in limited:   # 403/429 на второй странице — одна пауза без роста (после сброса бэкоффа первой страницы)
+        _venue_pause(n)
     for n, until in paused.items():
         errors[n] = f"пауза до {time.strftime('%H:%M', time.localtime(until))}"
     alt_recs = [r for r in recs if r["asset"] != "USDT" and r["ex"] != "bestchange"]
@@ -1598,42 +1870,27 @@ async def collect(s, cfg, force_alt=False):
     ads += alt_ads if force_alt else _alt["ads"]
     errors.update(alt_errors if force_alt else _alt["errors"])
 
-    ref, ref_src = None, "-"
-    if ref_task:
-        try:
-            ref, ref_src = await ref_task, "Rapira USDT/RUB"
-        except Exception:
-            pass
-    try:
-        spot = await spot_task
-    except Exception as e:
-        spot = {"Bybit": {"USDT": (1.0, 1.0)}}
-        errors["spot"] = f"{type(e).__name__}: {e}"[:120]
+    if spot_err:
+        errors["spot"] = spot_err
     recs += ([ref_rec] if ref_task else []) + [spot_rec, net_rec]
     errors.update({f"сети/{k}": v for k, v in net_errors.items()})
-    return {"ts": t_scan, "ads": ads, "ref": ref, "ref_src": ref_src, "spot": spot, "errors": errors, "jobs": recs}
+    return {"ts": t_scan, "ads": ads, "ref": ref, "ref_src": ref_src, "spot": spot, "errors": errors, "jobs": recs,
+            "extra": {"page2": page2}}
 
 
 def assemble(cfg, ads, ref=None, ref_src="-", spot=None, errors=None, blocked=frozenset(), over_banks=frozenset(),
-             ts=0.0, jobs=()):
+             ts=0.0, jobs=(), extra=None):
     """Сборка снимка из данных скана без сети и файлов: ориентиры (ref None — медиана P2P USDT), фильтры и отсев
     аномалий, стаканы, связки, сортировка «прибыль × надёжность». blocked — блэклист (ex, nick), over_banks — свои
     банки за лимитом СБП; отсеянные ловушки — в snap.traps (в TRAPS_LOG их кладёт scan). Справочник сетей —
-    живой netstatus (replay.py подставляет сохранённый в снимке). Тот же вход с другим cfg — replay.py."""
+    живой netstatus (replay.py подставляет сохранённый в снимке). Тот же вход с другим cfg — replay.py.
+    extra — счётчик доп. запросов глубины скана (collect), в snap.extra."""
     spot = spot if spot is not None else {"Bybit": {"USDT": (1.0, 1.0)}}
     errors = dict(errors or {})
     if ref is None:
         usdt = [a.price for a in ads if a.asset == "USDT"]
         ref, ref_src = (statistics.median(usdt), "медиана P2P") if usdt else (None, "-")
-    refs = {}
-    for a in cfg.assets:
-        mid = _mid(spot, a)
-        if ref and mid:
-            refs[a] = ref * mid
-        else:
-            p = [x.price for x in ads if x.asset == a]
-            if p:
-                refs[a] = statistics.median(p)
+    refs = _refs(cfg, ads, ref, spot)
 
     best, dropped, networks, traps = {}, {}, {}, []
     for a in ads:
@@ -1694,7 +1951,7 @@ def assemble(cfg, ads, ref=None, ref_src="-", spot=None, errors=None, blocked=fr
             if d:
                 deals.append(d)
     snap = Snapshot(ref or 0, ref_src, refs, best, [], networks, dropped, errors, groups, spot, over_banks, book,
-                    ts=ts, jobs=list(jobs), ads=ads, blocked=frozenset(blocked), traps=traps)
+                    ts=ts, jobs=list(jobs), ads=ads, blocked=frozenset(blocked), traps=traps, extra=dict(extra or {}))
     # сортировка «прибыль × надёжность» — score(): каждая единица веса риска снимает risk_penalty п.п. с профита
     deals.sort(key=lambda d: score(d, cfg, snap), reverse=True)
     # обменники разных сетей дают по связке на одну и ту же пару площадок; бот сигналит по паре
@@ -1712,8 +1969,9 @@ async def scan(s, cfg, force_alt=False):
     """Скан: сбор по сети (collect) и сборка снимка (assemble) с текущим блэклистом и банками за лимитом СБП.
     force_alt — разовый скан под свою сумму (`/calc`, «своя сумма»): всегда опросить не-USDT монеты
     заново и не трогать общий кэш _alt, потому что лимиты объявлений зависят от cfg.amount."""
-    raw = await collect(s, cfg, force_alt)
-    snap = assemble(cfg, blocked=blacklist.blocked(),
+    blocked = blacklist.blocked()
+    raw = await collect(s, cfg, force_alt, blocked=blocked)
+    snap = assemble(cfg, blocked=blocked,
                     over_banks=trades.banks_over_limit(trades.own_banks()[0]),   # свои банки, у которых лимит СБП исчерпан
                     **raw)
     TRAPS_LOG.extend(snap.traps)
