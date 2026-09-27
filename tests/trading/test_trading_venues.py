@@ -584,3 +584,20 @@ def test_no_urls_outside_accounts_bases():
         urls = {n.value for n in ast.walk(tree) if isinstance(n, ast.Constant) and isinstance(n.value, str)
                 and "://" in n.value}
         assert urls == set(), mod.__name__   # хосты — только accounts.BYBIT_BASE / BINGX_BASE
+
+
+def test_resolve_needs_exactly_one_good_candidate_and_no_errors(monkeypatch):
+    """Кандидатов больше одного: торгуется, только если «да» ровно у одного и проверка ни одного не сорвалась —
+    иначе сбой проверки второго кандидата мог бы скрыть, что их два (не угадываем)."""
+    monkeypatch.setitem(venues.CANDIDATES, ("bybit", "linear"), {"TONUSDT": ("GRAMUSDT", "TONUSDT")})
+    s = Session(bybit_instrument("GRAMUSDT"))                  # TONUSDT не из allowlist → ошибка проверки
+    mapping, why = run(venues.resolve_symbols(s, "bybit", "linear"))
+    assert mapping == {"TONUSDT": None} and "ошибка проверки" in why["TONUSDT"]
+    monkeypatch.setitem(venues.CANDIDATES, ("bybit", "linear"), {"TONUSDT": ("BTCUSDT", "ETHUSDT")})
+    both = {("GET", "/v5/market/instruments-info"): lambda c: bybit_ok({"list": [
+                {"symbol": c["query"]["symbol"], "status": "Trading", "contractType": "LinearPerpetual",
+                 "quoteCoin": "USDT", "settleCoin": "USDT"}]}),
+            ("GET", "/v5/market/tickers"): lambda c: bybit_ok({"list": [{"symbol": c["query"]["symbol"],
+                                                                         "turnover24h": "9e9"}]})}
+    mapping, why = run(venues.resolve_symbols(Session(both), "bybit", "linear"))
+    assert mapping == {"TONUSDT": None} and "несколько" in why["TONUSDT"]
