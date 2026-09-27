@@ -276,15 +276,20 @@ def _row_side(p):
     return side
 
 
+def _perp(category):
+    return category in ("linear", "swap")
+
+
 def netting_conflicts(rows, venue, symbol, strategy, group, side, has_stop):
-    """Причины не открывать из-за своих же позиций бота на том же символе биржи (односторонний режим сальдирует):
-    другая стратегия/группа со встречной стороной — сальдирование; с той же стороной, если у кого-то есть стоп, —
-    стоп tpslMode=Full / stopLoss одной заменит или закроет всю позицию символа (перекрывающиеся стопы)."""
+    """Причины не открывать перп из-за своих же перп-позиций бота на том же символе биржи (односторонний режим
+    сальдирует; спот — отдельные монеты, не сальдируется): другая стратегия/группа со встречной стороной —
+    сальдирование; с той же стороной, если у кого-то есть стоп, — стоп tpslMode=Full / stopLoss одной заменит или
+    закроет всю позицию символа (перекрывающиеся стопы)."""
     want = "long" if side == "buy" else "short"
     me = (strategy, _gid(venue, symbol, group))
     out = []
     for p in rows or ():
-        if p.get("venue") != venue or p.get("symbol") != symbol:
+        if p.get("venue") != venue or p.get("symbol") != symbol or not _perp(p.get("category")):
             continue
         if (p.get("strategy"), _gid(p.get("venue"), p.get("symbol"), p.get("group"))) == me:
             continue
@@ -298,13 +303,15 @@ def netting_conflicts(rows, venue, symbol, strategy, group, side, has_stop):
     return out
 
 
-def _size_problems(rows, venue, symbol, strategy, group, qty, notional, lim, hedge_ref_qty=None, need_ref=True):
-    """Итоговый размер: нога (биржа, символ, стратегия) и всё открытое — с позициями и ожидающими открытиями бота;
-    число групп стратегии; хедж — вся группа ≤ монета круга × 1.05."""
+def _size_problems(rows, venue, symbol, strategy, group, qty, notional, lim, hedge_ref_qty=None, need_ref=True,
+                   category="linear"):
+    """Итоговый размер: нога (биржа, спот/перп, символ, стратегия) и всё открытое — с позициями и ожидающими
+    открытиями бота; число групп стратегии; хедж — вся группа ≤ монета круга × 1.05."""
     bad = []
     rows = list(rows or ())
     leg = sum((_d(p.get("notional"), "номинал позиции") for p in rows if p.get("venue") == venue
-               and p.get("symbol") == symbol and p.get("strategy") == strategy), D(0)) + notional
+               and p.get("symbol") == symbol and p.get("strategy") == strategy
+               and _perp(p.get("category")) == _perp(category)), D(0)) + notional
     if leg > lim["position_usdt"]:
         bad.append(f"итоговая позиция {leg:.2f} USDT (с открытой и ожидающими ордерами) > {lim['position_usdt']} USDT")
     total = sum((_d(p.get("notional"), "номинал позиции") for p in rows), D(0)) + notional
@@ -425,7 +432,7 @@ def _check_open(req, ctx, mode, environ):
 
     # итоговый размер, группы, свои встречные позиции и стопы
     bad += _size_problems(ctx.positions, req.venue, req.symbol, req.strategy, req.group, qty, notional, lim,
-                          req.hedge_ref_qty)
+                          req.hedge_ref_qty, category=req.category)
     if perp:
         bad += netting_conflicts(ctx.positions, req.venue, req.symbol, req.strategy, req.group, req.side,
                                  stop is not None)
@@ -501,7 +508,7 @@ def _guard_open(order, strategy, group, mode, mark, instrument, leverage, margin
     notional = qty * entry
     bad += _instrument_problems(order.side, qty, price, stop, entry, instrument)
     bad += _size_problems(exposure, order.venue, order.symbol, strategy, group, qty, notional, lim,
-                          need_ref=False)   # хедж ≤ монета круга × 1.05 — в check_open вызывающего (круг знает он)
+                          need_ref=False, category=order.category)   # хедж ≤ монета круга × 1.05 — в check_open вызывающего (круг знает он)
     loss = max(D(0), -_d(realized_today, "результат дня"))
     room = lim["daily_loss_usdt"] - loss
     if loss >= lim["daily_loss_usdt"]:

@@ -409,6 +409,18 @@ def test_spot_funding_buy_checks_orders_of_symbol():
     assert "спот — только покупка ноги фандинга" in submit(s, buy, strategy="hedge")["reason"]
 
 
+def test_funding_spot_buy_and_perp_short_on_one_venue_symbol():
+    """Спот-нога не сальдируется с перп-ногой: шорт перпа фандинга после покупки спота на той же бирже — можно."""
+    book = Book()
+    s = Session(book.routes("bybit"))
+    spot = venues.Order("bybit", "spot", "ETHUSDT", "buy", "market", "0.01")
+    perp = venues.Order("bybit", "linear", "ETHUSDT", "sell", "market", "0.01")
+    assert submit(s, spot, strategy="funding", group="f1")["state"] == "open"
+    res = submit(s, perp, strategy="funding", group="f1")
+    assert res["state"] == "open", res["reason"]
+    assert [body(c)["category"] for c in creates(s)] == ["spot", "linear"]
+
+
 def test_position_actions_only_for_bot_positions_from_exchange():
     """venues.positions отдаёт и позиции владельца; own_positions помечает свои — сопровождение трогает только их."""
     book = Book()

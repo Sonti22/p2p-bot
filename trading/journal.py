@@ -307,17 +307,17 @@ def _price_hint(r):
 def bot_book(venue, category, symbol, path=None):
     """Позиция бота по символу биржи — по журналу: {net (знаковое сальдо: исполненные ордера ± поправки), keys
     {(стратегия, группа): {net, pending_open, pending_side, pending_reduce {buy, sell}, stop, px}}, client_ids (все id
-    бота по символу), active (open/unknown), uncertain (prepared/sending/unknown), pending_reduce {buy, sell}, stop
-    (последний стоп позиции бота или None)}."""
+    бота на этой бирже — ордер с таким id наш), active (open/unknown), uncertain (prepared/sending/unknown),
+    pending_reduce {buy, sell}, stop (последний стоп позиции бота или None)}."""
     rows = _rows("SELECT * FROM orders WHERE venue=? AND category=? AND symbol=? ORDER BY id", (venue, category, symbol),
                  path)
     adj = _rows("SELECT * FROM adjust WHERE venue=? AND category=? AND symbol=? ORDER BY id", (venue, category, symbol),
                 path)
     stop = _rows("SELECT price FROM stops WHERE venue=? AND symbol=?", (venue, symbol), path)
-    book = {"net": D0, "keys": {}, "client_ids": set(), "active": [], "uncertain": [],
+    ids = {r["client_id"] for r in _rows("SELECT client_id FROM orders WHERE venue=?", (venue,), path)}
+    book = {"net": D0, "keys": {}, "client_ids": ids, "active": [], "uncertain": [],
             "pending_reduce": {"buy": D0, "sell": D0}, "stop": venues.dec(stop[0]["price"]) if stop else None}
     for r in rows:
-        book["client_ids"].add(r["client_id"])
         if r["state"] == "rejected":
             continue
         k = book["keys"].setdefault((r["strategy"] or "", r["grp"] or ""), _key_book())
