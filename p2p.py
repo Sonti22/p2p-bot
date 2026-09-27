@@ -1073,6 +1073,23 @@ def route_hops(b, s, cfg, spot, over_banks=frozenset()):
     return {"venues": [venue1, venue2], "hops": hops}
 
 
+def spot_venues_ready(spot, venues, b_asset, s_asset):
+    """Тикеры площадок конвертации, сохранённых при старте круга (route_hops), ещё есть в свежем snap.spot?
+    Для сухого прогона на стадии sell: площадку, выбранную на старте, не переподбираем — сбой её тикера
+    (временный или общий сбой сбора спота, тогда spot почти пуст) должен ждать возврата, а не молча уводить
+    круг на другую биржу. venues пуст (простая связка, спот не участвует) — всегда готово."""
+    if not venues:
+        return True
+    if len(venues) == 1:
+        v = venues[0]
+        if "USDT" in (b_asset, s_asset):
+            alt = s_asset if b_asset == "USDT" else b_asset
+            return alt in spot.get(v, {})
+        return b_asset in spot.get(v, {}) and s_asset in spot.get(v, {})
+    v1, v2 = venues
+    return b_asset in spot.get(v1, {}) and s_asset in spot.get(v2, {})
+
+
 def _match(b, sell_ads, cfg, spot, over_banks=frozenset()):
     """Связка покупки b со стаканом продажи (sell_ads отсортированы: лучшая цена первой). Продажа
     собирается под фактический выход монеты маршрута: при прибыли его больше, чем сумма круга / цена,
