@@ -200,3 +200,30 @@ def test_stale_mark_on_missing_message_is_not_retried(monkeypatch):
     now[0] += B.STALE_RETRY_MAX
     asyncio.run(bot.mark_stale_deals(set()))
     assert len(_edits(bot)) == 1 and bot.live_msg[KEY]["stale"]
+
+
+# --- №15: кнопка «✖» в /fav удаляет маршрут, который на ней написан ------------------------------------------------
+
+def test_old_favdel_button_removes_only_its_route(monkeypatch):
+    monkeypatch.setattr(B, "deal_card", lambda d, c, a=None, r=None, breakdown=None: b"png")
+    bot = Stub(p2p.Config())
+    favorites.toggle(("HTX", "USDT", "KuCoin", "USDT"))
+    favorites.toggle(("MEXC", "USDT", "Bybit", "USDT"))
+    _, kb = bot.favorites_view()
+    old = {b["text"]: b["callback_data"] for row in kb["inline_keyboard"] for b in row}
+    press = {"id": "1", "data": old["✖ 1. HTX USDT → KuCoin USDT"], "message": {"message_id": 4}}
+    favorites.toggle(("Bybit", "USDT", "MEXC", "USDT"))       # список сменился: новый маршрут встал первым
+    asyncio.run(bot.on_callback(press))
+    assert favorites.keys() == {"MEXC|USDT|Bybit|USDT", "Bybit|USDT|MEXC|USDT"}
+    asyncio.run(bot.on_callback(press))                       # та же кнопка ещё раз — маршрута уже нет
+    assert favorites.keys() == {"MEXC|USDT|Bybit|USDT", "Bybit|USDT|MEXC|USDT"}
+    edit = [p for m, p in bot.out if m == "editMessageText"][-1]
+    assert "уже нет" in edit["text"] and "Bybit USDT → MEXC USDT" in edit["text"]
+
+
+def test_favdel_button_fits_telegram_callback_limit():
+    """callback_data у Telegram — до 64 байт: и самый длинный маршрут (BestChange ↔ BitPapa) в кнопку влезает."""
+    bot = Stub(p2p.Config())
+    favorites.toggle(("BestChange", "USDT", "BitPapa", "USDT"))
+    _, kb = bot.favorites_view()
+    assert all(len(b["callback_data"].encode()) <= 64 for row in kb["inline_keyboard"] for b in row)
