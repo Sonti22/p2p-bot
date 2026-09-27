@@ -339,3 +339,44 @@ def test_every_setting_is_documented_in_env_example():
         names |= set(re.findall(r"(?:getenv|env_float|_on|f)\(\"([A-Z][A-Z_]+)\"", inspect.getsource(mod)))
     assert {"PERPS", "PAPER_HEDGE", "SIM_FUNDING", "SIM_DIRECTIONAL", "FUND_SPOT_FEE", "DIR_STOP_SLIP"} <= names
     assert names - documented == set()
+
+
+def _kline_series(start, n):
+    return [(start + i * 3600, 100.0, 101.0, 99.0, 100.0) for i in range(n)]
+
+
+def _kline_get(series, limits):
+    """Ответ /v5/market/kline: последние limit свечей series (новые первыми), limit запоминаем."""
+    async def get(s, url):
+        limit = int(re.search(r"limit=(\d+)", url)[1])
+        limits.append(limit)
+        rows = sorted(series)[-limit:][::-1]
+        return {"retCode": 0, "result": {"list": [[str(int(r[0] * 1000)), *map(str, r[1:]), "0", "0"]
+                                                  for r in rows]}}
+    return get
+
+
+def test_klines_after_downtime_fill_the_whole_gap():
+    """В кеше 200 свечей, бот стоял 50 ч: догружаем от последней свечи, а не 5 штук — дыры нет."""
+    start = (NOW // 3600) * 3600 - 300 * 3600
+    series = _kline_series(start, 300)                  # у площадки — всё до текущего часа
+    perp._klines[("Bybit", "BTCUSDT")] = series[:250]   # у нас — до 50 ч назад
+    limits = []
+    asyncio.run(perp._bybit_klines(None, _kline_get(series, limits), "BTCUSDT", NOW))
+    assert limits and limits[0] >= 51
+    got = [k[0] for k in perp.klines("Bybit", "BTCUSDT")]
+    assert got == [k[0] for k in series] and perp.kline_gap("Bybit", "BTCUSDT") is None
+
+
+def test_klines_unrecoverable_gap_keeps_only_contiguous_tail():
+    """Разрыв длиннее KLINE_FULL — дозагрузить нельзя: в кеше только непрерывный хвост, разрыв виден (kline_gap)."""
+    start = (NOW // 3600) * 3600 - 3000 * 3600
+    series = _kline_series(start, 3000)
+    perp._klines[("Bybit", "BTCUSDT")] = series[:500]   # последней свече ~2500 ч
+    limits = []
+    asyncio.run(perp._bybit_klines(None, _kline_get(series, limits), "BTCUSDT", NOW))
+    assert limits == [perp.KLINE_FULL]
+    got = perp.klines("Bybit", "BTCUSDT")
+    assert [k[0] for k in got] == [k[0] for k in series[-perp.KLINE_FULL:]]
+    assert all(b[0] - a[0] == 3600 for a, b in zip(got, got[1:]))
+    assert perp.kline_gap("Bybit", "BTCUSDT") == (series[499][0], series[-perp.KLINE_FULL][0])

@@ -176,6 +176,7 @@ _spot = {}          # (площадка, символ) -> PerpQuote(kind="spot")
 _instr = {}         # (площадка, символ) -> Instrument
 _klines = {}        # (площадка, символ) -> [(начало, o, h, l, c)] по возрастанию времени
 _kline_srv = {}     # (площадка, символ) -> время сервера, когда свечи загружены (свеча закрыта раньше — она полная)
+_kline_gap = {}     # (площадка, символ) -> (последняя свеча до разрыва, первая после) — последний невосстановимый разрыв
 _skew = {}          # площадка -> сдвиг часов, сек
 _backoff = {}       # площадка -> {"delay", "until"}
 _meta = {"t": 0.0, "info_t": {}, "time_t": {}, "kline_t": {}, "errors": {}, "ok_t": {}}
@@ -183,7 +184,7 @@ _meta = {"t": 0.0, "info_t": {}, "time_t": {}, "kline_t": {}, "errors": {}, "ok_
 
 def reset():
     """Для тестов: забыть всё состояние модуля."""
-    for d in (_quotes, _spot, _instr, _klines, _kline_srv, _skew, _backoff):
+    for d in (_quotes, _spot, _instr, _klines, _kline_srv, _kline_gap, _skew, _backoff):
         d.clear()
     _meta.update(t=0.0, info_t={}, time_t={}, kline_t={}, errors={}, ok_t={})
 
@@ -452,6 +453,12 @@ def kline_time(venue, symbol):
     return _kline_srv.get((venue, symbol))
 
 
+def kline_gap(venue, symbol):
+    """Последний невосстановимый разрыв свечей (начало последней свечи до него, первой после) или None: свечи до
+    разрыва из кеша выброшены, стратегии на свечах (simdirectional) нужна пауза, пока хвост не станет достаточным."""
+    return _kline_gap.get((venue, symbol))
+
+
 def status(now=None):
     """Для /funding и /futures: ошибки, паузы, время последнего ответа, неторгуемые символы."""
     now = time.time() if now is None else now
@@ -539,12 +546,24 @@ async def _bybit_klines(s, get, sym, now):
     if not (_due("kline_t", key, KLINE_TTL, now) or _new_hour(key, now)):
         return
     have = _klines.get(key) or []
-    limit = 5 if len(have) >= 200 else KLINE_FULL
+    if len(have) >= 200:   # догружаем от последней свечи кеша до текущего часа (+2 — текущая и запас), не меньше 5
+        missing = (now - _skew.get("Bybit", 0.0) - have[-1][0]) // 3600 + 2
+        limit = int(min(KLINE_FULL, max(5, missing)))
+    else:
+        limit = KLINE_FULL
     rows = parse_bybit_klines(await get(s, f"{BYBIT}/v5/market/kline?category=linear&symbol={sym}&interval=60"
                                            f"&limit={limit}"))
     merged = {r[0]: r for r in have}
     merged.update({r[0]: r for r in rows})
-    _klines[key] = sorted(merged.values())[-KLINE_FULL:]
+    series = sorted(merged.values())
+    # разрыв (бот стоял дольше, чем можно догрузить одним запросом, или площадка отдала не все часы): старые свечи до
+    # разрыва индикаторам не годятся — в кеше только непрерывный хвост, сам разрыв виден стратегии (kline_gap)
+    for i in range(len(series) - 1, 0, -1):
+        if series[i][0] - series[i - 1][0] > 3600:
+            _kline_gap[key] = (series[i - 1][0], series[i][0])
+            series = series[i:]
+            break
+    _klines[key] = series[-KLINE_FULL:]
     _meta["kline_t"][key] = now
     _kline_srv[key] = now - _skew.get("Bybit", 0.0)   # момент запроса: всё, что закрылось раньше, пришло целиком
 
