@@ -69,7 +69,9 @@ def _value(name, text):
         return _dict_value(name, text)
     if kind == "list":
         items = [x.strip() for x in text.split(",") if x.strip()]
-        return [x.upper() for x in items] if name == "assets" else items
+        if name == "assets":
+            return [x.upper() for x in items]
+        return [x.lower() for x in items] if name == "exchanges" else items   # ключи FETCHERS, как EXCHANGES в .env
     return text
 
 
@@ -99,12 +101,22 @@ def stored_networks(net):
         netstatus.STATUS.update(saved)
 
 
+def enabled_ads(ads, cfg):
+    """Объявления только включённых в cfg площадок и монет — как их собрал бы живой скан (p2p.collect опрашивает
+    только cfg.exchanges и cfg.assets); в снимке — всё, что было включено при записи. Ключ площадки → Ad.ex —
+    p2p.MERCHANT_VENUES."""
+    venues = {p2p.MERCHANT_VENUES[n] for n in cfg.exchanges if n in p2p.MERCHANT_VENUES}
+    return [a for a in ads if a.ex in venues and a.asset in cfg.assets]
+
+
 def rebuild(scan, cfg):
     """Снимок p2p.Snapshot из сохранённого скана при настройках cfg (объявления каждый раз свежие — фильтры
-    меняют у них способы оплаты)."""
+    меняют у них способы оплаты). Выключенные в cfg площадки и монеты отсеиваются до сборки (enabled_ads) — их нет
+    ни в ориентирах, ни в стаканах, ни в связках."""
     spot = {v: {a: tuple(p) for a, p in q.items()} for v, q in (scan.get("spot") or {}).items()}
+    ads = enabled_ads(snapshots.ads_of(scan), cfg)
     with stored_networks(scan.get("net")):
-        return p2p.assemble(cfg, snapshots.ads_of(scan), ref=scan.get("ref") or None, ref_src=scan.get("ref_src", "-"),
+        return p2p.assemble(cfg, ads, ref=scan.get("ref") or None, ref_src=scan.get("ref_src", "-"),
                             spot=spot or None, errors=scan.get("errors"),
                             blocked=frozenset(tuple(x) for x in scan.get("blocked") or ()),
                             over_banks=frozenset(scan.get("over_banks") or ()), ts=scan.get("ts", 0.0))
