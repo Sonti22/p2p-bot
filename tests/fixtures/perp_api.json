@@ -582,6 +582,17 @@
   "retExtInfo": {},
   "time": 1790494000000
  },
+ "bybit_instr_TONCOINUSDT": {
+  "retCode": 0,
+  "retMsg": "OK",
+  "result": {
+   "category": "linear",
+   "list": [],
+   "nextPageCursor": ""
+  },
+  "retExtInfo": {},
+  "time": 1790494000000
+ },
  "bybit_spot_TONUSDT_error": {
   "retCode": 10001,
   "retMsg": "Not supported symbols",
@@ -787,6 +798,117 @@
     [
      "2709.50",
      "20"
+    ]
+   ]
+  }
+ },
+ "bingx_contract_GRAMTON-USDT": {
+  "code": 0,
+  "msg": "",
+  "data": [
+   {
+    "contractId": "103391",
+    "symbol": "GRAMTON-USDT",
+    "size": "0.001",
+    "quantityPrecision": 3,
+    "pricePrecision": 3,
+    "feeRate": 0.0005,
+    "makerFeeRate": 0.0002,
+    "takerFeeRate": 0.0005,
+    "tradeMinLimit": 0,
+    "tradeMinQuantity": 1.26,
+    "tradeMinUSDT": 2,
+    "currency": "USDT",
+    "asset": "GRAMTON",
+    "status": 1,
+    "apiStateOpen": "true",
+    "apiStateClose": "true",
+    "launchTime": 1783072800000,
+    "maintainTime": 0,
+    "offTime": 0,
+    "displayName": "GRAM-USDT"
+   }
+  ]
+ },
+ "bingx_contract_TONCOIN-USDT": {
+  "code": 109418,
+  "msg": "TONCOIN-USDT is offline currently,all validted symbols in api:/openApi/swap/v2/quote/contracts, please verify it",
+  "data": {}
+ },
+ "bingx_premium_GRAMTON-USDT": {
+  "code": 0,
+  "msg": "",
+  "data": {
+   "symbol": "GRAMTON-USDT",
+   "markPrice": "1.587",
+   "indexPrice": "1.586",
+   "lastFundingRate": "0.00005000",
+   "nextFundingTime": 1790496000000,
+   "fundingIntervalHours": 4,
+   "minFundingRate": "-0.02",
+   "maxFundingRate": "0.02",
+   "updateTime": 1790481600000
+  }
+ },
+ "bingx_depth_GRAMTON-USDT": {
+  "code": 0,
+  "msg": "",
+  "data": {
+   "T": 1790495435434,
+   "bids": [
+    [
+     "1.587",
+     "20.947"
+    ],
+    [
+     "1.586",
+     "7588.811"
+    ],
+    [
+     "1.585",
+     "10345.622"
+    ]
+   ],
+   "asks": [
+    [
+     "1.590",
+     "7419.057"
+    ],
+    [
+     "1.591",
+     "7371.991"
+    ],
+    [
+     "1.592",
+     "9329.790"
+    ]
+   ],
+   "bidsCoin": [
+    [
+     "1.587",
+     "20.947"
+    ],
+    [
+     "1.586",
+     "7588.811"
+    ],
+    [
+     "1.585",
+     "10345.622"
+    ]
+   ],
+   "asksCoin": [
+    [
+     "1.590",
+     "7419.057"
+    ],
+    [
+     "1.591",
+     "7371.991"
+    ],
+    [
+     "1.592",
+     "9329.790"
     ]
    ]
   }

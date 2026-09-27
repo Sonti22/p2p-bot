@@ -79,28 +79,41 @@ def test_refresh_builds_quotes_and_skips_closed_symbols():
     assert bx.funding_rate == pytest.approx(0.000024) and bx.lot == 0.0001 and bx.taker_fee == pytest.approx(0.05)
     assert bx.bids[0] == (84474.5, 0.001)
     gram = perp._quotes[("Bybit", "GRAMUSDT")]   # бывший TON: фандинг раз в 4 ч, лот 0.1
-    assert gram.interval_h == 4 and gram.lot == 0.1 and perp.asset_symbol("TON") == "GRAMUSDT"
-    assert ("BingX", "GRAMUSDT") not in perp._quotes                                  # на BingX его нет
-    assert not any("GRAM" in u and "premiumIndex" in u for u in calls)                 # не торгуется — не опрашиваем
+    assert gram.interval_h == 4 and gram.lot == 0.1 and gram.asset == "TON"
+    gx = perp._quotes[("BingX", "GRAMTONUSDT")]   # на BingX тот же TON — GRAMTON-USDT
+    assert gx.interval_h == 4 and gx.lot == 0.001 and gx.min_qty == 1.26 and gx.asset == "TON"
+    assert perp.quote_for("BingX", "TON", now=gx.ts) is gx and perp.spot_for("Bybit", "TON", now=gx.ts).kind == "spot"
+    assert any("premiumIndex?symbol=GRAMTON-USDT" in u for u in calls)
+    assert not any("GRAM-USDT" in u for u in calls)   # BingX GRAM-USDT — другой токен, его не спрашиваем
     assert perp._spot[("Bybit", "BTCUSDT")].kind == "spot"
     assert perp.klines("Bybit", "BTCUSDT")[0][0] < perp.klines("Bybit", "BTCUSDT")[-1][0]
     assert all(u.split("/")[2] in perp.HOSTS for u in calls)
-    assert "нет в списке" in perp.status()["closed"][("BingX", "GRAMUSDT")]
+    assert perp.status()["closed"] == {}
 
 
-def test_closed_symbol_is_skipped_not_an_error(monkeypatch):
-    """TONUSDT на Bybit закрыт (Closed): тикер и стакан не запрашиваем, спот TON площадка не знает — ошибка только
-    спота, котировки BTC и пауза площадки не страдают."""
-    monkeypatch.setenv("PERP_SYMBOLS", "BTCUSDT,TONUSDT")
+def test_venue_symbol_table():
+    assert perp.venue_symbol("Bybit", "TON") == "GRAMUSDT" and perp.venue_symbol("BingX", "TON") == "GRAMTONUSDT"
+    assert perp.venue_symbol("BingX", "btc") == "BTCUSDT" and perp.bingx_symbol("GRAMTONUSDT") == "GRAMTON-USDT"
+    assert perp.venue_symbols("BingX", ["BTC", "TON"]) == {"BTCUSDT": "BTC", "GRAMTONUSDT": "TON"}
+
+
+def test_closed_or_offline_symbol_is_skipped_not_an_error(monkeypatch):
+    """Символ закрыт (Bybit TONUSDT — Closed) или снят (BingX TONCOIN-USDT — 109418): тикер и стаканы не запрашиваем,
+    ошибок нет, котировки BTC и пауза площадки не страдают."""
+    monkeypatch.setitem(perp.VENUE_SYMBOLS, "TON", {"Bybit": "TONUSDT", "BingX": "TONCOINUSDT"})
+    monkeypatch.setenv("PERP_ASSETS", "BTC,TON")
     calls = []
     j = api()
     errors = asyncio.run(perp.refresh(None, make_get({"bybit_spot_TONUSDT": j["bybit_spot_TONUSDT_error"]},
                                                      calls=calls), now=NOW))
-    assert set(errors) == {"Bybit/spot/TONUSDT"} and "Not supported" in errors["Bybit/spot/TONUSDT"]
+    assert errors == {}
     assert ("Bybit", "TONUSDT") not in perp._quotes and ("Bybit", "BTCUSDT") in perp._quotes
-    assert not any("TON" in u and ("tickers" in u or "category=linear&symbol=TON" in u and "orderbook" in u)
-                   for u in calls)
-    assert "Bybit" not in perp._backoff and "Closed" in perp.status()["closed"][("Bybit", "TONUSDT")]
+    assert [u for u in calls if "TON" in u] == [
+        f"{perp.BYBIT}/v5/market/instruments-info?category=linear&symbol=TONUSDT",
+        f"{perp.BINGX}/openApi/swap/v2/quote/contracts?symbol=TONCOIN-USDT"]
+    closed = perp.status()["closed"]
+    assert "Closed" in closed[("Bybit", "TONUSDT")] and "offline" in closed[("BingX", "TONCOINUSDT")]
+    assert not perp._backoff
 
 
 def test_backoff_per_venue_and_recovery():

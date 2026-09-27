@@ -17,10 +17,10 @@ NOW = 1790494000.0
 @pytest.fixture(autouse=True)
 def _clean(monkeypatch):
     perp.reset()
-    for k in ("SIM_FUNDING", "FUND_SYMBOLS", "FUND_NOTIONAL", "FUND_ENTRY_APR", "FUND_EXIT_APR", "FUND_PAYBACK_HOURS",
+    for k in ("SIM_FUNDING", "FUND_ASSETS", "FUND_NOTIONAL", "FUND_ENTRY_APR", "FUND_EXIT_APR", "FUND_PAYBACK_HOURS",
               "FUND_MAX_BASIS", "FUND_STOP", "FUND_MAX_DAYS", "FUND_MAX_OPEN", "FUND_SPOT_FEE", "PERP_MAX_AGE"):
         monkeypatch.delenv(k, raising=False)
-    monkeypatch.setenv("FUND_SYMBOLS", "BTCUSDT")
+    monkeypatch.setenv("FUND_ASSETS", "BTC")
     yield
     perp.reset()
 
@@ -61,7 +61,7 @@ def test_open_settle_both_legs_and_close(tmp_path, monkeypatch):
     t = NOW + 600
     _market(0.0001, 0.0006, next_funding=t)
     out = SF.tick(now=NOW, path=db)
-    assert out["opened"] == [{"scheme": "perp_perp", "symbol": "BTCUSDT", "apr": pytest.approx(SF.apr(0.0005 / 8))}]
+    assert out["opened"] == [{"scheme": "perp_perp", "symbol": "BTC", "apr": pytest.approx(SF.apr(0.0005 / 8))}]
     assert SF.tick(now=NOW + 1, path=db)["opened"] == []   # одна позиция на (схему, символ)
     # до расчёта ставки сменились — спишутся последние перед расчётом
     perp.reset()
@@ -128,7 +128,7 @@ def test_view_text(tmp_path):
     _market(0.0, 0.0005)
     SF.tick(now=NOW, path=db)
     text = SF.view(db, now=NOW + 60)
-    assert "Арбитраж фандинга" in text and "перп–перп BTCUSDT" in text and "&lt;" in text   # «<» экранирован
+    assert "Арбитраж фандинга" in text and "перп–перп BTC:" in text and "&lt;" in text   # «<» экранирован
     assert "<b>Сейчас</b>" in text
 
 

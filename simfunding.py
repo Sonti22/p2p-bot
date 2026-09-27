@@ -1,6 +1,6 @@
 """Бумажный арбитраж фандинга — только симуляция на публичных котировках perp.py, ордеров нет. База data/sim_funding.db.
 
-Две схемы на одном символе (FUND_SYMBOLS, по умолчанию BTCUSDT,ETHUSDT,GRAMUSDT):
+Две схемы на одной монете (FUND_ASSETS, по умолчанию BTC,ETH,TON; символ на площадке — perp.venue_symbol):
   perp_perp — лонг перпа там, где ставка (в час) ниже, шорт — где выше (Bybit ↔ BingX): доход — разница ставок;
   spot_perp — лонг спота Bybit + шорт перпа Bybit: доход — ставка, пока она положительная.
 Учёт: фандинг каждой ноги в её собственный расчёт (perp.settle — ставка из последней котировки до расчёта, mark
@@ -11,7 +11,7 @@
 (схему, символ), за тик — одна новая. Выход: после ≥ 1 расчёта доходность ниже FUND_EXIT_APR (или сразу — если
 ставка развернулась сильнее −FUND_ENTRY_APR), MTM хуже −FUND_STOP % позиции, срок FUND_MAX_DAYS.
 
-Настройки .env: SIM_FUNDING (1), FUND_SYMBOLS, FUND_NOTIONAL (1000 USDT на ногу), FUND_ENTRY_APR (20),
+Настройки .env: SIM_FUNDING (1), FUND_ASSETS, FUND_NOTIONAL (1000 USDT на ногу), FUND_ENTRY_APR (20),
 FUND_EXIT_APR (5), FUND_PAYBACK_HOURS (48), FUND_MAX_BASIS (0.3), FUND_STOP (1.0), FUND_MAX_DAYS (14),
 FUND_MAX_OPEN (2), FUND_SPOT_FEE (0.1 — % тейкера спота Bybit).
 """
@@ -35,8 +35,7 @@ def _on(name, default):
 def settings():
     f = lambda k, d: float(os.getenv(k, d))   # noqa: E731
     return {"on": _on("SIM_FUNDING", "1"),
-            "symbols": [x.strip().upper() for x in os.getenv("FUND_SYMBOLS", "BTCUSDT,ETHUSDT,GRAMUSDT").split(",")
-                        if x.strip()],
+            "assets": [x.strip().upper() for x in os.getenv("FUND_ASSETS", "BTC,ETH,TON").split(",") if x.strip()],
             "notional": f("FUND_NOTIONAL", 1000), "entry_apr": f("FUND_ENTRY_APR", 20), "exit_apr": f("FUND_EXIT_APR", 5),
             "payback_h": f("FUND_PAYBACK_HOURS", 48), "max_basis": f("FUND_MAX_BASIS", 0.3), "stop": f("FUND_STOP", 1.0),
             "max_days": f("FUND_MAX_DAYS", 14), "max_open": int(f("FUND_MAX_OPEN", 2)), "spot_fee": f("FUND_SPOT_FEE", 0.1)}
@@ -84,7 +83,7 @@ def evaluate(scheme, long_q, short_q, cfg=None):
     lot = max(long_q.lot or 0, short_q.lot or 0)
     qty = perp.floor_lot(cfg["notional"] / mid, lot, max(long_q.min_qty or 0, short_q.min_qty or 0))
     edge_h = hourly(short_q) - (hourly(long_q) if long_q.kind == "perp" else 0.0)
-    c = {"scheme": scheme, "symbol": short_q.symbol, "long": long_q, "short": short_q, "qty": qty,
+    c = {"scheme": scheme, "symbol": short_q.asset or short_q.symbol, "long": long_q, "short": short_q, "qty": qty,
          "apr": apr(edge_h), "edge_h": edge_h, "basis": (short_q.mid / long_q.mid - 1) * 100, "ok": False, "why": ""}
     if not qty:
         c["why"] = "лот больше позиции"
@@ -112,25 +111,26 @@ def evaluate(scheme, long_q, short_q, cfg=None):
 
 
 def candidates(now=None, cfg=None):
-    """Все пары ног по символам (по свежим котировкам): перп–перп в обе стороны берём ту, где разница ставок в
-    пользу шорта, и спот Bybit + шорт перпа Bybit."""
+    """Все пары ног по монетам (по свежим котировкам): перп–перп — в ту сторону, где разница ставок в час в пользу
+    шорта (интервалы площадок могут различаться), и спот Bybit + шорт перпа Bybit."""
     cfg = cfg or settings()
     out = []
-    for sym in cfg["symbols"]:
-        a, b = perp.quote("Bybit", sym, now), perp.quote("BingX", sym, now)
+    for asset in cfg["assets"]:
+        a, b = perp.quote_for("Bybit", asset, now), perp.quote_for("BingX", asset, now)
         if a and b:
             long_q, short_q = (a, b) if hourly(a) <= hourly(b) else (b, a)
             out.append(evaluate("perp_perp", long_q, short_q, cfg))
-        spot = perp.spot_quote("Bybit", sym, now)
+        spot = perp.spot_for("Bybit", asset, now)
         if spot and a:
             out.append(evaluate("spot_perp", spot, a, cfg))
     return [c for c in out if c]
 
 
-def _leg_quote(venue, symbol, spot=False, fresh=True, now=None):
+def _leg_quote(venue, asset, spot=False, fresh=True, now=None):
+    """Котировка ноги позиции по монете (symbol в базе — монета бота): свежая или последняя любой давности."""
     if spot:
-        return perp.spot_quote(venue, symbol, now) if fresh else perp._spot.get((venue, symbol))
-    return perp.quote(venue, symbol, now) if fresh else perp._quotes.get((venue, symbol))
+        return perp.spot_for(venue, asset, now)
+    return perp.quote_for(venue, asset, now) if fresh else perp.last_for(venue, asset)
 
 
 def _open(con, c, now):

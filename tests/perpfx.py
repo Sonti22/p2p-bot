@@ -14,6 +14,9 @@ def api():
         return json.load(f)
 
 
+_KEYS = set(api())
+
+
 def route(url):
     sym = (re.search(r"symbol=([A-Za-z-]+)", url) or [None, ""])[1]
     if "api.bybit.com" in url:
@@ -28,7 +31,7 @@ def route(url):
         if "server/time" in url:
             return "bingx_time"
         if "quote/contracts" in url:
-            return "bingx_contracts"
+            return f"bingx_contract_{sym}" if f"bingx_contract_{sym}" in _KEYS else "bingx_contracts"
         if "premiumIndex" in url:
             return f"bingx_premium_{sym}"
         if "quote/depth" in url:
@@ -59,12 +62,14 @@ def book(mid, spread, size, levels=5, step=None):
 
 
 def quote(venue="Bybit", symbol="BTCUSDT", mid=84000.0, spread=1.0, size=1.0, rate=0.0001, next_funding=None,
-          ts=None, lot=0.001, min_qty=0.001, fee=0.055, interval_h=8.0, kind="perp", mark=None, skew=0.0, now=None):
+          ts=None, lot=0.001, min_qty=0.001, fee=0.055, interval_h=8.0, kind="perp", mark=None, skew=0.0, now=None,
+          asset=None):
     now = 1790494000.0 if now is None else now
     bids, asks = book(mid, spread, size)
     return perp.PerpQuote(venue, symbol, mark or mid, mid, mid, bids[0][0], asks[0][0], rate,
                           now + 3600 if next_funding is None else next_funding, interval_h,
-                          now if ts is None else ts, skew, bids, asks, lot, min_qty, 5.0, fee, kind)
+                          now if ts is None else ts, skew, bids, asks, lot, min_qty, 5.0, fee, kind,
+                          asset or symbol[:-4])
 
 
 def install(*quotes, spot=()):

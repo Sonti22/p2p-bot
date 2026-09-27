@@ -59,9 +59,9 @@ def choose(asset, coin_qty, amount, ref, coin_rub, risk=0.0, now=None):
     if not st["on"] or asset not in st["assets"] or coin_qty <= 0 or amount <= 0:
         return None, ""
     now = time.time() if now is None else now
-    sym = perp.asset_symbol(asset)
     plans, notes = [], []
     for venue in perp.VENUES:
+        sym = perp.venue_symbol(venue, asset)   # TON: GRAMUSDT там, где он торгуется
         q = perp.quote(venue, sym, now)
         if q is None:
             inst = perp.instrument(venue, sym)

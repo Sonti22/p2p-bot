@@ -61,9 +61,9 @@ def test_choose_picks_cheaper_venue_and_counts_funding():
 
 
 def test_choose_without_quotes_explains_why():
-    perp._instr[("BingX", "GRAMUSDT")] = perp.Instrument("BingX", "GRAMUSDT", False, note="нет в списке контрактов")
+    perp._instr[("BingX", "GRAMTONUSDT")] = perp.Instrument("BingX", "GRAMTONUSDT", False, note="снят")
     plan, note = simperp.choose("TON", 100, 10000, RUB, 110, now=NOW)   # TON → перп GRAMUSDT
-    assert plan is None and "BingX: GRAMUSDT не торгуется" in note and "Bybit: нет свежей котировки" in note
+    assert plan is None and "BingX: GRAMTONUSDT не торгуется (снят)" in note and "Bybit: нет свежей котировки" in note
     assert simperp.choose("USDT", 100, 10000, RUB, 90, now=NOW) == (None, "")   # стейблкоин не хеджируем
 
 
@@ -217,3 +217,14 @@ def test_bot_hedge_failure_does_not_block_cycle(monkeypatch, tmp_path):
     d = _btc_deal()
     asyncio.run(bot.maybe_start_paper_cycle([d], TB.snap_groups([d])))
     assert len(paper.open_cycles(path=db)) == 1
+
+
+def test_ton_hedges_with_per_venue_symbols():
+    """TON (он же GRAM): на Bybit — GRAMUSDT, на BingX — GRAMTON-USDT; интервал фандинга 4 ч."""
+    install(quote("Bybit", "GRAMUSDT", mid=1.59, spread=0.001, size=10000, rate=0.00005, lot=0.1, min_qty=0.1,
+                  interval_h=4, ts=NOW, asset="TON"),
+            quote("BingX", "GRAMTONUSDT", mid=1.588, spread=0.003, size=10000, rate=0.00005, lot=0.001, min_qty=1.26,
+                  fee=0.05, interval_h=4, ts=NOW, asset="TON"))
+    plan, _ = simperp.choose("TON", 70.0, 10000, RUB, 1.59 * RUB, now=NOW)
+    assert plan["symbol"] == {"Bybit": "GRAMUSDT", "BingX": "GRAMTONUSDT"}[plan["venue"]]
+    assert set(plan["alt"]) == {"Bybit", "BingX"} - {plan["venue"]}

@@ -3,17 +3,18 @@
 Нужны бумажным симуляциям (simperp — хедж кругов, simfunding — фандинг, simdirectional — тренд). Источники:
   Bybit v5:  /v5/market/tickers (linear: mark/index/last/bid/ask, fundingRate, nextFundingTime),
              /v5/market/instruments-info (шаг лота, минимумы, интервал фандинга, статус),
-             /v5/market/orderbook (linear и spot — стакан для исполнения по глубине), /v5/market/time,
+             /v5/market/orderbook (linear и spot, спот — по символам с живым перпом), /v5/market/time,
              /v5/market/kline (1ч свечи для simdirectional);
   BingX swap: /openApi/swap/v2/quote/premiumIndex (mark/index/ставка/следующий расчёт),
-             /openApi/swap/v2/quote/contracts (шаг лота, минимумы, комиссия), /openApi/swap/v2/quote/depth,
+             /openApi/swap/v2/quote/contracts?symbol= (шаг лота, минимумы, комиссия), /openApi/swap/v2/quote/depth,
              /openApi/swap/v2/server/time.
 Только GET без редиректов и только на два хоста. Опрос раз в PERP_INTERVAL секунд (по умолчанию 30), у каждой
 площадки свой бэкофф после ошибки (как у P2P-площадок: 30 с → 60 → … до 10 мин). Символ не торгуется — котировки
-нет, это не ошибка площадки. TON с 15.06.2026 называется GRAM (1:1): перп TONUSDT на Bybit закрыт, торгуется
-GRAMUSDT (фандинг раз в 4 ч); на BingX нет ни TON, ни GRAM.
+нет, это не ошибка площадки. Монеты — как в боте (BTC, ETH, TON), символ перпа на каждой площадке — одна таблица
+VENUE_SYMBOLS (venue_symbol): TON с 15.06.2026 называется GRAM (1:1) — Bybit GRAMUSDT (TONUSDT закрыт), BingX
+GRAMTON-USDT; интервал фандинга у GRAM 4 ч, у BTC/ETH 8 ч — берётся из ответов площадок.
 
-Настройки .env: PERPS=0 — не опрашивать; PERP_INTERVAL; PERP_SYMBOLS (BTCUSDT,ETHUSDT,GRAMUSDT);
+Настройки .env: PERPS=0 — не опрашивать; PERP_INTERVAL; PERP_ASSETS (BTC,ETH,TON);
 PERP_TAKER_FEES (Bybit:0.055,BingX:0.05 — % тейкера; у BingX по умолчанию берётся из справочника контрактов);
 PERP_MAX_AGE — сколько секунд котировка считается свежей (90).
 """
@@ -29,9 +30,11 @@ BYBIT = "https://api.bybit.com"
 BINGX = "https://open-api.bingx.com"
 HOSTS = ("api.bybit.com", "open-api.bingx.com")
 VENUES = ("Bybit", "BingX")
-DEFAULT_SYMBOLS = "BTCUSDT,ETHUSDT,GRAMUSDT"
-# монета P2P → базовый актив перпа: TON переименован в GRAM 1:1 (15.06.2026), перп TONUSDT на Bybit закрыт
-ASSET_ALIASES = {"TON": "GRAM"}
+DEFAULT_ASSETS = "BTC,ETH,TON"
+# монета бота → символ перпа на площадке (без дефиса; дефис BingX ставит bingx_symbol). TON переименован в GRAM 1:1
+# (15.06.2026): Bybit — GRAMUSDT (TONUSDT закрыт), BingX swap — GRAMTON-USDT. BingX GRAM-USDT — другой, снятый токен:
+# для TON не брать. Остальные монеты — <МОНЕТА>USDT.
+VENUE_SYMBOLS = {"TON": {"Bybit": "GRAMUSDT", "BingX": "GRAMTONUSDT"}}
 DEFAULT_TAKER = {"Bybit": 0.055, "BingX": 0.05}   # % тейкера перпа без VIP-уровня
 DEPTH = 50            # уровней стакана
 INFO_TTL = 6 * 3600   # справочник контрактов
@@ -47,6 +50,10 @@ def _on(name, default="1"):
     return os.getenv(name, default).strip().lower() in ("1", "true", "yes", "on")
 
 
+def _assets(spec):
+    return [x.strip().upper() for x in spec.split(",") if x.strip()]
+
+
 def settings():
     """Читать при каждом обращении (после load_env), не при импорте."""
     fees = dict(DEFAULT_TAKER)
@@ -59,7 +66,7 @@ def settings():
         except ValueError:
             continue
     return {"on": _on("PERPS"), "interval": max(10.0, float(os.getenv("PERP_INTERVAL", 30))),
-            "symbols": [x.strip().upper() for x in os.getenv("PERP_SYMBOLS", DEFAULT_SYMBOLS).split(",") if x.strip()],
+            "assets": _assets(os.getenv("PERP_ASSETS", DEFAULT_ASSETS)),
             "taker": fees, "taker_explicit": explicit, "max_age": float(os.getenv("PERP_MAX_AGE", 90))}
 
 
@@ -68,10 +75,15 @@ def bingx_symbol(symbol):
     return symbol[:-4] + "-" + symbol[-4:] if symbol.endswith("USDT") else symbol
 
 
-def asset_symbol(asset):
-    """Монета P2P → символ перпа: BTC → BTCUSDT, TON → GRAMUSDT (ASSET_ALIASES)."""
+def venue_symbol(venue, asset):
+    """Символ перпа монеты бота на площадке: BTC → BTCUSDT; TON → GRAMUSDT на Bybit, GRAMTONUSDT на BingX."""
     a = asset.upper()
-    return ASSET_ALIASES.get(a, a) + "USDT"
+    return VENUE_SYMBOLS.get(a, {}).get(venue, a + "USDT")
+
+
+def venue_symbols(venue, assets):
+    """{символ площадки: монета бота} для опроса."""
+    return {venue_symbol(venue, a): a for a in assets}
 
 
 @dataclass
@@ -108,6 +120,7 @@ class PerpQuote:
     min_notional: float = 0.0
     taker_fee: float = 0.05   # %
     kind: str = "perp"        # perp | spot
+    asset: str = ""           # монета бота (TON для GRAMUSDT)
 
     @property
     def mid(self):
@@ -341,25 +354,39 @@ def funding_windows(q, start, hours):
 # --- доступ к состоянию ---
 
 def quotes():
-    """Копия последних котировок {(площадка, символ): PerpQuote} — для Snapshot.perps."""
+    """Копия последних котировок {(площадка, символ площадки): PerpQuote} — для Snapshot.perps."""
     return dict(_quotes)
 
 
-def quote(venue, symbol, now=None, max_age=None):
-    """Свежая котировка перпа или None (нет, символ не торгуется, старше PERP_MAX_AGE)."""
-    q = _quotes.get((venue, symbol))
+def _fresh(q, now, max_age):
     if q is None:
         return None
     limit = settings()["max_age"] if max_age is None else max_age
     return q if q.age(now) <= limit else None
+
+
+def quote(venue, symbol, now=None, max_age=None):
+    """Свежая котировка перпа по символу площадки или None (нет, не торгуется, старше PERP_MAX_AGE)."""
+    return _fresh(_quotes.get((venue, symbol)), now, max_age)
+
+
+def quote_for(venue, asset, now=None, max_age=None):
+    """Свежая котировка перпа монеты бота на площадке (TON → GRAMUSDT/GRAMTONUSDT)."""
+    return quote(venue, venue_symbol(venue, asset), now, max_age)
+
+
+def last_for(venue, asset):
+    """Последняя котировка перпа монеты любой давности (для учёта фандинга) или None."""
+    return _quotes.get((venue, venue_symbol(venue, asset)))
 
 
 def spot_quote(venue, symbol, now=None, max_age=None):
-    q = _spot.get((venue, symbol))
-    if q is None:
-        return None
-    limit = settings()["max_age"] if max_age is None else max_age
-    return q if q.age(now) <= limit else None
+    return _fresh(_spot.get((venue, symbol)), now, max_age)
+
+
+def spot_for(venue, asset, now=None, max_age=None):
+    """Стакан спота монеты (Bybit, тот же символ, что у перпа: GRAMUSDT для TON)."""
+    return spot_quote(venue, venue_symbol(venue, asset), now, max_age)
 
 
 def instrument(venue, symbol):
@@ -371,7 +398,7 @@ def klines(venue, symbol):
 
 
 def status(now=None):
-    """Для /funding и /futures: ошибки, паузы, возраст данных."""
+    """Для /funding и /futures: ошибки, паузы, время последнего ответа, неторгуемые символы."""
     now = time.time() if now is None else now
     return {"errors": dict(_meta["errors"]),
             "paused": {v: st["until"] for v, st in _backoff.items() if st["until"] > now},
@@ -414,7 +441,7 @@ async def _sync_time(s, get, venue, now):
     _meta["time_t"][venue] = now
 
 
-async def _bybit_symbol(s, get, sym, now, cfg):
+async def _bybit_symbol(s, get, sym, asset, cfg):
     inst = _instr.get(("Bybit", sym))
     t, book = await asyncio.gather(get(s, f"{BYBIT}/v5/market/tickers?category=linear&symbol={sym}"),
                                    get(s, f"{BYBIT}/v5/market/orderbook?category=linear&symbol={sym}&limit={DEPTH}"))
@@ -424,15 +451,15 @@ async def _bybit_symbol(s, get, sym, now, cfg):
         "Bybit", sym, d["mark"], d["index"], d["last"], bids[0][0] if bids else d["bid"],
         asks[0][0] if asks else d["ask"], d["funding_rate"], d["next_funding"], d["interval_h"] or inst.interval_h,
         time.time(), _skew.get("Bybit", 0.0), bids, asks, inst.lot, inst.min_qty, inst.min_notional,
-        _taker("Bybit", inst, cfg))
+        _taker("Bybit", inst, cfg), asset=asset)
 
 
-async def _bybit_spot(s, get, sym, now):
+async def _bybit_spot(s, get, sym, asset):
     bids, asks = parse_bybit_book(await get(s, f"{BYBIT}/v5/market/orderbook?category=spot&symbol={sym}&limit={DEPTH}"))
     if bids and asks:
         mid = (bids[0][0] + asks[0][0]) / 2
         _spot[("Bybit", sym)] = PerpQuote("Bybit", sym, mid, mid, mid, bids[0][0], asks[0][0], 0.0, 0.0, 0.0,
-                                          time.time(), _skew.get("Bybit", 0.0), bids, asks, kind="spot")
+                                          time.time(), _skew.get("Bybit", 0.0), bids, asks, kind="spot", asset=asset)
 
 
 async def _bybit_klines(s, get, sym, now):
@@ -448,20 +475,28 @@ async def _bybit_klines(s, get, sym, now):
     _meta["kline_t"][("Bybit", sym)] = now
 
 
+def _live(venue, syms):
+    """Символы площадки, что торгуются по справочнику; котировки неторгуемых убираем."""
+    live = {x: a for x, a in syms.items() if _instr[(venue, x)].active}
+    for x in syms:
+        if x not in live:
+            _quotes.pop((venue, x), None)
+            _spot.pop((venue, x), None)
+    return live
+
+
 async def _refresh_bybit(s, get, cfg, now):
+    syms = venue_symbols("Bybit", cfg["assets"])
     await _sync_time(s, get, "Bybit", now)
-    if _due("info_t", "Bybit", INFO_TTL, now) or any(("Bybit", x) not in _instr for x in cfg["symbols"]):
+    if _due("info_t", "Bybit", INFO_TTL, now) or any(("Bybit", x) not in _instr for x in syms):
         res = await asyncio.gather(*(get(s, f"{BYBIT}/v5/market/instruments-info?category=linear&symbol={x}")
-                                     for x in cfg["symbols"]))
-        for sym, j in zip(cfg["symbols"], res):
+                                     for x in syms))
+        for sym, j in zip(syms, res):
             _instr[("Bybit", sym)] = parse_bybit_instrument(j, sym)
         _meta["info_t"]["Bybit"] = now
-    live = [x for x in cfg["symbols"] if _instr[("Bybit", x)].active]
-    for x in cfg["symbols"]:
-        if x not in live:
-            _quotes.pop(("Bybit", x), None)
-    jobs = ([(f"Bybit/{x}", _bybit_symbol(s, get, x, now, cfg)) for x in live]
-            + [(f"Bybit/spot/{x}", _bybit_spot(s, get, x, now)) for x in cfg["symbols"]]
+    live = _live("Bybit", syms)
+    jobs = ([(f"Bybit/{x}", _bybit_symbol(s, get, x, a, cfg)) for x, a in live.items()]
+            + [(f"Bybit/spot/{x}", _bybit_spot(s, get, x, a)) for x, a in live.items()]
             + [(f"Bybit/kline/{x}", _bybit_klines(s, get, x, now)) for x in live])
     res = await asyncio.gather(*(c for _, c in jobs), return_exceptions=True)
     if live and all(isinstance(r, Exception) for r in res[:len(live)]):
@@ -469,7 +504,17 @@ async def _refresh_bybit(s, get, cfg, now):
     return {k: f"{type(e).__name__}: {e}"[:120] for (k, _), e in zip(jobs, res) if isinstance(e, Exception)}
 
 
-async def _bingx_symbol(s, get, sym, now, cfg):
+BINGX_NOT_LISTED = (109425, 109418)   # символа нет / снят с торгов — не ошибка площадки
+
+
+def parse_bingx_contract(j, symbol):
+    """Справочник одного контракта (contracts?symbol=): нет или снят — неторгуемый Instrument с причиной."""
+    if isinstance(j, dict) and j.get("code") in BINGX_NOT_LISTED:
+        return Instrument("BingX", symbol, False, note=str(j.get("msg") or j.get("code"))[:80])
+    return parse_bingx_contracts(j, [symbol])[symbol]
+
+
+async def _bingx_symbol(s, get, sym, asset, cfg):
     inst = _instr.get(("BingX", sym))
     bx = bingx_symbol(sym)
     p, book = await asyncio.gather(get(s, f"{BINGX}/openApi/swap/v2/quote/premiumIndex?symbol={bx}"),
@@ -482,21 +527,20 @@ async def _bingx_symbol(s, get, sym, now, cfg):
     _quotes[("BingX", sym)] = PerpQuote(
         "BingX", sym, d["mark"], d["index"], mid, bids[0][0], asks[0][0], d["funding_rate"], d["next_funding"],
         d["interval_h"] or inst.interval_h, time.time(), _skew.get("BingX", 0.0), bids, asks, inst.lot,
-        inst.min_qty, inst.min_notional, _taker("BingX", inst, cfg))
+        inst.min_qty, inst.min_notional, _taker("BingX", inst, cfg), asset=asset)
 
 
 async def _refresh_bingx(s, get, cfg, now):
+    syms = venue_symbols("BingX", cfg["assets"])
     await _sync_time(s, get, "BingX", now)
-    if _due("info_t", "BingX", INFO_TTL, now) or any(("BingX", x) not in _instr for x in cfg["symbols"]):
-        for sym, inst in parse_bingx_contracts(await get(s, f"{BINGX}/openApi/swap/v2/quote/contracts"),
-                                               cfg["symbols"]).items():
-            _instr[("BingX", sym)] = inst
+    if _due("info_t", "BingX", INFO_TTL, now) or any(("BingX", x) not in _instr for x in syms):
+        res = await asyncio.gather(*(get(s, f"{BINGX}/openApi/swap/v2/quote/contracts?symbol={bingx_symbol(x)}")
+                                     for x in syms))
+        for sym, j in zip(syms, res):
+            _instr[("BingX", sym)] = parse_bingx_contract(j, sym)
         _meta["info_t"]["BingX"] = now
-    live = [x for x in cfg["symbols"] if _instr[("BingX", x)].active]
-    for x in cfg["symbols"]:
-        if x not in live:
-            _quotes.pop(("BingX", x), None)
-    res = await asyncio.gather(*(_bingx_symbol(s, get, x, now, cfg) for x in live), return_exceptions=True)
+    live = _live("BingX", syms)
+    res = await asyncio.gather(*(_bingx_symbol(s, get, x, a, cfg) for x, a in live.items()), return_exceptions=True)
     errors = [r for r in res if isinstance(r, Exception)]
     if live and len(errors) == len(live):
         raise errors[0]
