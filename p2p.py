@@ -167,15 +167,16 @@ def _env_parsed(name, parse, default):
 
 # Пороги мерчантов по площадкам: MERCHANT_MIN="Bybit:100/97,HTX:300/96" — «площадка:сделок/%» (имя как в Ad.ex,
 # регистр не важен; «Bybit:100» или «Bybit:/97» — вторая часть общая). Не задана площадка — общие MIN_ORDERS/MIN_RATE;
-# пусто (по умолчанию) — как раньше. Счётчики разные: Bybit — недавние сделки, HTX/MEXC — за месяц,
+# пусто (по умолчанию) — как раньше. Счётчики разные: Bybit — недавние (recentOrderNum), HTX/MEXC — за месяц,
 # KuCoin/BitPapa/LBank — за всё время, BestChange — положительные отзывы.
-# Предложение по tests/fixtures (уникальные мерчанты, выборки малые): сделок — p25 до 1 значащей цифры,
-# % — p10 без выбросов <90%, не мягче общих 100/95 (фильтры мерчантов не ослаблять):
-#   Bybit   n=8  сделок p25 77, p50 201;    % p10 97.8      → 70/97   → 100/97
-#   HTX     n=7  сделок p25 308, p50 592;   % p10 96.4      → 300/96
-#   KuCoin  n=6  сделок min 980, p25 1732;  % p10 97.7      → 1000/97
-#   MEXC    n=6  сделок p25 22, p50 66;     % p10 98.5      → 20/98   → 100/98
-#   BitPapa n=6  сделок p25 18, p50 43;     % p10 97.1      → 10/97   → 100/97
+# Предложение по tests/fixtures (уникальные мерчанты USDT/BTC/ETH обеих сторон, выборки малые): сделок — p25,
+# вниз до 1 значащей цифры; % — p10 без выбросов <90%, вниз до целого; не мягче общих 100/95 (CLAUDE.md:
+# фильтры мерчантов не ослаблять):
+#   Bybit   n=8  сделок p25 77, p50 201;    % p10 97.8          → 70/97 → 100/97
+#   HTX     n=7  сделок p25 308, p50 592;   % p10 96.5 (без 25) → 300/96
+#   KuCoin  n=6  сделок min 980, p25 1732;  % p10 97.7          → 1000/97
+#   MEXC    n=6  сделок p25 22, p50 66;     % p10 98.5          → 20/98 → 100/98
+#   BitPapa n=6  сделок p25 18, p50 43;     % p10 97.1 (без 0)  → 10/97 → 100/97
 #   LBank   n=5  сделок 0–2 у всех; BestChange — снимка нет: общий порог.
 MERCHANT_MIN_SUGGESTED = "Bybit:100/97,HTX:300/96,KuCoin:1000/97,MEXC:100/98,BitPapa:100/97"
 MERCHANT_VENUES = {"bybit": "Bybit", "htx": "HTX", "kucoin": "KuCoin", "mexc": "MEXC", "bitpapa": "BitPapa",
@@ -640,8 +641,9 @@ def terms_flags(text):
 
 
 def usable(a, cfg, blocked=frozenset()):
+    min_orders, min_rate = cfg.merchant_thresholds(a.ex)   # MERCHANT_MIN площадки, иначе общие
     return bool(_pays(a, cfg)) and a.min_amt <= cfg.amount <= a.max_amt and a.avail * a.price >= cfg.amount \
-        and a.orders >= cfg.min_orders and a.rate >= cfg.min_rate and (a.ex, a.nick) not in blocked \
+        and a.orders >= min_orders and a.rate >= min_rate and (a.ex, a.nick) not in blocked \
         and not terms_flags(a.terms)[0]
 
 
@@ -649,7 +651,8 @@ def _signal_ok(a, cfg, blocked=frozenset()):
     """Фильтр объявления для стакана глубины: мерчант/способ оплаты/условия, без требования, что объём
     покрывает всю сумму в одиночку — это делают _stack (покупка) и _stack_qty (продажа, под фактический
     выход монеты маршрута), складывая несколько объявлений."""
-    return bool(_pays(a, cfg)) and a.orders >= cfg.min_orders and a.rate >= cfg.min_rate \
+    min_orders, min_rate = cfg.merchant_thresholds(a.ex)
+    return bool(_pays(a, cfg)) and a.orders >= min_orders and a.rate >= min_rate \
         and (a.ex, a.nick) not in blocked and not terms_flags(a.terms)[0]
 
 
@@ -1584,7 +1587,8 @@ def _risks(deal, cfg, snap):
             if dev >= cfg.max_dev * 0.6:
                 risks.append((2 if dev >= cfg.max_dev * 0.8 else 1,
                               f"{side}: цена {dev:.1f}% от ориентира (отсев >{cfg.max_dev:g}%)"))
-        if ad.orders < cfg.min_orders * 1.5 or ad.rate < cfg.min_rate + 1:
+        min_orders, min_rate = cfg.merchant_thresholds(ad.ex)
+        if ad.orders < min_orders * 1.5 or ad.rate < min_rate + 1:
             risks.append((1, f"{side}: мерчант у порога фильтра ({ad.orders} сделок/{ad.rate:.0f}%)"))
         risky = [n for n in terms_flags(ad.terms)[1] if n in TERMS_RISKY]
         if risky:
