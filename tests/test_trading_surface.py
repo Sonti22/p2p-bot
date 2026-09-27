@@ -361,6 +361,8 @@ ALLOWED_SENDERS = {
     ("payouts", "payout_call"): "выплаты Cryptomus — только PAYOUT_CALLS, защищённый payouts.py",
     ("p2p", "_json"): "публичные запросы без ключей — только p2p.JSON_ALLOWED (пин JSON_ALLOWED_PIN ниже)",
     ("p2p", "_bc_download"): "выгрузка BestChange: GET BC_URL (info.zip), без ключей",
+    ("perp", "_get"): "публичные котировки перпов: GET только https на perp.HOSTS (пин PERP_HOSTS_PIN ниже), без ключей "
+                      "и редиректов",
     ("bot", "Bot.call"): "Telegram Bot API",
     ("bot", "Bot._post_photo"): "Telegram sendPhoto",
     ("bot", "Bot.send_document"): "Telegram sendDocument",
@@ -386,6 +388,8 @@ JSON_ALLOWED_PIN = frozenset({
     ("GET", "api.htx.com", "/v2/reference/currencies"),
     ("GET", "api.kucoin.com", "/api/v3/currencies/"),
 })
+# perp._get (публичные котировки перпов, без ключей) ходит только на эти хосты. Расширить — только владелец, как выше
+PERP_HOSTS_PIN = ("api.bybit.com", "open-api.bingx.com")
 # сетевой модуль, импортированный целиком: (модуль бота или "*" — любой, сетевой модуль) → какие его атрибуты можно
 # трогать (только через точку: socket.gethostname(), не s = socket)
 ALLOWED_NET_IMPORTS = {
@@ -943,6 +947,28 @@ def test_public_json_allowlist_pinned():
         assert p2p.json_allowed(method, url), url
         assert not p2p.json_allowed(method, url.replace(host, host + ":443", 1))
         assert not p2p.json_allowed("PUT" if method == "GET" else "GET", url)
+
+
+def test_perp_public_get_hosts_pinned():
+    """perp._get (публичные котировки перпов Bybit/BingX, без ключей) — только https на perp.HOSTS, и он ровно
+    PERP_HOSTS_PIN; другой хост, http, порт, логин в адресе — ValueError до отправки."""
+    import perp
+    assert tuple(perp.HOSTS) == PERP_HOSTS_PIN, HOW_TO_UPDATE + f"\nperp.HOSTS: {perp.HOSTS}"
+
+    class Session:
+        sent = []
+
+        def get(self, url, **kw):
+            self.sent.append(url)
+            raise AssertionError(f"запрос ушёл: {url}")
+
+    s, scheme = Session(), "https" + "://"
+    for url in ("http" + "://api.bybit.com/v5/market/tickers", scheme + "api.bybit.com:8443/v5/market/tickers",
+                scheme + "x@open-api.bingx.com/openApi/swap/v2/quote/premiumIndex", scheme + "api2.bybit.com/x",
+                scheme + "open-api.bingx.com.example.org/x", scheme + "example.org/x"):
+        with pytest.raises(ValueError):
+            asyncio.run(perp._get(s, url))
+    assert s.sent == []
 
 
 def _hits(patterns, text):

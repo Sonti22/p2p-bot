@@ -59,9 +59,10 @@ jobs:
           if echo "$last" | grep -qiE '\b(failed|errors?)\b'; then exit 1; fi
           n=$(echo "$last" | grep -oE '^[0-9]+ passed' | cut -d' ' -f1 || true)
           echo "trading tests passed: ${n:-0}"
-          # порог — нынешнее число тестов tests/test_trading_surface.py (не ниже 173); когда в main появится
-          # tests/trading/ (ветка claude/trading-core, ~656 тестов), поднять его до нового общего числа
-          test "${n:-0}" -ge 173
+          # порог — нынешнее число тестов tests/test_trading_surface.py (214); когда в main появится tests/trading/
+          # (ветка claude/trading-core, ~656 тестов), поднять его до нового общего числа — иначе выпавшие тесты
+          # trading/ этот шаг не заметит
+          test "${n:-0}" -ge 214
       - name: Guard (защищённые файлы, домены, опасные вызовы, секреты) — скрипт из main, а не из ветки
         run: git show origin/main:scripts/guard.py > "$RUNNER_TEMP/guard.py" && python "$RUNNER_TEMP/guard.py" origin/main
 
