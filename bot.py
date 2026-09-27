@@ -27,6 +27,7 @@ import paper
 import payouts
 import perp
 import presets
+import simfunding
 import simmaker
 import simperp
 import snapshots
@@ -92,6 +93,7 @@ COMMANDS = [{"command": "best", "description": "Лучшая связка сей
             {"command": "stats", "description": "Журнал сделок: день/неделя/месяц, расчёт vs факт"},
             {"command": "export", "description": "Журнал сделок в CSV для банка и 3-НДФЛ: /export month|year"},
             {"command": "paper", "description": "Сухой прогон: круги, статистика, /paper on|off|amount|report|reset"},
+            {"command": "funding", "description": "Арбитраж фандинга на бумаге: позиции, итог, ставки сейчас"},
             {"command": "mybanks", "description": "Мои банки и бесплатные лимиты СБП"},
             {"command": "fav", "description": "Избранные маршруты"},
             {"command": "alert", "description": "Алерт на курс, напр. /alert USDT sell 92 7d"},
@@ -2116,10 +2118,19 @@ class Bot:
         медленная площадка фьючерсов не задерживала сигналы. Только чтение, без ключей и ордеров."""
         while True:
             try:
-                await perp.refresh_if_due(self.s)
+                if await perp.refresh_if_due(self.s) is not None:
+                    self.sim_tick()
             except Exception as e:
                 logger.error("perp_loop error: %s", e)
             await asyncio.sleep(PERP_LOOP_TICK)
+
+    def sim_tick(self):
+        """Бумажные симуляции на свежих котировках перпов; сбой одной не мешает другой и опросу."""
+        for name, run in (("simfunding", simfunding.tick),):
+            try:
+                run()
+            except Exception as e:
+                logger.error("%s: %s", name, e)
 
     def status_view(self, status_path=DEV_STATUS):
         """Текст «/status»: версия, аптайм, время/длительность последнего скана, ошибки площадок,
@@ -3167,6 +3178,8 @@ class Bot:
         # план 2.6: отчёт калибровки — только владельцу (не в GUEST_CMDS), за флагом CALIBRATION=1 (по умолчанию выкл.)
         elif cmd == "/calibration" and calibration.enabled():
             await self.send(calibration.report_text())
+        elif cmd == "/funding":
+            await self.send(simfunding.view())
         elif cmd == "/fav":
             text, kb = self.favorites_view()
             await self.send(text, markup=kb)
