@@ -39,11 +39,15 @@ python cards.py    # перерисовать аватарки
 `payout` или `trading` (tests/test_payouts.py, tests/payout_stubs.py, paper_trading.py…); на любой глубине —
 `conftest.py`, `pytest.ini`, `pyproject.toml`, `setup.cfg`, `tox.ini`, `sitecustomize.py`, `usercustomize.py`,
 `requirements.txt`, `*.pth`, `*.exe`, `*.dll`, `*.pyd`, `*.pyc`, `*.so`, `*.bat`, `*.cmd`, `*.ps1`, `__pycache__`;
-в корне — файлы и папки с именем модуля стандартной библиотеки (`json.py`, `hashlib/`…). Новые файлы называть без
+в корне — файлы и папки с именем модуля стандартной библиотеки или установленного пакета (`json.py`, `hashlib/`,
+`pytest.py`, `aiohttp/`…). Новые файлы называть без
 этих слов. В `tests/fixtures/` guard пропускает только `.json`. Guard блокирует и любую добавленную/удалённую
 строку с `payout`/`PAYOUT`/`pay_to|ok|no|hist|stop` в других файлах (bot.py, accounts.py, .env.example…) и такую же
-строку торгового кода: `TRADING…`, `trd_…`, `import trading`/`trading.…`, эндпоинты ордеров и позиций Bybit/BingX,
-`orderLinkId`/`clientOrderId`/`reduceOnly`, ключи `bybit_trade`/`bingx_trade`.
+строку торгового кода: `TRADING…`, `trd_…`, `import trading`/`trading.…`, эндпоинты ордеров, позиций и режимов маржи
+Bybit/BingX, пути вывода и переводов (`/withdraw/apply`, `/inter-transfer`, `/innerTransfer`, `/v1/transfer/`…),
+`orderLinkId`/`clientOrderId`/`reduceOnly`/`positionIdx`/`positionSide`, ключи `bybit_trade`/`bingx_trade`. Торговые
+строки в `tests/` guard не считает (там списки запретных путей нарочно; `tests/trading/` и `tests/conftest.py` защищены
+путём), строки выплат — считает и там.
 Guard также блокирует: новые домены в коде, `subprocess`/`os.system`/`eval`/`exec`, браузерную и UI-автоматизацию, секреты.
 
 ## Правила
@@ -73,7 +77,22 @@ Launcher на ПК после каждого обновления кода пе�
 Торговое ядро `trading/`, его тесты `tests/trading/`, любой путь со словом `trading` (`scripts/trading_keys.py`,
 `tests/test_trading_surface.py`…) и строки торгового кода в остальных файлах (см. guard выше: `TRADING`, `trd_*`,
 `import trading`, ордера, ключи `*_trade`) меняет только владелец вручную, мерж — только ручной. Не писать торговый код
-вне `trading/`, не ослаблять `tests/test_trading_surface.py` (отправители запросов — только из его списка) и блок сети
-в `tests/conftest.py`. Никогда, и в `trading/` тоже: выводы, переводы между счетами, отпуск крипты и «оплачено» в P2P,
-браузерная и UI-автоматизация. TRADING launcher после каждого обновления кода пишет в 0 (включает только владелец на ПК);
-из Telegram торговлю можно только выключить или понизить режим.
+вне `trading/`, не ослаблять `tests/test_trading_surface.py` и блок сети в `tests/conftest.py`. Никогда, и в `trading/`
+тоже: выводы, переводы между счетами, отпуск крипты и «оплачено» в P2P, браузерная и UI-автоматизация. TRADING launcher
+после каждого обновления кода пишет в 0 (включает только владелец на ПК); из Telegram торговлю можно только выключить
+или понизить режим.
+
+`tests/test_trading_surface.py` (AST всего кода, кроме `tests/`) запрещает вне `trading/`: эндпоинты ордеров, позиций,
+исполнений, режимов маржи и своих P2P-объявлений (Bybit, BingX, MEXC, HTX, KuCoin) — и фьючерсные эндпоинты чтения
+тоже (позиции, фьючерсный баланс: фьючерсы бот читает только в `trading/`); ключи и имена `*_trade`. Во всём коде, и в
+`trading/` тоже: вывод, переводы между счетами и субаккаунтами, P2P «отпустить»/«оплачено»; эндпоинт выплат
+Cryptomus — только в модуле выплат (см. «Выплаты»). Отправлять запросы (`.post/.put/.delete/.request/.send/.urlopen/
+.ws_connect…`, `.get/.head/.open` у сетевого клиента, `requests`/`urllib.request`/`http.client`/`websockets`,
+`socket.create_connection`…) могут только функции из его `ALLOWED_SENDERS`; из `socket`, `ssl`, `http` — только исключения, `gethostbyname*`/`gethostname`,
+`HTTPStatus`; `getattr` с вычисляемым именем — только из `ALLOWED_DYNAMIC` или по переменной цикла по строковой
+константе модуля. `p2p._json` шлёт только `p2p.JSON_ALLOWED` (запинен там), подписанные GET бирж — только
+`accounts.*_READ_PATHS`; `research/` бот не импортирует, а сам он только читает (GET). Новая площадка или адрес = запись
+в `JSON_ALLOWED` = правка пина владельцем.
+
+Guard или `test_trading_surface` красные из-за твоей правки — не обходить (никаких `vars()`, склейки строк, псевдонимов):
+отметить задачу в `ROADMAP.md` как «ждёт владельца: <что>» и взять следующую.
