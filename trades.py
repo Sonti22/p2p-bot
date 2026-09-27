@@ -302,6 +302,7 @@ def set_fact(trade_id, fact_percent, path=DB_PATH, source=None):
 # Автосопоставление истории биржи (accounts.account_history) со сделками журнала для автозаполнения факта.
 AUTO_MATCH_WINDOW = 1800          # сек — запись истории считается той самой сделкой, если она не дальше по времени
 AUTO_MATCH_AMOUNT_TOLERANCE = 0.25  # 25% — насколько сумма записи истории (в ₽) может отличаться от суммы круга
+JOURNAL_FIAT = "RUB"   # журнал рублёвый: сумма круга и факт — в ₽, ноги сделки — только P2P-ордера за рубли
 
 
 def unmatched(path=DB_PATH, since=None):
@@ -346,13 +347,16 @@ def _p2p_leg(it):
 
 def _match_leg(hist, asset, side, ts, want_fiat, window, amount_tolerance):
     """Ближайшая по времени запись истории биржи (`accounts.account_history`) для одной ноги сделки:
-    P2P-ордер (_p2p_leg), та же монета, та же сторона (buy/sell), цена есть, сумма в ₽ (amount*price)
+    P2P-ордер (_p2p_leg) за рубли (JOURNAL_FIAT: ордер за INR/KZT с похожими временем и суммой — не наша нога),
+    та же монета, та же сторона (buy/sell), цена есть, сумма в ₽ (amount*price)
     не дальше `amount_tolerance` от суммы круга сделки, само время — не дальше `window` секунд от времени
     сделки. Кандидатов несколько — берём ближайший по времени. Ничего не подошло — None."""
     asset = (asset or "").upper()
     best, best_dt = None, None
     for it in hist or []:
         if not _p2p_leg(it) or (it.get("asset") or "").upper() != asset or it.get("side") != side:
+            continue
+        if str(it.get("fiat")).upper() != JOURNAL_FIAT:
             continue
         price = it.get("price") or 0
         if price <= 0 or abs(it.get("ts", 0) - ts) > window:
@@ -368,7 +372,7 @@ def _match_leg(hist, asset, side, ts, want_fiat, window, amount_tolerance):
 
 def match_fact(trade, hist_by_ex, window=AUTO_MATCH_WINDOW, amount_tolerance=AUTO_MATCH_AMOUNT_TOLERANCE):
     """Чистый реализованный % сделки журнала (`unmatched`) по истории подключённых бирж: в истории нашлись
-    P2P-ордер покупки и P2P-ордер продажи той же монеты рядом по времени и сумме (_match_leg). Считаем от
+    P2P-ордер покупки и P2P-ордер продажи той же монеты за рубли рядом по времени и сумме (_match_leg). Считаем от
     реальных цен и количества ордера покупки, вычитая издержки, которые заложил расчёт (route_costs): комиссию
     банка и вывод монеты между площадками (как p2p._route_qty) — а не валовое «продажа / покупка − 1».
     `hist_by_ex` — {биржа (в нижнем регистре): список записей `accounts.account_history` за этот опрос}.

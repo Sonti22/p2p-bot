@@ -67,3 +67,40 @@ def test_amount_changed_during_scan_does_not_leak_into_that_scan(monkeypatch):
     asyncio.run(bot.show_best(snap))
     assert f"на {p2p._money(50000)} ₽" in photos(bot)[-1][1]["caption"]
     assert bot.cfg.amount == 1000                    # новая сумма применится со следующего скана
+
+
+# --- №7: RUB-журнал сопоставляется только с рублёвыми P2P-ордерами -----------------------------------------------
+
+def _leg(side, price, fiat, ts, amount=100.0):
+    return {"id": f"{side}{fiat}{ts}", "side": side, "asset": "USDT", "fiat": fiat, "amount": amount, "price": price,
+            "ts": ts}
+
+
+def _trade(ts, amount=9000.0):
+    return {"id": 1, "ts": ts, "buy_ex": "Bybit", "buy_asset": "USDT", "sell_ex": "Bybit", "sell_asset": "USDT",
+            "amount": amount, "profit": 2.0, "route": "внутри биржи"}
+
+
+@pytest.mark.parametrize("fiat", ["INR", "KZT"])
+def test_match_fact_skips_foreign_fiat_orders(fiat):
+    now = time.time()
+    foreign_sell = {"bybit": [_leg("buy", 90.0, "RUB", now), _leg("sell", 95.0, fiat, now + 60)]}
+    foreign_buy = {"bybit": [_leg("buy", 90.0, fiat, now), _leg("sell", 95.0, "RUB", now + 60)]}
+    assert trades.match_fact(_trade(now), foreign_sell) is None
+    assert trades.match_fact(_trade(now), foreign_buy) is None
+    # чужая валюта ближе по времени — берётся рублёвый ордер, а не она
+    both = {"bybit": [_leg("buy", 90.0, "RUB", now), _leg("sell", 95.0, fiat, now + 10),
+                      _leg("sell", 93.0, "rub", now + 600)]}
+    assert trades.match_fact(_trade(now), both) == pytest.approx((93.0 / 90.0 - 1) * 100)
+
+
+def test_auto_match_does_not_write_fact_from_inr_order():
+    """Журнал 9 000 ₽: купил 100 USDT по 90 RUB, продал 100 USDT по 95 INR — это не «факт +5.56%»."""
+    d = (2.0, make_ad("Bybit", "buy", 90.0), make_ad("Bybit", "sell", 92.0), "внутри биржи")
+    now = time.time()
+    trade_id = trades.log_trade(d, 9000, ts=now)[0]
+    bot = Stub(p2p.Config())
+    asyncio.run(bot.auto_match_facts({"bybit": [_leg("buy", 90.0, "RUB", now), _leg("sell", 95.0, "INR", now + 60)]}))
+    assert texts(bot) == [] and trades.get_trade(trade_id) and trades.unmatched()[0]["id"] == trade_id
+    asyncio.run(bot.auto_match_facts({"bybit": [_leg("buy", 90.0, "RUB", now), _leg("sell", 95.0, "RUB", now + 60)]}))
+    assert len(texts(bot)) == 1 and trades.unmatched() == []
