@@ -2072,11 +2072,38 @@ def spot_url(route):
 RELIABLE, RISKY, TRAP = "✅ надёжно", "⚠️ риск", "🪤 ловушка"
 
 
+# BestChange-факторы метки надёжности (ROADMAP «Метка надёжности сигнала, часть 3»): резерв обменников связки меньше
+# стольких объёмов круга — может кончиться, пока идут оплата и перевод; выгрузка (info.zip) старше стольких минут —
+# курс и резерв в ней могли уйти (обычно она обновляется раз в BC_REFRESH, старая — выгрузка не скачивается)
+BC_RESERVE_MARGIN = 1.5
+BC_STALE_MIN = 10.0
+
+
+def _bc_risks(ad, side, cfg, snap):
+    """Риски стороны-обменника (ex == BestChange): [(вес, причина)] — выгрузка старая, резерв впритык. Резерв —
+    сумма avail обменников этой стороны в стакане снимка (у обменника avail — его резерв в монете; у стека связки —
+    только взятый объём), нужно — объём круга cfg.amount / цена."""
+    if ad.ex != "BestChange":
+        return []
+    out = []
+    if snap.ts and ad.fetched_ts and snap.ts - ad.fetched_ts > BC_STALE_MIN * 60:
+        out.append((1, f"{side}: выгрузка BestChange {int((snap.ts - ad.fetched_ts) // 60)} мин назад — курс и "
+                       f"резерв могли уйти"))
+    nicks = set(ad.nicks or (ad.nick,))
+    own = [a for a in snap.groups.get((ad.ex, ad.side, ad.asset), []) if a.nick in nicks and a.net == ad.net]
+    need = cfg.amount / ad.price if ad.price > 0 else 0.0
+    reserve = sum(a.avail for a in own)
+    if own and need > 0 and reserve < need * BC_RESERVE_MARGIN:
+        out.append((1, f"{side}: резерв обменника впритык ({reserve / need:.1f}× объёма круга) — может кончиться "
+                       f"до перевода"))
+    return out
+
+
 def _risks(deal, cfg, snap):
     """Риски связки: [(вес, причина)] — отклонение цены от ориентира (ближе к отсеву — тяжелее), мерчант у
     порога фильтра по сделкам/отзывам, рискованные условия, мерчант офлайн (merchant_offline), число
     переводов/конвертаций, волатильная монета, спред ≥5% и «обменник → обменник» (оба конца на BestChange: курсы
-    с условиями, AML-проверки и заморозки)."""
+    с условиями, AML-проверки и заморозки); у обменника — старая выгрузка и резерв впритык (_bc_risks)."""
     profit, b, s, route = deal
     risks = []
     for ad, side in ((b, "покупка"), (s, "продажа")):
@@ -2098,6 +2125,7 @@ def _risks(deal, cfg, snap):
         risky = [n for n in terms_flags(ad.terms)[1] if n in TERMS_RISKY]
         if risky:
             risks.append((2, f"{side}: условия — {', '.join(risky)}"))
+        risks += _bc_risks(ad, side, cfg, snap)
     steps = route.split(" → ") if route else []
     transfers = sum(1 for st in steps if "перевод" in st or "спот" in st or "через" in st)
     if transfers >= 2:
