@@ -1,16 +1,170 @@
+import functools
 import inspect
+import ipaddress
 import json
 import logging
 import os
 import re
 import shutil
+import socket
 import sys
 import tempfile
+from asyncio import base_events, proactor_events, selector_events
 
 import pytest
 
-import netstatus
-import p2p
+# --- Сеть в тестах заблокирована ------------------------------------------------------------------------------------
+# Тесты — только офлайн (заглушки Session, фикстуры площадок): настоящий запрос из теста на ПК владельца (смоук launcher)
+# ушёл бы на биржу с его ключами, а в CI — наружу. Блок ставится при загрузке conftest — до импорта модулей бота, сборки
+# тестов и фикстур любого scope — на всех уровнях, через которые Python выходит в сеть: socket.connect/connect_ex/sendto,
+# DNS (getaddrinfo, gethostbyname*), asyncio (create_connection, create_datagram_endpoint, sock_connect — на Windows
+# Proactor соединяется мимо socket.connect); aiohttp, requests, urllib, http.client идут через них. Разрешены только
+# unix-сокеты и loopback к портам, которые открыл сам процесс тестов (локальные aiohttp-серверы тестов, socketpair цикла
+# asyncio на Windows); к чужому порту на 127.0.0.1 — нет: там слушает прокси VPN (у владельца системный прокси на
+# 127.0.0.1), и запрос ушёл бы через него наружу. Имена loopback резолвить можно. Попытка — исключение
+# сразу (соединения нет) и красный тест в конце, даже если код под тестом исключение проглотил. Метка allow_network
+# снимает блок для одного теста — ни у одного теста её быть не должно. Нарочный обход (_socket напрямую, ctypes) этим не
+# поймать — это остаточный риск; здесь — всё, что пишется без умысла спрятать.
+
+
+class NetworkBlocked(ConnectionRefusedError):
+    """Сетевая ошибка, как без сети: код, который её ждёт, ведёт себя как офлайн, а тест всё равно краснеет."""
+
+
+# attempts — куда писать попытки (список текущего теста или outside); ports — порты, которые процесс открыл сам (bind)
+_NET = {"allowed": False, "outside": [], "ports": set()}
+_NET["attempts"] = _NET["outside"]
+_NET_MP = pytest.MonkeyPatch()
+
+
+def _local_host(host):
+    if host is None:
+        return True
+    if isinstance(host, bytes):
+        host = host.decode("ascii", "replace")
+    host = str(host).strip("[]").split("%", 1)[0]
+    if host in ("", "localhost"):
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _local_addr(address):
+    """Куда соединяться можно: unix-сокет или loopback-порт, открытый этим же процессом."""
+    if isinstance(address, (str, bytes, os.PathLike)):   # AF_UNIX: путь к файлу, не сеть
+        return True
+    return (isinstance(address, tuple) and len(address) >= 2 and _local_host(address[0])
+            and address[1] in _NET["ports"])
+
+
+def _net_blocked(what, target):
+    _NET["attempts"].append(f"{what}({target!r})")
+    raise NetworkBlocked(f"сеть в тестах заблокирована: {what}({target!r}) — подмени запрос заглушкой "
+                         f"(Session, p2p._json, фикстура offline)")
+
+
+def _block(owner, name, target):
+    """owner.name(...) — только если target(*args, **kwargs) — локальный адрес (target → (локальный?, что показать))."""
+    real = getattr(owner, name)
+    what = f"{getattr(owner, '__name__', owner)}.{name}"
+
+    def check(args, kwargs):
+        if not _NET["allowed"]:
+            ok, shown = target(*args, **kwargs)
+            if not ok:
+                _net_blocked(what, shown)
+
+    if inspect.iscoroutinefunction(real):
+        @functools.wraps(real)
+        async def wrapper(*args, **kwargs):
+            check(args, kwargs)
+            return await real(*args, **kwargs)
+    else:
+        @functools.wraps(real)
+        def wrapper(*args, **kwargs):
+            check(args, kwargs)
+            return real(*args, **kwargs)
+    _NET_MP.setattr(owner, name, wrapper)
+
+
+def _host_arg(host, *args, **kwargs):
+    return _local_host(host), host
+
+
+def _sock_addr(sock, address, *args, **kwargs):
+    return _local_addr(address), address
+
+
+def _sendto_addr(sock, data, *rest):
+    return _local_addr(rest[-1] if rest else None), (rest[-1] if rest else None)
+
+
+def _loop_host(loop, factory, host=None, port=None, **kwargs):
+    return _local_host(host), (host, port)
+
+
+def _loop_remote(loop, factory, local_addr=None, remote_addr=None, **kwargs):
+    return remote_addr is None or _local_addr(remote_addr), remote_addr
+
+
+_real_bind = socket.socket.bind
+
+
+def _bind_and_remember(self, address):
+    """Порт, который процесс открыл сам (сервер теста, socketpair), — к нему по loopback соединяться можно."""
+    _real_bind(self, address)
+    try:
+        name = self.getsockname()
+    except OSError:
+        return
+    if isinstance(name, tuple) and len(name) >= 2:
+        _NET["ports"].add(name[1])
+
+
+_NET_MP.setattr(socket.socket, "bind", _bind_and_remember)
+for _name in ("getaddrinfo", "gethostbyname", "gethostbyname_ex", "gethostbyaddr"):
+    _block(socket, _name, _host_arg)
+for _name in ("connect", "connect_ex"):
+    _block(socket.socket, _name, _sock_addr)
+_block(socket.socket, "sendto", _sendto_addr)
+_block(base_events.BaseEventLoop, "create_connection", _loop_host)
+_block(base_events.BaseEventLoop, "create_datagram_endpoint", _loop_remote)
+for _cls in (selector_events.BaseSelectorEventLoop, proactor_events.BaseProactorEventLoop):
+    _block(_cls, "sock_connect", lambda loop, sock, address: _sock_addr(sock, address))
+
+
+def pytest_configure(config):
+    config.addinivalue_line("markers", "allow_network: снять блок сети для одного теста (ни у одного теста её нет)")
+
+
+@pytest.fixture(autouse=True)
+def _no_network(request):
+    """Сеть — только свои loopback-порты; попытка выйти наружу — красный тест (см. блок выше). → попытки этого теста."""
+    attempts = []
+    _NET.update(attempts=attempts, allowed=request.node.get_closest_marker("allow_network") is not None)
+    yield attempts
+    _NET.update(attempts=_NET["outside"], allowed=False)
+    if attempts:
+        pytest.fail("тест пытался выйти в сеть (заблокировано): " + "; ".join(attempts[:5]), pytrace=False)
+
+
+@pytest.fixture
+def network_attempts(_no_network):
+    """Попытки выйти в сеть в этом тесте — для тестов самого блока (очисти список, если попытка ожидаема)."""
+    return _no_network
+
+
+def pytest_sessionfinish(session, exitstatus):
+    """Попытки вне тестов (импорт, сборка, фикстуры module/session) — тоже красный прогон."""
+    if _NET["outside"]:
+        print("\nсеть вне тестов (заблокировано): " + "; ".join(_NET["outside"][:5]), file=sys.stderr)
+        session.exitstatus = 1
+
+
+import netstatus  # noqa: E402
+import p2p  # noqa: E402
 
 FIX = os.path.join(os.path.dirname(__file__), "fixtures")
 
@@ -111,7 +265,14 @@ def offline(monkeypatch):
                 return name(url) if callable(name) else load(name)
         raise AssertionError(f"unexpected URL in test: {url}")
 
+    async def no_bestchange(s, local=None):   # выгрузки BestChange в фикстурах нет — обменник недоступен, как без сети
+        raise OSError("BestChange в тестах офлайн")
+
     monkeypatch.setattr(p2p, "_json", fake_json)
+    # BestChange качается мимо _json (свой ClientSession с привязкой к локальному адресу) — без подмены тест со сканом
+    # ходил на bestchange.ru с реального адреса ПК
+    monkeypatch.setattr(p2p, "_bc_download", no_bestchange)
+    monkeypatch.setattr(p2p, "_local_addrs", lambda: [])
     netstatus.reset()
     for cache in (p2p._bybit_pay, p2p._mexc_pay, p2p._mexc_coins):
         cache.clear()
@@ -264,6 +425,7 @@ _GUARD["on"] = True
 def pytest_unconfigure(config):
     _GUARD["on"] = False
     _SESSION_MP.undo()
+    _NET_MP.undo()
     shutil.rmtree(_SESSION_ROOT, ignore_errors=True)
 
 
