@@ -198,7 +198,7 @@ def test_load_dataset_segments_follow_listing_and_delivery(tmp_path):
         "TONUSDT": {"symbol": "TONUSDT", "status": "Closed", "launchTime": str(T0 - 10 * H),
                     "deliveryTime": str(T0 + 2000 * H), "fundingInterval": 240,
                     "lotSizeFilter": {"qtyStep": "0.1", "minOrderQty": "0.1", "minNotionalValue": "5"}},
-        "GRAMUSDT": {"symbol": "GRAMUSDT", "status": "Trading", "launchTime": str(T0 + 2100 * H + 5),
+        "GRAMUSDT": {"symbol": "GRAMUSDT", "launchTime": str(T0 + 2100 * H + 5),
                      "deliveryTime": "0", "fundingInterval": 240,
                      "lotSizeFilter": {"qtyStep": "0.1", "minOrderQty": "0.1", "minNotionalValue": "5"}},
     }
