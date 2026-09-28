@@ -1449,7 +1449,9 @@ class Bot:
         self.start_ts = time.time()     # для аптайма в /status
         self.scan_error = ""            # текст последней ошибки скана — для watchdog
         self.scan_errors = 0            # ошибок скана подряд
-        self.stall_alerted = False      # watchdog уже сообщил «скан стоит» — ждём восстановления
+        self.stall_alerted = False      # watchdog уже сообщил «скан стоит» (Telegram принял) — ждём восстановления
+        self.watchdog_prev_tick = 0.0   # время прошлого тика watchdog — заметить сон ПК между тиками
+        self.watchdog_wake_ts = 0.0     # когда watchdog заметил пробуждение ПК: простой скана считается от него
         # id сигналов от времени старта в мс: после рестарта старая кнопка did:N не попадёт на новую связку
         self.next_deal_id = int(self.start_ts * 1000)
         self.last_scan_ts = 0.0         # unix-время окончания последнего скана
@@ -2571,30 +2573,57 @@ class Bot:
             minutes = SCAN_STALL_MINUTES_DEFAULT
         return max(minutes * 60, 3 * self.cfg.interval)
 
+    def watchdog_awake(self, now):
+        """Запоминает время тика watchdog. False — с прошлого тика прошло больше 3×WATCHDOG_TICK: ПК спал (или цикл
+        событий стоял) и скан не мог идти — тик пропускаем, простой скана дальше считаем от пробуждения, а не от
+        последнего скана до сна (иначе сразу после сна — ложное «⚠️ Скан стоит… 480 мин», а за ним «✅ снова идёт»)."""
+        prev, self.watchdog_prev_tick = self.watchdog_prev_tick, now
+        if prev and now - prev > 3 * WATCHDOG_TICK:
+            self.watchdog_wake_ts = now
+            return False
+        return True
+
     def watchdog_message(self, now=None):
         """Проверка watchdog: текст алерта или сообщения о восстановлении, None — сообщать нечего. Отдельная площадка
         (check_venues) тут ни при чём: смотрим, идёт ли скан целиком — он мог зависнуть или падать каждый раз
-        (исключение вне адаптеров), и тогда бот молчит, пока владелец не заметит отсутствие сигналов."""
+        (исключение вне адаптеров), и тогда бот молчит, пока владелец не заметит отсутствие сигналов. Состояние
+        алерта (stall_alerted) не меняет — это делает watchdog_check, когда Telegram принял сообщение."""
         now = time.time() if now is None else now
-        since = self.last_scan_ts or self.start_ts
+        if not self.watchdog_awake(now):
+            return None
+        scanned = self.last_scan_ts and self.last_scan_ts >= self.watchdog_wake_ts   # был скан после пробуждения
+        since = self.last_scan_ts if scanned else max(self.start_ts, self.watchdog_wake_ts)
         idle = now - since
         if idle > self.scan_stall_limit():
             if self.stall_alerted:
                 return None
-            self.stall_alerted = True
             ago = f"{int(idle // 60)} мин"
-            what = (f"последний успешный скан {ago} назад" if self.last_scan_ts
-                    else f"с запуска ({ago}) ни одного успешного скана")
+            if scanned:
+                what = f"последний успешный скан {ago} назад"
+            elif self.watchdog_wake_ts > self.start_ts:
+                what = f"после пробуждения ПК ({ago}) ни одного успешного скана"
+            else:
+                what = f"с запуска ({ago}) ни одного успешного скана"
             text = f"⚠️ Скан стоит: {what} — сигналы не приходят."
             if self.scan_errors:
                 text += f"\nОшибок скана подряд: {self.scan_errors}, последняя: {html.escape(self.scan_error)}"
             else:
                 text += "\nОшибок нет — похоже, скан завис. Проверьте /logs, при необходимости перезапустите бота."
             return text
-        if self.stall_alerted and self.last_scan_ts:
-            self.stall_alerted = False
+        if self.stall_alerted and scanned:
             return "✅ Скан снова идёт."
         return None
+
+    async def watchdog_check(self, now=None):
+        """Один тик watchdog: сообщение — в топик «Разработка»; stall_alerted меняется, только если Telegram его принял
+        (r["ok"]), — не дошло, повторим на следующем тике, а не замолчим до восстановления."""
+        text = self.watchdog_message(now)
+        if not text:
+            return
+        alert = not self.stall_alerted   # без алерта сообщение — только алерт, после него — только восстановление
+        r = await self.send(text, topic="dev")
+        if (r or {}).get("ok"):
+            self.stall_alerted = alert
 
     async def watchdog_loop(self):
         """Раз в WATCHDOG_TICK: скан целиком стоит дольше SCAN_STALL_MINUTES — один алерт владельцу (топик «Разработка»),
@@ -2602,11 +2631,10 @@ class Bot:
         while True:
             await asyncio.sleep(WATCHDOG_TICK)
             if not self.chat_id:
+                self.watchdog_awake(time.time())   # тики идут и без чата — сон ПК в это время тоже заметим
                 continue   # владельца ещё нет — не «тратим» алерт впустую, проверим, когда он появится
             try:
-                text = self.watchdog_message()
-                if text:
-                    await self.send(text, topic="dev")
+                await self.watchdog_check()
             except Exception as e:
                 logger.error("watchdog: %s", e)
 
