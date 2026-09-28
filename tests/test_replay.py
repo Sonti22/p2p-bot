@@ -71,7 +71,7 @@ def test_replay_disabled_venue_drops_its_routes(offline):
         assert _venues(snap_b) == {"Bybit"}
         res = replay.compare([scan], [spec])
         assert res["b"]["keys"] and all(k[0] == k[2] == "Bybit" for k in res["b"]["keys"])
-    live = asyncio.run(p2p.scan(None, _cfg(exchanges=["bybit"])))   # тот же ответ площадок, живой скан без MEXC
+    live = arun(p2p.scan(None, _cfg(exchanges=["bybit"])))   # тот же ответ площадок, живой скан без MEXC
     assert _venues(live) == {"Bybit"}                                # collect и сам опрашивает только включённые
     assert {replay._key(d) for d in snap_b.deals} == {replay._key(d) for d in live.deals}
 
@@ -85,7 +85,7 @@ def test_replay_excluded_asset_drops_it_from_results_and_books(offline):
     res = replay.compare([scan], ["assets=BTC"])
     assert res["b"]["keys"] and all(k[1] == k[3] == "BTC" for k in res["b"]["keys"])
     assert res["a"]["deals"] == len(snap.deals) and res["live_hit"] == res["live"]   # A = живой скан, как и был
-    live = asyncio.run(p2p.scan(None, _cfg(assets=["BTC"])))
+    live = arun(p2p.scan(None, _cfg(assets=["BTC"])))
     assert _assets(live) == {"BTC"}
     assert {replay._key(d) for d in snap_b.deals} == {replay._key(d) for d in live.deals}
 
@@ -109,7 +109,7 @@ def test_replay_median_ref_recomputed_without_disabled_venues(offline, monkeypat
     assert scan["ref_src"] == p2p.REF_MEDIAN
     specs = ["exchanges=" + ",".join(venues), f"max_dev={max_dev}"]
     snap_b = replay.rebuild(scan, replay.override(replay.cfg_of(scan), specs))
-    live = asyncio.run(p2p.scan(None, _cfg(exchanges=venues, max_dev=max_dev)))
+    live = arun(p2p.scan(None, _cfg(exchanges=venues, max_dev=max_dev)))
     assert live.deals and live.ref != scan["ref"]                    # медиана без выключенных площадок другая
     assert snap_b.ref == pytest.approx(live.ref) and snap_b.ref_src == p2p.REF_MEDIAN
     assert _keys(snap_b) == _keys(live)
@@ -122,7 +122,7 @@ def test_replay_median_ref_recomputed_without_usdt(offline, monkeypatch):
     _rapira_down(monkeypatch)
     scan, _snap = _saved_scan(_cfg(assets=["USDT", "BTC"]))
     snap_b = replay.rebuild(scan, replay.override(replay.cfg_of(scan), ["assets=BTC"]))
-    live = asyncio.run(p2p.scan(None, _cfg(assets=["BTC"])))
+    live = arun(p2p.scan(None, _cfg(assets=["BTC"])))
     assert live.ref == snap_b.ref == 0 and live.ref_src == snap_b.ref_src == "-"
     assert snap_b.refs == pytest.approx(live.refs) and _keys(snap_b) == _keys(live)
 
@@ -210,7 +210,7 @@ def test_override_pay_filters_in_replay(offline, spec, field):
     нижнем регистре), а не ноль связок (include) или ничего не исключено (exclude) из-за регистра."""
     scan, _snap = _saved_scan(_cfg())
     snap_b = replay.rebuild(scan, replay.override(replay.cfg_of(scan), [spec]))
-    live = asyncio.run(p2p.scan(None, _cfg(**{field: spec.partition("=")[2].lower().split(",")})))
+    live = arun(p2p.scan(None, _cfg(**{field: spec.partition("=")[2].lower().split(",")})))
     assert live.deals and _keys(snap_b) == _keys(live)
 
 
