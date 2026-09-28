@@ -30,6 +30,7 @@ import presets
 import simdirectional
 import simfunding
 import simmaker
+import hedge_plans
 import simperp
 import snapshots
 import trades
@@ -1566,6 +1567,11 @@ class Bot:
             return
         d, cfg, snap = entry
         trade_id, bank, total, crossed = trades.log_trade(d, cfg.amount)
+        try:   # план хеджа «что открыл бы бот» (без ордеров); сбой не мешает журналу
+            hedge_plans.record(trade_id, d, cfg.amount, ref=getattr(snap, "ref", 0.0) or 0.0,
+                               risk=cfg.risk_buffer.get(d[1].asset, 0.0))
+        except Exception as e:
+            logger.error("hedge_plans: %s: %s", type(e).__name__, e)
         await self.call("answerCallbackQuery", callback_query_id=cq["id"], text="Записано в журнал ✅")
         await self.send(f"Расчёт был {d[0]:+.2f}%. Какой вышел факт?", markup=fact_markup(trade_id), topic="journal")
         await self.call("editMessageReplyMarkup", chat_id=self.chat_id, message_id=cq["message"]["message_id"],
@@ -1812,7 +1818,12 @@ class Bot:
         план/факт, срывы по причинам, нехватка глубины стакана, среднее время круга. План здесь — без запаса
         на курс (paper._PLAN_CMP): в факте запаса нет, иначе факт выглядел бы лучше плана на размер запаса."""
         if not rows:
-            return "🧪 Отчёт сухого прогона: завершённых кругов ещё нет."
+            text = "🧪 Отчёт сухого прогона: завершённых кругов ещё нет."
+            try:   # план хеджа реальных сделок (hedge_plans) от кругов прогона не зависит
+                text += "\n".join(hedge_plans.report_lines())
+            except Exception as e:
+                logger.error("hedge_plans: %s: %s", type(e).__name__, e)
+            return text
         lines = ["🧪 <b>Отчёт сухого прогона</b> — по площадкам и парам (план — без запаса на курс, как и факт):", ""]
         for r in rows:
             line = (f"{r['buy_ex']}→{r['sell_ex']} ({r['buy_asset']}→{r['sell_asset']}): "
@@ -1851,6 +1862,10 @@ class Bot:
             lines += simperp.report_lines()
         except Exception as e:
             logger.error("simperp: %s: %s", type(e).__name__, e)
+        try:
+            lines += hedge_plans.report_lines()
+        except Exception as e:
+            logger.error("hedge_plans: %s: %s", type(e).__name__, e)
         lines += ["", *self.paper_vs_real_lines(rows)]
         lines.append("")
         lines.append("📄 разбор по связкам — файлом CSV ниже.")
