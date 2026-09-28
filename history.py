@@ -12,11 +12,17 @@
 и, если не было, почему (последняя преграда: unconfirmed / max_signals / cooldown / quiet / trap / paused / unsent /
 stale — данные площадки устарели: она не ответила за VENUE_TIMEOUT, это пропуск).
 Пишет бот после отправки сигналов (Bot.record_signals); доля «пропущенных» — signal_stats().
+
+Таблица bank_spreads — в тот же момент, что history, лучший % связок по банку: side "buy" — банк, которым платим
+мерчанту на покупке (способы оплаты объявления покупки), "sell" — банк, в который получаем рубли на продаже; «SBP» —
+способ «СБП» без названия банка. /banks без монеты — bank_spread_stats() за 7 дней. Срок хранения тот же.
 """
 import os
 import sqlite3
 import statistics
 import time
+
+import trades
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(HERE, "data", "history.db")
@@ -45,16 +51,19 @@ def _connect(path):
                 "first_seen REAL, last_seen REAL, scans INTEGER, max_profit REAL, signalled INTEGER, signal_ts REAL, "
                 "reason_not_signalled TEXT, amount REAL, min_profit REAL)")
     con.execute("CREATE INDEX IF NOT EXISTS idx_signals_last ON signals (last_seen)")
+    con.execute("CREATE TABLE IF NOT EXISTS bank_spreads ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, side TEXT, bank TEXT, profit REAL)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_bank_spreads_ts ON bank_spreads (ts)")
     return con
 
 
-def _insert(rows, path=DB_PATH, routes=()):
+def _insert(rows, path=DB_PATH, routes=(), banks=()):
     """rows: [(ts, buy_ex, sell_ex, asset_buy, asset_sell, profit, ref[, amount]), ...].
     Сумма круга (amount) необязательна для обратной совместимости со старыми записями/тестами —
     без неё в базе останется NULL, и backtest() возьмёт сумму, переданную в него самого.
     routes — строки history_routes [(ts, buy_ex, asset_buy, sell_ex, asset_sell, profit), ...], пишутся в той же
-    транзакции."""
-    if not rows and not routes:
+    транзакции. banks — строки bank_spreads [(ts, side, bank, profit), ...], там же."""
+    if not rows and not routes and not banks:
         return
     rows = [r if len(r) == 8 else (*r, None) for r in rows]
     con = _connect(path)
@@ -63,10 +72,33 @@ def _insert(rows, path=DB_PATH, routes=()):
                         "VALUES (?, ?, ?, ?, ?, ?, ?, ?)", rows)
         con.executemany("INSERT INTO history_routes (ts, buy_ex, asset_buy, sell_ex, asset_sell, profit) "
                         "VALUES (?, ?, ?, ?, ?, ?)", list(routes))
+        con.executemany("INSERT INTO bank_spreads (ts, side, bank, profit) VALUES (?, ?, ?, ?)", list(banks))
     con.close()
 
 
 _last = {"t": 0.0}   # время последней записи — троттлинг раз в 5 минут (сбрасывается в тестах)
+
+
+def ad_banks(ad):
+    """Банки способов оплаты объявления (trades.bank_of), «SBP» — есть СБП без названия банка; без повторов."""
+    out = []
+    for p in ad.pays:
+        bank = trades.bank_of(p) or ("SBP" if trades.is_sbp(p) else "")
+        if bank and bank not in out:
+            out.append(bank)
+    return out
+
+
+def _bank_best(deals):
+    """{(side, bank): лучший % связки} по сделкам скана: buy — банки объявления покупки, sell — продажи."""
+    best = {}
+    for profit, b, s, _route in deals:
+        for side, ad in (("buy", b), ("sell", s)):
+            for bank in ad_banks(ad):
+                key = (side, bank)
+                if key not in best or profit > best[key]:
+                    best[key] = profit
+    return best
 
 
 def record(snap, amount=None, path=DB_PATH):
@@ -90,7 +122,8 @@ def record(snap, amount=None, path=DB_PATH):
             routes[rkey] = profit
     _insert([(now, buy_ex, sell_ex, ab, sa, profit, snap.ref, amount)
             for (buy_ex, sell_ex), (profit, ab, sa) in best.items()], path,
-            routes=[(now, *rkey, profit) for rkey, profit in routes.items()])
+            routes=[(now, *rkey, profit) for rkey, profit in routes.items()],
+            banks=[(now, side, bank, profit) for (side, bank), profit in _bank_best(snap.deals).items()])
     _last["t"] = now
     return True
 
@@ -165,6 +198,32 @@ def _merged_episodes(rows, gap):
     return out
 
 
+def venue_signals(since, until=None, path=DB_PATH, cooldown=None):
+    """Связки выше порога за окно [since, until] по направлениям площадок — для утреннего дайджеста:
+    {(buy_ex, sell_ex): {"episodes": эпизодов, "best": лучший %}}. Эпизод — появление связки (buy_ex, монета, sell_ex,
+    монета) над порогом; просела на скан и вернулась быстрее cooldown — тот же эпизод (как signal_stats). Разные монеты
+    одного направления складываются. Базы нет — {}."""
+    until = time.time() if until is None else until
+    gap = _cooldown() if cooldown is None else cooldown
+    if not os.path.exists(path):
+        return {}
+    con = _connect(path)
+    rows = con.execute("SELECT buy_ex, buy_asset, sell_ex, sell_asset, first_seen, last_seen, signalled, "
+                       "reason_not_signalled, max_profit FROM signals WHERE last_seen >= ? AND first_seen <= ? "
+                       "ORDER BY buy_ex, buy_asset, sell_ex, sell_asset, first_seen, id", (since, until)).fetchall()
+    con.close()
+    best = {}
+    for r in rows:
+        k = (r[0], r[2])
+        best[k] = max(best.get(k, r[8]), r[8])
+    out = {}
+    for ep in _merged_episodes([(r[:4], *r[4:8]) for r in rows], gap):
+        k = (ep["key"][0], ep["key"][2])
+        rec = out.setdefault(k, {"episodes": 0, "best": best[k]})
+        rec["episodes"] += 1
+    return out
+
+
 def signal_stats(path=DB_PATH, days=7, now=None, min_minutes=3, cooldown=None):
     """Сводка эпизодов signals за `days` дней: всего, с сигналом, «долгие» (держались ≥ min_minutes от первого до
     последнего скана) и сколько из них прошло без сигнала — доля пропущенных связок (цель этапа 2 — ≤ 10%), и
@@ -217,6 +276,7 @@ def cleanup(path=DB_PATH, now=None):
         cur = con.execute("DELETE FROM history WHERE ts < ?", (now - RETENTION,))
         con.execute("DELETE FROM history_routes WHERE ts < ?", (now - RETENTION,))
         con.execute("DELETE FROM signals WHERE last_seen < ?", (now - RETENTION,))
+        con.execute("DELETE FROM bank_spreads WHERE ts < ?", (now - RETENTION,))
     con.close()
     return cur.rowcount
 
@@ -310,3 +370,23 @@ def median_vs_bestchange(path=DB_PATH, days=30, now=None):
     p2p = [statistics.median(by_day[d]["p2p"]) if by_day[d]["p2p"] else None for d in order]
     bc = [statistics.median(by_day[d]["bc"]) if by_day[d]["bc"] else None for d in order]
     return labels, p2p, bc
+
+
+def bank_spread_stats(days=7, path=DB_PATH, now=None):
+    """Спред связок по банкам за `days` дней (bank_spreads): {side: [(банк, срезов, средний лучший %, лучший %,
+    доля срезов с плюсом)]}, внутри стороны — по убыванию среднего. side: "buy" — чем платим мерчанту на покупке,
+    "sell" — куда получаем на продаже. Базы или данных нет — {}."""
+    now = time.time() if now is None else now
+    if not os.path.exists(path):
+        return {}
+    con = _connect(path)
+    rows = con.execute("SELECT side, bank, COUNT(*), AVG(profit), MAX(profit), "
+                       "SUM(CASE WHEN profit > 0 THEN 1 ELSE 0 END) FROM bank_spreads WHERE ts >= ? "
+                       "GROUP BY side, bank", (now - days * 86400,)).fetchall()
+    con.close()
+    out = {}
+    for side, bank, n, avg, best, pos in rows:
+        out.setdefault(side, []).append((bank, n, avg, best, pos / n if n else 0.0))
+    for side in out:
+        out[side].sort(key=lambda r: (-r[2], r[0]))
+    return out

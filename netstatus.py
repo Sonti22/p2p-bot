@@ -20,6 +20,10 @@ HTX_NATIVE_ONLY = ("BTC", "ETH")   # _parse_htx оставляет у этих �
 PARTIAL = {("HTX", a) for a in HTX_NATIVE_ONLY}
 STATUS = {}      # (площадка, монета) -> {сеть: {"dep": bool|None, "wd": bool|None, "fee": float|None, "min": float|None}}
 CHANGES = []     # (площадка, монета, сеть, "вывод"/"ввод", открыт: bool)
+# сети из справочников площадок, которых normalize() не знает (вне KNOWN_NETS): (площадка, монета, имя) ->
+# {"first", "last", "seen"} — подсказка владельцу, что маппинг пора расширить (/nets); на расчёт не влияет
+UNMAPPED = {}
+UNMAPPED_MAX = 60
 _meta = {"t": 0.0, "errors": {}}
 
 
@@ -117,7 +121,26 @@ def _parse_mexc(j, asset):
     return out
 
 
+def _note_unmapped(venue, asset, nets, now=None):
+    """Запомнить сети справочника вне KNOWN_NETS (normalize вернула имя как есть). Журнал ограничен UNMAPPED_MAX —
+    сверх него выпадают давно не виденные."""
+    now = time.time() if now is None else now
+    for net in nets:
+        if not net or net in KNOWN_NETS:
+            continue
+        rec = UNMAPPED.setdefault((venue, asset, net), {"first": now, "last": now, "seen": 0})
+        rec["last"], rec["seen"] = now, rec["seen"] + 1
+    while len(UNMAPPED) > UNMAPPED_MAX:
+        del UNMAPPED[min(UNMAPPED, key=lambda k: UNMAPPED[k]["last"])]
+
+
+def unmapped():
+    """Журнал нераспознанных сетей: [(площадка, монета, имя, запись)], недавние первыми."""
+    return sorted(((v, a, n, r) for (v, a, n), r in UNMAPPED.items()), key=lambda x: (-x[3]["last"], x[:3]))
+
+
 def _apply(venue, asset, nets):
+    _note_unmapped(venue, asset, nets)
     old = STATUS.get((venue, asset)) or {}
     for net, rec in nets.items():
         prev = old.get(net)
@@ -225,4 +248,5 @@ def pop_changes():
 def reset():
     STATUS.clear()
     CHANGES.clear()
+    UNMAPPED.clear()
     _meta.update(t=0.0, errors={})

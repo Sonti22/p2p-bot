@@ -6,7 +6,12 @@
 не меньше этой суммы (p2p._stack на отфильтрованном по цене срезе snap.groups); «reliable» — метка
 p2p.reliability() встречной связки (лучшая по snap.deals с этим же объявлением) не хуже «⚠️ риск»,
 т.е. не «🪤 ловушка». Нет объявления встречной связки для reliable — алерт не срабатывает: подтвердить
-надёжность нечем."""
+надёжность нечем.
+
+Алерт на связку (kind="route"): /alert route Bybit MEXC USDT 3% 7d — сообщить, когда связка покупка на buy_ex →
+продажа на sell_ex по монете asset (одна монета с обеих сторон) даст не меньше rate % чистыми, как в сигнале
+(snap.deals), со своим порогом и сроком. Условия «reliable» и «repeat» — те же; «vol» не нужен: связка уже
+посчитана на сумму круга. Строка в той же таблице: side="route", rate — порог %, buy_ex/sell_ex — площадки."""
 import os
 import re
 import sqlite3
@@ -36,6 +41,9 @@ def _connect(path):
         con.execute("ALTER TABLE alerts ADD COLUMN min_volume REAL")
     if "require_reliable" not in cols:
         con.execute("ALTER TABLE alerts ADD COLUMN require_reliable INTEGER")
+    for col in ("kind", "buy_ex", "sell_ex"):   # апгрейд базы до алертов на связку; '' / NULL — алерт на курс
+        if col not in cols:
+            con.execute(f"ALTER TABLE alerts ADD COLUMN {col} TEXT DEFAULT ''")
     con.commit()
     return con
 
@@ -65,6 +73,24 @@ def add(chat_id, asset, side, rate, expires_ts, path=DB_PATH, repeat_cooldown=No
     return alert_id
 
 
+def add_route(chat_id, buy_ex, sell_ex, asset, pct, expires_ts, path=DB_PATH, repeat_cooldown=None,
+              require_reliable=False):
+    """Создать алерт на связку buy_ex → sell_ex по asset с порогом pct % чистыми, вернуть id."""
+    con = _connect(path)
+    with con:
+        cur = con.execute("INSERT INTO alerts (chat_id, asset, side, rate, created_ts, expires_ts, repeat_cooldown, "
+                          "min_volume, require_reliable, kind, buy_ex, sell_ex) "
+                          "VALUES (?, ?, 'route', ?, ?, ?, ?, NULL, ?, 'route', ?, ?)",
+                          (chat_id, asset, pct, time.time(), expires_ts, repeat_cooldown, int(require_reliable),
+                           buy_ex, sell_ex))
+        alert_id = cur.lastrowid
+    con.close()
+    return alert_id
+
+
+_RATE_ONLY = "COALESCE(kind, '') != 'route'"
+
+
 def _prune_expired(con, now):
     con.execute("DELETE FROM alerts WHERE expires_ts <= ?", (now,))
 
@@ -79,7 +105,23 @@ def list_all(chat_id, path=DB_PATH, now=None):
     with con:
         _prune_expired(con, now)
     rows = con.execute("SELECT id, asset, side, rate, expires_ts, repeat_cooldown, min_volume, "
-                       "require_reliable FROM alerts WHERE chat_id = ? ORDER BY id", (chat_id,)).fetchall()
+                       f"require_reliable FROM alerts WHERE chat_id = ? AND {_RATE_ONLY} ORDER BY id",
+                       (chat_id,)).fetchall()
+    con.close()
+    return rows
+
+
+def list_routes(chat_id, path=DB_PATH, now=None):
+    """Активные алерты на связку чата [(id, buy_ex, sell_ex, asset, pct, expires_ts, repeat_cooldown,
+    require_reliable), ...] — для /alerts."""
+    now = time.time() if now is None else now
+    if not os.path.exists(path):
+        return []
+    con = _connect(path)
+    with con:
+        _prune_expired(con, now)
+    rows = con.execute("SELECT id, buy_ex, sell_ex, asset, rate, expires_ts, repeat_cooldown, require_reliable "
+                       "FROM alerts WHERE chat_id = ? AND kind = 'route' ORDER BY id", (chat_id,)).fetchall()
     con.close()
     return rows
 
@@ -138,7 +180,7 @@ def due(snap, cfg, path=DB_PATH, now=None):
     with con:
         _prune_expired(con, now)
     rows = con.execute("SELECT id, chat_id, asset, side, rate, repeat_cooldown, last_fired_ts, "
-                       "min_volume, require_reliable FROM alerts").fetchall()
+                       f"min_volume, require_reliable FROM alerts WHERE {_RATE_ONLY}").fetchall()
     fired = []
     for alert_id, chat_id, asset, side, rate, cooldown, last_fired, min_volume, require_reliable in rows:
         if cooldown is not None and last_fired is not None and now - last_fired < cooldown:
@@ -156,6 +198,38 @@ def due(snap, cfg, path=DB_PATH, now=None):
         if best_ad is not None:
             fired.append((alert_id, chat_id, asset, side, rate, best_ad.price, best_ad))
     con.close()
+    return fired
+
+
+def route_due(snap, cfg, path=DB_PATH, now=None):
+    """Сработавшие алерты на связку: [(id, chat_id, buy_ex, sell_ex, asset, pct, связка)]. Связка — лучшая по
+    прибыли из snap.deals с этими площадками и монетой (с обеих сторон), не по устаревшим данным площадки
+    (p2p.deal_stale), с прибылью ≥ порога и, при reliable, не «🪤 ловушка». Как в due(): алерт помечается
+    сработавшим только после доставки (mark_fired), истёкшие удаляются."""
+    now = time.time() if now is None else now
+    if not os.path.exists(path):
+        return []
+    con = _connect(path)
+    with con:
+        _prune_expired(con, now)
+    rows = con.execute("SELECT id, chat_id, buy_ex, sell_ex, asset, rate, repeat_cooldown, last_fired_ts, "
+                       "require_reliable FROM alerts WHERE kind = 'route'").fetchall()
+    con.close()
+    fired = []
+    for alert_id, chat_id, buy_ex, sell_ex, asset, pct, cooldown, last_fired, require_reliable in rows:
+        if cooldown is not None and last_fired is not None and now - last_fired < cooldown:
+            continue
+        best = None
+        for d in snap.deals:
+            profit, b, s, _ = d
+            if (b.ex, s.ex, b.asset, s.asset) != (buy_ex, sell_ex, asset, asset) or profit < pct or p2p.deal_stale(d):
+                continue
+            if require_reliable and p2p.reliability(d, cfg, snap)[0] == p2p.TRAP:
+                continue
+            if best is None or profit > best[0]:
+                best = d
+        if best is not None:
+            fired.append((alert_id, chat_id, buy_ex, sell_ex, asset, pct, best))
     return fired
 
 
