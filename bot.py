@@ -281,6 +281,11 @@ STALE_RETRY_MAX = 600       # сек: потолок паузы между по�
 # кнопки из-за них выключать нельзя (Bot._fancy_failed)
 NOT_BUTTON_ERRORS = ("message is not modified", "message to edit not found", "message can't be edited",
                      "message not found", "chat not found")
+# признаки отказа из-за самой разметки кнопок («can't parse inline keyboard button», «can't parse reply keyboard
+# markup», BUTTON_TYPE_INVALID, REPLY_MARKUP_INVALID) — только так сервер или клиент не принимает цвета (style) и «📋»
+# (copy_text). Отказ без них (403 «bot was blocked by the user», «message is too long», «can't parse entities»)
+# повтор с обычными кнопками не исправит, и цветные кнопки из-за него выключать нельзя (Bot._fancy_failed)
+BUTTON_ERRORS = ("button", "keyboard", "markup")
 MARKET_STATUS_INTERVAL = 60  # сек: не чаще обновляем закреплённое сообщение «Статус рынка»
 MSK = timezone(timedelta(hours=3))                    # тихие часы и /pause считаем по МСК, не по времени ПК
 PAUSE_PRESETS = {"30m": 1800, "1h": 3600, "3h": 3 * 3600}  # аргументы /pause -> секунды
@@ -1514,14 +1519,15 @@ class Bot:
         return markup if self.fancy or not markup else plain_markup(markup)
 
     def _fancy_failed(self, r, markup):
-        """Отправка с цветными кнопками/«📋» не удалась: дальше шлём обычные кнопки и повторяем. 429 и 5xx — не про
-        кнопки (перегрузка/сбой Telegram): цвета не выключаем, повтор — забота вызывающего (retry_after). Отказ правки
-        не из-за кнопок (NOT_BUTTON_ERRORS: подпись не изменилась, сообщения нет или его нельзя править) — тоже: иначе
-        одна правка живой карточки или «⌛ устарела» выключала бы цветные кнопки всему боту до перезапуска."""
+        """Отправка с цветными кнопками/«📋» не удалась из-за самих кнопок (BUTTON_ERRORS): дальше шлём обычные кнопки
+        и повторяем. Остальные отказы — не про кнопки, цвета не выключаем: 429 и 5xx (перегрузка/сбой Telegram, повтор —
+        забота вызывающего, retry_after), 403 (гость заблокировал бота), «message is too long», «can't parse entities»,
+        отказ правки из NOT_BUTTON_ERRORS (подпись не изменилась, сообщения нет или его нельзя править) — иначе один
+        такой отказ выключал бы цветные кнопки всему боту до перезапуска."""
         code = r.get("error_code") or 0
         text = str(r.get("description") or "").lower()
-        if r.get("ok") or not self.fancy or not is_fancy(markup) or code == 429 or code >= 500 \
-                or any(x in text for x in NOT_BUTTON_ERRORS):
+        if r.get("ok") or not self.fancy or not is_fancy(markup) or code in (403, 429) or code >= 500 \
+                or any(x in text for x in NOT_BUTTON_ERRORS) or not any(x in text for x in BUTTON_ERRORS):
             return False
         self.fancy = False
         logger.warning("Telegram: цветные кнопки/copy_text не поддерживаются, дальше обычные: %s", r.get("description"))
