@@ -92,7 +92,7 @@ def test_command_creates_lists_and_fires_route_alert():
     arun(bot.handle("/alert route bybit MEXC usdt 2.5% 7d reliable repeat 1h"))
     assert texts(bot)[-1].startswith("🔔 Алерт на связку создан: Bybit → MEXC USDT ≥2.5% чистыми, срок 7d, повтор")
     text, kb = B.alerts_view("1")
-    assert "🔀 Bybit → MEXC USDT ≥2.5%" in text and kb["inline_keyboard"][0][0]["callback_data"].startswith("delalert:")
+    assert text.startswith("🔔 <b>Алерты</b>") and "🔀 Bybit → MEXC USDT ≥2.5%" in text and kb["inline_keyboard"][0][0]["callback_data"].startswith("delalert:")
     arun(bot.check_alerts(snap([deal(3.1)])))
     msg = texts(bot)[-1]
     assert msg.startswith("🔔 <b>Алерт связки:</b> Bybit → MEXC USDT <b>+3.10%</b> чистыми (порог 2.5%)")
@@ -110,3 +110,7 @@ def test_command_rejects_bad_input():
     assert "не больше 90d" in texts(bot)[-1]
     arun(bot.handle("/alert route Bybit MEXC USDT 3% 7d vol 50000"))
     assert texts(bot)[-1] == B.ALERT_HELP
+    bot.cfg.exchanges = [e for e in bot.cfg.exchanges if e != "mexc"]
+    arun(bot.handle("/alert route Bybit MEXC USDT 3% 7d"))
+    assert texts(bot)[-1].startswith("MEXC сейчас не сканируется")
+    assert B.alerts.list_routes("1") == []

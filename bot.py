@@ -783,7 +783,7 @@ def alerts_view(chat_id):
     rows, routes = alerts.list_all(chat_id), alerts.list_routes(chat_id)
     if not rows and not routes:
         return (f"🔔 <b>Алертов нет</b>\n\n{ALERT_HELP}", {"inline_keyboard": []})
-    lines = ["🔔 <b>Алерты на курс</b>", ""]
+    lines = ["🔔 <b>Алерты</b>" if routes else "🔔 <b>Алерты на курс</b>", ""]
     kb = []
     for alert_id, buy_ex, sell_ex, asset, pct, expires_ts, cooldown, require_reliable in routes:
         left_h = max(0, round((expires_ts - time.time()) / 3600))
@@ -1709,6 +1709,11 @@ class Bot:
         buy_ex, sell_ex = names.get(m.group(1).lower()), names.get(m.group(2).lower())
         if not buy_ex or not sell_ex:
             await self.send(f"Площадки: {', '.join(VENUE_NAMES.values())}.")
+            return
+        off = [VENUE_NAMES.get(k, k) for k in VENUE_NAMES if VENUE_NAMES[k] in (buy_ex, sell_ex)
+               and k not in self.cfg.exchanges]
+        if off:   # площадка не сканируется — связки через неё не появятся, алерт молча не сработал бы
+            await self.send(f"{', '.join(off)} сейчас не сканируется — включи в «⚙️ Настройки → 🎛 Фильтры».")
             return
         asset = m.group(3).upper()
         if asset not in self.cfg.assets:
