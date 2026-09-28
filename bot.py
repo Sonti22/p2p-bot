@@ -18,6 +18,7 @@ import accounts
 import calibration
 import favorites
 import alerts
+import backup
 import blacklist
 import fees
 import history
@@ -27,6 +28,7 @@ import paper
 import payouts
 import perp
 import presets
+import reputation
 import simdirectional
 import simfunding
 import simmaker
@@ -110,8 +112,9 @@ COMMANDS = [{"command": "best", "description": "Лучшая связка сей
             {"command": "alerts", "description": "Список алертов на курс"},
             {"command": "blacklist", "description": "Скрытые мерчанты и обменники"},
             {"command": "traps", "description": "Последние отсеянные ловушки (обучение без риска)"},
+            {"command": "nets", "description": "Сети площадок, которые бот не распознал"},
             {"command": "maker", "description": "Цена мейкера на площадках, напр. /maker USDT"},
-            {"command": "banks", "description": "Объём по банкам на площадках, напр. /banks USDT"},
+            {"command": "banks", "description": "Банки: спред за 7 дней; /banks USDT — объём сейчас"},
             {"command": "balance", "description": "Баланс по подключённым биржам"},
             {"command": "payout", "description": "Выплата Cryptomus на адрес из белого списка, /payout history"},
             {"command": "fees", "description": "Комиссии вывода по сетям и возраст данных"},
@@ -123,7 +126,7 @@ COMMANDS = [{"command": "best", "description": "Лучшая связка сей
             {"command": "logs", "description": "Последние строки лога (logs/bot.log)"},
             {"command": "guests", "description": "Гости: кому ещё слать сигналы (/allow id, /deny id)"},
             {"command": "safety", "description": "Безопасность: 115-ФЗ, блокировки карт, правила сделки"},
-            {"command": "help", "description": "Как работать с сигналами"}]
+            {"command": "help", "description": "Справка по разделам: сигнал, метки, команды"}]
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEV_STATUS = os.path.join(HERE, ".dev_status.json")   # пишет launcher.py при каждом запуске
 PERP_LOOP_TICK = 5   # сек: как часто perp_loop проверяет, пора ли опросить перпы (сам интервал — PERP_INTERVAL)
@@ -164,6 +167,73 @@ LINKS = {"inline_keyboard": [
     [{"text": "Bybit P2P", "url": "https://www.bybit.com/fiat/trade/otc/?actionType=1&token=USDT&fiat=RUB"},
      {"text": "MEXC P2P", "url": "https://www.mexc.com/ru-RU/buy-crypto/p2p?fiat=RUB"}],
     [{"text": "BestChange", "url": "https://www.bestchange.ru/"}, {"text": "BitPapa", "url": "https://bitpapa.com/ru"}]]}
+
+
+# /help владельца — разделы кнопками (как docs/owner-guide.md): ключ → (кнопка, текст). Раздел открывается правкой того
+# же сообщения. Гостю — прежняя справка одним сообщением (GUIDE): его кнопки обрабатывает запиненный on_guest_callback.
+_GUIDE_PARTS = GUIDE_BODY.split("\n\n<b>")
+HELP_SECTIONS = {
+    "signal": ("📨 Сигнал", _GUIDE_PARTS[0]),
+    "safety": ("🛡 Безопасность", "<b>" + _GUIDE_PARTS[1]),
+    "costs": ("🧮 Что учтено в %", "<b>" + "\n\n<b>".join(_GUIDE_PARTS[2:]).rstrip()),
+    "labels": ("🏷 Метки", "<b>Метки надёжности</b>\n"
+               "✅ надёжно — причин риска нет; ⚠️ риск — 1–2 причины (в скобках); 🪤 ловушка — 3 и больше, сигналом "
+               "не приходит (SIGNAL_TRAPS=0), в /top и /best видна с меткой.\n"
+               "Надёжность N/10 — 10 минус веса причин; оценка ±X — прибыль минус штраф за риск, по ней сортировка.\n\n"
+               "<b>Причины риска</b>: цена далеко от ориентира, мерчант у порога фильтров, рискованные условия, мерчант "
+               "офлайн, 2+ перевода или конвертации, волатильная монета, спред ≥ 5%, «обменник → обменник».\n\n"
+               "<b>Отсеивается совсем</b>: цена дальше MAX_DEV (видно в /traps), стоп-фразы в условиях (третьи лица, "
+               "мессенджеры), мерчанты ниже MIN_ORDERS / MIN_RATE / MERCHANT_MIN, блэклист."),
+    "market": ("📊 Рынок", "<b>Рынок</b>\n"
+               "/best — лучшая связка сейчас\n/top — топ связок графиком, «📄 Подробно» — текстом\n"
+               "/calc 20000 — расчёт под свою сумму (20к, 1,5 млн), настройки не меняет\n"
+               "/maker USDT — цена, чтобы встать первым объявлением, место в стакане\n"
+               "/banks USDT — объём объявлений по банкам\n/fees — комиссии вывода по сетям\n"
+               "/history — лучшее время суток и хитмап спреда за 7 дней\n"
+               "/backtest — сколько раз связки были выше порога по истории\n/safety — 115-ФЗ, блокировки, правила"),
+    "journal": ("🧾 Сделки", "<b>Сделки и журнал</b>\n"
+                "/stats — журнал за день, неделю, месяц: сделки, сумма, расчёт против факта\n"
+                "/export (month / year / prev) — журнал в CSV для банка и 3-НДФЛ\n"
+                "/mybanks — свои банки и бесплатные лимиты СБП\n/fav — избранные маршруты\n"
+                "/alert USDT sell 92 7d, /alerts — алерты на курс\n"
+                "/blacklist, /blacklist note &lt;id&gt; &lt;текст&gt; — скрытые мерчанты\n"
+                "/balance — баланс подключённых бирж, итог в ₽\n/traps — последние отсеянные ловушки"),
+    "paper": ("🧪 Сухой прогон", "<b>Сухой прогон и бумажные симуляции (без денег)</b>\n"
+              "/paper — открытый круг, итоги, план против факта, виртуальный баланс\n"
+              "/paper on / off — включить / выключить\n/paper amount 20000 — сумма круга\n"
+              "/paper report — отчёт по площадкам и парам + CSV\n/paper reset — обнулить (с подтверждением)\n"
+              "/funding — бумажный арбитраж фандинга\n/futures — бумажная стратегия EMA 20/100\n"
+              "/maker paper — бумажный мейкер\n/calibration — поправка факт − план (CALIBRATION=1)"),
+    "settings": ("⚙️ Настройки", "<b>Настройки и служебное</b>\n"
+                 "/settings — порог, сумма, фильтры, мои биржи и банки, тихие часы, пауза, пресеты (всё в .env)\n"
+                 "/amount 100000, /min 1.5 — сумма круга и порог сигнала\n"
+                 "/pause 30m / 1h / 3h / до утра, /resume — пауза сигналов\n"
+                 "/status — скан, ошибки, скорость; «📋 Подробно» — всё\n/logs — хвост logs/bot.log\n"
+                 "/dev — версия, изменения, план, CI\n/allow, /deny, /guests — гости"),
+    "keys": ("🔑 Биржи", "<b>Биржи — только чтение</b>\n"
+             "«⚙️ Настройки → 🔑 Мои биржи → ➕ Подключить». Ключ — только для чтения: сообщение с ним бот сразу "
+             "удалит, проверит права и будет показывать баланс и движения. Ключ с правами торговли или вывода бот "
+             "удалит сразу (если не ALLOW_UNSAFE_KEYS=1)."),
+}
+HELP_INTRO = ("❓ <b>Справка</b>\n\nБот ищет P2P-связки за рубли и присылает карточку: что купить, куда перевести, "
+              "где продать и сколько останется чистыми. Деньги он не трогает — сделки делаешь ты.\n\n"
+              "Выбери раздел кнопкой ниже. Законы, документы для банка, блокировки карт — /safety. "
+              "Площадки — ссылками внизу.")
+
+
+def help_view(section=None):
+    """(текст, кнопки) «/help»: без section — вступление и кнопки разделов; с section — текст раздела и те же кнопки
+    (открытый раздел отмечен), неизвестный раздел — вступление. Внизу — ссылки на площадки (LINKS)."""
+    keys = list(HELP_SECTIONS)
+    if section not in keys:
+        section = None
+    text = HELP_INTRO if section is None else HELP_SECTIONS[section][1] + "\n\n<i>Разделы — кнопками ниже.</i>"
+    buttons = [{"text": ("• " if k == section else "") + HELP_SECTIONS[k][0], "callback_data": f"help:{k}"}
+               for k in keys]
+    rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
+    if section is not None:
+        rows.append([{"text": "⬅️ Оглавление", "callback_data": "help:"}])
+    return text, {"inline_keyboard": rows + LINKS["inline_keyboard"]}
 # «🛡 Безопасность» (/safety) — общая справка, доступна и гостям; только факты, без советов по обходу контроля банков.
 SAFETY = ("🛡 <b>Безопасность P2P</b> — справка, не юридическая консультация.\n\n"
           "<b>115-ФЗ.</b> Банк может запросить документы по операциям и ограничить их. Храни историю ордеров "
@@ -203,6 +273,7 @@ VENUE_NAMES = dict(EXCHANGE_NAMES, bestchange="BestChange")  # + обменни�
 ACCOUNT_NAMES = dict(EXCHANGE_NAMES, bingx="BingX", cryptomus="Cryptomus")
 ACCOUNT_ONLY = tuple(ex for ex in ACCOUNT_NAMES if ex not in VENUE_NAMES)   # ("bingx", "cryptomus")
 ACCOUNT_POLL_INTERVAL_DEFAULT = 60  # опрос истории аккаунтов, сек — если не задано в .env
+KEY_RECHECK_HOURS_DEFAULT = 1.0     # повторная проверка прав ключей бирж, часы — если не задано в .env
 LIVE_EDIT_INTERVAL = 30     # сек: не чаще обновляем карточку последнего сигнала вместо повторной отправки
 STALE_RETRY_BASE = 30       # сек: пометку «⌛ устарела» после 429/5xx/сбоя сети повторим не раньше (дальше ×2)
 STALE_RETRY_MAX = 600       # сек: потолок паузы между повторами пометки
@@ -219,10 +290,26 @@ PAPER_RESET_MARKUP = {"inline_keyboard": [[{"text": "🗑 Да, обнулить
                                            {"text": "Отмена", "callback_data": "paper_reset:no"}]]}
 
 
+DIGEST_MAX = 4000                  # утренний дайджест — одно сообщение, предел Telegram 4096 с запасом
+DIGEST_VENUES = 8                  # направлений площадок в дайджесте, остальные — «…ещё N»
+DIGEST_FALLBACK_WINDOW = 12 * 3600  # начало ночи неизвестно (бот перезапущен в тихие часы) — окно 12 ч до конца
+
+
 def account_poll_interval():
     """Читаем ACCOUNT_POLL_INTERVAL при каждом обращении, а не при импорте модуля — иначе значение
     из .env не подхватывается: load_env() вызывается в main() уже после импорта bot.py."""
     return int(os.getenv("ACCOUNT_POLL_INTERVAL", ACCOUNT_POLL_INTERVAL_DEFAULT))
+
+
+def key_recheck_hours():
+    """KEY_RECHECK_HOURS — раз в сколько часов accounts_loop заново проверяет права сохранённых ключей бирж теми же
+    правилами, что и при старте (биржа могла перевыпустить ключ с торговлей/выводом, а процесс живёт неделями).
+    0 — только при старте; мусор или минус — значение по умолчанию. Читаем при каждом обращении."""
+    try:
+        v = float(os.getenv("KEY_RECHECK_HOURS", KEY_RECHECK_HOURS_DEFAULT))
+    except ValueError:
+        return KEY_RECHECK_HOURS_DEFAULT
+    return v if v >= 0 and v == v and v != float("inf") else KEY_RECHECK_HOURS_DEFAULT
 
 
 def signal_traps():
@@ -678,6 +765,31 @@ def terms_log_lines(limit=TERMS_LOG_SHOW, room=TRAPS_TEXT_MAX):
     return lines if len(lines) > 2 else []
 
 
+NETS_ROWS = 30   # строк в /nets
+
+
+def unmapped_nets_view(rows=None, now=None):
+    """Текст «/nets»: сети из справочников площадок, которые netstatus.normalize не распознал (вне KNOWN_NETS). Такая
+    «сеть» не совпадёт с той же сетью под другим именем у другой площадки — маршрут через неё не найдётся. Только
+    подсказка: расширить маппинг в netstatus.normalize; на расчёт не влияет."""
+    rows = netstatus.unmapped() if rows is None else rows
+    now = time.time() if now is None else now
+    if not rows:
+        return ("🧭 <b>Нераспознанные сети</b>\n\nПока нет: все сети из справочников площадок бот узнаёт "
+                f"({', '.join(netstatus.KNOWN_NETS)}). Справочники обновляются раз в {netstatus.TTL // 60} мин.")
+    lines = ["🧭 <b>Нераспознанные сети</b>", "",
+             "Эти имена сетей бот не сопоставил со своими — перевод через них между площадками не посчитается, "
+             "даже если у обеих сеть одна. На расчёт это не влияет; если сеть нужна — добавить имя в "
+             "netstatus.normalize.", ""]
+    for venue, asset, net, rec in rows[:NETS_ROWS]:
+        ago = max(0, int((now - rec["last"]) // 60))
+        lines.append(f"• {html.escape(venue)} {html.escape(asset or '')}: <code>{html.escape(net)}</code> — "
+                     f"{rec['seen']} раз, последний {ago} мин назад")
+    if len(rows) > NETS_ROWS:
+        lines.append(f"• …ещё {len(rows) - NETS_ROWS}")
+    return "\n".join(lines)
+
+
 MAKER_HELP = ("Формат: /maker USDT — цена, чтобы встать первым в очереди на покупку и на продажу, и сколько это "
               "стоит против сделки сразу.")
 
@@ -765,6 +877,32 @@ def maker_book_lines(snap, cfg, ex, asset, post_side, price):
 
 BANKS_HELP = ("Формат: /banks USDT — сколько объявлений и какой объём (₽) по каждому банку/способу оплаты "
               "на каждой подключённой площадке, отдельно на покупку и на продажу.")
+BANK_HISTORY_DAYS = 7    # /banks без монеты — история спреда связок по банкам за столько дней
+BANK_HISTORY_ROWS = 8    # банков на сторону
+
+
+def bank_history_view(days=BANK_HISTORY_DAYS, stats=None):
+    """Текст «/banks» без монеты: через какие банки связки выгоднее за `days` дней (history.bank_spread_stats) —
+    отдельно банк, которым платим на покупке, и банк, куда получаем на продаже: средний лучший % связки в срезе
+    истории (раз в 5 минут), лучший %, доля срезов с плюсом."""
+    stats = history.bank_spread_stats(days) if stats is None else stats
+    lines = [f"🏦 <b>Спред связок по банкам за {days} дн.</b>", ""]
+    if not stats:
+        lines.append("Истории ещё нет — бот пишет её раз в 5 минут, пока есть связки.")
+    for side, label in (("buy", "Платим мерчанту (покупка)"), ("sell", "Получаем (продажа)")):
+        rows = stats.get(side)
+        if not rows:
+            continue
+        lines.append(f"<b>{label}</b>")
+        for bank, n, avg, best, pos in rows[:BANK_HISTORY_ROWS]:
+            name = "СБП (банк не указан)" if bank == "SBP" else trades.BANK_NAMES.get(bank, bank)
+            lines.append(f"• {html.escape(name)}: в среднем {avg:+.2f}%, лучшая {best:+.2f}%, в плюсе "
+                         f"{pos * 100:.0f}% срезов ({n})")
+        if len(rows) > BANK_HISTORY_ROWS:
+            lines.append(f"• …ещё {len(rows) - BANK_HISTORY_ROWS}")
+        lines.append("")
+    lines.append("Средний — лучшей связки, где банк есть у объявления, по срезам истории. " + BANKS_HELP)
+    return "\n".join(lines).rstrip()
 
 
 def banks_view(snap, cfg, asset):
@@ -802,16 +940,26 @@ ALERT_HELP = ("Формат: /alert USDT sell 92 7d — сообщу, когда
               "«reliable» — встречная связка с этим объявлением не хуже «⚠️ риск» (не «🪤 ловушка»);\n"
               "«repeat 1h» — алерт не удалится после срабатывания, а будет проверяться дальше и может "
               "сработать снова не раньше, чем через кулдаун (здесь 1h) после прошлого раза.\n"
-              "Пример: /alert USDT sell 92 7d vol 50000 reliable repeat 1h")
+              "Пример: /alert USDT sell 92 7d vol 50000 reliable repeat 1h\n\n"
+              "Алерт на связку: /alert route Bybit MEXC USDT 3% 7d — сообщу, когда покупка на Bybit → продажа на "
+              "MEXC по USDT даст ≥3% чистыми (как сигнал, но со своим порогом и сроком). Можно «reliable» и "
+              "«repeat 1h».")
 
 
 def alerts_view(chat_id):
     """Текст и кнопки «/alerts»: активные алерты чата с удалением."""
-    rows = alerts.list_all(chat_id)
-    if not rows:
+    rows, routes = alerts.list_all(chat_id), alerts.list_routes(chat_id)
+    if not rows and not routes:
         return (f"🔔 <b>Алертов нет</b>\n\n{ALERT_HELP}", {"inline_keyboard": []})
-    lines = ["🔔 <b>Алерты на курс</b>", ""]
+    lines = ["🔔 <b>Алерты</b>" if routes else "🔔 <b>Алерты на курс</b>", ""]
     kb = []
+    for alert_id, buy_ex, sell_ex, asset, pct, expires_ts, cooldown, require_reliable in routes:
+        left_h = max(0, round((expires_ts - time.time()) / 3600))
+        mark = f" 🔁 каждые ≥{cooldown / 3600:g} ч" if cooldown else ""
+        rel_mark = " 🛡 не хуже риска" if require_reliable else ""
+        lines.append(f"🔀 {html.escape(buy_ex)} → {html.escape(sell_ex)} {asset} ≥{pct:g}% "
+                     f"(осталось ~{left_h} ч){mark}{rel_mark}")
+        kb.append([{"text": f"🗑 {buy_ex}→{sell_ex} {asset} ≥{pct:g}%"[:64], "callback_data": f"delalert:{alert_id}"}])
     for alert_id, asset, side, rate, expires_ts, cooldown, min_volume, require_reliable in rows:
         label, cmp = ("продать", "≥") if side == "sell" else ("купить", "≤")
         left_h = max(0, round((expires_ts - time.time()) / 3600))
@@ -1231,6 +1379,29 @@ def speed_lines(speed, timeout):
     return lines
 
 
+STATS_DIRECTIONS = 8   # направлений в /stats, остальные — «…ещё N»
+
+
+def direction_lines(rows, limit=STATS_DIRECTIONS):
+    """Строки /stats «По направлениям за месяц» из trades.by_direction: какие пары площадок реально приносят деньги —
+    по факту (₽ и средний %), где факта нет — только расчёт. [] — сделок за месяц нет."""
+    if not rows:
+        return []
+    lines = ["", "<b>По направлениям за месяц</b> (покупка → продажа):"]
+    for d in rows[:limit]:
+        line = (f"• {html.escape(d['buy_ex'])} → {html.escape(d['sell_ex'])}: {d['count']} сд., "
+                f"{_money(d['amount'])} ₽, расчёт {d['avg_profit']:+.2f}%")
+        if d["fact_count"]:
+            rub = f"{d['fact_rub']:+,.0f}".replace(",", " ")
+            line += f", факт {d['avg_fact']:+.2f}% (у {d['fact_count']}) ≈ {rub} ₽"
+        else:
+            line += ", факта нет"
+        lines.append(line)
+    if len(rows) > limit:
+        lines.append(f"• …ещё {len(rows) - limit}")
+    return lines
+
+
 def market_status_view(snap, cfg):
     """Текст закреплённого сообщения «Статус рынка»: ориентир курса, лучшая связка, площадки ок/недоступны."""
     lines = ["📌 <b>Статус рынка</b>", "", f"Ориентир USDT: {snap.ref:.2f} ₽ ({html.escape(snap.ref_src)})"]
@@ -1259,6 +1430,7 @@ class Bot:
         self.fancy = os.getenv("FANCY_BUTTONS", "1") != "0"   # цветные кнопки и «📋»; сам выключится при ошибке API
         self.topics = {}          # ключ топика -> message_thread_id, если у бота включены топики в личке
         self.cur_thread = None    # топик, из которого пришла последняя команда/кнопка — туда и отвечаем
+        self.key_checked_ts = time.time()   # последняя проверка прав ключей (check_key_safety), для KEY_RECHECK_HOURS
         entries = {g.strip() for g in os.getenv("TG_GUESTS", "").split(",") if g.strip()}
         self.guests = {g for g in entries if not g.startswith("@")}          # id чатов гостей
         self.pending = {g.lower() for g in entries if g.startswith("@")}   # @ники: доступ откроется с первого сообщения
@@ -1276,6 +1448,7 @@ class Bot:
         self.quiet_hours = os.getenv("QUIET_HOURS", "01:00-08:00")   # окно тихих часов, МСК "HH:MM-HH:MM"
         self.quiet_on = os.getenv("QUIET_HOURS_ON", "0") == "1"      # тихие часы включены (кнопка в настройках)
         self.night_deals = {}    # (ex,asset,ex,asset) -> лучшая связка за тихие часы, для утреннего дайджеста
+        self.quiet_since = None  # когда начались текущие тихие часы (для окна утреннего дайджеста)
         self._was_quiet = False  # тихие часы были на прошлом скане — для разового дайджеста при выходе из них
         self.awaiting_amount = False  # ждём сумму текстом после «✏️ Своя сумма»
         self.awaiting_preset_name = False  # ждём имя пресета текстом после «💾 Сохранить как пресет»
@@ -1290,10 +1463,12 @@ class Bot:
         self.signal_rows = {}   # (ex,asset,ex,asset) -> id открытого эпизода в history.signals (связка выше порога)
         self.snapshot_scans = 0      # сканов с запуска — снимок пишется каждый SNAPSHOT_EVERY-й
         self.snapshot_keep = set()   # id сканов, на которых стартовал круг сухого прогона: их снимок пишется всегда
+        self.rep_task = None         # фоновый пересчёт меток репутации мерчантов (schedule_reputation)
         self.cal = None              # EV_RANK=1: калибровка (calibration.build) и когда собрана — пересборка раз в
         self.cal_ts = 0.0            # calibration.REFRESH сек, в отдельном потоке
         self.live_msg = {}   # (ex,asset,ex,asset) -> последнее сообщение сигнала для «живой карточки» (editMessage)
         self.chip_tasks = set()   # фоновые уточнения фишек сумм у отправленных карточек (ссылки держим до конца)
+        self.backup_task = None   # фоновая суточная копия баз (schedule_backup)
         self.live = {}                                            # (ex,asset,ex,asset) -> {"first": ts, "streak": n}
         self.live_scans = int(os.getenv("LIVE_SCANS", 2))        # сигнал, только если связка держится ≥ N сканов
         self.venue = {}   # ex -> {"streak": сканов подряд с ошибкой, "down_since": ts, "alerted_at": ts}
@@ -1663,6 +1838,9 @@ class Bot:
         """Команда «/alert USDT sell 92 7d [vol 50000] [reliable] [repeat 1h]»: разобрать и создать
         алерт на курс — одноразовый либо «повторно» с кулдауном, с необязательными условиями через
         «И» (объём стакана / надёжность встречной связки) в любом порядке хвоста."""
+        if (arg or "").strip().lower().startswith("route"):
+            await self.add_route_alert(arg.strip()[5:])
+            return
         m = re.match(r"(\w+)\s+(buy|sell)\s+([\d.,]+)\s+(\d+[hdw])(\s.*)?$", (arg or "").strip(), re.I)
         if not m:
             await self.send(ALERT_HELP)
@@ -1716,6 +1894,61 @@ class Bot:
         await self.send(f"🔔 Алерт создан: {asset} {label} {cmp}{rate:g} ₽, срок {dur_s}{notes}. "
                         f"Список — /alerts.")
 
+    async def add_route_alert(self, arg):
+        """«/alert route <площадка покупки> <площадка продажи> <монета> <порог>% <срок> [reliable] [repeat 1h]»."""
+        m = re.match(r"\s*(\w+)\s+(\w+)\s+(\w+)\s+(-?[\d.,]+)%?\s+(\d+[hdw])(\s.*)?$", arg or "", re.I)
+        if not m:
+            await self.send(ALERT_HELP)
+            return
+        names = {**{k.lower(): v for k, v in VENUE_NAMES.items()}, **{v.lower(): v for v in VENUE_NAMES.values()}}
+        buy_ex, sell_ex = names.get(m.group(1).lower()), names.get(m.group(2).lower())
+        if not buy_ex or not sell_ex:
+            await self.send(f"Площадки: {', '.join(VENUE_NAMES.values())}.")
+            return
+        off = [VENUE_NAMES.get(k, k) for k in VENUE_NAMES if VENUE_NAMES[k] in (buy_ex, sell_ex)
+               and k not in self.cfg.exchanges]
+        if off:   # площадка не сканируется — связки через неё не появятся, алерт молча не сработал бы
+            await self.send(f"{', '.join(off)} сейчас не сканируется — включи в «⚙️ Настройки → 🎛 Фильтры».")
+            return
+        asset = m.group(3).upper()
+        if asset not in self.cfg.assets:
+            await self.send(f"Монета {asset} не отслеживается ботом ({', '.join(self.cfg.assets)}).")
+            return
+        try:
+            pct = float(m.group(4).replace(",", "."))
+        except ValueError:
+            await self.send("Порог — число в %, например 3 или 2.5%.")
+            return
+        if not -10 <= pct <= MIN_PROFIT_MAX:
+            await self.send(f"Порог — от −10 до {MIN_PROFIT_MAX:g}%.")
+            return
+        dur = alerts.parse_duration(m.group(5))
+        if dur is None:
+            await self.send("Срок — число + h/d/w (часы/дни/недели), не больше 90d.")
+            return
+        require_reliable, cooldown_s = False, None
+        tokens = (m.group(6) or "").split()
+        i = 0
+        while i < len(tokens):
+            tok = tokens[i].lower()
+            if tok == "reliable":
+                require_reliable, i = True, i + 1
+            elif tok == "repeat" and i + 1 < len(tokens):
+                cooldown_s, i = tokens[i + 1].lower(), i + 2
+            else:
+                await self.send(ALERT_HELP)
+                return
+        cooldown = alerts.parse_duration(cooldown_s) if cooldown_s else None
+        if cooldown_s and cooldown is None:
+            await self.send("Кулдаун repeat — число + h/d/w (часы/дни/недели), не больше 90d.")
+            return
+        alerts.add_route(self.chat_id, buy_ex, sell_ex, asset, pct, time.time() + dur, repeat_cooldown=cooldown,
+                         require_reliable=require_reliable)
+        notes = "".join([f", повтор не чаще раза в {cooldown_s}" if cooldown_s else "",
+                         ", надёжность не хуже риска" if require_reliable else ""])
+        await self.send(f"🔔 Алерт на связку создан: {buy_ex} → {sell_ex} {asset} ≥{pct:g}% чистыми, "
+                        f"срок {m.group(5).lower()}{notes}. Список — /alerts.")
+
     async def check_alerts(self, snap, cfg=None):
         """Сработавшие алерты по текущему снимку → сообщение в тот чат, где алерт создан. Сработавшим
         (одноразовый — удалён) алерт помечается только после доставки; сбой — повторим в следующем скане."""
@@ -1726,6 +1959,20 @@ class Bot:
                                     f"({cmp}{rate:g}) — {fmt_ad(ad)}", chat_id=chat_id, topic="signals")
             except Exception as e:   # сеть/таймаут: остальные алерты этого скана тоже не дойдут
                 logger.warning("alert send error: %s", accounts.api_error_text(e))   # без URL с токеном бота
+                break
+            if not r.get("ok"):
+                logger.warning("alert not sent: %s", r.get("description"))
+            if delivery_final(r):
+                alerts.mark_fired(alert_id)
+        for alert_id, chat_id, buy_ex, sell_ex, asset, pct, d in alerts.route_due(snap, cfg or self.cfg):
+            profit, b, sl, route = d
+            try:
+                r = await self.send(f"🔔 <b>Алерт связки:</b> {html.escape(buy_ex)} → {html.escape(sell_ex)} {asset} "
+                                    f"<b>{profit:+.2f}%</b> чистыми (порог {pct:g}%) на "
+                                    f"{_money(self.snap_cfg(snap).amount)} ₽\nКупить: {fmt_ad(b)}\nПродать: {fmt_ad(sl)}",
+                                    chat_id=chat_id, topic="signals")
+            except Exception as e:
+                logger.warning("alert send error: %s", accounts.api_error_text(e))
                 break
             if not r.get("ok"):
                 logger.warning("alert not sent: %s", r.get("description"))
@@ -1749,6 +1996,7 @@ class Bot:
                 lines.append(line)
             else:
                 lines.append(f"{label}: сделок нет")
+        lines += direction_lines(trades.by_direction(trades.period_start("month")))
         banks = trades.month_banks()
         if banks:   # только информация: сколько разных мерчантов было по каждой своей карте
             lines += ["", f"Контрагенты по картам (ориентир ЦБ 16-МР: &gt;{trades.COUNTERPARTY_DAY} в день, "
@@ -2071,7 +2319,12 @@ class Bot:
         """/banks <монета>: объявления и объём по каждому банку на всех подключённых площадках."""
         asset = (arg or "").strip().upper()
         if not asset:
-            await self.send(BANKS_HELP)
+            try:
+                text = bank_history_view(stats=await asyncio.to_thread(history.bank_spread_stats, BANK_HISTORY_DAYS))
+            except Exception as e:
+                logger.warning("bank history: %s", e)
+                text = BANKS_HELP
+            await self.send(text)
             return
         if asset not in self.cfg.assets:
             await self.send(f"Монета {asset} не отслеживается ботом ({', '.join(self.cfg.assets)}).")
@@ -2280,6 +2533,20 @@ class Bot:
         snap.cfg = cfg
         return await self.ev_rank(snap, cfg)
 
+    def schedule_reputation(self):
+        """Раз в reputation.REFRESH — пересчёт меток мерчантов (paper.db + snapshots.db) фоном в отдельном потоке:
+        скан его не ждёт, прошлый пересчёт ещё идёт — новый не запускаем."""
+        if not reputation.due() or (self.rep_task is not None and not self.rep_task.done()):
+            return
+        self.rep_task = asyncio.ensure_future(self.refresh_reputation())
+
+    async def refresh_reputation(self):
+        try:
+            n = await asyncio.to_thread(reputation.refresh)
+            logger.info("репутация мерчантов: меток %d", n)
+        except Exception as e:
+            logger.warning("reputation: %s", e)
+
     async def scan_loop(self):
         while True:
             snap = None
@@ -2291,6 +2558,7 @@ class Bot:
                 self.track_liveness(self.last)
                 if history.record(snap, self.snap_cfg(snap).amount):   # не чаще раза в 5 минут, независимо от чата
                     history.cleanup()
+                self.schedule_reputation()
 
                 if simmaker.enabled():   # бумажный мейкер (SIM_MAKER=1): только расчёт по снимку, объявлений нет
                     try:
@@ -2311,7 +2579,28 @@ class Bot:
                 logger.error("scan error: %s", e)
             if snap is not None:   # после сигналов: снимок для разбора не задерживает их
                 await self.save_snapshot(snap)
+                self.schedule_backup()   # суточная копия баз — фоном, скан не ждёт
             await asyncio.sleep(self.cfg.interval)
+
+    def schedule_backup(self):
+        """Раз в сутки — копия баз (backup.py) фоном в отдельном потоке; скан её не ждёт, вторая параллельно не идёт."""
+        if self.backup_task is not None and not self.backup_task.done():
+            return
+        try:
+            if not backup.due():
+                return
+        except (OSError, ValueError) as e:   # не читается data/backup или чужая папка — скан не падает
+            logger.warning("backup: %s", e)
+            return
+        self.backup_task = asyncio.ensure_future(self.run_backup())
+
+    async def run_backup(self):
+        try:
+            dest, files = await asyncio.to_thread(backup.run)
+            if dest:
+                logger.info("резервная копия баз: %s (%d файлов)", dest, len(files))
+        except Exception as e:
+            logger.warning("backup: %s", e)
 
     async def save_snapshot(self, snap):
         """Снимок скана в data/snapshots.db (snapshots.py): каждый SNAPSHOT_EVERY-й скан (первый после запуска —
@@ -2349,6 +2638,49 @@ class Bot:
                 run()
             except Exception as e:
                 logger.error("%s: %s", name, e)
+
+    async def open_help(self, cq, section):
+        """Кнопка раздела /help: правим то же сообщение; не вышло — шлём новым."""
+        text, kb = help_view(section or None)
+        msg = cq.get("message") or {}
+        r = await self.call("editMessageText", chat_id=self.chat_id, message_id=msg.get("message_id"), text=text,
+                            parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
+        if not r.get("ok") and "message is not modified" not in r.get("description", ""):
+            await self.send(text, markup=kb)
+
+    def status_brief(self, status_path=DEV_STATUS):
+        """(текст, кнопки) «/status» коротко: версия и аптайм, последний скан (жив ли, длительность, p50/p90),
+        ошибки площадок одной строкой, связок выше порога. «📋 Подробно» — полный status_view."""
+        st = _dev_status(status_path)
+        lines = [f"📟 <b>Статус</b> · <code>{html.escape(st.get('version', '?'))}</code> · аптайм "
+                 f"{_uptime_str(time.time() - self.start_ts)}"]
+        if self.last_scan_ts:
+            age = time.time() - self.last_scan_ts
+            fresh = age <= max(3 * self.cfg.interval, 60)
+            when = datetime.fromtimestamp(self.last_scan_ts).strftime("%H:%M:%S")
+            line = f"{'🟢' if fresh else '🔴'} Скан {when} ({self.last_scan_duration:.1f} с)"
+            speed = self.speed.summary()
+            if speed:
+                p50, p90 = speed["scan"]
+                line += f" · p50 {p50:.1f} / p90 {p90:.1f} с"
+            if not fresh:
+                line += f" — {int(age // 60)} мин назад"
+            lines.append(line)
+        else:
+            lines.append("⏳ Скана ещё не было")
+        snap = self.last
+        if snap is not None:
+            if snap.errors:
+                names = ", ".join(html.escape(k) for k in list(snap.errors)[:4])
+                more = f" +{len(snap.errors) - 4}" if len(snap.errors) > 4 else ""
+                lines.append(f"⚠️ Ошибки площадок ({len(snap.errors)}): {names}{more}")
+            else:
+                lines.append("✅ Ошибок нет — все площадки отвечают")
+            above = sum(1 for d in snap.deals if d[0] >= self.cfg.min_profit)
+            lines.append(f"🔔 Связок выше порога {self.cfg.min_profit:g}%: {above}")
+        kb = {"inline_keyboard": [[{"text": "📋 Подробно", "callback_data": "status_full"},
+                                   {"text": "🔄 Обновить", "callback_data": "status"}]]}
+        return "\n".join(lines), kb
 
     def status_view(self, status_path=DEV_STATUS):
         """Текст «/status»: версия, аптайм, время/длительность последнего скана, ошибки площадок (и таймауты: площадка
@@ -2434,25 +2766,81 @@ class Bot:
                     cfg = copy.deepcopy(self.snap_cfg(snap))
                 self.night_deals[key] = (d, cfg)
 
-    async def send_night_digest(self):
-        """Дайджест по окончании тихих часов: топ-3 связки за ночь по прибыли, одним сообщением; сумма круга у
-        каждой — та, на которую её посчитали (из её снимка), а не текущая."""
-        deals, self.night_deals = list(self.night_deals.values()), {}
-        if not deals:
-            await self.send("🌅 Тихие часы закончились — связок выше порога не было.", topic="signals")
-            return
-        top = sorted(deals, key=lambda dc: dc[0][0], reverse=True)[:3]
-        parts = [f"{i}) {fmt_deal(d, cfg)}" for i, (d, cfg) in enumerate(top, 1)]
-        await self.send("🌅 <b>Доброе утро! Топ-3 связки за ночь</b>\n\n" + "\n\n".join(parts), topic="signals")
+    def night_signal_lines(self, since, now, limit=DIGEST_VENUES):
+        """Строки дайджеста «сколько было связок выше порога по направлениям площадок» за ночь (history.signals):
+        сначала направления с большим числом эпизодов, не больше limit строк, остальное — «…ещё N»."""
+        try:
+            counts = history.venue_signals(since, now)
+        except Exception as e:
+            logger.warning("digest signals: %s", e)
+            return []
+        if not counts:
+            return []
+        total = sum(v["episodes"] for v in counts.values())
+        order = sorted(counts.items(), key=lambda kv: (-kv[1]["episodes"], -kv[1]["best"], kv[0]))
+        lines = [f"📡 <b>Связки выше порога</b>: {total} по {len(counts)} направл."]
+        lines += [f"• {html.escape(b)} → {html.escape(s)}: {v['episodes']} (лучшая {v['best']:+.2f}%)"
+                  for (b, s), v in order[:limit]]
+        if len(order) > limit:
+            lines.append(f"• …ещё {len(order) - limit} направл.")
+        return lines
 
-    def paper_digest_line(self):
-        """Одна строка сводки сухого прогона за сутки для утреннего дайджеста — то же, что «За сегодня»
-        в /paper. None — сухой прогон выключен или за сутки не было ни одного завершённого круга (не слать)."""
+    def night_digest_text(self, deals, since, now):
+        """Утренний дайджест одним сообщением (до DIGEST_MAX символов): связки выше порога по площадкам за ночь,
+        топ-3 связки ночи и итог сухого прогона за сутки. deals — [(связка, cfg её снимка)] из night_deals."""
+        head = f"🌅 <b>Доброе утро! Итоги ночи</b> ({_hhmm_msk(since)}–{_hhmm_msk(now)} МСК)"
+        signals = self.night_signal_lines(since, now)
+        top = sorted(deals, key=lambda dc: dc[0][0], reverse=True)[:3]
+        try:
+            paper_lines = self.paper_digest_lines(now)
+        except Exception as e:   # paper.db занята/испорчена — дайджест со связками всё равно уходит
+            logger.warning("digest paper: %s", e)
+            paper_lines = []
+
+        def build(full_deals, venues):
+            parts = [head]
+            if signals:
+                parts.append("\n".join(signals[:venues + 1] if venues < len(signals) - 1 else signals))
+            if top:
+                items = [f"{i}) {fmt_deal(d, cfg)}" if full_deals else f"{i}) {html.escape(d[1].ex)} → "
+                         f"{html.escape(d[2].ex)} {html.escape(d[1].asset)}/{html.escape(d[2].asset)} "
+                         f"<b>{d[0]:+.2f}%</b>" for i, (d, cfg) in enumerate(top, 1)]
+                parts.append("🏆 <b>Топ-3 связки за ночь</b>\n\n" + "\n\n".join(items))
+            else:
+                parts.append("Тихие часы закончились — связок выше порога не было.")
+            if paper_lines:
+                parts.append("\n".join(paper_lines))
+            return "\n\n".join(parts)
+
+        text = build(True, len(signals))
+        if len(text) > DIGEST_MAX:
+            text = build(False, len(signals))    # топ-3 одной строкой вместо полной карточки
+        venues = len(signals)
+        while len(text) > DIGEST_MAX and venues > 1:
+            venues -= 1                          # меньше направлений — первая строка (итог) остаётся
+            text = build(False, venues)
+        return text[:DIGEST_MAX]
+
+    async def send_night_digest(self):
+        """Дайджест по окончании тихих часов — одно сообщение (night_digest_text): связки по площадкам за ночь, топ-3
+        по прибыли и сухой прогон за сутки; сумма круга у каждой связки — та, на которую её посчитали (из её
+        снимка), а не текущая."""
+        deals, self.night_deals = list(self.night_deals.values()), {}
+        now = time.time()
+        since = self.quiet_since or now - DIGEST_FALLBACK_WINDOW
+        self.quiet_since = None
+        await self.send(self.night_digest_text(deals, since, now), topic="signals")
+
+    def paper_digest_lines(self, now=None):
+        """Сводка сухого прогона за последние сутки для утреннего дайджеста: строка итогов (как «За сегодня» в /paper,
+        но за 24 ч до now), результат исполнившихся в ₽ и самые частые причины срывов. [] — прогон выключен или за
+        сутки не завершилось ни одного круга."""
         if not paper.settings()["on"]:
-            return None
-        p = paper.stats()["day"]
+            return []
+        now = time.time() if now is None else now
+        p = paper.summary_since(now - 86400)
         if not p["total"]:
-            return None
+            return []
         line = f"🧪 Сухой прогон за сутки: {p['total']} кругов, исполнилось {p['done']}"
         if p["failed"]:
             reasons = ", ".join(f"{paper.FAIL_LABELS.get(r, r)} {n}" for r, n in p["failed_by_reason"].items())
@@ -2464,23 +2852,28 @@ class Bot:
             change = paper.balance_change()
             change_str = f"{change:+,.0f}".replace(",", " ")
             line += f", баланс {_money(balance)} ₽ ({change_str} ₽)"
-        return line
+        lines = [line]
+        if p["done"]:
+            lines.append(f"Итог исполнившихся за сутки: {p['profit_rub']:+,.0f} ₽".replace(",", " "))
+        if p["top_notes"]:
+            lines.append("Причины срывов: " + "; ".join(f"{html.escape(n[:80])} ×{c}" for n, c in p["top_notes"]))
+        return lines
 
-    async def send_paper_digest(self):
-        """Отправить строку `paper_digest_line()` в топик «Сигналы», если есть что показать."""
-        line = self.paper_digest_line()
-        if line:
-            await self.send(line, topic="signals")
+    def paper_digest_line(self):
+        """Первая строка paper_digest_lines() — итоги сухого прогона за сутки; None — показывать нечего."""
+        lines = self.paper_digest_lines()
+        return lines[0] if lines else None
 
     async def quiet_and_pause_tick(self, snap):
         """Тихие часы копят связки для утреннего дайджеста вместо отправки; обычная пауза (ручная или
         по /pause) просто не шлёт сигналы. Дайджест уходит один раз — в момент выхода из тихих часов."""
         quiet = self.is_quiet_now()
         if quiet:
+            if not self._was_quiet and self.quiet_since is None:
+                self.quiet_since = time.time()   # начало ночи — окно для «связок по площадкам» в дайджесте
             self.collect_night_deals(snap)
         elif self._was_quiet:
             await self.send_night_digest()
-            await self.send_paper_digest()
         self._was_quiet = quiet
         paused = self.paused or (self.pause_until and time.time() < self.pause_until)
         since = time.time()   # отправленное notify в этом скане отмечено в self.sent не раньше
@@ -3014,6 +3407,12 @@ class Bot:
             await self.send(f"✅ автосопоставление сделки #{trade['id']}: факт {fact:+.2f}% чистыми{was} "
                             f"(расчёт был {trade['profit']:+.2f}%)", topic="journal")
 
+    def key_recheck_due(self, now=None):
+        """Пора ли повторно проверить права ключей: KEY_RECHECK_HOURS > 0 и с прошлой проверки прошло столько часов."""
+        hours = key_recheck_hours()
+        now = time.time() if now is None else now
+        return hours > 0 and now - self.key_checked_ts >= hours * 3600
+
     async def accounts_loop(self):
         while True:
             if self.chat_id:
@@ -3021,6 +3420,11 @@ class Bot:
                     await self.check_accounts()
                 except Exception as e:
                     logger.error("accounts_loop error: %s", e)
+                if self.key_recheck_due():
+                    try:
+                        await self.check_key_safety(periodic=True)
+                    except Exception as e:
+                        logger.error("key recheck error: %s", type(e).__name__)
             await asyncio.sleep(account_poll_interval())
 
     async def command_loop(self):
@@ -3322,7 +3726,12 @@ class Bot:
             text, kb = dev_view()
             await self.send(text, markup=kb)
         elif data == "status":
+            text, kb = self.status_brief()
+            await self.send(text, markup=kb)
+        elif data == "status_full":
             await self.send(self.status_view())
+        elif data.startswith("help:"):
+            await self.open_help(cq, data[5:])
         elif data == "paper":
             await self.send(self.paper_view(), markup=self.paper_markup())
         elif data.startswith(("paper_set:", "paper_amt:")):
@@ -3536,6 +3945,8 @@ class Bot:
                 await self.send(text, markup=kb)
         elif cmd == "/traps":
             await self.send(traps_view())
+        elif cmd == "/nets":
+            await self.send(unmapped_nets_view())
         elif cmd == "/maker":
             await self.maker(arg)
         elif cmd == "/banks":
@@ -3553,7 +3964,8 @@ class Bot:
             text, kb = dev_view()
             await self.send(text, markup=kb)
         elif cmd == "/status":
-            await self.send(self.status_view())
+            text, kb = self.status_brief()
+            await self.send(text, markup=kb)
         elif cmd == "/logs":
             await self.send(logs_view(LOG_PATH))
         elif cmd == "/amount" and arg:
@@ -3574,8 +3986,11 @@ class Bot:
             await self.cmd_pause(arg)
         elif cmd == "/resume":
             await self.cmd_resume()
-        else:
-            await self.send(GUIDE if REPLY_CHAT.get() is not None else OWNER_GUIDE, markup=LINKS)
+        elif REPLY_CHAT.get() is not None:   # гостю — справка одним сообщением (кнопки разделов — у владельца)
+            await self.send(GUIDE, markup=LINKS)
+        else:   # /help и незнакомая команда — оглавление справки с кнопками разделов
+            text, kb = help_view()
+            await self.send(text, markup=kb)
 
     async def cmd_payout(self, arg):
         """/payout — выплата Cryptomus на адрес из белого списка; /payout history — последние 10 выплат.
@@ -3744,13 +4159,17 @@ class Bot:
         await self.send(f"⚠️ {name}: ключ даёт больше, чем чтение ({html.escape(detail)}) — удалил его из бота.\n"
                         + advice + env_key_hint(ex))
 
-    async def check_key_safety(self):
-        """При старте: если сохранённый ключ биржи даёт торговать/выводить — удалить его и попросить read-only."""
+    async def check_key_safety(self, periodic=False):
+        """При старте и раз в KEY_RECHECK_HOURS (periodic=True, из accounts_loop): если сохранённый ключ биржи даёт
+        торговать/выводить — удалить его и попросить read-only. Не удалось проверить — ключ не трогаем, как при старте."""
+        self.key_checked_ts = time.time()
         for ex in accounts.ONBOARDABLE:
             if accounts.keys(ex) is None:
                 continue
             safe, detail = await accounts.api_permissions(self.s, ex)
             if not safe and allow_unsafe_keys():   # владелец оставил ключ сознательно — без удаления и без спама
+                if periodic and accounts.verify_status(ex) == ("unsafe", detail):
+                    continue                        # то же, что уже знаем: не писать в лог каждый час
                 accounts.set_verified(ex, "unsafe", detail)
                 logger.warning("%s: ключ даёт больше, чем чтение (%s) — оставлен, ALLOW_UNSAFE_KEYS=1", ex, detail)
             elif not safe:

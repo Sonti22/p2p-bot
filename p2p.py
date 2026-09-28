@@ -27,6 +27,7 @@ import aiohttp
 import fees
 import netstatus
 import perp
+import reputation
 
 import blacklist
 import trades
@@ -2584,6 +2585,9 @@ def _signal_ad(a, who, pays_title, terms=True):
     notes = terms_flags(a.terms)[1] if terms else []
     if notes:
         lines.append(f"• ⚠️ Условия: {html.escape('; '.join(notes[:2]))}")
+    rep = reputation.label(a) if terms else None   # история мерчанта (reputation.py) — подсказка, не блокировка
+    if rep:
+        lines.append(f"• {html.escape(rep)}")
     return lines
 
 
