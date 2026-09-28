@@ -76,3 +76,15 @@ def test_stack_accepts_rounding_shortfall_within_one_kopeck():
     st = p2p._stack([ad], 50000)
     assert st is not None
     assert st.price == pytest.approx(50000 / (49999.995 / 100.0))
+
+
+# --- обменник → Bybit → стакан обменников: вывод с Bybit — на каждый из переводов ---
+
+def test_exchanger_to_exchanger_stack_via_bybit_fee_times_parts():
+    ads = [make_ad("BestChange", "sell", 89.9 - i * 0.1, net="ERC20", min_amt=500, max_amt=25_000,
+                   avail=25_000 / (89.9 - i * 0.1)) for i in range(3)]
+    b = make_ad("BestChange", "buy", 85.0, net="TRC20")
+    profit, _, s, route = p2p._match(b, ads, _cfg(), SPOT)
+    assert s.parts == 3
+    assert "через Bybit: перевод −2.4 USDT (ERC20) ×3" in route   # 0.8 USDT × 3
+    assert profit == pytest.approx(((50000 / 85.0 - 2.4) * s.price / 50000 - 1) * 100)
