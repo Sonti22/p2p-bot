@@ -110,6 +110,7 @@ COMMANDS = [{"command": "best", "description": "Лучшая связка сей
             {"command": "alerts", "description": "Список алертов на курс"},
             {"command": "blacklist", "description": "Скрытые мерчанты и обменники"},
             {"command": "traps", "description": "Последние отсеянные ловушки (обучение без риска)"},
+            {"command": "nets", "description": "Сети площадок, которые бот не распознал"},
             {"command": "maker", "description": "Цена мейкера на площадках, напр. /maker USDT"},
             {"command": "banks", "description": "Объём по банкам на площадках, напр. /banks USDT"},
             {"command": "balance", "description": "Баланс по подключённым биржам"},
@@ -712,6 +713,31 @@ def traps_view():
     for t in rows:
         when = datetime.fromtimestamp(t["ts"]).strftime("%d.%m %H:%M")
         lines.append(f"{when} — {html.escape(t['reason'])}")
+    return "\n".join(lines)
+
+
+NETS_ROWS = 30   # строк в /nets
+
+
+def unmapped_nets_view(rows=None, now=None):
+    """Текст «/nets»: сети из справочников площадок, которые netstatus.normalize не распознал (вне KNOWN_NETS). Такая
+    «сеть» не совпадёт с той же сетью под другим именем у другой площадки — маршрут через неё не найдётся. Только
+    подсказка: расширить маппинг в netstatus.normalize; на расчёт не влияет."""
+    rows = netstatus.unmapped() if rows is None else rows
+    now = time.time() if now is None else now
+    if not rows:
+        return ("🧭 <b>Нераспознанные сети</b>\n\nПока нет: все сети из справочников площадок бот узнаёт "
+                f"({', '.join(netstatus.KNOWN_NETS)}). Справочники обновляются раз в {netstatus.TTL // 60} мин.")
+    lines = ["🧭 <b>Нераспознанные сети</b>", "",
+             "Эти имена сетей бот не сопоставил со своими — перевод через них между площадками не посчитается, "
+             "даже если у обеих сеть одна. На расчёт это не влияет; если сеть нужна — добавить имя в "
+             "netstatus.normalize.", ""]
+    for venue, asset, net, rec in rows[:NETS_ROWS]:
+        ago = max(0, int((now - rec["last"]) // 60))
+        lines.append(f"• {html.escape(venue)} {html.escape(asset or '')}: <code>{html.escape(net)}</code> — "
+                     f"{rec['seen']} раз, последний {ago} мин назад")
+    if len(rows) > NETS_ROWS:
+        lines.append(f"• …ещё {len(rows) - NETS_ROWS}")
     return "\n".join(lines)
 
 
@@ -3640,6 +3666,8 @@ class Bot:
                 await self.send(text, markup=kb)
         elif cmd == "/traps":
             await self.send(traps_view())
+        elif cmd == "/nets":
+            await self.send(unmapped_nets_view())
         elif cmd == "/maker":
             await self.maker(arg)
         elif cmd == "/banks":
