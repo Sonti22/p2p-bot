@@ -39,7 +39,7 @@ from p2p import ALL_EXCHANGES, AMOUNT_MAX, AMOUNT_MIN, DEFAULT_ASSETS, ENV_PATH,
     deal_for_amount, deal_fresh, fmt_ad, fmt_breakeven, fmt_deal, fmt_top, load_env, maker_neighbors, maker_place, maker_quote, \
     maker_round_fee, parse_amount, parse_min_profit, profit_breakdown, reliability, reliability_index, route_hops, scan, \
     score, setup_logging, spot_url, traps_log, venue_url
-from p2p import depth_for_deal, depth_settings
+from p2p import depth_for_deal, depth_settings, terms_log, terms_summary
 
 logger = logging.getLogger(__name__)
 
@@ -633,14 +633,33 @@ def traps_view():
     rows = traps_log()
     if not rows:
         return ("🪤 <b>Ловушки</b>\n\nПока ни одной: объявление с ценой намного выгоднее рынка (отсев по "
-                "MAX_DEV) автоматически отсеивается и в сигналы не попадает — здесь появятся примеры.")
+                "MAX_DEV) автоматически отсеивается и в сигналы не попадает — здесь появятся примеры."
+                + "\n".join(terms_log_lines()))
     lines = ["🪤 <b>Отсеянные ловушки</b>", "",
               "Цена выглядит заманчиво, но слишком далека от рынка — скан такие объявления отсеивает "
               "и в сигнал не пускает. Ниже — последние примеры, без риска.", ""]
     for t in rows:
         when = datetime.fromtimestamp(t["ts"]).strftime("%d.%m %H:%M")
         lines.append(f"{when} — {html.escape(t['reason'])}")
-    return "\n".join(lines)
+    return "\n".join(lines + terms_log_lines())
+
+
+TERMS_LOG_SHOW = 10
+
+
+def terms_log_lines(limit=TERMS_LOG_SHOW):
+    """Раздел «/traps»: последние мерчанты, отсеянные стоп-фразами условий (p2p.terms_log), — сверить, не режет ли
+    список нормальных. Журнала нет — пусто."""
+    rows = terms_log()
+    if not rows:
+        return []
+    lines = ["", f"🚫 <b>Отсеяны стоп-фразами в условиях</b> — {len(rows)} мерчантов с запуска, последние:"]
+    for r in rows[:limit]:
+        when = datetime.fromtimestamp(r["last"]).strftime("%d.%m %H:%M")
+        side = "покупка" if r["side"] == "buy" else "продажа"
+        lines.append(f"{when} — {html.escape(r['ex'])} {html.escape(r['nick'])} ({side} {html.escape(r['asset'])}): "
+                     f"{html.escape(r['label'])}, фраза «{html.escape(r['phrase'])}», сканов {r['scans']}")
+    return lines
 
 
 MAKER_HELP = ("Формат: /maker USDT — цена, чтобы встать первым в очереди на покупку и на продажу, и сколько это "
@@ -2295,6 +2314,10 @@ class Bot:
             return "\n".join(lines)
         above = sum(1 for d in snap.deals if d[0] >= self.cfg.min_profit)
         lines.append(f"Связок выше порога {self.cfg.min_profit:g}%: {above}")
+        terms = terms_summary()
+        if terms:
+            top = ", ".join(f"{label} {n}" for label, n in sorted(terms.items(), key=lambda kv: -kv[1]))
+            lines.append(f"Отсеяно стоп-фразами в условиях: {sum(terms.values())} мерчантов с запуска ({top}) — /traps")
         extra, lim = snap.extra, depth_settings()
         lines.append(f"Доп. запросы глубины в скане: вторые страницы {extra.get('page2', 0)} (лимит "
                      f"{lim['page2_max']}), под суммы {extra.get('amounts', 0)} (лимит {lim['chips_max']})")

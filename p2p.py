@@ -759,6 +759,21 @@ def terms_flags(text):
     return blocked, notes
 
 
+def terms_hits(text):
+    """Стоп-фразы в условиях объявления: [(причина, сработавший фрагмент)] — по тем же TERMS_BLOCK и с тем же вырезанием
+    отрицаний, что terms_flags; для журнала отсева (TERMS_LOG, /traps, /status)."""
+    t = _TERMS_NEG_THIRD.sub(" ", (text or "").lower())
+    out = []
+    for pat, label in TERMS_BLOCK:
+        m = re.search(pat, t, re.I)
+        if m:
+            end = m.end()
+            while end < len(t) and t[end].isalnum():   # фрагмент до конца слова: «третьи лиц» → «третьи лица»
+                end += 1
+            out.append((label, t[m.start():end].strip()))
+    return out
+
+
 def merchant_offline(a, cfg):
     """Мерчант объявления офлайн: площадка так и отдаёт (Ad.online is False — сейчас только LBank) или последний раз
     был на площадке раньше MERCHANT_OFFLINE_MIN минут до получения объявления (Ad.last_seen — если площадка отдаёт
@@ -1493,6 +1508,7 @@ class Snapshot:
     ads: list = field(default_factory=list)         # все объявления скана до фильтров — для снимков (snapshots.py)
     blocked: frozenset = field(default_factory=frozenset)   # блэклист (ex, nick), с которым собран снимок
     traps: list = field(default_factory=list)       # ловушки, отсеянные в этом скане (_trap_entry)
+    terms_hits: list = field(default_factory=list)  # срабатывания стоп-фраз условий в этом скане (_terms_entries)
     perps: dict = field(default_factory=dict)       # (площадка, символ) -> perp.PerpQuote: последние котировки перпов
     # EV_RANK=1: (ex покупки, монета, ex продажи, монета) -> (EV п.п., p исполнения) — calibration.rank_snapshot;
     # пусто — EV в карточке не показываем
@@ -1559,6 +1575,55 @@ def _trap_entry(a, ref, cfg, ts=0.0):
 def traps_log():
     """Последние отсеянные ловушки, новые первыми."""
     return list(reversed(TRAPS_LOG))
+
+
+# Журнал отсева по стоп-фразам условий (terms_hits): объявление с «третьими лицами», уводом в мессенджер и т. п. скан
+# отсеивает молча — здесь видно, кого и какой фразой, чтобы владелец мог сверить список TERMS_BLOCK (не режет ли он
+# нормальных мерчантов). Запись — на (площадка, ник, причина): одно объявление на каждом скане счёт не раздувает.
+TERMS_LOG_SIZE = 200
+TERMS_LOG = {}   # (ex, nick, причина) -> {"first", "last", "scans", "phrase", "asset", "side"}
+
+
+def _terms_entries(ads, ts=0.0):
+    """Срабатывания стоп-фраз в объявлениях скана (до всех фильтров): [{ts, ex, nick, side, asset, label, phrase}]."""
+    out = []
+    for a in ads:
+        if not a.terms:
+            continue
+        for label, phrase in terms_hits(a.terms):
+            out.append({"ts": ts or time.time(), "ex": a.ex, "nick": a.nick, "side": a.side, "asset": a.asset,
+                        "label": label, "phrase": phrase[:60]})
+    return out
+
+
+def record_terms_hits(entries):
+    """Добавить срабатывания скана (snap.terms_hits) в TERMS_LOG; сверх TERMS_LOG_SIZE — забыть самые давние."""
+    seen = set()
+    for e in entries:
+        key = (e["ex"], e["nick"], e["label"])
+        rec = TERMS_LOG.get(key)
+        if rec is None:
+            rec = TERMS_LOG[key] = {"first": e["ts"], "last": e["ts"], "scans": 0}
+        if key not in seen:   # два объявления мерчанта в одном скане — один скан
+            rec["scans"] += 1
+            seen.add(key)
+        rec.update(last=max(rec["last"], e["ts"]), phrase=e["phrase"], asset=e["asset"], side=e["side"])
+    while len(TERMS_LOG) > TERMS_LOG_SIZE:
+        del TERMS_LOG[min(TERMS_LOG, key=lambda k: TERMS_LOG[k]["last"])]
+
+
+def terms_log():
+    """Журнал отсева по стоп-фразам, свежие первыми: [{ex, nick, label, phrase, asset, side, first, last, scans}]."""
+    rows = [dict(v, ex=k[0], nick=k[1], label=k[2]) for k, v in TERMS_LOG.items()]
+    return sorted(rows, key=lambda r: -r["last"])
+
+
+def terms_summary():
+    """{причина: сколько мерчантов (площадка+ник)} по журналу — для /status."""
+    out = {}
+    for _ex, _nick, label in TERMS_LOG:
+        out[label] = out.get(label, 0) + 1
+    return out
 
 
 async def _timed(coro, rec):
@@ -1991,7 +2056,8 @@ def assemble(cfg, ads, ref=None, ref_src="-", spot=None, errors=None, blocked=fr
             if d:
                 deals.append(d)
     snap = Snapshot(ref or 0, ref_src, refs, best, [], networks, dropped, errors, groups, spot, over_banks, book,
-                    ts=ts, jobs=list(jobs), ads=ads, blocked=frozenset(blocked), traps=traps, extra=dict(extra or {}))
+                    ts=ts, jobs=list(jobs), ads=ads, blocked=frozenset(blocked), traps=traps, extra=dict(extra or {}),
+                    terms_hits=_terms_entries(ads, ts))
     # сортировка «прибыль × надёжность» — score(): каждая единица веса риска снимает risk_penalty п.п. с профита
     deals.sort(key=lambda d: score(d, cfg, snap), reverse=True)
     # обменники разных сетей дают по связке на одну и ту же пару площадок; бот сигналит по паре
@@ -2015,6 +2081,7 @@ async def scan(s, cfg, force_alt=False):
                     over_banks=trades.banks_over_limit(trades.own_banks()[0]),   # свои банки, у которых лимит СБП исчерпан
                     **raw)
     TRAPS_LOG.extend(snap.traps)
+    record_terms_hits(snap.terms_hits)
     # котировки перпов опрашивает perp_loop бота со своим интервалом; скан сеть перпов не ждёт. Здесь, а не в
     # assemble: сборка остаётся чистой — replay старых снимков живые котировки не читает
     snap.perps = perp.quotes()
