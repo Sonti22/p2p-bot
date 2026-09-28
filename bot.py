@@ -865,16 +865,26 @@ ALERT_HELP = ("Формат: /alert USDT sell 92 7d — сообщу, когда
               "«reliable» — встречная связка с этим объявлением не хуже «⚠️ риск» (не «🪤 ловушка»);\n"
               "«repeat 1h» — алерт не удалится после срабатывания, а будет проверяться дальше и может "
               "сработать снова не раньше, чем через кулдаун (здесь 1h) после прошлого раза.\n"
-              "Пример: /alert USDT sell 92 7d vol 50000 reliable repeat 1h")
+              "Пример: /alert USDT sell 92 7d vol 50000 reliable repeat 1h\n\n"
+              "Алерт на связку: /alert route Bybit MEXC USDT 3% 7d — сообщу, когда покупка на Bybit → продажа на "
+              "MEXC по USDT даст ≥3% чистыми (как сигнал, но со своим порогом и сроком). Можно «reliable» и "
+              "«repeat 1h».")
 
 
 def alerts_view(chat_id):
     """Текст и кнопки «/alerts»: активные алерты чата с удалением."""
-    rows = alerts.list_all(chat_id)
-    if not rows:
+    rows, routes = alerts.list_all(chat_id), alerts.list_routes(chat_id)
+    if not rows and not routes:
         return (f"🔔 <b>Алертов нет</b>\n\n{ALERT_HELP}", {"inline_keyboard": []})
-    lines = ["🔔 <b>Алерты на курс</b>", ""]
+    lines = ["🔔 <b>Алерты</b>" if routes else "🔔 <b>Алерты на курс</b>", ""]
     kb = []
+    for alert_id, buy_ex, sell_ex, asset, pct, expires_ts, cooldown, require_reliable in routes:
+        left_h = max(0, round((expires_ts - time.time()) / 3600))
+        mark = f" 🔁 каждые ≥{cooldown / 3600:g} ч" if cooldown else ""
+        rel_mark = " 🛡 не хуже риска" if require_reliable else ""
+        lines.append(f"🔀 {html.escape(buy_ex)} → {html.escape(sell_ex)} {asset} ≥{pct:g}% "
+                     f"(осталось ~{left_h} ч){mark}{rel_mark}")
+        kb.append([{"text": f"🗑 {buy_ex}→{sell_ex} {asset} ≥{pct:g}%"[:64], "callback_data": f"delalert:{alert_id}"}])
     for alert_id, asset, side, rate, expires_ts, cooldown, min_volume, require_reliable in rows:
         label, cmp = ("продать", "≥") if side == "sell" else ("купить", "≤")
         left_h = max(0, round((expires_ts - time.time()) / 3600))
@@ -1749,6 +1759,9 @@ class Bot:
         """Команда «/alert USDT sell 92 7d [vol 50000] [reliable] [repeat 1h]»: разобрать и создать
         алерт на курс — одноразовый либо «повторно» с кулдауном, с необязательными условиями через
         «И» (объём стакана / надёжность встречной связки) в любом порядке хвоста."""
+        if (arg or "").strip().lower().startswith("route"):
+            await self.add_route_alert(arg.strip()[5:])
+            return
         m = re.match(r"(\w+)\s+(buy|sell)\s+([\d.,]+)\s+(\d+[hdw])(\s.*)?$", (arg or "").strip(), re.I)
         if not m:
             await self.send(ALERT_HELP)
@@ -1802,6 +1815,61 @@ class Bot:
         await self.send(f"🔔 Алерт создан: {asset} {label} {cmp}{rate:g} ₽, срок {dur_s}{notes}. "
                         f"Список — /alerts.")
 
+    async def add_route_alert(self, arg):
+        """«/alert route <площадка покупки> <площадка продажи> <монета> <порог>% <срок> [reliable] [repeat 1h]»."""
+        m = re.match(r"\s*(\w+)\s+(\w+)\s+(\w+)\s+(-?[\d.,]+)%?\s+(\d+[hdw])(\s.*)?$", arg or "", re.I)
+        if not m:
+            await self.send(ALERT_HELP)
+            return
+        names = {**{k.lower(): v for k, v in VENUE_NAMES.items()}, **{v.lower(): v for v in VENUE_NAMES.values()}}
+        buy_ex, sell_ex = names.get(m.group(1).lower()), names.get(m.group(2).lower())
+        if not buy_ex or not sell_ex:
+            await self.send(f"Площадки: {', '.join(VENUE_NAMES.values())}.")
+            return
+        off = [VENUE_NAMES.get(k, k) for k in VENUE_NAMES if VENUE_NAMES[k] in (buy_ex, sell_ex)
+               and k not in self.cfg.exchanges]
+        if off:   # площадка не сканируется — связки через неё не появятся, алерт молча не сработал бы
+            await self.send(f"{', '.join(off)} сейчас не сканируется — включи в «⚙️ Настройки → 🎛 Фильтры».")
+            return
+        asset = m.group(3).upper()
+        if asset not in self.cfg.assets:
+            await self.send(f"Монета {asset} не отслеживается ботом ({', '.join(self.cfg.assets)}).")
+            return
+        try:
+            pct = float(m.group(4).replace(",", "."))
+        except ValueError:
+            await self.send("Порог — число в %, например 3 или 2.5%.")
+            return
+        if not -10 <= pct <= MIN_PROFIT_MAX:
+            await self.send(f"Порог — от −10 до {MIN_PROFIT_MAX:g}%.")
+            return
+        dur = alerts.parse_duration(m.group(5))
+        if dur is None:
+            await self.send("Срок — число + h/d/w (часы/дни/недели), не больше 90d.")
+            return
+        require_reliable, cooldown_s = False, None
+        tokens = (m.group(6) or "").split()
+        i = 0
+        while i < len(tokens):
+            tok = tokens[i].lower()
+            if tok == "reliable":
+                require_reliable, i = True, i + 1
+            elif tok == "repeat" and i + 1 < len(tokens):
+                cooldown_s, i = tokens[i + 1].lower(), i + 2
+            else:
+                await self.send(ALERT_HELP)
+                return
+        cooldown = alerts.parse_duration(cooldown_s) if cooldown_s else None
+        if cooldown_s and cooldown is None:
+            await self.send("Кулдаун repeat — число + h/d/w (часы/дни/недели), не больше 90d.")
+            return
+        alerts.add_route(self.chat_id, buy_ex, sell_ex, asset, pct, time.time() + dur, repeat_cooldown=cooldown,
+                         require_reliable=require_reliable)
+        notes = "".join([f", повтор не чаще раза в {cooldown_s}" if cooldown_s else "",
+                         ", надёжность не хуже риска" if require_reliable else ""])
+        await self.send(f"🔔 Алерт на связку создан: {buy_ex} → {sell_ex} {asset} ≥{pct:g}% чистыми, "
+                        f"срок {m.group(5).lower()}{notes}. Список — /alerts.")
+
     async def check_alerts(self, snap, cfg=None):
         """Сработавшие алерты по текущему снимку → сообщение в тот чат, где алерт создан. Сработавшим
         (одноразовый — удалён) алерт помечается только после доставки; сбой — повторим в следующем скане."""
@@ -1812,6 +1880,20 @@ class Bot:
                                     f"({cmp}{rate:g}) — {fmt_ad(ad)}", chat_id=chat_id, topic="signals")
             except Exception as e:   # сеть/таймаут: остальные алерты этого скана тоже не дойдут
                 logger.warning("alert send error: %s", accounts.api_error_text(e))   # без URL с токеном бота
+                break
+            if not r.get("ok"):
+                logger.warning("alert not sent: %s", r.get("description"))
+            if delivery_final(r):
+                alerts.mark_fired(alert_id)
+        for alert_id, chat_id, buy_ex, sell_ex, asset, pct, d in alerts.route_due(snap, cfg or self.cfg):
+            profit, b, sl, route = d
+            try:
+                r = await self.send(f"🔔 <b>Алерт связки:</b> {html.escape(buy_ex)} → {html.escape(sell_ex)} {asset} "
+                                    f"<b>{profit:+.2f}%</b> чистыми (порог {pct:g}%) на "
+                                    f"{_money(self.snap_cfg(snap).amount)} ₽\nКупить: {fmt_ad(b)}\nПродать: {fmt_ad(sl)}",
+                                    chat_id=chat_id, topic="signals")
+            except Exception as e:
+                logger.warning("alert send error: %s", accounts.api_error_text(e))
                 break
             if not r.get("ok"):
                 logger.warning("alert not sent: %s", r.get("description"))
