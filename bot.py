@@ -192,6 +192,8 @@ AMOUNT_PRESETS = (25000, 50000, 100000, 200000)
 VENUE_DOWN_AFTER = 900      # сек: площадка отдаёт ошибку дольше — алерт, даже если сканы не подряд
 VENUE_FAIL_STREAK = 3       # или столько сканов подряд с ошибкой
 VENUE_ALERT_COOLDOWN = 3600  # не чаще раза в час на площадку
+SCAN_STALL_MINUTES_DEFAULT = 5   # мин без успешного скана — алерт «скан стоит» (SCAN_STALL_MINUTES)
+WATCHDOG_TICK = 60                # сек между проверками watchdog
 LADDER_ALERT_COOLDOWN = 86400  # предложение лестницы суммы сухого прогона — не чаще раза в сутки
 EXCHANGE_NAMES = {"bybit": "Bybit", "mexc": "MEXC", "htx": "HTX", "kucoin": "KuCoin", "bitpapa": "BitPapa",
                   "lbank": "LBank"}
@@ -1247,6 +1249,9 @@ class Bot:
         self.deals_by_id = {}   # id -> (d, снимок cfg, snap на момент сигнала) для кнопок «✅ Сделал»/«📝 Инструкция»; не переживает рестарт
         self.acc_seen = {}   # ex -> set известных ключей истории; None пока не было первого опроса
         self.start_ts = time.time()     # для аптайма в /status
+        self.scan_error = ""            # текст последней ошибки скана — для watchdog
+        self.scan_errors = 0            # ошибок скана подряд
+        self.stall_alerted = False      # watchdog уже сообщил «скан стоит» — ждём восстановления
         # id сигналов от времени старта в мс: после рестарта старая кнопка did:N не попадёт на новую связку
         self.next_deal_id = int(self.start_ts * 1000)
         self.last_scan_ts = 0.0         # unix-время окончания последнего скана
@@ -2215,6 +2220,7 @@ class Bot:
                 t0 = time.time()
                 snap = self.last = await self.fresh_scan()
                 self.last_scan_ts, self.last_scan_duration = time.time(), time.time() - t0
+                self.scan_errors = 0
                 self.track_liveness(self.last)
                 if history.record(snap, self.snap_cfg(snap).amount):   # не чаще раза в 5 минут, независимо от чата
                     history.cleanup()
@@ -2236,9 +2242,57 @@ class Bot:
                     await self.update_market_status(self.last)
             except Exception as e:
                 logger.error("scan error: %s", e)
+                if snap is None:   # сам скан не прошёл (а не шаг после него) — для watchdog
+                    self.scan_error, self.scan_errors = f"{type(e).__name__}: {e}"[:200], self.scan_errors + 1
             if snap is not None:   # после сигналов: снимок для разбора не задерживает их
                 await self.save_snapshot(snap)
             await asyncio.sleep(self.cfg.interval)
+
+    def scan_stall_limit(self):
+        """Сколько секунд без успешного скана — уже «скан стоит»: SCAN_STALL_MINUTES (по умолчанию 5 мин), но не
+        меньше трёх интервалов скана (INTERVAL) — иначе редкий опрос давал бы ложные алерты."""
+        try:
+            minutes = float(os.getenv("SCAN_STALL_MINUTES", SCAN_STALL_MINUTES_DEFAULT))
+        except ValueError:
+            minutes = SCAN_STALL_MINUTES_DEFAULT
+        if not minutes > 0:
+            minutes = SCAN_STALL_MINUTES_DEFAULT
+        return max(minutes * 60, 3 * self.cfg.interval)
+
+    def watchdog_message(self, now=None):
+        """Проверка watchdog: текст алерта или сообщения о восстановлении, None — сообщать нечего. Отдельная площадка
+        (check_venues) тут ни при чём: смотрим, идёт ли скан целиком — он мог зависнуть или падать каждый раз
+        (исключение вне адаптеров), и тогда бот молчит, пока владелец не заметит отсутствие сигналов."""
+        now = time.time() if now is None else now
+        since = self.last_scan_ts or self.start_ts
+        idle = now - since
+        if idle > self.scan_stall_limit():
+            if self.stall_alerted:
+                return None
+            self.stall_alerted = True
+            what = "последний успешный скан" if self.last_scan_ts else "с запуска успешных сканов нет,"
+            text = f"⚠️ Скан стоит: {what} {int(idle // 60)} мин назад — сигналы не приходят."
+            if self.scan_errors:
+                text += f"\nОшибок скана подряд: {self.scan_errors}, последняя: {html.escape(self.scan_error)}"
+            else:
+                text += "\nОшибок нет — похоже, скан завис. Проверьте /logs, при необходимости перезапустите бота."
+            return text
+        if self.stall_alerted and self.last_scan_ts:
+            self.stall_alerted = False
+            return "✅ Скан снова идёт."
+        return None
+
+    async def watchdog_loop(self):
+        """Раз в WATCHDOG_TICK: скан целиком стоит дольше SCAN_STALL_MINUTES — один алерт владельцу (топик «Разработка»),
+        пошёл снова — сообщение о восстановлении. Своя задача, а не шаг scan_loop: зависший скан её не остановит."""
+        while True:
+            await asyncio.sleep(WATCHDOG_TICK)
+            try:
+                text = self.watchdog_message()
+                if text and self.chat_id:
+                    await self.send(text, topic="dev")
+            except Exception as e:
+                logger.error("watchdog: %s", e)
 
     async def save_snapshot(self, snap):
         """Снимок скана в data/snapshots.db (snapshots.py): каждый SNAPSHOT_EVERY-й скан (первый после запуска —
@@ -3697,6 +3751,7 @@ async def main():
             await bot.setup_topics()
             await bot.check_key_safety()
         bot.perp_task = asyncio.ensure_future(bot.perp_loop())   # публичные данные перпов — своим циклом (perp.py)
+        bot.watchdog_task = asyncio.ensure_future(bot.watchdog_loop())   # «скан стоит» — своей задачей
         logger.info("Бот запущен: каждые %ss, порог %g%%, биржи %s", cfg.interval, cfg.min_profit,
                     ', '.join(cfg.exchanges))
         await asyncio.gather(bot.scan_loop(), bot.command_loop(), bot.accounts_loop(), bot.payouts_loop())
