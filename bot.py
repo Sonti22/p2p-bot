@@ -639,32 +639,43 @@ def traps_view():
     if not rows:
         return ("🪤 <b>Ловушки</b>\n\nПока ни одной: объявление с ценой намного выгоднее рынка (отсев по "
                 "MAX_DEV) автоматически отсеивается и в сигналы не попадает — здесь появятся примеры."
-                + "\n".join(terms_log_lines()))
+                + "\n".join(terms_log_lines(room=TRAPS_TEXT_MAX - 300)))
     lines = ["🪤 <b>Отсеянные ловушки</b>", "",
               "Цена выглядит заманчиво, но слишком далека от рынка — скан такие объявления отсеивает "
               "и в сигнал не пускает. Ниже — последние примеры, без риска.", ""]
     for t in rows:
         when = datetime.fromtimestamp(t["ts"]).strftime("%d.%m %H:%M")
         lines.append(f"{when} — {html.escape(t['reason'])}")
-    return "\n".join(lines + terms_log_lines())
+    text = "\n".join(lines)
+    return text + "\n".join(terms_log_lines(room=TRAPS_TEXT_MAX - len(text)))
 
 
 TERMS_LOG_SHOW = 10
+TRAPS_TEXT_MAX = 3900   # /traps одним сообщением: лимит Telegram 4096 символов, с запасом
 
 
-def terms_log_lines(limit=TERMS_LOG_SHOW):
+def terms_log_lines(limit=TERMS_LOG_SHOW, room=TRAPS_TEXT_MAX):
     """Раздел «/traps»: последние мерчанты, отсеянные стоп-фразами условий (p2p.terms_log), — сверить, не режет ли
-    список нормальных. Журнала нет — пусто."""
+    список нормальных. Не длиннее room символов (с переводами строк): /traps уходит одним сообщением, длиннее 4096
+    Telegram его не примет — лишние строки раздела не показываем. Журнала нет или места нет — пусто."""
     rows = terms_log()
     if not rows:
         return []
-    lines = ["", f"🚫 <b>Отсеяны стоп-фразами в условиях</b> — {len(rows)} мерчантов с запуска, последние:"]
+    merchants = len({(r["ex"], r["nick"]) for r in rows})
+    lines = ["", f"🚫 <b>Отсеяны стоп-фразами в условиях</b> — {merchants} мерчантов с запуска, последние:"]
+    used = sum(len(x) + 1 for x in lines)
+    if used > room:
+        return []
     for r in rows[:limit]:
         when = datetime.fromtimestamp(r["last"]).strftime("%d.%m %H:%M")
         side = "покупка" if r["side"] == "buy" else "продажа"
-        lines.append(f"{when} — {html.escape(r['ex'])} {html.escape(r['nick'])} ({side} {html.escape(r['asset'])}): "
-                     f"{html.escape(r['label'])}, фраза «{html.escape(r['phrase'])}», сканов {r['scans']}")
-    return lines
+        line = (f"{when} — {html.escape(r['ex'])} {html.escape(r['nick'])} ({side} {html.escape(r['asset'])}): "
+                f"{html.escape(r['label'])}, фраза «{html.escape(r['phrase'])}», сканов {r['scans']}")
+        if used + len(line) + 1 > room:
+            break
+        lines.append(line)
+        used += len(line) + 1
+    return lines if len(lines) > 2 else []
 
 
 MAKER_HELP = ("Формат: /maker USDT — цена, чтобы встать первым в очереди на покупку и на продажу, и сколько это "
@@ -2361,7 +2372,8 @@ class Bot:
         terms = terms_summary()
         if terms:
             top = ", ".join(f"{label} {n}" for label, n in sorted(terms.items(), key=lambda kv: -kv[1]))
-            lines.append(f"Отсеяно стоп-фразами в условиях: {sum(terms.values())} мерчантов с запуска ({top}) — /traps")
+            merchants = len({(r["ex"], r["nick"]) for r in terms_log()})
+            lines.append(f"Отсеяно стоп-фразами в условиях: {merchants} мерчантов с запуска ({top}) — /traps")
         extra, lim = snap.extra, depth_settings()
         lines.append(f"Доп. запросы глубины в скане: вторые страницы {extra.get('page2', 0)} (лимит "
                      f"{lim['page2_max']}), под суммы {extra.get('amounts', 0)} (лимит {lim['chips_max']})")

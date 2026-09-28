@@ -76,3 +76,24 @@ def test_live_scan_records_fixture_hits(offline):
     """Живой конвейер на фикстурах: scan кладёт срабатывания в журнал (если в фикстурах есть такие условия)."""
     s = arun(p2p.scan(None, p2p.Config(assets=["USDT"])))
     assert len(p2p.terms_log()) == len({(h["ex"], h["nick"], h["label"]) for h in s.terms_hits})
+
+
+def test_merchant_with_two_reasons_counted_once():
+    p2p.record_terms_hits(p2p._terms_entries([_ad("m1", "третьи лица, пишите в телеграм")], ts=1000.0))
+    assert p2p.terms_summary() == {"оплата от третьих лиц": 1, "зовёт на связь вне площадки": 1}
+    assert "— 1 мерчантов с запуска" in B.traps_view()
+    bot = Stub(p2p.Config())
+    bot.last = snap([])
+    assert "Отсеяно стоп-фразами в условиях: 1 мерчантов" in bot.status_view()
+
+
+def test_traps_message_stays_within_telegram_limit(monkeypatch):
+    """Полный журнал ловушек (30 длинных строк) + журнал стоп-фраз — /traps всё равно одним сообщением ≤ 4096."""
+    long_reason = "купить USDT на Bybit по 84,12 ₽ — на 5.3% ниже рынка (ориентир 88,50 ₽, отсев >4%) " + "x" * 15
+    monkeypatch.setattr(B, "traps_log", lambda: [{"ts": 1000.0 + i, "reason": long_reason} for i in range(30)])
+    for i in range(10):
+        p2p.record_terms_hits(p2p._terms_entries([_ad(f"m{i}" * 5, "третьи лица " + "y" * 40)], ts=1000.0 + i))
+    text = B.traps_view()
+    assert 3000 < len(text) <= 4096 and "Отсеяны стоп-фразами" in text   # раздел урезан, но влез
+    monkeypatch.setattr(B, "traps_log", lambda: [{"ts": 1000.0, "reason": "коротко"}])
+    assert "сканов 1" in B.traps_view()                               # место есть — раздел на месте
