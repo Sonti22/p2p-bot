@@ -1,6 +1,7 @@
 """Торговое ядро, gates: пороги плана «бумага → кнопка → автомат»; статистика бэктеста — только из локального файла
 владельца в data/ (не из git, с sha кода research/); укороченная бумага — только с флагом владельца в .env; minlot сразу
 после сильного бэктеста, автомат — только при пройденных порогах; математика."""
+import hashlib
 import json
 import math
 import os
@@ -28,13 +29,50 @@ def _flags(monkeypatch):
     monkeypatch.setattr(gates, "_FLAGS", {"short_paper": False})
 
 
-def bot_root(tmp_path, stats=None, *, sha=None, tracked=False, version=1, ts=None, worktree=False):
+def _varint(value):
+    """git encode_varint (индекс v4)."""
+    out = [value & 127]
+    value >>= 7
+    while value:
+        value -= 1
+        out.insert(0, 128 | (value & 127))
+        value >>= 7
+    return bytes(out)
+
+
+def git_index(paths, version=2, sparse=(), link=None):
+    """Индекс git по формату index-format.txt (как пишет git): записи 62 байта + путь (v2/v3 — с выравниванием до 8,
+    v4 — сжатие префикса), расширение «link» (split index: 20 байт id общего индекса), SHA-1 содержимого в конце.
+    sparse — папки-записи (mode 040000, sparse index)."""
+    entries = sorted([(p, 0o100644) for p in paths] + [(d.rstrip("/") + "/", 0o040000) for d in sparse])
+    out, prev = bytearray(b"DIRC" + version.to_bytes(4, "big") + len(entries).to_bytes(4, "big")), b""
+    for path, mode in entries:
+        name = path.encode()
+        head = bytes(24) + mode.to_bytes(4, "big") + bytes(12) + hashlib.sha1(name).digest() + \
+            min(len(name), 0xFFF).to_bytes(2, "big")
+        if version == 4:
+            common = 0
+            while common < min(len(prev), len(name)) and prev[common] == name[common]:
+                common += 1
+            out += head + _varint(len(prev) - common) + name[common:] + b"\0"
+        else:
+            size = ((62 + len(name) + 8) // 8) * 8
+            out += head + name + b"\0" * (size - 62 - len(name))
+        prev = name
+    if link is not None:                                   # id общего индекса + пустые битовые карты delete/replace
+        body = link + bytes(24)
+        out += b"link" + len(body).to_bytes(4, "big") + body
+    return bytes(out) + hashlib.sha1(bytes(out)).digest()
+
+
+def bot_root(tmp_path, stats=None, *, sha=None, tracked=False, version=1, ts=None, worktree=False, index_version=2):
     """Папка «бота»: research/ с кодом, data/gates_backtest.json, индекс git (.git — папка или файл worktree)."""
     root = tmp_path / "bot"
     (root / "research").mkdir(parents=True, exist_ok=True)
     (root / "research" / "hedge_bt.py").write_bytes(b"X = 1\n")
     (root / "data").mkdir(exist_ok=True)
-    index = b"DIRC\x00\x00\x00\x02research/hedge_bt.py\x00" + (b"data/gates_backtest.json\x00" if tracked else b"")
+    paths = ["research/hedge_bt.py", "research/report.py"] + (["data/gates_backtest.json"] if tracked else [])
+    index = git_index(paths, index_version)
     if worktree:
         gitdir = tmp_path / "gitdir"
         gitdir.mkdir(exist_ok=True)
@@ -145,6 +183,75 @@ def test_load_backtest_refusals(tmp_path, case, why):
         os.remove(os.path.join(root, ".git", "index"))
     bt, reason = gates.load_backtest("hedge", path=path, root=root)
     assert bt is None and why in reason, reason
+
+
+@pytest.mark.parametrize("index_version", [2, 3, 4])
+def test_tracked_stats_file_refused_for_every_index_version(tmp_path, index_version):
+    """Индекс разбирается по формату git: в v4 пути сжаты префиксом («data/gates_backtest.json» целиком в байтах
+    индекса нет) — закоммиченная статистика всё равно не проходит; незакоммиченная — проходит."""
+    root = bot_root(tmp_path, tracked=True, index_version=index_version)
+    index = open(os.path.join(root, ".git", "index"), "rb").read()
+    if index_version == 4:
+        assert b"data/gates_backtest.json" in index or b"gates_backtest.json" in index
+    bt, why = gates.load_backtest("hedge", root=root)
+    assert bt is None and "есть в git" in why, why
+    clean = bot_root(tmp_path / "clean", index_version=index_version)
+    assert gates.load_backtest("hedge", root=clean)[0] is not None
+
+
+def test_committed_stats_file_found_with_v4_prefix_compression():
+    """Раньше: подстрока пути в байтах индекса; в v4 путь «data/gates_backtest.json» после «data/a.json» хранится как
+    «gates_backtest.json» — подстрока не находилась."""
+    data = git_index(["data/a.json", "data/gates_backtest.json", "research/hedge_bt.py"], 4)
+    assert b"data/gates_backtest.json" not in data
+    paths, dirs = gates.index_entries(data)
+    assert paths == {"data/a.json", "data/gates_backtest.json", "research/hedge_bt.py"} and dirs == set()
+    sparse = git_index(["research/hedge_bt.py"], 2, sparse=["data"])
+    assert gates.index_entries(sparse) == ({"research/hedge_bt.py"}, {"data"})
+
+
+@pytest.mark.parametrize("damage", ["version", "checksum", "truncated", "garbage"])
+def test_unparsable_index_refuses(tmp_path, damage):
+    root = bot_root(tmp_path)
+    path = os.path.join(root, ".git", "index")
+    data = open(path, "rb").read()
+    if damage == "version":
+        body = data[:4] + (5).to_bytes(4, "big") + data[8:-20]
+        data = body + hashlib.sha1(body).digest()
+    elif damage == "checksum":
+        data = data[:-1] + bytes([data[-1] ^ 1])
+    elif damage == "truncated":
+        body = data[:40]
+        data = body + hashlib.sha1(body).digest()
+    else:
+        data = b"DIRC\x00\x00\x00\x02research/hedge_bt.py\x00"          # как раньше подделывал тест: не индекс
+    open(path, "wb").write(data)
+    bt, why = gates.load_backtest("hedge", root=root)
+    assert bt is None and "не разобран" in why, why
+
+
+@pytest.mark.parametrize("tracked", [True, False])
+def test_split_index_shared_entries_count(tmp_path, tracked):
+    """Split index (git update-index --split-index): записи — в sharedindex.<id>, в самом индексе — только расширение
+    «link». Статистика в общем индексе — «есть в git»; нет общего индекса — не разобрать (порог не пройден)."""
+    root = bot_root(tmp_path)
+    shared = git_index(["research/hedge_bt.py"] + (["data/gates_backtest.json"] if tracked else []))
+    sid = hashlib.sha1(shared).digest()
+    with open(os.path.join(root, ".git", f"sharedindex.{sid.hex()}"), "wb") as f:
+        f.write(shared)
+    with open(os.path.join(root, ".git", "index"), "wb") as f:
+        f.write(git_index([], link=sid))
+    bt, why = gates.load_backtest("hedge", root=root)
+    assert (bt is None and "есть в git" in why) if tracked else bt is not None, why
+    os.remove(os.path.join(root, ".git", f"sharedindex.{sid.hex()}"))
+    bt, why = gates.load_backtest("hedge", root=root)
+    assert bt is None and "не разобран" in why
+
+
+def test_stats_binding_is_not_called_a_signature():
+    """sha кода research/ — привязка, не подпись: так и написано (кто пишет в data/, впишет любые цифры)."""
+    src = open(gates.__file__, encoding="utf-8").read()
+    assert "НЕ подпись" in src and "подписана" not in src
 
 
 def test_load_backtest_worktree_git_file_and_sha_follows_code(tmp_path):

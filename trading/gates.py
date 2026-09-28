@@ -9,9 +9,12 @@
   остальные условия качества и минимумы количества — как в плане;
 - auto — confirm пройден И порог «кнопка → авто» по реальным сделкам И 0 unknown дольше 10 мин и 0 нарушений лимитов.
 Статистика бэктеста — ТОЛЬКО из локального файла, который владелец сгенерировал у себя (`load_backtest`,
-data/gates_backtest.json): путь внутри data/ бота (data/ — в .gitignore), файла нет в индексе git (закоммиченная
-статистика порог не проходит никогда), в файле sha256 кода research/, который её посчитал, и он совпадает с кодом
-research/ сейчас. Словарь или другой объект вместо загруженного файла — не бэктест: порог не пройден.
+data/gates_backtest.json): путь внутри data/ бота (data/ — в .gitignore), файла нет в индексе git — индекс разбирается
+по формату git (версии 2, 3 и 4 со сжатием путей, split index, sparse-папки), а не поиском подстроки; незнакомый
+формат — порог не пройден (закоммиченная статистика порог не проходит никогда); в файле sha256 кода research/,
+который её посчитал, и он совпадает с кодом research/ сейчас. Это привязка к коду, а НЕ подпись: кто может писать в
+data/ на ПК владельца, может вписать туда любые цифры с текущим sha — защита от подделки здесь только в том, что data/
+локальна и не приходит из git. Словарь или другой объект вместо загруженного файла — не бэктест: порог не пройден.
 Нет нужной цифры, NaN или не число — порог не пройден (fail closed). Статистика бумаги и реальной торговли — словари от
 кода бумаги/журнала; здесь только сравнения и простая математика (Sharpe, PF, просадка, 90% ДИ).
 """
@@ -96,7 +99,8 @@ def _loaded(backtest, strategy):
 
 
 def research_sha(root=None):
-    """sha256 кода research/ (все .py по имени; переводы строк нормализованы) — им подписана статистика бэктеста."""
+    """sha256 кода research/ (все .py по имени; переводы строк нормализованы) — к нему привязана статистика бэктеста
+    (не подпись: sha открыт, его может вписать любой, кто пишет в data/)."""
     folder = os.path.join(root or ROOT, RESEARCH_DIR)
     names = sorted(n for n in os.listdir(folder) if n.endswith(".py"))
     if not names:
@@ -109,25 +113,120 @@ def research_sha(root=None):
     return h.hexdigest()
 
 
-def _git_index(root):
-    """Байты индекса git папки бота (.git — папка или файл «gitdir: …» у worktree) или None — не прочитать."""
+def _gitdir(root):
+    """Папка git бота (.git — папка или файл «gitdir: …» у worktree) или None."""
     dotgit = os.path.join(root, ".git")
     try:
         if os.path.isdir(dotgit):
-            gitdir = dotgit
-        elif os.path.isfile(dotgit):
+            return dotgit
+        if os.path.isfile(dotgit):
             with open(dotgit, encoding="utf-8") as f:
                 text = f.read().strip()
             if not text.startswith("gitdir:"):
                 return None
             gitdir = text[len("gitdir:"):].strip()
-            gitdir = gitdir if os.path.isabs(gitdir) else os.path.normpath(os.path.join(root, gitdir))
-        else:
-            return None
-        with open(os.path.join(gitdir, "index"), "rb") as f:
-            return f.read()
+            return gitdir if os.path.isabs(gitdir) else os.path.normpath(os.path.join(root, gitdir))
     except (OSError, UnicodeDecodeError):
         return None
+    return None
+
+
+def _git_index(root):
+    """Байты индекса git папки бота или None — не прочитать."""
+    gitdir = _gitdir(root)
+    if gitdir is None:
+        return None
+    try:
+        with open(os.path.join(gitdir, "index"), "rb") as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def _varint(data, pos):
+    """Число git «offset varint» (индекс v4: сколько байт отрезать от предыдущего пути) → (число, новая позиция)."""
+    b = data[pos]
+    pos += 1
+    value = b & 0x7F
+    while b & 0x80:
+        value += 1
+        b = data[pos]
+        pos += 1
+        value = (value << 7) + (b & 0x7F)
+    return value, pos
+
+
+def index_entries(data, gitdir=None):
+    """Пути индекса git → (set путей, set sparse-папок) или ValueError — не разобрать. Формат git (index-format.txt):
+    «DIRC», версия 2/3/4, число записей; запись — 62 байта stat + sha + флаги (у v3/v4 с флагом extended — ещё 2),
+    затем путь: v2/v3 — строка с NUL и выравниванием до 8 байт, v4 — сжатие префикса (varint + остаток до NUL); в конце
+    SHA-1 содержимого (нули — index.skipHash), не сошлась — не SHA-1 индекс, ValueError. Split index (расширение
+    «link») — записи и из sharedindex.<sha> (объединение: так строже). Sparse-папка (mode 040000) — всё под ней
+    считается в индексе."""
+    if len(data) < 32 or data[:4] != b"DIRC":
+        raise ValueError("не индекс git")
+    tail = data[-20:]
+    if tail != b"\0" * 20 and tail != hashlib.sha1(data[:-20]).digest():   # noqa: S324 — формат git, не защита
+        # не SHA-1 индекс (репозиторий sha256 и т. п.) или битый файл — разбирать по чужой раскладке нельзя
+        raise ValueError("контрольная сумма индекса git не сошлась")
+    version, count = int.from_bytes(data[4:8], "big"), int.from_bytes(data[8:12], "big")
+    if version not in (2, 3, 4):
+        raise ValueError(f"индекс git версии {version} — не разобрать")
+    paths, dirs, pos, prev = set(), set(), 12, b""
+    for _ in range(count):
+        start = pos
+        mode = int.from_bytes(data[pos + 24:pos + 28], "big")
+        flags = int.from_bytes(data[pos + 60:pos + 62], "big")
+        pos += 62
+        if flags & 0x4000:
+            if version < 3:
+                raise ValueError("extended-флаг в индексе v2")
+            pos += 2
+        if version == 4:
+            strip, pos = _varint(data, pos)
+            end = data.index(b"\0", pos)
+            if strip > len(prev):
+                raise ValueError("битое сжатие пути в индексе v4")
+            name = prev[:len(prev) - strip] + data[pos:end]
+            pos = end + 1
+        else:
+            end = data.index(b"\0", pos)
+            name = data[pos:end]
+            pos = start + ((end - start) // 8 + 1) * 8   # NUL + выравнивание: длина записи кратна 8
+        if pos > len(data) - 20:
+            raise ValueError("индекс git обрезан")
+        prev = name
+        path = name.decode("utf-8", "surrogateescape")
+        (dirs if mode == 0o040000 else paths).add(path.rstrip("/"))
+    while pos + 8 <= len(data) - 20:   # расширения до контрольной суммы
+        sig, size = data[pos:pos + 4], int.from_bytes(data[pos + 4:pos + 8], "big")
+        body = data[pos + 8:pos + 8 + size]
+        if len(body) != size:
+            raise ValueError("расширение индекса git обрезано")
+        if sig == b"link":
+            if gitdir is None or len(body) < 20:
+                raise ValueError("split index без папки git — не разобрать")
+            shared = body[:20].hex()
+            if shared != "0" * 40:
+                with open(os.path.join(gitdir, f"sharedindex.{shared}"), "rb") as f:
+                    more, more_dirs = index_entries(f.read(), gitdir)
+                paths |= more
+                dirs |= more_dirs
+        pos += 8 + size
+    return paths, dirs
+
+
+def _tracked(root, rel):
+    """rel в индексе git бота: True / False или None — индекс не прочитать или не разобрать."""
+    gitdir = _gitdir(root)
+    index = _git_index(root)
+    if index is None:
+        return None
+    try:
+        paths, dirs = index_entries(index, gitdir)
+    except (ValueError, IndexError, OSError):
+        return None
+    return rel in paths or any(rel == d or rel.startswith(d + "/") for d in dirs)
 
 
 def load_backtest(strategy, path=None, root=None, now=None):
@@ -140,11 +239,12 @@ def load_backtest(strategy, path=None, root=None, now=None):
     real, data_dir = os.path.realpath(path), os.path.realpath(os.path.join(root, "data"))
     if not real.startswith(data_dir + os.sep):
         return None, "статистика бэктеста — только из локального файла в data/ бота (не из репозитория)"
-    index = _git_index(root)
-    if index is None:
-        return None, "не проверить, что файл статистики не из git (нет индекса git) — порог не пройден"
     rel = os.path.relpath(real, os.path.realpath(root)).replace(os.sep, "/")
-    if rel.encode("utf-8") in index:
+    tracked = _tracked(root, rel)
+    if tracked is None:
+        return None, ("не проверить, что файл статистики не из git (нет индекса git или он не разобран) — порог не "
+                      "пройден")
+    if tracked:
         return None, f"{rel} есть в git — закоммиченная статистика бэктеста порог не проходит"
     try:
         with open(real, encoding="utf-8") as f:
