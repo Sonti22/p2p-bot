@@ -98,6 +98,7 @@ def _patch_paper_db(monkeypatch, db):
     monkeypatch.setattr(B.paper, "get_balance", functools.partial(B.paper.get_balance, path=db))
     monkeypatch.setattr(B.paper, "balance_change", functools.partial(B.paper.balance_change, path=db))
     monkeypatch.setattr(B.paper, "stats", functools.partial(B.paper.stats, path=db))
+    monkeypatch.setattr(B.paper, "summary_since", functools.partial(B.paper.summary_since, path=db))
     monkeypatch.setattr(B.paper, "ladder_suggestion", functools.partial(B.paper.ladder_suggestion, path=db))
     monkeypatch.setattr(B.paper, "banks_this_month", functools.partial(B.paper.banks_this_month, path=db))
     monkeypatch.setattr(B.paper, "report_rows", functools.partial(B.paper.report_rows, path=db))
@@ -3278,17 +3279,20 @@ def test_status_no_errors_says_all_ok(tmp_path):
     assert "Ошибок нет" in text
 
 
-def test_status_command_sends_status_view(monkeypatch):
-    monkeypatch.setattr(B.Bot, "status_view", lambda self, status_path=B.DEV_STATUS: "STATUS TEXT")
+def test_status_command_sends_brief_with_details_button(monkeypatch):
+    monkeypatch.setattr(B.Bot, "status_brief", lambda self, status_path=B.DEV_STATUS: ("BRIEF", {"k": 1}))
     bot = Stub(p2p.Config())
     arun(bot.handle("/status"))
-    assert texts(bot)[-1] == "STATUS TEXT"
+    assert texts(bot)[-1] == "BRIEF"
 
 
-def test_status_callback_sends_status_view(monkeypatch):
+def test_status_callback_sends_brief_and_full_by_button(monkeypatch):
+    monkeypatch.setattr(B.Bot, "status_brief", lambda self, status_path=B.DEV_STATUS: ("BRIEF", {"k": 1}))
     monkeypatch.setattr(B.Bot, "status_view", lambda self, status_path=B.DEV_STATUS: "STATUS TEXT")
     bot = Stub(p2p.Config())
     arun(bot.on_callback({"id": "1", "data": "status", "message": {"message_id": 1}}))
+    assert texts(bot)[-1] == "BRIEF"
+    arun(bot.on_callback({"id": "2", "data": "status_full", "message": {"message_id": 1}}))
     assert texts(bot)[-1] == "STATUS TEXT"
 
 

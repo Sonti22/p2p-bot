@@ -431,6 +431,26 @@ def stats(path=DB_PATH, now=None):
     return out
 
 
+def by_direction(since=0.0, path=DB_PATH):
+    """Сделки журнала не старше `since` по направлению площадка покупки → площадка продажи (монеты складываются) —
+    для /stats: [{"buy_ex", "sell_ex", "count", "amount", "avg_profit", "fact_count", "avg_fact", "fact_rub"}].
+    avg_fact и fact_rub (сумма amount × факт %, ₽) — только по сделкам с настоящим фактом (не «как расчёт»);
+    фактов нет — None. Порядок: сначала больший fact_rub (без факта — в конце), затем больше сделок."""
+    if not os.path.exists(path):
+        return []
+    con = _connect(path)
+    rows = con.execute(
+        "SELECT buy_ex, sell_ex, COUNT(*), COALESCE(SUM(amount), 0), AVG(profit), "
+        f"SUM(CASE WHEN {_REAL_FACT} THEN 1 ELSE 0 END), "
+        f"AVG(CASE WHEN {_REAL_FACT} THEN fact END), SUM(CASE WHEN {_REAL_FACT} THEN amount * fact / 100.0 END) "
+        "FROM trades WHERE ts >= ? GROUP BY buy_ex, sell_ex", (since,)).fetchall()
+    con.close()
+    out = [{"buy_ex": r[0], "sell_ex": r[1], "count": r[2], "amount": r[3], "avg_profit": r[4], "fact_count": r[5],
+            "avg_fact": r[6], "fact_rub": r[7]} for r in rows]
+    out.sort(key=lambda d: (d["fact_rub"] is None, -(d["fact_rub"] or 0), -d["count"], d["buy_ex"], d["sell_ex"]))
+    return out
+
+
 def facts_by_pair(since=0.0, path=DB_PATH):
     """Реальные сделки с настоящим фактом (не «как расчёт»/«±0.5 п.п.») не старше `since` по связке площадка/монета
     покупки → площадка/монета продажи — для сравнения с сухим прогоном в `/paper report`:
