@@ -23,7 +23,6 @@ Book (исполнения, условные стопы, отмена), сеть
 import asyncio
 import json
 import os
-import subprocess
 import time
 from decimal import Decimal as D
 
@@ -800,39 +799,16 @@ def test_committed_stats_with_other_case_or_under_data_counts_as_tracked(tmp_pat
     assert gates.load_backtest("hedge", root=root)[0] is not None
 
 
-def _git(cwd, *args):
-    env = dict(os.environ, GIT_TERMINAL_PROMPT="0", GIT_CONFIG_NOSYSTEM="1", HOME=str(cwd))
-    return subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "-c", "core.hooksPath=",
-                           "-c", "commit.gpgsign=false", *args], cwd=cwd, env=env, check=True,
-                          capture_output=True, text=True).stdout
-
-
-@pytest.mark.skipif(os.name != "nt", reason="регистронезависимая файловая система (ПК владельца — Windows)")
-@pytest.mark.parametrize("name", ["DATA/gates_backtest.json", "Data/gates_backtest.json"])
-def test_committed_stats_pulled_on_windows_are_refused(tmp_path, name):
-    origin = tmp_path / "origin"
-    (origin / "research").mkdir(parents=True)
-    (origin / "research" / "hedge_bt.py").write_bytes(b"X = 1\n")
-    (origin / ".gitignore").write_text("data/\n", encoding="utf-8")
-    _git(origin, "init", "-q", "-b", "main")
-    _git(origin, "add", "-A")
-    _git(origin, "commit", "-q", "-m", "init")
-    pc = tmp_path / "pc"
-    _git(tmp_path, "clone", "-q", str(origin), str(pc))
-    (pc / "data").mkdir()
-    sha = gates.research_sha(str(pc))
-    forged = {"version": 1, "generated_at": time.time() - 60, "research_sha": sha,
-              "strategies": {"hedge": {"days": 99, "count": 999, "ratio_ok_share": 1, "cost_to_buffer": 0,
-                                       "sigma_ratio": 0}}}
-    blob = origin / "forged.json"
-    blob.write_text(json.dumps(forged), encoding="utf-8")
-    oid = _git(origin, "hash-object", "-w", str(blob)).strip()
-    blob.unlink()
-    _git(origin, "update-index", "--add", "--cacheinfo", f"100644,{oid},{name}")
-    _git(origin, "commit", "-q", "-m", "stats")
-    _git(pc, "pull", "-q", "--no-rebase", "origin", "main")
-    assert (pc / "data" / "gates_backtest.json").exists()
-    bt, why = gates.load_backtest("hedge", root=str(pc))
+@pytest.mark.parametrize("name", ["DATA/gates_backtest.json", "Data/gates_backtest.json", "data/GATES_backtest.json"])
+@pytest.mark.parametrize("version", [2, 4])
+def test_stats_committed_with_other_case_after_pull_is_refused(tmp_path, name, version):
+    """Как после git pull на Windows (core.ignorecase): закоммиченный «DATA/…» лёг поверх локального data/… владельца —
+    в индексе путь другим регистром, на диске — data/gates_backtest.json: статистика «в git», порог не пройден."""
+    from test_trading_gates import bot_root, git_index
+    root = bot_root(tmp_path)
+    with open(os.path.join(root, ".git", "index"), "wb") as f:
+        f.write(git_index(["research/hedge_bt.py", name], version))
+    bt, why = gates.load_backtest("hedge", root=root)
     assert bt is None and "есть в git" in why
 
 
