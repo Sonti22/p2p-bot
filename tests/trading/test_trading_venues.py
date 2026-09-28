@@ -22,6 +22,7 @@ from trading_stubs import CREDS, KEY, SECRET, Book, Resp, Session, bingx_err, bi
 
 CID = "t260927013512a1b2c3d4"
 TS = "1700000000000"
+T0 = 1_700_000_000_000
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
@@ -47,8 +48,10 @@ def swap(**over):
 # --- allowlist: ровно эти вызовы ---
 
 def test_allowlist_is_exactly_the_approved_calls():
+    """Стопа всей позиции символа (Bybit trading-stop) нет; BingX — история ордеров символа (исполнения без id
+    бота)."""
     assert set(venues.ALLOWED[venues.BYBIT]) == {
-        ("POST", "/v5/order/create"), ("POST", "/v5/order/cancel"), ("POST", "/v5/position/trading-stop"),
+        ("POST", "/v5/order/create"), ("POST", "/v5/order/cancel"),
         ("POST", "/v5/position/set-leverage"), ("GET", "/v5/order/realtime"), ("GET", "/v5/order/history"),
         ("GET", "/v5/execution/list"), ("GET", "/v5/position/list"), ("GET", "/v5/position/closed-pnl"),
         ("GET", "/v5/account/wallet-balance"), ("GET", "/v5/account/info"), ("GET", "/v5/user/query-api")}
@@ -56,6 +59,7 @@ def test_allowlist_is_exactly_the_approved_calls():
         ("POST", "/openApi/swap/v2/trade/order"), ("DELETE", "/openApi/swap/v2/trade/order"),
         ("POST", "/openApi/swap/v2/trade/leverage"), ("POST", "/openApi/swap/v2/trade/marginType"),
         ("GET", "/openApi/swap/v2/trade/order"), ("GET", "/openApi/swap/v2/trade/openOrders"),
+        ("GET", "/openApi/swap/v2/trade/allOrders"),
         ("GET", "/openApi/swap/v2/user/positions"), ("GET", "/openApi/swap/v3/user/balance"),
         ("GET", "/openApi/swap/v2/user/income"), ("GET", "/openApi/swap/v2/trade/leverage"),
         ("GET", "/openApi/swap/v2/trade/marginType"), ("GET", "/openApi/swap/v1/positionSide/dual"),
@@ -165,8 +169,11 @@ def test_public_get_only_public_list(venue, path):
     ("isLeverage", 1), ("triggerPrice", "60000"), ("closeOnTrigger", True), ("takeProfit", "70000"),
     ("orderFilter", "tpslOrder"), ("slippageTolerance", "1"), ("timestamp", TS), ("signature", "x"),
     ("recvWindow", "5000"), ("smpType", "None"), ("orderIv", "0.5"), ("marketUnit", "quoteCoin"),
+    ("stopLoss", "70000"), ("tpslMode", "Full"), ("tpslMode", "Partial"), ("slTriggerBy", "MarkPrice"),
+    ("slSize", "0.001"), ("slOrderType", "Market"),
 ])
 def test_bybit_order_extra_or_foreign_fields_refused(field, value):
+    """Стоп всей позиции символа у ордера (stopLoss/tpslMode) — нет: стоп бота — отдельный условный ордер."""
     with pytest.raises(ValueError):
         venues.prepare("bybit", "POST", "/v5/order/create", linear(**{field: value}), CREDS)
 
@@ -175,6 +182,7 @@ def test_bybit_order_extra_or_foreign_fields_refused(field, value):
     ("quoteOrderQty", "100"), ("stopPrice", "2000"), ("closePosition", "true"), ("takeProfit", "{}"),
     ("priceRate", "0.05"), ("activationPrice", "2000"), ("stopGuaranteed", "true"), ("positionId", "1"),
     ("workingType", "MARK_PRICE"), ("timestamp", TS), ("signature", "x"), ("recvWindow", "5000"),
+    ("stopLoss", '{"type":"STOP_MARKET","stopPrice":2900,"workingType":"MARK_PRICE"}'),
 ])
 def test_bingx_order_extra_fields_refused(field, value):
     with pytest.raises(ValueError):
@@ -203,13 +211,72 @@ def test_bybit_order_bad_values_refused(over):
     linear(price="60000"),                                                      # маркет с ценой
     linear(timeInForce="GTC"),                                                  # маркет с timeInForce
     {k: v for k, v in linear().items() if k != "positionIdx"},                  # linear без positionIdx
-    linear(reduceOnly=True, stopLoss="70000"),                                  # reduceOnly со стопом
-    linear(tpslMode="Full"),                                                    # tpslMode без стопа
+    linear(reduceOnly=True, stopLoss="70000"),                                  # стоп позиции — нет
+    linear(tpslMode="Full"),                                                    # tpslMode — нет
     linear(marketUnit="baseCoin"),                                              # marketUnit не для linear
+    linear(orderType="Limit", price="60000"),                                   # лимитка без IOC/FOK
+    linear(orderType="Limit", price="60000", timeInForce="GTC"),                # висящая лимитка — нет
+    linear(orderType="Limit", price="60000", timeInForce="PostOnly"),
+    linear(triggerPrice="70000", triggerDirection=1, triggerBy="MarkPrice"),    # условный без reduceOnly
+    linear(side="Buy", reduceOnly=True, triggerPrice="70000", triggerDirection=2, triggerBy="MarkPrice"),  # не туда
+    linear(reduceOnly=True, triggerPrice="60000", triggerDirection=2),          # без triggerBy
+    linear(reduceOnly=True, triggerPrice="60000", triggerDirection=2, triggerBy="LastPrice"),
+    linear(reduceOnly=True, triggerPrice="60000", triggerDirection="2", triggerBy="MarkPrice"),
+    linear(orderType="Limit", price="60000", timeInForce="IOC", reduceOnly=True, triggerPrice="60000",
+           triggerDirection=2, triggerBy="MarkPrice"),                          # условная лимитка — нет
+    {**{k: v for k, v in linear(category="spot").items() if k != "positionIdx"}, "marketUnit": "baseCoin",
+     "triggerPrice": "1", "triggerDirection": 2, "triggerBy": "MarkPrice"},     # условный на споте — нет
 ])
 def test_bybit_cross_field_rules(params):
     with pytest.raises(ValueError):
         venues.prepare("bybit", "POST", "/v5/order/create", params, CREDS)
+
+
+def test_bot_stop_orders_are_conditional_reduce_only_with_our_id():
+    """Стоп бота — условный рыночный reduceOnly-ордер с нашим клиентским id на размер позиции бота (Bybit: triggerPrice
+    по mark в сторону убытка; BingX: STOP_MARKET) — не стоп всей позиции символа."""
+    stop = venues.Order("bybit", "linear", "BTCUSDT", "sell", "stop", "0.001", reduce_only=True, trigger="60000")
+    _, _, p = venues.create_call(stop, CID)
+    assert p == {"category": "linear", "symbol": "BTCUSDT", "side": "Sell", "orderType": "Market", "qty": "0.001",
+                 "orderLinkId": CID, "positionIdx": 0, "reduceOnly": True, "triggerPrice": "60000",
+                 "triggerDirection": 2, "triggerBy": "MarkPrice"}
+    short_stop = venues.Order("bybit", "linear", "BTCUSDT", "buy", "stop", "0.001", reduce_only=True, trigger="70000")
+    assert venues.create_call(short_stop, CID)[2]["triggerDirection"] == 1
+    bx = venues.Order("bingx", "swap", "ETHUSDT", "buy", "stop", "0.01", reduce_only=True, trigger="3500")
+    _, _, q = venues.create_call(bx, CID)
+    assert q == {"symbol": "ETH-USDT", "side": "BUY", "positionSide": "BOTH", "type": "STOP_MARKET",
+                 "quantity": "0.01", "stopPrice": "3500", "workingType": "MARK_PRICE", "clientOrderId": CID,
+                 "reduceOnly": "true"}
+    venues.prepare("bingx", "POST", "/openApi/swap/v2/trade/order", q, CREDS)
+    for bad in (dict(reduce_only=False), dict(trigger=None), dict(price="1"), dict(tif="IOC")):
+        kw = dict(reduce_only=True, trigger="60000")
+        kw.update(bad)
+        with pytest.raises(ValueError):
+            venues.create_call(venues.Order("bybit", "linear", "BTCUSDT", "sell", "stop", "0.001", **kw), CID)
+    with pytest.raises(ValueError):                                             # спот — без условных
+        venues.create_call(venues.Order("bybit", "spot", "BTCUSDT", "sell", "stop", "0.001", trigger="1"), CID)
+    with pytest.raises(ValueError):                                             # цена срабатывания — только у стопа
+        venues.create_call(venues.Order("bybit", "linear", "BTCUSDT", "sell", "market", "0.001", trigger="1"), CID)
+    for over in ({"type": "STOP_MARKET"}, {"type": "STOP_MARKET", "stopPrice": "3500", "workingType": "MARK_PRICE"},
+                 {"type": "STOP_MARKET", "stopPrice": "3500", "workingType": "MARK_PRICE", "reduceOnly": "false"},
+                 {"type": "STOP_MARKET", "stopPrice": "3500", "workingType": "CONTRACT_PRICE", "reduceOnly": "true"},
+                 {"type": "LIMIT", "price": "3000", "timeInForce": "GTC"}, {"type": "LIMIT", "price": "3000"}):
+        with pytest.raises(ValueError):
+            venues.prepare("bingx", "POST", "/openApi/swap/v2/trade/order", swap(**over), CREDS)
+
+
+def test_open_limits_are_ioc_by_default_and_journal_stop_not_sent():
+    """Лимитка — IOC (или FOK), висящих ордеров бот не ставит; stop_loss ордера на открытие на биржу не уходит (стоп
+    бота журнал ставит отдельным ордером после исполнения)."""
+    o = venues.Order("bybit", "linear", "ETHUSDT", "buy", "limit", "0.01", price="3000", stop_loss="2800")
+    _, _, p = venues.create_call(o, CID)
+    assert p["timeInForce"] == "IOC" and "stopLoss" not in p and "tpslMode" not in p
+    fok = venues.Order("bingx", "swap", "ETHUSDT", "buy", "limit", "0.01", price="3000", tif="FOK", stop_loss="2800")
+    q = venues.create_call(fok, CID)[2]
+    assert q["timeInForce"] == "FOK" and "stopLoss" not in q
+    with pytest.raises(ValueError):
+        venues.create_call(venues.Order("bybit", "linear", "ETHUSDT", "buy", "limit", "0.01", price="3000",
+                                        tif="GTC"), CID)
 
 
 @pytest.mark.parametrize("over", [
@@ -220,7 +287,8 @@ def test_bybit_cross_field_rules(params):
     {"stopLoss": '{"type":"STOP","stopPrice":2900,"price":2890,"workingType":"MARK_PRICE"}'},
     {"stopLoss": '{"type":"STOP_MARKET","stopPrice":2900,"workingType":"MARK_PRICE","stopGuaranteed":true}'},
     {"stopLoss": '{"type":"STOP_MARKET","stopPrice":-1,"workingType":"MARK_PRICE"}'}, {"stopLoss": "not json"},
-    {"reduceOnly": "true", "stopLoss": venues.bingx_stop_loss(Decimal("2900"))},
+    {"reduceOnly": "true", "stopLoss": '{"type":"STOP_MARKET","stopPrice":2900,"workingType":"MARK_PRICE"}'},
+    {"type": "LIMIT", "price": "3000", "timeInForce": "PostOnly"},
 ])
 def test_bingx_bad_values_refused(over):
     with pytest.raises(ValueError):
@@ -312,15 +380,17 @@ def test_bingx_query_sorted_signed_and_vector():
     assert req.headers == {"X-BX-APIKEY": KEY} and req.body is None
 
 
-def test_bingx_stop_loss_json_encoded_in_url_signature_over_raw_string():
-    stop = venues.bingx_stop_loss(Decimal("2900.50"))
-    assert stop == '{"type":"STOP_MARKET","stopPrice":2900.5,"workingType":"MARK_PRICE"}'
-    req = venues.prepare("bingx", "POST", "/openApi/swap/v2/trade/order", swap(side="BUY", stopLoss=stop), CREDS,
-                         timestamp=TS)
-    query = req.url.split("?", 1)[1]
-    enc = [p for p in query.split("&") if p.startswith("stopLoss=")][0]
-    assert "{" not in enc and '"' not in enc and unquote(enc[len("stopLoss="):]) == stop
-    assert query.endswith("signature=3ac295ae526c75d1af4b085d2263e983eb22283a5a70cf5896e805fa03e78563")
+def test_bingx_stop_order_query_sorted_and_signed_independently():
+    """Стоп бота BingX (STOP_MARKET): query отсортирован, подпись — HMAC-SHA256 секрета по сырой строке (эталон
+    считается здесь hmac, а не кодом ядра); JSON в query больше нет."""
+    p = swap(side="BUY", type="STOP_MARKET", stopPrice="3500.5", workingType="MARK_PRICE", reduceOnly="true")
+    req = venues.prepare("bingx", "POST", "/openApi/swap/v2/trade/order", p, CREDS, timestamp=TS)
+    canonical = ("clientOrderId=t260927013512a1b2c3d4&positionSide=BOTH&quantity=0.01&recvWindow=5000&reduceOnly=true"
+                 "&side=BUY&stopPrice=3500.5&symbol=ETH-USDT&timestamp=1700000000000&type=STOP_MARKET"
+                 "&workingType=MARK_PRICE")
+    sig = hmac.new(SECRET.encode(), canonical.encode(), hashlib.sha256).hexdigest()
+    assert req.url == f"https://open-api.bingx.com/openApi/swap/v2/trade/order?{canonical}&signature={sig}"
+    assert "{" not in unquote(req.url)
 
 
 def test_bingx_official_signature_example_through_accounts():
@@ -336,15 +406,16 @@ def test_sent_bytes_equal_signed_bytes_no_redirects_no_secret_on_wire():
                  ("POST", "/openApi/swap/v2/trade/order"): bingx_ok({}),
                  ("DELETE", "/openApi/swap/v2/trade/order"): bingx_ok({}),
                  ("GET", "/v5/order/realtime"): bybit_ok({"list": []})})
-    stop = venues.bingx_stop_loss(Decimal("3100"))
+    stop = {"type": "STOP_MARKET", "stopPrice": "3100", "workingType": "MARK_PRICE", "reduceOnly": "true",
+            "side": "BUY"}
     run(venues.call(s, "bybit", "POST", "/v5/order/create", linear(), CREDS, timestamp=TS))
-    run(venues.call(s, "bingx", "POST", "/openApi/swap/v2/trade/order", swap(stopLoss=stop), CREDS, timestamp=TS))
+    run(venues.call(s, "bingx", "POST", "/openApi/swap/v2/trade/order", swap(**stop), CREDS, timestamp=TS))
     run(venues.call(s, "bingx", "DELETE", "/openApi/swap/v2/trade/order", {"symbol": "ETH-USDT", "clientOrderId": CID},
                     CREDS, timestamp=TS))
     run(venues.call(s, "bybit", "GET", "/v5/order/realtime", {"category": "linear", "symbol": "BTCUSDT"}, CREDS))
     by, bx, dl, rt = s.calls
     assert by["data"] == venues.prepare("bybit", "POST", "/v5/order/create", linear(), CREDS, TS).body.encode()
-    assert bx["url"] == venues.prepare("bingx", "POST", "/openApi/swap/v2/trade/order", swap(stopLoss=stop), CREDS,
+    assert bx["url"] == venues.prepare("bingx", "POST", "/openApi/swap/v2/trade/order", swap(**stop), CREDS,
                                        TS).url and bx["data"] is None
     assert dl["method"] == "DELETE" and dl["query"]["clientOrderId"] == CID
     assert all(c["redirects"] is False for c in s.calls)
@@ -398,16 +469,23 @@ def test_create_call_builders():
     m, p, params = venues.create_call(o, CID)
     assert (m, p) == ("POST", "/v5/order/create") and params == {
         "category": "linear", "symbol": "BTCUSDT", "side": "Sell", "orderType": "Market", "qty": "0.001",
-        "orderLinkId": CID, "positionIdx": 0, "stopLoss": "70000", "tpslMode": "Full", "slTriggerBy": "MarkPrice"}
+        "orderLinkId": CID, "positionIdx": 0}                         # стоп — отдельным ордером бота после исполнения
     _, _, sp = venues.create_call(venues.Order("bybit", "spot", "ETHUSDT", "buy", "market", "0.1"), CID)
     assert sp["marketUnit"] == "baseCoin" and "positionIdx" not in sp
     _, _, lim = venues.create_call(venues.Order("bybit", "linear", "ETHUSDT", "buy", "limit", "0.01", price="3000.10",
                                                 reduce_only=True), CID)
-    assert lim["price"] == "3000.1" and lim["timeInForce"] == "GTC" and lim["reduceOnly"] is True
+    assert lim["price"] == "3000.1" and lim["timeInForce"] == "IOC" and lim["reduceOnly"] is True
     m, p, bx = venues.create_call(venues.Order("bingx", "swap", "ETHUSDT", "buy", "market", "0.01", stop_loss="2900"),
                                   CID)
     assert (m, p) == ("POST", "/openApi/swap/v2/trade/order") and bx["positionSide"] == "BOTH"
-    assert bx["symbol"] == "ETH-USDT" and "reduceOnly" not in bx and json.loads(bx["stopLoss"])["stopPrice"] == 2900
+    assert bx["symbol"] == "ETH-USDT" and "reduceOnly" not in bx and "stopLoss" not in bx
+    assert json.dumps(bx)
+    # символ позиции бота из журнала (закрытие, стоп): только кандидат этого канонического символа, свежесть не нужна
+    ton = venues.Order("bingx", "swap", "TONUSDT", "buy", "market", "10", reduce_only=True)
+    assert venues.create_call(ton, CID, venue_sym="GRAMTON-USDT")[2]["symbol"] == "GRAMTON-USDT"
+    for wrong in ("GRAM-USDT", "BTC-USDT"):
+        with pytest.raises(ValueError):
+            venues.create_call(ton, CID, venue_sym=wrong)
     _, _, close = venues.create_call(venues.Order("bingx", "swap", "ETHUSDT", "buy", "market", "0.01",
                                                   reduce_only=True), CID)
     assert close["reduceOnly"] == "true" and close["positionSide"] == "BOTH"
@@ -505,8 +583,17 @@ def test_order_and_position_views():
         == Decimal("0.2")
     assert venues.order_view("bybit", {"orderLinkId": CID, "orderStatus": "Rejected", "cumExecQty": "0"})["state"] \
         == "rejected"
-    for weird in ("Weird", "Triggered"):
-        assert venues.order_view("bybit", {"orderLinkId": CID, "orderStatus": weird})["state"] is None
+    assert venues.order_view("bybit", {"orderLinkId": CID, "orderStatus": "Weird"})["state"] is None
+    cond = venues.order_view("bybit", {"orderLinkId": CID, "orderStatus": "Triggered", "orderType": "Market",
+                                       "triggerPrice": "60000", "updatedTime": "1700000000000"})
+    assert cond["state"] == "open" and cond["type"] == "stop" and cond["trigger"] == Decimal("60000")
+    assert cond["ts"] == 1700000000
+    plain = venues.order_view("bybit", {"orderLinkId": CID, "orderStatus": "New", "orderType": "Market",
+                                        "triggerPrice": "0"})
+    assert plain["type"] == "market" and plain["trigger"] is None and plain["ts"] is None
+    bx_stop = venues.order_view("bingx", {"clientOrderId": CID, "status": "NEW", "type": "STOP_MARKET",
+                                          "stopPrice": "3500", "commission": "-0.0123"})
+    assert bx_stop["type"] == "stop" and bx_stop["trigger"] == Decimal("3500") and bx_stop["fee"] == Decimal("0.0123")
     b = venues.order_view("bingx", {"order": {"symbol": "ETH-USDT", "orderId": 1735950529123455000123, "side": "SELL",
                                               "type": "MARKET", "origQty": "0.01", "status": "FILLED",
                                               "clientOrderID": CID.upper(), "executedQty": "0.01",
@@ -648,11 +735,11 @@ def test_outcome_code_sets_are_disjoint_and_messages_by_venue():
 
 
 def test_status_tables_exact():
-    assert venues._BYBIT_STATES == {"New": "open", "PartiallyFilled": "open", "Untriggered": "open", "Active": "open",
-                                    "Filled": "filled", "Cancelled": "closed", "PartiallyFilledCanceled": "closed",
-                                    "Deactivated": "closed", "Rejected": "closed"}
+    assert venues._BYBIT_STATES == {"New": "open", "PartiallyFilled": "open", "Untriggered": "open",
+                                    "Triggered": "open", "Active": "open", "Filled": "filled", "Cancelled": "closed",
+                                    "PartiallyFilledCanceled": "closed", "Deactivated": "closed", "Rejected": "closed"}
     assert venues._BINGX_STATES == {"NEW": "open", "PARTIALLY_FILLED": "open", "PARTIALLYFILLED": "open",
-                                    "PENDING": "open", "FILLED": "filled", "CANCELED": "closed",
+                                    "PENDING": "open", "TRIGGERED": "open", "FILLED": "filled", "CANCELED": "closed",
                                     "CANCELLED": "closed", "EXPIRED": "closed", "FAILED": "closed"}
     for status, state in venues._BYBIT_STATES.items():
         want = "rejected" if status == "Rejected" else state
@@ -693,6 +780,13 @@ def test_open_orders_listing_strict():
                                    "type": "market", "qty": Decimal("0"), "price": None,
                                    "trigger": Decimal("60000"), "stop_type": "StopLoss", "reduce_only": True}]
     assert s.calls[0]["query"] == {"category": "linear", "symbol": "BTCUSDT", "limit": "50"}
+    assert s.calls[1]["query"] == {"category": "linear", "symbol": "BTCUSDT", "limit": "50", "orderFilter": "StopOrder"}
+    assert len(rows) == 1                                               # один и тот же стоп в обоих ответах — один раз
+    only_stops = Session({("GET", "/v5/order/realtime"): lambda c: bybit_ok({"list": [
+        {"orderId": "9", "symbol": "BTCUSDT", "side": "Buy", "orderType": "Market", "stopOrderType": "StopLoss",
+         "triggerPrice": "60000"}] if c["query"].get("orderFilter") == "StopOrder" else []})})
+    rows, _ = run(venues.open_orders(only_stops, "bybit", "linear", "BTCUSDT", CREDS))
+    assert [r["stop_type"] for r in rows] == ["StopLoss"]              # стоп виден, даже если «все виды» его не дали
     for answer in (bybit_ok({"list": [{"symbol": "ETHUSDT"}]}), bybit_ok({"list": [{"symbol": "BTCUSDT"}] * 50}),
                    bybit_ok({"nolist": []}), bybit_ok({"list": ["x"]}), Resp(500, b""), Resp(exc=TimeoutError())):
         s = Session({("GET", "/v5/order/realtime"): answer})
@@ -759,6 +853,87 @@ def test_account_positions_include_other_coins():
     assert run(venues.account_positions(bad, "bybit", CREDS))[0] is None
 
 
+def test_cross_account_check_sees_usdc_inverse_option_and_borrows():
+    """Bybit UTA под кросс-маржой: общий залог и у USDC-перпов, инверсных, опционов и займов спот-маржи — всё это
+    читается и считается чужим (symbol None); не прочитали хоть что-то — None (кросс запрещён)."""
+    book = Book()
+    book.lists[("linear", "USDC")] = [{"symbol": "BTCPERP", "positionIdx": 0, "side": "Sell", "size": "5"}]
+    book.lists[("inverse", None)] = [{"symbol": "BTCUSD", "positionIdx": 0, "side": "Buy", "size": "100"}]
+    book.lists[("option", None)] = [{"symbol": "BTC-27DEC26-80000-C", "positionIdx": 0, "side": "Buy", "size": "1"}]
+    book.borrows = [{"coin": "USDT", "borrowAmount": "250"}, {"coin": "BTC", "borrowAmount": ""}]
+    s = Session(book.routes("bybit"))
+    rows, why = run(venues.account_positions(s, "bybit", CREDS))
+    assert why == "" and [(r["raw_symbol"], r["symbol"], r["signed"]) for r in rows] == [
+        ("BTCPERP (linear USDC)", None, Decimal("-5")), ("BTCUSD (inverse)", None, Decimal("100")),
+        ("BTC-27DEC26-80000-C (option)", None, Decimal("1")), ("заём USDT", None, Decimal("250"))]
+    assert [c["query"] for c in s.sent("GET", "/v5/position/list")] == [
+        {"category": "linear", "settleCoin": "USDT", "limit": "200"},
+        {"category": "linear", "settleCoin": "USDC", "limit": "200"},
+        {"category": "inverse", "limit": "200"}, {"category": "option", "limit": "200"}]
+    for route in (("GET", "/v5/account/wallet-balance"), ("GET", "/v5/position/list")):
+        broken = Session(book.routes("bybit") | {route: lambda c: (Resp(500, b"") if "USDC" in str(c["query"]) or
+                                                                   "wallet" in c["path"] else book.routes("bybit")[
+                                                                       ("GET", c["path"])](c))})
+        assert run(venues.account_positions(broken, "bybit", CREDS))[0] is None
+    for params in ({"category": "inverse", "symbol": "BTCUSDT"}, {"category": "option", "settleCoin": "USDT"},
+                   {"category": "linear"}, {"category": "spot", "settleCoin": "USDT"}):
+        with pytest.raises(ValueError):                                  # только чтение, без лишних сочетаний
+            venues.prepare("bybit", "GET", "/v5/position/list", params, CREDS)
+
+
+def test_executions_windows_strict_and_views():
+    s = Session({("GET", "/v5/execution/list"): lambda c: bybit_ok({"list": [
+        {"symbol": "BTCUSDT", "orderLinkId": CID, "orderId": "1", "side": "Sell", "execQty": "0.001",
+         "execPrice": "65000", "execTime": c["query"]["startTime"], "execType": "Trade", "execId": "e1",
+         "execFee": "0.03"}]})})
+    week = venues.EXEC_WINDOW_MS
+    rows, why = run(venues.executions(s, "bybit", "linear", "BTCUSDT", 1_700_000_000_000,
+                                      1_700_000_000_000 + 2 * week, CREDS))
+    assert why == "" and len(rows) == 3 and len(s.calls) == 3                # окна по 7 дней
+    assert rows[0] == {"client_id": CID, "order_id": "1", "exec_id": "e1", "side": "sell", "qty": Decimal("0.001"),
+                       "price": Decimal("65000"), "ts": 1_700_000_000_000, "kind": "Trade", "fee": Decimal("0.03")}
+    too_long = run(venues.executions(s, "bybit", "linear", "BTCUSDT", 0, (venues.EXEC_MAX_WINDOWS + 1) * week, CREDS))
+    assert too_long[0] is None
+    for answer in (bybit_ok({"list": [{"symbol": "BTCUSDT", "execQty": "1", "execTime": "1", "execType": "Trade"}]
+                            * 100}), bybit_ok({"list": [{"symbol": "ETHUSDT"}]}),
+                   bybit_ok({"list": [{"symbol": "BTCUSDT", "execQty": "x", "execTime": "1", "execType": "Trade"}]}),
+                   Resp(500, b"")):
+        s = Session({("GET", "/v5/execution/list"): answer})
+        assert run(venues.executions(s, "bybit", "linear", "BTCUSDT", T0, T0 + 1, CREDS))[0] is None
+    bx = Session({("GET", "/openApi/swap/v2/trade/allOrders"): bingx_ok({"orders": [
+        {"symbol": "ETH-USDT", "orderId": 5, "clientOrderId": "", "side": "BUY", "type": "MARKET", "executedQty": "0.5",
+         "updateTime": 1700000000000, "avgPrice": "3000"},
+        {"symbol": "ETH-USDT", "orderId": 6, "clientOrderId": CID.upper(), "side": "SELL", "type": "LIMIT",
+         "executedQty": "0", "updateTime": 1700000000000}]})})
+    rows, why = run(venues.executions(bx, "bingx", "swap", "ETH-USDT", T0, T0 + 1, CREDS))
+    assert why == "" and [(r["client_id"], r["qty"]) for r in rows] == [("", Decimal("0.5"))]   # неисполненный — мимо
+    assert bx.calls[0]["query"]["startTime"] == str(T0) and bx.calls[0]["query"]["endTime"] == str(T0 + 1)
+
+
+def test_capital_position_mode_funding_and_closed_pnl_readers():
+    book = Book()
+    s = Session(book.routes("bybit") | book.routes("bingx"))
+    assert run(venues.capital(s, "bybit", CREDS)) == (Decimal("10000"), "")
+    assert run(venues.capital(s, "bingx", CREDS)) == (Decimal("10000"), "")
+    book.equity = "0"
+    assert run(venues.capital(s, "bybit", CREDS))[0] is None
+    assert run(venues.position_mode(s, "bingx", CREDS)) == ("oneway", "")
+    book.dual = "true"
+    assert run(venues.position_mode(s, "bingx", CREDS))[0] is None
+    book.dual = "maybe"
+    assert run(venues.position_mode(s, "bingx", CREDS))[0] is None
+    assert run(venues.position_mode(Session(), "bybit", CREDS)) == ("oneway", "")
+    book.funding = [{"symbol": "ETH-USDT", "income": "-0.02", "time": 1700000000000, "tranId": "f1"}]
+    assert run(venues.funding_income(s, "ETH-USDT", T0, T0 + 1, CREDS)) == ([{"ref": "f1", "amount": Decimal("-0.02"),
+                                                                       "ts": 1700000000000}], "")
+    book.funding = [{"symbol": "ETH-USDT", "income": "x", "time": 1, "tranId": "f1"}]
+    assert run(venues.funding_income(s, "ETH-USDT", T0, T0 + 1, CREDS))[0] is None
+    book.closed = [{"symbol": "BTCUSDT", "orderId": "77", "closedSize": "0.001", "closedPnl": "-3.3",
+                    "updatedTime": "1700000000000"}]
+    assert run(venues.closed_pnl(s, "BTCUSDT", T0, T0 + 1, CREDS)) == ([{"order_id": "77", "qty": Decimal("0.001"),
+                                                                   "pnl": Decimal("-3.3"), "ts": 1700000000000}], "")
+
+
 def test_instrument_and_mark_price():
     book = Book()
     s = Session(book.routes("bybit") | book.routes("bingx"))
@@ -794,8 +969,4 @@ def test_setting_call_builders():
         with pytest.raises(ValueError):
             venues.leverage_call("bybit", "BTCUSDT", bad)
     assert venues.margin_isolated_call("ETH-USDT")[2] == {"symbol": "ETH-USDT", "marginType": "ISOLATED"}
-    assert venues.stop_call("BTCUSDT", Decimal("70000.50"))[2]["stopLoss"] == "70000.5"
-    with pytest.raises(ValueError):
-        venues.stop_call("BTCUSDT", Decimal("0"))
-    with pytest.raises(ValueError):
-        venues.stop_call("DOGEUSDT", Decimal("1"))
+    assert not hasattr(venues, "stop_call")                              # стопа всей позиции символа нет

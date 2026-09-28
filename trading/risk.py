@@ -6,15 +6,21 @@
 - Режим minlot (решение владельца 2026-09-27: «кнопка с минимальным лотом» сразу после хорошего бэктеста): ≤ 50 USDT
   на позицию, ≤ 5 USDT дневного убытка, плечо ≤ 2, у направленной — только изолированная маржа.
 - Чужое не трогаем (решение владельца: ключи на ОСНОВНОМ аккаунте): по символу с ручной позицией или ордером владельца
-  (ctx.foreign — trading/ownership.py) открытий нет; внутри бота — ни встречной стороны, ни второго стопа на одном
-  символе биржи (стоп tpslMode=Full / stopLoss действует на всю позицию символа).
+  (ctx.foreign — trading/ownership.py) открытий нет; внутри бота — ни встречной стороны, ни второго ключа со стопом на
+  одном символе биржи.
 - Размер — по ИТОГОВОЙ позиции: открытое + ожидающие ордера на открытие (ctx.positions — journal.exposure()) + этот
-  ордер; на ногу (биржа, символ, стратегия), суммарно, хедж ≤ монета круга × 1.05 — по всей группе.
+  ордер; на ногу (биржа, символ, стратегия), суммарно (по свежим ценам), хедж ≤ монета круга × 1.05 — по всей группе.
+  Группы считаются так, чтобы меткой их не обойти: направленная — по ноге (биржа, символ), метка не в счёт, и весь
+  номинал стратегии ≤ потолка позиции; метка хеджа или фандинга — только одной монеты.
 - Плечо и режим маржи — с биржи (ctx.leverage, ctx.margin_mode), не из запроса; не узнали или плечо выше потолка —
-  отказ. Направленная — только изолированная; хедж/фандинг под кросс-маржой — только в minlot, со стопом, худший
-  убыток по которому укладывается в остаток дневного лимита, и без чужих позиций на аккаунте (ctx.foreign_account).
-- Направленная: стоп обязателен, срабатывает раньше ликвидации (изолированная формула и оценка биржи) и худший убыток
-  по нему укладывается в остаток дневного лимита.
+  отказ. Направленная — только изолированная; хедж/фандинг под кросс-маржой — только в minlot, со стопом, и без чужих
+  позиций на аккаунте (ctx.foreign_account).
+- Худший убыток по стопам — по ИТОГОВОЙ позиции ключа (стратегия, группа): уже открытое + ожидающее + этот ордер по
+  среднему входу, со стопом ордера (он встанет на всю позицию ключа), плюс худшие убытки всех остальных стопов бота —
+  вместе не больше остатка дневного лимита (направленная и кросс).
+- Направленная: стоп обязателен, срабатывает раньше ликвидации (изолированная формула и оценка биржи).
+- Смена стопа (`check_stop_move`) — только к входу, раньше ликвидации; смена плеча (`check_leverage_change`) — не выше
+  потолка стратегий на символе, запас до ликвидации и стоп раньше новой ликвидации.
 - Количество, цена и стоп — по шагам инструмента (ctx.instrument, `quantize`): размер только вниз, стоп — к цене
   входа (никогда не за неё), минимум количества и номинала биржи.
 - Дневной стоп — по дню МСК: реализованный результат дня + нереализованный убыток ≥ лимита → новые открытия стоп.
@@ -255,6 +261,13 @@ def worst_stop_loss(side, qty, entry, stop):
     return qty * abs(entry - stop) * STOP_SLIPPAGE + qty * entry * WORST_FEES
 
 
+def key_worst(side, qty, entry, stop):
+    """Худший убыток позиции бота со стопом (side — сторона входа: buy — лонг): qty × max(вход − стоп, 0) ×
+    STOP_SLIPPAGE + номинал × WORST_FEES; стоп за входом (в прибыли) — только комиссии."""
+    loss = (entry - stop) if side == "buy" else (stop - entry)
+    return qty * max(loss, D(0)) * STOP_SLIPPAGE + qty * entry * WORST_FEES
+
+
 def _stop_before_liq(side, stop, entry, leverage, est_liq):
     """Стоп срабатывает раньше ликвидации: строго между ценой ликвидации (изолированная формула и оценка биржи — худшая)
     и входом."""
@@ -264,9 +277,86 @@ def _stop_before_liq(side, stop, entry, leverage, est_liq):
 
 # --- позиции бота: итоговый размер, группы, встречные стороны ---
 
-def _gid(venue, symbol, group):
-    """Группа позиции: хедж — круг, фандинг — пара ног; без группы — нога (биржа:символ)."""
-    return str(group) if group not in (None, "") else f"{venue}:{symbol}"
+def _gid(venue, symbol, group, strategy=None):
+    """Группа позиции: хедж — круг, фандинг — пара ног; без группы — нога (биржа:символ). Направленная — всегда нога
+    (биржа:символ): метка вызывающего не объединяет позиции разных символов в «одну направленную»."""
+    if strategy == "directional" or group in (None, ""):
+        return f"{venue}:{symbol}"
+    return str(group)
+
+
+def _key_of(p):
+    """(биржа, перп?, символ, стратегия, группа) строки journal.exposure."""
+    return (p.get("venue"), _perp(p.get("category")), p.get("symbol"), p.get("strategy"),
+            _gid(p.get("venue"), p.get("symbol"), p.get("group"), p.get("strategy")))
+
+
+def _row_entry(p):
+    """Средний вход строки exposure (entry) или цена оценки (px)."""
+    for k in ("entry", "px"):
+        v = p.get(k)
+        if v is not None:
+            v = _d(v, "вход позиции бота")
+            if v > 0:
+                return v
+    q = _d(p.get("qty"), "размер позиции бота")
+    return _d(p.get("notional"), "номинал позиции") / q if q > 0 else D(0)
+
+
+def _row_worst(p):
+    """Худший убыток строки exposure со стопом (0 — стопа нет). Стоп есть, а цены его нет — весь номинал."""
+    stop = p.get("stop_price")
+    if stop is None:
+        return _d(p.get("notional"), "номинал позиции") if p.get("stop") else D(0)
+    side = "buy" if _row_side(p) == "long" else "sell"
+    return key_worst(side, _d(p.get("qty"), "размер позиции бота"), _row_entry(p), _d(stop, "стоп позиции бота"))
+
+
+def stop_budget(rows, venue, category, symbol, strategy, group, side, qty, entry, stop):
+    """Худший убыток по стопам после открытия: (итоговая позиция ключа — уже открытое и ожидающее того же ключа + этот
+    ордер по среднему входу, со стопом ордера или, если его нет, стопом ключа; остальные позиции бота со стопами).
+    Итогового стопа нет — (None, остальные)."""
+    me = (venue, _perp(category), symbol, strategy, _gid(venue, symbol, group, strategy))
+    have_q, cost, key_stop, others = D(0), D(0), None, D(0)
+    for p in rows or ():
+        q = _d(p.get("qty"), "размер позиции бота")
+        if q <= 0:
+            continue
+        if _key_of(p) == me:
+            have_q += q
+            cost += q * _row_entry(p)
+            if p.get("stop_price") is not None:
+                key_stop = _d(p.get("stop_price"), "стоп позиции бота")
+        else:
+            others += _row_worst(p)
+    stop = stop if stop is not None else key_stop
+    total = have_q + qty
+    if stop is None or total <= 0:
+        return None, others
+    return key_worst(side, total, (cost + qty * entry) / total, stop), others
+
+
+def _budget_problems(rows, key, category, stop, qty, entry, room, what):
+    """Итоговая позиция ключа со стопом + все остальные стопы бота ≤ остатка дневного лимита. key — (биржа, символ,
+    стратегия, группа, сторона)."""
+    venue, symbol, strategy, group, side = key
+    mine, others = stop_budget(rows, venue, category, symbol, strategy, group, side, qty, entry, stop)
+    if mine is None:
+        return []
+    if mine + others > room:
+        return [f"{what}: худший убыток по стопам {mine + others:.2f} USDT (итоговая позиция ключа {mine:.2f} + "
+                f"остальные {others:.2f}) > остатка дневного лимита {room:.2f} USDT"]
+    return []
+
+
+def _combined_worst(rows, key, category, stop, qty, entry):
+    """Для кросс-маржи: худший убыток итоговой позиции ключа + всех остальных стопов бота; стопа ордера нет или он не с
+    той стороны — None. key — (биржа, символ, стратегия, группа, сторона)."""
+    venue, symbol, strategy, group, side = key
+    if stop is None or worst_stop_loss(side, qty, entry, stop) is None:
+        return None
+    mine, others = stop_budget(rows, venue, category, symbol, strategy, group, side, qty, entry, stop)
+    return mine + others
 
 
 def _row_side(p):
@@ -283,15 +373,15 @@ def _perp(category):
 def netting_conflicts(rows, venue, symbol, strategy, group, side, has_stop):
     """Причины не открывать перп из-за своих же перп-позиций бота на том же символе биржи (односторонний режим
     сальдирует; спот — отдельные монеты, не сальдируется): другая стратегия/группа со встречной стороной —
-    сальдирование; с той же стороной, если у кого-то есть стоп, — стоп tpslMode=Full / stopLoss одной заменит или
-    закроет всю позицию символа (перекрывающиеся стопы)."""
+    сальдирование; с той же стороной, если у кого-то есть стоп, — два ключа со стопами на одной позиции символа
+    (перекрывающиеся стопы: чей стоп закроет чью часть, биржа не знает)."""
     want = "long" if side == "buy" else "short"
-    me = (strategy, _gid(venue, symbol, group))
+    me = (strategy, _gid(venue, symbol, group, strategy))
     out = []
     for p in rows or ():
         if p.get("venue") != venue or p.get("symbol") != symbol or not _perp(p.get("category")):
             continue
-        if (p.get("strategy"), _gid(p.get("venue"), p.get("symbol"), p.get("group"))) == me:
+        if (p.get("strategy"), _gid(p.get("venue"), p.get("symbol"), p.get("group"), p.get("strategy"))) == me:
             continue
         if _d(p.get("qty"), "размер позиции бота") <= 0:
             continue
@@ -306,7 +396,9 @@ def netting_conflicts(rows, venue, symbol, strategy, group, side, has_stop):
 def _size_problems(rows, venue, symbol, strategy, group, qty, notional, lim, hedge_ref_qty=None, need_ref=True,
                    category="linear"):
     """Итоговый размер: нога (биржа, спот/перп, символ, стратегия) и всё открытое — с позициями и ожидающими
-    открытиями бота; число групп стратегии; хедж — вся группа ≤ монета круга × 1.05."""
+    открытиями бота; число групп стратегии (направленная — по ногам биржа:символ, метка группы не в счёт; метка хеджа
+    или фандинга — только одной монеты); направленная — ещё весь номинал стратегии ≤ потолка позиции; хедж — вся
+    группа ≤ монета круга × 1.05."""
     bad = []
     rows = list(rows or ())
     leg = sum((_d(p.get("notional"), "номинал позиции") for p in rows if p.get("venue") == venue
@@ -317,17 +409,26 @@ def _size_problems(rows, venue, symbol, strategy, group, qty, notional, lim, hed
     total = sum((_d(p.get("notional"), "номинал позиции") for p in rows), D(0)) + notional
     if total > lim["total_usdt"]:
         bad.append(f"суммарно открыто {total:.2f} USDT > {lim['total_usdt']} USDT")
-    me = _gid(venue, symbol, group)
-    groups = {_gid(p.get("venue"), p.get("symbol"), p.get("group")) for p in rows if p.get("strategy") == strategy
-              and _d(p.get("qty"), "размер позиции бота") > 0}
+    live = [p for p in rows if p.get("strategy") == strategy and _d(p.get("qty"), "размер позиции бота") > 0]
+    if strategy == "directional":
+        whole = sum((_d(p.get("notional"), "номинал позиции") for p in live), D(0)) + notional
+        if whole > lim["position_usdt"]:
+            bad.append(f"направленная: весь номинал стратегии {whole:.2f} USDT > {lim['position_usdt']} USDT")
+    me = _gid(venue, symbol, group, strategy)
+    groups = {_gid(p.get("venue"), p.get("symbol"), p.get("group"), strategy) for p in live}
     if me not in groups and len(groups) + 1 > lim["max_groups"]:
         bad.append(f"уже открыто {len(groups)} ({strategy}), предел {lim['max_groups']}")
+    if strategy != "directional" and group not in (None, ""):
+        coins = {p.get("symbol") for p in live if _gid(p.get("venue"), p.get("symbol"), p.get("group"), strategy) == me}
+        if coins - {symbol}:
+            bad.append(f"метка группы {group!r} уже у другой монеты ({', '.join(sorted(map(str, coins)))}) — группа "
+                       f"хеджа/фандинга только одной монеты")
     if strategy == "hedge" and need_ref:
         if hedge_ref_qty is None:
             bad.append("хедж без размера круга")
         else:
             group_qty = sum((_d(p.get("qty"), "размер позиции бота") for p in rows if p.get("strategy") == "hedge"
-                             and _gid(p.get("venue"), p.get("symbol"), p.get("group")) == me), D(0)) + qty
+                             and _gid(p.get("venue"), p.get("symbol"), p.get("group"), "hedge") == me), D(0)) + qty
             if group_qty > _d(hedge_ref_qty, "монета круга") * HARD["hedge_qty_ratio"]:
                 bad.append(f"хедж группы {group_qty} больше монеты круга × {HARD['hedge_qty_ratio']}")
     return bad
@@ -335,8 +436,9 @@ def _size_problems(rows, venue, symbol, strategy, group, qty, notional, lim, hed
 
 def _margin_problems(strategy, mode, margin_mode, stop_worst, room, foreign_account):
     """Режим маржи: не узнали — отказ; направленная — только изолированная; кросс (общий залог основного аккаунта) —
-    только хедж/фандинг в minlot, со стопом, худший убыток которого ≤ остатка дневного лимита, и без чужих позиций на
-    аккаунте. → (причины, заметки)."""
+    только хедж/фандинг в minlot, со стопом, и худший убыток итоговой позиции ключа вместе со всеми остальными стопами
+    бота (stop_worst — _combined_worst) ≤ остатка дневного лимита, и без чужих позиций на аккаунте. → (причины,
+    заметки)."""
     bad, notes = [], []
     if margin_mode not in ("isolated", "cross"):
         return [f"режим маржи неизвестен ({margin_mode!r}) — открытие запрещено"], notes
@@ -459,8 +561,10 @@ def _check_open(req, ctx, mode, environ):
             dist = liq_distance(req.side, entry, lev, est)
             if dist < lim["liq_open"]:
                 bad.append(f"запас до ликвидации {dist:.3f} < {lim['liq_open']}")
-        worst = None if stop is None else worst_stop_loss(req.side, qty, entry, stop)
-        mb, notes = _margin_problems(req.strategy, mode, ctx.margin_mode, worst, room, ctx.foreign_account)
+        key = (req.venue, req.symbol, req.strategy, req.group, req.side)
+        mb, notes = _margin_problems(req.strategy, mode, ctx.margin_mode,
+                                     _combined_worst(ctx.positions, key, req.category, stop, qty, entry), room,
+                                     ctx.foreign_account)
         bad += mb
     if req.strategy == "directional":
         if stop is None:
@@ -468,9 +572,8 @@ def _check_open(req, ctx, mode, environ):
         elif worst_stop_loss(req.side, qty, entry, stop) is None:
             bad.append("стоп не с той стороны от входа")
         else:
-            if worst_stop_loss(req.side, qty, entry, stop) > room:
-                bad.append(f"направленная: худший убыток по стопу {worst_stop_loss(req.side, qty, entry, stop):.2f} "
-                           f"USDT > остатка дневного лимита {room:.2f} USDT")
+            bad += _budget_problems(ctx.positions, (req.venue, req.symbol, req.strategy, req.group, req.side),
+                                    req.category, stop, qty, entry, room, "направленная")
             if perp and lev is not None:
                 est = None if ctx.est_liq is None else _d(ctx.est_liq, "цена ликвидации")
                 if not _stop_before_liq(req.side, stop, entry, lev, est):
@@ -481,19 +584,23 @@ def _check_open(req, ctx, mode, environ):
 
 
 def guard_open(order, strategy, group, mode, *, mark, instrument, leverage, margin_mode, foreign, foreign_account,
-               exposure, realized_today, environ=None):
+               exposure, realized_today, unrealized=None, capital=None, est_liq=None, environ=None):
     """Жёсткие проверки открытия внутри journal.submit (защита в глубину: не заменяют check_open вызывающего, а
     повторяют главное по свежим данным биржи): чужое по символу, свои встречные позиции и стопы, шаги инструмента,
-    итоговый размер (minlot — 50 USDT), фактическое плечо, режим маржи и кросс, стоп направленной. → причины."""
+    коридор лимитки ±0.5% от mark, итоговый размер (minlot — 50 USDT) по свежим ценам, дневной лимит (min(лимит режима,
+    2% капитала); реализованный + нереализованный убыток), фактическое плечо, запас до ликвидации (est_liq — цена
+    ликвидации позиции символа с биржи), режим маржи и кросс, худший убыток по стопам итоговой позиции ключа вместе со
+    всеми остальными стопами бота, стоп направленной раньше ликвидации. Нет капитала или нереализованного — отказ.
+    → причины."""
     try:
         return _guard_open(order, strategy, group, mode, mark, instrument, leverage, margin_mode, foreign,
-                           foreign_account, exposure, realized_today, environ)
+                           foreign_account, exposure, realized_today, unrealized, capital, est_liq, environ)
     except Exception as e:   # noqa: BLE001
         return [f"ошибка проверки риска: {type(e).__name__}: {e}"[:200]]
 
 
 def _guard_open(order, strategy, group, mode, mark, instrument, leverage, margin_mode, foreign, foreign_account,
-                exposure, realized_today, environ):
+                exposure, realized_today, unrealized, capital, est_liq, environ):
     if mode not in LIVE_MODES or strategy not in STRATEGIES:
         return [f"режим {mode!r} / стратегия {strategy!r}: открытие запрещено"]
     bad = _foreign_problems(foreign)
@@ -507,33 +614,100 @@ def _guard_open(order, strategy, group, mode, mark, instrument, leverage, margin
     stop = None if order.stop_loss is None else _d(order.stop_loss, "стоп")
     notional = qty * entry
     bad += _instrument_problems(order.side, qty, price, stop, entry, instrument)
+    if price is not None and abs(price - mark) / mark > HARD["limit_band"]:
+        bad.append(f"лимитка дальше ±{HARD['limit_band'] * 100}% от mark")
     bad += _size_problems(exposure, order.venue, order.symbol, strategy, group, qty, notional, lim,
                           need_ref=False, category=order.category)   # хедж ≤ монета круга × 1.05 — в check_open вызывающего (круг знает он)
-    loss = max(D(0), -_d(realized_today, "результат дня"))
-    room = lim["daily_loss_usdt"] - loss
-    if loss >= lim["daily_loss_usdt"]:
-        bad.append(f"дневной стоп: реализованный убыток {loss} USDT ≥ {lim['daily_loss_usdt']} USDT")
-    worst = None if stop is None else worst_stop_loss(order.side, qty, entry, stop)
+    cap = _d(capital, "капитал")
+    if cap <= 0:
+        raise ValueError("капитал неизвестен")
+    limit = min(lim["daily_loss_usdt"], cap * HARD["daily_loss_share"])
+    loss = max(D(0), -(_d(realized_today, "результат дня") + min(_d(unrealized, "нереализованный"), D(0))))
+    room = limit - loss
+    if loss >= limit:
+        bad.append(f"дневной стоп: убыток дня {loss:.2f} USDT ≥ {limit:.2f} USDT (реализованный + нереализованный)")
     if order.category == "spot":
         if order.side != "buy" or strategy != "funding":
             bad.append("спот — только покупка ноги фандинга")
         return bad
     bad += netting_conflicts(exposure, order.venue, order.symbol, strategy, group, order.side, stop is not None)
+    lev = None
     if leverage is None:
         bad.append("фактическое плечо символа не прочитано с биржи — открытие запрещено")
     elif not 1 <= _d(leverage, "плечо символа") <= lim["leverage"]:
         bad.append(f"плечо символа на бирже {leverage} вне 1..{lim['leverage']}")
-    bad += _margin_problems(strategy, mode, margin_mode, worst, room, foreign_account)[0]
+    else:
+        lev = _d(leverage, "плечо символа")
+    est = None if est_liq is None else _d(est_liq, "цена ликвидации")
+    if lev is not None:
+        dist = liq_distance(order.side, entry, lev, est)
+        if dist < lim["liq_open"]:
+            bad.append(f"запас до ликвидации {dist:.3f} < {lim['liq_open']}")
+    key = (order.venue, order.symbol, strategy, group, order.side)
+    bad += _margin_problems(strategy, mode, margin_mode,
+                            _combined_worst(exposure, key, order.category, stop, qty, entry), room, foreign_account)[0]
     if strategy == "directional":
-        if worst is None:
+        if stop is None or worst_stop_loss(order.side, qty, entry, stop) is None:
             bad.append("направленная — нужен стоп с правильной стороны")
-        elif worst > room:
-            bad.append(f"направленная: худший убыток по стопу {worst:.2f} USDT > остатка дневного лимита {room:.2f}")
-        elif leverage is not None and not _stop_before_liq(order.side, stop, entry, _d(leverage, "плечо"), None):
-            bad.append("стоп за ценой ликвидации — сработает позже ликвидации")
+        else:
+            bad += _budget_problems(exposure, key, order.category, stop, qty, entry, room, "направленная")
+            if lev is not None and not _stop_before_liq(order.side, stop, entry, lev, est):
+                bad.append("стоп за ценой ликвидации — сработает позже ликвидации")
     if strategy == "hedge" and order.side != "sell":
         bad.append("хедж — только шорт перпа")
     return bad
+
+
+def check_stop_move(side, entry, stop, old_stop, mark, liq, leverage):
+    """Новый стоп позиции бота (journal.set_stop); side — сторона входа позиции (buy — лонг): стоп с правильной стороны
+    от mark и раньше ликвидации (оценка биржи и изолированная формула при фактическом плече); уже стоящий стоп двигать
+    можно только к входу и дальше в прибыль (худший убыток только меньше того, что проверили при открытии); первый стоп
+    позиции без стопа — только уменьшает риск. → причины."""
+    try:
+        bad = []
+        stop, mark = _d(stop, "стоп"), _d(mark, "mark")
+        if (side == "buy" and not 0 < stop < mark) or (side == "sell" and not stop > mark):
+            bad.append("стоп не с той стороны от mark")
+        liqs = [] if leverage is None else [isolated_liq(side, _d(entry, "вход"), _d(leverage, "плечо"))]
+        liqs += [] if liq is None else [_d(liq, "цена ликвидации")]
+        if not liqs:
+            bad.append("ни цены ликвидации, ни плеча — стоп против ликвидации не проверить")
+        elif (side == "buy" and stop <= max(liqs)) or (side == "sell" and stop >= min(liqs)):
+            bad.append("стоп за ценой ликвидации — сработает позже ликвидации")
+        if old_stop is not None:
+            old = _d(old_stop, "стоп")
+            if (side == "buy" and stop < old) or (side == "sell" and stop > old):
+                bad.append("стоп позиции двигается только к входу (худший убыток не растёт)")
+        return bad
+    except Exception as e:   # noqa: BLE001
+        return [f"ошибка проверки стопа: {type(e).__name__}: {e}"[:200]]
+
+
+def check_leverage_change(keys, mode, leverage, environ=None):
+    """Смена плеча символа (journal.set_leverage): keys — [(стратегия, сторона входа или None, вход, стоп или None)]
+    ключей бота на символе (и стратегия будущего открытия — со стороной None). Плечо — не выше потолка каждой из
+    стратегий в режиме; у позиции бота — запас до ликвидации при новом плече ≥ порога открытия и стоп раньше новой
+    ликвидации. → причины."""
+    try:
+        lev = _d(leverage, "плечо")
+        bad = []
+        for strategy, side, entry, stop in keys:
+            if strategy not in STRATEGIES:
+                return [f"стратегия {strategy!r} неизвестна — плечо не меняем"]
+            lim = limits(strategy, mode, environ)
+            if not 1 <= lev <= lim["leverage"]:
+                bad.append(f"плечо {lev} вне 1..{lim['leverage']} ({strategy}, {mode})")
+                continue
+            if side is None:
+                continue
+            e = _d(entry, "вход")
+            if liq_distance(side, e, lev) < lim["liq_open"]:
+                bad.append(f"{strategy}: запас до ликвидации при плече {lev} < {lim['liq_open']}")
+            if stop is not None and not _stop_before_liq(side, _d(stop, "стоп"), e, lev, None):
+                bad.append(f"{strategy}: стоп позиции за новой ценой ликвидации (плечо {lev})")
+        return bad
+    except Exception as e:   # noqa: BLE001
+        return [f"ошибка проверки плеча: {type(e).__name__}: {e}"[:200]]
 
 
 def check_spot_sell(qty, bot_bought):
@@ -562,25 +736,49 @@ def check_close(qty, bot_size, reducing):
     return Verdict(True, (), None)
 
 
+def _liq_dist(p):
+    """Запас до ликвидации со стороны позиции: long — (mark − liq)/mark, short — (liq − mark)/mark; ValueError — нет
+    данных."""
+    side = p.get("side")
+    if side not in ("long", "short"):
+        raise ValueError(f"сторона {side!r}")
+    mark, liq = _d(p.get("mark"), "mark"), p.get("liq")
+    if liq is None:
+        raise ValueError("нет цены ликвидации")
+    liq = _d(liq, "ликвидация")
+    return (mark - liq) / mark if side == "long" else (liq - mark) / mark
+
+
 def position_actions(positions):
-    """Позиции БОТА → [(позиция, действие, причина)]: "reduce" при запасе до ликвидации < 12%, "alert" < 20%, если
-    цены ликвидации нет, она не с той стороны от mark или данные битые (не угадываем). Позиции без owned=True (чужие
-    или не сверенные с журналом — ownership) пропускаются: их бот не трогает. Запас — со стороны позиции: long —
-    (mark − liq)/mark, short — (liq − mark)/mark. Сокращать — не больше bot_size (своей части)."""
+    """Позиции с биржи (journal.own_positions) → [(позиция, действие, причина)]: у позиции БОТА (owned=True — вся
+    позиция символа бота) "reduce" при запасе до ликвидации < 12%, "alert" < 20%, если цены ликвидации нет, она не с
+    той стороны от mark или данные битые (не угадываем); сокращать — не больше bot_size. Позиция, где у бота по журналу
+    своя часть, а на бирже по символу другое (mismatch / sign_suspect — владелец добавил, позицию бота закрыла биржа,
+    знак BingX не сходится), — всегда "alert" с запасом до ликвидации и причиной (без сокращения: чья там позиция, не
+    доказано) — сопровождение молча не отключается. Позиции без доли бота — позиции владельца: их бот не трогает и не
+    комментирует."""
     out = []
     for p in positions or ():
-        if not isinstance(p, dict) or p.get("owned") is not True:
+        if not isinstance(p, dict):
+            continue
+        if p.get("owned") is not True:
+            if p.get("mismatch") is True or p.get("sign_suspect") is True:
+                why = ("знак позиции BingX не сходится с журналом бота" if p.get("sign_suspect") is True else
+                       f"позиция на бирже не совпадает с журналом бота (у бота {p.get('bot_net')})")
+                try:
+                    why += f"; до ликвидации {_liq_dist(p):.3f}"
+                except (ValueError, ArithmeticError) as e:
+                    why += f"; запас до ликвидации не посчитать: {e}"
+                out.append((p, "alert", why + " — бот не сокращает, проверьте вручную"))
             continue
         try:
-            side = p.get("side")
-            if side not in ("long", "short"):
-                raise ValueError(f"сторона {side!r}")
-            mark, liq = _d(p.get("mark"), "mark"), p.get("liq")
-            if liq is None:
+            if p.get("liq") is None:
+                _d(p.get("mark"), "mark")
+                if p.get("side") not in ("long", "short"):
+                    raise ValueError(f"сторона {p.get('side')!r}")
                 out.append((p, "alert", "нет цены ликвидации"))
                 continue
-            liq = _d(liq, "ликвидация")
-            dist = (mark - liq) / mark if side == "long" else (liq - mark) / mark
+            dist = _liq_dist(p)
         except (ValueError, ArithmeticError) as e:
             out.append((p, "alert", f"данные позиции: {e}"))
             continue

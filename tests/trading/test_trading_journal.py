@@ -96,7 +96,9 @@ def test_intent_persisted_before_request_with_exact_params():
     assert seen[0]["state"] == "sending" and json.loads(seen[0]["params"]) == body(creates(s)[0])
     assert row["strategy"] == "directional" and row["mode"] == "confirm"
     assert Decimal(row["notional"]) == Decimal("65")                    # номинал считает ядро по цене биржи
-    assert len(creates(s)) == 1 and not lookups(s)
+    assert "stopLoss" not in body(creates(s)[0])                        # стоп — отдельным ордером после исполнения
+    # у ордера со стопом ядро ждёт исполнения (запросы только по нашему id): не исполнен — стоп ставить не на что
+    assert len(creates(s)) == 1 and {c["query"]["orderLinkId"] for c in lookups(s)} <= {row["client_id"]}
     assert journal.blocking() == []
     assert all(c["timeout"].total == venues.REQUEST_TIMEOUT for c in s.calls)   # таймаут у каждого запроса
 
@@ -157,7 +159,7 @@ def test_bingx_resend_same_business_params_fresh_timestamp():
     res = submit(s, BX(stop_loss="3500"))
     posts = creates(s)
     assert res["state"] == "open" and len(posts) == 2
-    assert business(posts[0]) == business(posts[1]) and business(posts[0])["stopLoss"].startswith('{"type"')
+    assert business(posts[0]) == business(posts[1]) and "stopLoss" not in business(posts[0])
 
 
 def test_still_unknown_after_bounded_resends_blocks_opens():
@@ -411,9 +413,9 @@ def test_resolve_refuses_inflight_row():
     row = _row("unknown")
     journal._inflight.add(row["client_id"])
     with pytest.raises(ValueError, match="отправляется"):
-        journal.resolve(row["client_id"], "closed", "x")
+        journal.resolve(row["client_id"], "closed", "x", filled="0")
     journal._inflight.discard(row["client_id"])
-    assert journal.resolve(row["client_id"], "closed", "x")["state"] == "closed"
+    assert journal.resolve(row["client_id"], "closed", "x", filled="0")["state"] == "closed"
     assert [e["event"] for e in journal.pending_events()] == ["resolved"]
 
 
@@ -462,9 +464,9 @@ def test_resume_marks_interrupted_unknown_and_resolve_by_owner():
     assert {r["client_id"] for r in resumed} == {a["client_id"], b["client_id"]}
     assert all(r["state"] == "unknown" and "перезапустился" in r["note"] for r in resumed)
     assert {r["client_id"] for r in journal.blocking()} == {a["client_id"], b["client_id"]}
-    journal.resolve(a["client_id"], "closed", "проверил в кабинете")
+    journal.resolve(a["client_id"], "closed", "проверил в кабинете", filled="0")
     with pytest.raises(ValueError):
-        journal.resolve(c["client_id"], "closed", "не unknown")
+        journal.resolve(c["client_id"], "closed", "не unknown", filled="0")
     assert journal.get(a["client_id"])["note"].startswith("владелец:")
     f = _row("filled")
     assert journal.close_out(f["client_id"])["state"] == "closed"
@@ -535,7 +537,7 @@ def test_reconcile_row_failure_keeps_other_events(monkeypatch):
         return real(row, view, expect)
     monkeypatch.setattr(journal, "_apply_view", flaky)
     s = Session({RT: book.bybit_query, HIST: bybit_ok({"list": []})})
-    events = run(journal.reconcile(s, lambda v: CREDS))
+    events = run(journal.reconcile(s, lambda v: CREDS, positions=False))
     assert [(e, r["client_id"]) for e, r in events] == [("filled", a["client_id"])]
     got = {(e["event"], e["client_id"]) for e in journal.pending_events()}
     assert got == {("filled", a["client_id"]), ("reconcile_error", b["client_id"])}
@@ -576,7 +578,7 @@ def test_reconcile_updates_states_and_alerts_once():
     book.bybit_store(mism["client_id"], symbol="BTCUSDT", side="Sell", orderType="Market", qty="5",
                      orderStatus="New", cumExecQty="0")
     s = Session({RT: book.bybit_query, HIST: bybit_ok({"list": []})})
-    events = run(journal.reconcile(s, _creds_for))
+    events = run(journal.reconcile(s, _creds_for, positions=False))
     got = {row["client_id"]: ev for ev, row in events}
     assert got == {filled["client_id"]: "filled", found["client_id"]: "found", gone_err["client_id"]: "rejected",
                    gone_amb["client_id"]: "notfound", vanished["client_id"]: "notfound", mism["client_id"]: "mismatch"}
@@ -584,7 +586,7 @@ def test_reconcile_updates_states_and_alerts_once():
     assert st == {filled["client_id"]: "filled", found["client_id"]: "open", gone_err["client_id"]: "rejected",
                   gone_amb["client_id"]: "unknown", vanished["client_id"]: "unknown", mism["client_id"]: "unknown"}
     assert journal.get(filled["client_id"])["avg_price"] == "65000"
-    assert run(journal.reconcile(s, _creds_for)) == []                       # тревоги — по одному разу
+    assert run(journal.reconcile(s, _creds_for, positions=False)) == []      # тревоги — по одному разу
     assert {(e["client_id"], e["event"]) for e in journal.pending_events()} == {(r, ev) for r, ev in got.items()}
     assert all(c["method"] == "GET" for c in s.calls)                        # сверка ничего не отправляет
 
@@ -602,7 +604,7 @@ def test_reconcile_any_age_and_keyless_still_block():
     old = _row("open", created=time.time() - 400 * 86400)
     bx = _row("unknown", venue="bingx")
     s = Session({RT: bybit_ok({"list": []}), HIST: bybit_ok({"list": []})})
-    events = run(journal.reconcile(s, lambda v: CREDS if v == "bybit" else None))
+    events = run(journal.reconcile(s, lambda v: CREDS if v == "bybit" else None, positions=False))
     assert [(e, r["client_id"]) for e, r in events] == [("notfound", old["client_id"])]
     assert {c["query"].get("orderLinkId") for c in s.calls} == {old["client_id"]}
     assert {r["client_id"] for r in journal.blocking()} == {old["client_id"], bx["client_id"]}
@@ -842,5 +844,5 @@ def test_ton_order_refused_until_symbol_verified_then_uses_gram():
                                                  "side": "Sell", "orderType": "Market", "qty": "10",
                                                  "orderStatus": "Filled", "cumExecQty": "10"}]})
     venues._RESOLVED.clear()                                                # сверка идёт по символу из параметров
-    events = run(journal.reconcile(s, _creds_for))
+    events = run(journal.reconcile(s, _creds_for, positions=False))
     assert [e for e, _ in events] == ["filled"] and s.calls[-1]["query"]["symbol"] == "GRAMUSDT"

@@ -146,7 +146,8 @@ def test_total_open_cap_2000_and_group_counts():
     pairs = [pos(group=g, venue=v) for g in ("a", "b") for v in ("bybit", "bingx")]
     fund = dict(strategy="funding", side="sell", hedge_ref_qty=None)
     bad(req(**fund), ctx(positions=pairs), "confirm", why="предел 2")
-    ok(req(group="b", **fund), ctx(positions=pairs), "confirm")             # вторая нога уже открытой пары
+    ok(req(group="b", symbol="ETHUSDT", stop_loss=None, **fund), ctx(positions=pairs), "confirm")   # нога той же пары
+    bad(req(group="b", **fund), ctx(positions=pairs), "confirm", why="другой монеты")   # метка пары ETH на BTC — нет
     one = [pos("directional", group=None)]
     bad(req(strategy="directional", side="buy", stop_loss=D("64000"), hedge_ref_qty=None), ctx(positions=one),
         "confirm", why="предел 1")
@@ -457,3 +458,110 @@ def test_directional_stop_fits_daily_room_and_triggers_before_liquidation():
     bad(req(stop_loss=D("33000"), **d), c, "confirm", why="стоп за ценой ликвидации")   # изолированная ≈ 33150
     ok(req(stop_loss=D("33200"), **d), c, "confirm")
     assert risk.isolated_liq("buy", D(100), D(2)) == D("51") and risk.isolated_liq("sell", D(100), D(2)) == D("149")
+
+
+# --- ревью 2: итоговая позиция ключа по стопам, метки групп, guard_open, смена стопа и плеча, тревоги ---
+
+def key_row(strategy="directional", venue="bybit", symbol="ETHUSDT", side="long", qty="0.02", entry="4000", stop=None,
+            group=None, category="linear"):
+    """Строка journal.exposure позиции бота (с входом и ценой стопа ключа)."""
+    return {"venue": venue, "category": category, "symbol": symbol, "strategy": strategy, "group": group, "side": side,
+            "qty": D(qty), "net": D(qty) if side == "long" else -D(qty), "pending": D(0), "px": D(entry),
+            "entry": D(entry), "notional": D(qty) * D(entry), "unrealized": D(0), "stop": stop is not None,
+            "stop_price": None if stop is None else D(stop)}
+
+
+ETH4000 = dict(mark=D("4000"), book=[(D("4001"), D("10"))], instrument=INST)
+DIR_ETH = dict(strategy="directional", symbol="ETHUSDT", side="buy", qty=D("0.02"), stop_loss=D("2800"),
+               hedge_ref_qty=None)
+
+
+def test_worst_loss_vs_daily_room_is_resulting_key_position_not_per_order():
+    """0.02 ETH по 4000 со стопом 2800 — худший 36.16 ≤ 50; вторая такая же добавка к тому же ключу — итог 0.04 со
+    стопом 2800: 72.32 > 50 — отказ (раньше считалось по ордеру и проходило)."""
+    ok(req(**DIR_ETH), ctx(**ETH4000), "confirm")
+    v = bad(req(**DIR_ETH), ctx(positions=[key_row(stop="2800")], **ETH4000), "confirm", why="худший убыток по стопам")
+    assert any("72.32" in r for r in v.reasons)
+    other = key_row(symbol="BTCUSDT", qty="0.0005", entry="65000", stop="40000")   # чужой ключ со стопом: 18.81
+    bad(req(**DIR_ETH), ctx(positions=[other], **ETH4000), "confirm", why="худший убыток по стопам")   # 36.16+18.81
+    mine = risk.stop_budget([key_row(stop="2800")], "bybit", "linear", "ETHUSDT", "directional", None, "buy", D("0.02"),
+                            D("4000"), D("3500"))[0]
+    assert mine == D("0.04") * 500 * risk.STOP_SLIPPAGE + D("0.32")      # новый стоп — на весь ключ
+    exp = [key_row(stop="2800")]
+    guard = risk.guard_open(venues.Order("bybit", "linear", "ETHUSDT", "buy", "market", "0.02", stop_loss="2800"),
+                            "directional", "", "confirm", mark=D("4000"), instrument=INST, leverage=D(2),
+                            margin_mode="isolated", foreign=[], foreign_account=None, exposure=exp,
+                            realized_today=D(0), unrealized=D(0), capital=D("10000"))
+    assert any("худший убыток по стопам" in r for r in guard), guard
+
+
+def test_cross_minlot_hedges_sum_of_stops_within_room():
+    """Кросс в minlot: три хеджа по 4.58 каждый ≤ 5, но вместе — нет: считается сумма всех стопов бота."""
+    cross = ctx(margin_mode="cross")
+    one = key_row("hedge", symbol="BTCUSDT", side="short", qty="0.0007", entry="65000", stop="68800", group="c1")
+    assert risk.key_worst("sell", D("0.0007"), D("65000"), D("68800")) < 5
+    ok(req(stop_loss=D("68800")), cross, "minlot")
+    bad(req(stop_loss=D("68800"), group="c2"), ctx(margin_mode="cross", positions=[
+        dict(one, venue="bingx")]), "minlot", why="худший убыток")
+
+
+def test_one_directional_cap_not_bypassed_by_reusing_group_label():
+    """Направленная ETH на 200 USDT с меткой 'dir' открыта; новая направленная BTC с той же меткой — отказ (одна
+    направленная и весь номинал стратегии ≤ 200); метку хеджа нельзя переиспользовать на другой монете."""
+    eth = [key_row(qty="0.05", entry="4000", stop="3900", group="dir")]
+    d = dict(strategy="directional", side="buy", stop_loss=D("64000"), hedge_ref_qty=None, group="dir")
+    v = bad(req(**d), ctx(positions=eth, book=[(D("65010"), D("1"))]), "confirm", why="предел 1")
+    assert any("весь номинал стратегии" in r for r in v.reasons)
+    hedges = [key_row("hedge", symbol="ETHUSDT", side="short", qty="0.1", entry="3000", group="c1")]
+    bad(req(group="c1", hedge_ref_qty=D("0.001")), ctx(positions=hedges), "confirm", why="другой монеты")
+
+
+def test_guard_open_checks_liquidation_distance_and_limit_band():
+    """guard_open внутри submit: запас до ликвидации по цене ликвидации с биржи и коридор лимитки ±0.5% от mark."""
+    order = venues.Order("bybit", "linear", "BTCUSDT", "sell", "market", "0.0007")
+    base = dict(mark=D("65000"), instrument=INST, leverage=D(3), margin_mode="isolated", foreign=[],
+                foreign_account=None, exposure=[], realized_today=D(0), unrealized=D(0), capital=D("10000"))
+    assert risk.guard_open(order, "hedge", "c1", "confirm", **base) == []
+    near = risk.guard_open(order, "hedge", "c1", "confirm", est_liq=D("66000"), **base)
+    assert any("запас до ликвидации 0.015" in r for r in near), near
+    lim = venues.Order("bybit", "linear", "BTCUSDT", "sell", "limit", "0.0007", price="64600")
+    assert any("±0.5" in r for r in risk.guard_open(lim, "hedge", "c1", "confirm", **base))
+    assert any("капитал" in r for r in risk.guard_open(order, "hedge", "c1", "confirm", **dict(base, capital=None)))
+    loss = risk.guard_open(order, "hedge", "c1", "minlot", **dict(base, realized_today=D("-3"),
+                                                                  unrealized=D("-2")))
+    assert any("дневной стоп" in r for r in loss), loss                  # 3 + 2 ≥ 5 (minlot)
+    small = risk.guard_open(order, "hedge", "c1", "confirm", **dict(base, capital=D("1000"), realized_today=D("-20")))
+    assert any("дневной стоп" in r for r in small)                         # 2% от 1000 = 20 < 50
+
+
+def test_check_stop_move_and_leverage_change():
+    """Стоп — только к входу и раньше ликвидации; плечо — не выше потолка стратегий на символе, стоп раньше новой
+    ликвидации."""
+    assert risk.check_stop_move("buy", D("65000"), D("62000"), D("60000"), D("64000"), None, D(2)) == []
+    assert any("только к входу" in r for r in risk.check_stop_move("buy", D("65000"), D("34000"), D("60000"),
+                                                                  D("64000"), None, D(2)))
+    assert any("ликвидации" in r for r in risk.check_stop_move("buy", D("65000"), D("33000"), None, D("64000"), None,
+                                                              D(2)))
+    assert any("не с той стороны" in r for r in risk.check_stop_move("sell", D("65000"), D("64000"), None, D("64500"),
+                                                                    None, D(2)))
+    assert risk.check_stop_move("sell", D("65000"), D("66000"), None, D("64500"), D("96000"), None) == []
+    assert risk.check_leverage_change([("hedge", None, None, None)], "confirm", 3) == []
+    assert any("вне 1..2" in r for r in risk.check_leverage_change([("hedge", None, None, None)], "minlot", 3))
+    assert any("вне 1..2" in r for r in risk.check_leverage_change([("directional", "buy", D("65000"), D("34000"))],
+                                                                   "confirm", 3))
+    late = risk.check_leverage_change([("hedge", "sell", D("65000"), D("97000"))], "confirm", 3)
+    assert any("стоп позиции за новой ценой ликвидации" in r for r in late), late
+    assert risk.check_leverage_change([("arb", None, None, None)], "confirm", 2)
+
+
+def test_position_actions_alert_for_bot_position_that_does_not_match_venue():
+    """У бота по журналу позиция, на бирже по символу другое (владелец добавил) или знак BingX не сходится — тревога с
+    запасом до ликвидации, без сокращения; позиции без доли бота — тишина."""
+    rows = [dict(owned=False, mismatch=True, bot_net=D("-0.001"), side="short", mark=D(100), liq=D("101.5")),
+            dict(owned=False, sign_suspect=True, mismatch=True, bot_net=D("-0.5"), side="long", mark=D(100),
+                 liq=D("98.5")),
+            dict(owned=False, mismatch=False, side="short", mark=D(100), liq=D(101))]
+    acts = risk.position_actions(rows)
+    assert [a for _, a, _ in acts] == ["alert", "alert"]
+    assert "до ликвидации 0.015" in acts[0][2] and "не сокращает" in acts[0][2]
+    assert "знак позиции BingX" in acts[1][2]

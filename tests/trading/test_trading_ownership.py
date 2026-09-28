@@ -99,18 +99,38 @@ def test_open_refused_on_bingx_symbol_with_owner_position_or_stop():
     assert submit(s, BX())["reason"].startswith(risk.FOREIGN) and not creates(s)
 
 
-def test_own_orders_and_own_position_stop_are_attributed():
-    """Свой открытый ордер (id из журнала) и стоп своей позиции (цена — последний стоп бота) — не чужое."""
+def filled_routes(book, venue="bybit"):
+    """«Биржа», где рыночные ордера исполняются сразу (условные стопы — висят)."""
+    if venue == "bybit":
+        return book.routes("bybit", **{"POST /v5/order/create": book.bybit_create(status="Filled")})
+    return book.routes("bingx", **{"POST /openApi/swap/v2/trade/order": book.bingx_create(status="FILLED")})
+
+
+def stops_sent(s):
+    return [body(c) for c in s.sent(*CREATE_BY) if "triggerPrice" in body(c)]
+
+
+def test_bot_stop_is_its_own_conditional_order_and_position_stop_without_id_is_foreign():
+    """Стоп бота — отдельный условный reduceOnly-ордер с его клиентским id на размер позиции бота (свой по id); добавка
+    к ключу — стоп переставляется на весь ключ; стоп позиции без id (tpslMode у Bybit) — чужой даже на цене бота."""
     book = Book()
-    own(stop="70000", book=book)                                               # шорт бота 0.001 со стопом 70000
-    book.foreign.append(stop_order("70000"))
-    s = Session(book.routes("bybit"))
-    first = submit(s, BY(stop_loss="70000"))                                  # тот же стоп — не перекрывается
-    assert first["state"] == "open"
-    book.foreign[0] = stop_order("70000")
-    assert submit(s, BY())["state"] == "open"                                 # в списке — и наш открытый ордер
-    book.foreign[0] = stop_order("71000")                                     # стоп поменял владелец
-    res = submit(s, BY())
+    s = Session(filled_routes(book))
+    first = submit(s, BY(side="buy", stop_loss="60000"), strategy="directional")
+    assert first["state"] == "filled", first["reason"]
+    assert "stopLoss" not in body(creates(s)[0]) and "tpslMode" not in body(creates(s)[0])
+    stop = stops_sent(s)
+    assert [(b["side"], b["qty"], b["triggerPrice"], b["triggerDirection"], b["reduceOnly"]) for b in stop] == [
+        ("Sell", "0.001", "60000", 2, True)]
+    k = journal.bot_book("bybit", "linear", "BTCUSDT")["keys"][("directional", "")]
+    assert k["stop"] == D("60000") and k["pending_stop"] == D("0.001") and k["net"] == D("0.001")
+    second = submit(s, BY(side="buy", stop_loss="61000"), strategy="directional")   # стоп бота в списке — свой
+    assert second["state"] == "filled", second["reason"]
+    assert [(b["qty"], b["triggerPrice"]) for b in stops_sent(s)] == [("0.001", "60000"), ("0.002", "61000")]
+    assert len(s.sent("POST", "/v5/order/cancel")) == 1                       # старый стоп снят
+    k = journal.bot_book("bybit", "linear", "BTCUSDT")["keys"][("directional", "")]
+    assert k["stop"] == D("61000") and k["pending_stop"] == D("0.002") and len(k["stops"]) == 1
+    book.foreign.append(dict(stop_order("61000", side="Sell")))                 # стоп позиции без id — владельца
+    res = submit(s, BY(side="buy", stop_loss="61000"), strategy="directional")
     assert res["reason"].startswith(risk.FOREIGN) and "StopLoss" in res["reason"]
 
 
@@ -122,16 +142,27 @@ def test_position_not_matching_journal_is_foreign():
     assert res["reason"].startswith(risk.FOREIGN) and "short 0.003" in res["reason"]
 
 
-def test_position_closed_by_venue_syncs_journal_with_event():
-    """На бирже пусто, у бота по журналу шорт (стоп сработал): поправка обнуляет сальдо, событие владельцу, открытие
-    идёт дальше."""
+def test_position_closed_by_venue_syncs_journal_books_worst_loss_and_blocks_strategy():
+    """На бирже пусто, у бота по журналу шорт (ликвидация или владелец закрыл): поправка обнуляет сальдо, в результат
+    дня — худший убыток (без стопа — весь номинал), событие владельцу; это открытие отменено, дальше открытия стратегии
+    запрещены, пока результат не подтверждён (settle_venue_close)."""
     book = Book()
     own()                                                                      # на «бирже» позиции нет
-    assert journal.bot_book("bybit", "linear", "BTCUSDT")["net"] == D("-0.001")
-    res = submit(Session(book.routes("bybit")), BY())
-    assert res["state"] == "open"
+    fee = journal.pnl_today()
+    assert journal.bot_book("bybit", "linear", "BTCUSDT")["net"] == D("-0.001") and fee < 0   # оценка комиссии входа
+    s = Session(book.routes("bybit"))
+    res = submit(s, BY())
+    assert res["state"] == "refused" and "закрыла биржа" in res["reason"] and not creates(s)
     assert journal.bot_book("bybit", "linear", "BTCUSDT")["net"] == 0
     assert [e["event"] for e in journal.pending_events()] == ["closed_by_venue"]
+    assert journal.pnl_today() == fee - D("65")                                # 0.001 × 65000 — без стопа весь номинал
+    left = journal.unsettled("hedge")
+    assert len(left) == 1 and left[0]["qty"] == "0.001"
+    res = submit(s, BY())
+    assert res["state"] == "refused" and "не подтверждено" in res["reason"]
+    journal.settle_venue_close(left[0]["ref"], "-1.5", "проверил в кабинете")
+    assert journal.pnl_today() == fee - D("1.5") and journal.unsettled() == []
+    assert submit(s, BY())["state"] == "open"
 
 
 @pytest.mark.parametrize("route,answer", [
@@ -158,8 +189,7 @@ def test_unreadable_or_strange_snapshot_refuses(route, answer):
 
 def test_close_limited_to_own_journal_size():
     book = Book()
-    own(book=book)                                                             # бот: шорт 0.001
-    book.position["BTCUSDT"] -= D("0.01")                                     # плюс шорт владельца 0.01
+    own(book=book)                                                             # бот: шорт 0.001 (вся позиция символа)
     s = Session(book.routes("bybit"))
     res = submit(s, BY(side="buy", qty="0.002", reduce_only=True), purpose="close")
     assert res["state"] == "refused" and "своей позиции бота" in res["reason"] and not creates(s)
@@ -167,6 +197,18 @@ def test_close_limited_to_own_journal_size():
     assert submit(s, BY(side="buy", reduce_only=True), purpose="close")["state"] == "open"
     again = submit(s, BY(side="buy", reduce_only=True), purpose="close")       # первое закрытие ещё не исполнено
     assert again["state"] == "refused" and len(creates(s)) == 1
+
+
+def test_close_refused_when_owner_position_merged_with_bot_position():
+    """Владелец добавил свой шорт к шорту бота: позиция символа не вся бота — закрытие не уходит (сальдо биржи не
+    равно журналу — чья там позиция, не доказано), событие владельцу."""
+    book = Book()
+    own(book=book)
+    book.position["BTCUSDT"] -= D("0.01")
+    s = Session(book.routes("bybit"))
+    res = submit(s, BY(side="buy", reduce_only=True), purpose="close")
+    assert res["state"] == "refused" and res["reason"].startswith(risk.FOREIGN) and not creates(s)
+    assert [e["event"] for e in journal.pending_events()] == ["foreign"]
 
 
 def test_close_refused_without_own_position_even_if_owner_has_one():
@@ -178,9 +220,10 @@ def test_close_refused_without_own_position_even_if_owner_has_one():
 
 
 def test_close_limited_per_strategy_group():
-    own(strategy="hedge", group="c1")
-    own(strategy="hedge", group="c2", qty="0.002")
-    s = Session(Book().routes("bybit"))
+    book = Book()
+    own(strategy="hedge", group="c1", book=book)
+    own(strategy="hedge", group="c2", qty="0.002", book=book)
+    s = Session(book.routes("bybit"))
     res = submit(s, BY(side="buy", qty="0.002", reduce_only=True), purpose="close", strategy="hedge", group="c1")
     assert res["state"] == "refused"
     assert submit(s, BY(side="buy", qty="0.001", reduce_only=True), purpose="close", strategy="hedge",
@@ -226,14 +269,15 @@ def test_set_leverage_only_without_foreign_and_110043_is_ok():
     book = Book()
     book.foreign.append(MANUAL_BY)
     s = Session(book.routes("bybit") | {LEV_BY: bybit_err(110043, "leverage not modified")})
-    kind, why = run(journal.set_leverage(s, "bybit", "BTCUSDT", 2, CREDS))
+    kind, why = run(journal.set_leverage(s, "bybit", "BTCUSDT", 2, CREDS, strategy="hedge"))
     assert kind == "refused" and why.startswith(risk.FOREIGN) and not s.sent(*LEV_BY)
     book.foreign.clear()
-    assert run(journal.set_leverage(s, "bybit", "BTCUSDT", 2, CREDS))[0] == "ok"
+    assert run(journal.set_leverage(s, "bybit", "BTCUSDT", 2, CREDS, strategy="hedge"))[0] == "ok"
     assert body(s.sent(*LEV_BY)[0]) == {"category": "linear", "symbol": "BTCUSDT", "buyLeverage": "2",
                                         "sellLeverage": "2"}
+    assert run(journal.set_leverage(s, "bybit", "BTCUSDT", 2, CREDS))[0] == "refused"   # без стратегии — нет
     with pytest.raises(ValueError):
-        run(journal.set_leverage(s, "bybit", "BTCUSDT", 4, CREDS))
+        run(journal.set_leverage(s, "bybit", "BTCUSDT", 4, CREDS, strategy="hedge"))
     assert len(s.sent(*LEV_BY)) == 1
     s.routes[LEV_BY] = bybit_err(110043)
     assert venues.leverage_outcome("bybit", 200, {"retCode": 110043})[0] == "ok"
@@ -245,7 +289,7 @@ def test_set_leverage_and_margin_bingx_refused_with_owner_position():
     book = Book()
     book.position["ETH-USDT"] = D("1")
     s = Session(book.routes("bingx") | {LEV_BX: bingx_ok({}), MARGIN_BX: bingx_ok({})})
-    assert run(journal.set_leverage(s, "bingx", "ETHUSDT", 2, CREDS))[0] == "refused"
+    assert run(journal.set_leverage(s, "bingx", "ETHUSDT", 2, CREDS, strategy="hedge"))[0] == "refused"
     assert run(journal.set_margin_isolated(s, "ETHUSDT", CREDS))[0] == "refused"
     assert not s.sent(*LEV_BX) and not s.sent(*MARGIN_BX)
     book.position.clear()
@@ -253,12 +297,12 @@ def test_set_leverage_and_margin_bingx_refused_with_owner_position():
     assert s.sent(*MARGIN_BX)[0]["query"]["marginType"] == "ISOLATED"
 
 
-# --- 7. стоп всей позиции (tpslMode=Full) — только когда вся позиция бота ---
+# --- 7. стоп позиции бота — условный ордер бота на его размер, только когда вся позиция символа бота ---
 
 def test_set_stop_only_on_whole_own_position():
     book = Book()
     book.liq["BTCUSDT"] = "96000"
-    s = Session(book.routes("bybit") | {STOP_BY: bybit_ok({})})
+    s = Session(book.routes("bybit"))
     assert run(journal.set_stop(s, "bybit", "BTCUSDT", "70000", CREDS))[0] == "refused"    # позиции бота нет
     own(book=book)
     book.position["BTCUSDT"] -= D("0.004")                                    # и шорт владельца на том же символе
@@ -267,15 +311,25 @@ def test_set_stop_only_on_whole_own_position():
     book.position["BTCUSDT"] += D("0.004")
     assert run(journal.set_stop(s, "bybit", "BTCUSDT", "64000", CREDS))[0] == "refused"    # шорт: стоп ниже mark
     assert run(journal.set_stop(s, "bybit", "BTCUSDT", "97000", CREDS))[0] == "refused"    # за ликвидацией
-    assert not s.sent(*STOP_BY)
+    assert run(journal.set_stop(s, "bybit", "BTCUSDT", "x", CREDS))[0] == "refused"        # не число — не исключение
+    assert not creates(s)
     assert run(journal.set_stop(s, "bybit", "BTCUSDT", "70000", CREDS))[0] == "ok"
-    assert body(s.sent(*STOP_BY)[0]) == {"category": "linear", "symbol": "BTCUSDT", "tpslMode": "Full",
-                                         "positionIdx": 0, "stopLoss": "70000", "slTriggerBy": "MarkPrice"}
-    assert journal.bot_book("bybit", "linear", "BTCUSDT")["stop"] == D("70000")
-    book.foreign.append(stop_order("70000"))                                  # теперь стоп позиции — бота
-    snap = run(ownership.fetch(s, "bybit", "linear", "BTCUSDT", "BTCUSDT", CREDS, market=False))
-    assert ownership.foreign(snap, journal.bot_book("bybit", "linear", "BTCUSDT")) == []
-    assert run(journal.set_stop(s, "bingx", "ETHUSDT", "3500", CREDS))[0] == "refused"
+    first = body(creates(s)[0])
+    assert {k: first[k] for k in ("side", "orderType", "qty", "reduceOnly", "triggerPrice", "triggerDirection",
+                                  "triggerBy")} == {"side": "Buy", "orderType": "Market", "qty": "0.001",
+                                                    "reduceOnly": True, "triggerPrice": "70000", "triggerDirection": 1,
+                                                    "triggerBy": "MarkPrice"}
+    k = journal.bot_book("bybit", "linear", "BTCUSDT")["keys"][("hedge", "")]
+    assert k["stop"] == D("70000") and k["pending_stop"] == D("0.001")
+    snap = run(ownership.fetch(s, "bybit", "linear", "BTCUSDT", "BTCUSDT", CREDS, market=False,
+                               exec_since=journal._exec_since("bybit", "linear", "BTCUSDT")))
+    assert ownership.foreign(snap, journal.bot_book("bybit", "linear", "BTCUSDT")) == []   # стоп бота — по id
+    kind, why = run(journal.set_stop(s, "bybit", "BTCUSDT", "72000", CREDS))                # дальше от входа — нет
+    assert kind == "refused" and "только к входу" in why and len(creates(s)) == 1
+    assert run(journal.set_stop(s, "bybit", "BTCUSDT", "68000.04", CREDS))[0] == "ok"       # к входу; шаг 0.1 — вниз
+    assert [body(c)["triggerPrice"] for c in creates(s)] == ["70000", "68000"]
+    assert len(s.sent("POST", "/v5/order/cancel")) == 1                                    # старый стоп снят
+    assert run(journal.set_stop(s, "bingx", "ETHUSDT", "3500", CREDS))[0] == "refused"      # позиции бота нет
 
 
 # --- 11. кросс-маржа основного аккаунта ---
@@ -367,9 +421,10 @@ def test_hedge_must_be_short_in_submit():
 
 # --- чистые функции ownership ---
 
-def _snap(net, orders, errors=()):
-    return ownership.Snapshot("bybit", "linear", "BTCUSDT", "BTCUSDT", {"net": D(net), "rows": [], "leverage": D(2)},
-                              orders, D(2), "isolated", None, None, None, tuple(errors))
+def _snap(net, orders, errors=(), execs=(), venue="bybit"):
+    return ownership.Snapshot(venue, "linear", "BTCUSDT", "BTCUSDT", {"net": D(net), "rows": [], "leverage": D(2)},
+                              orders, D(2), "isolated", None, None, None, tuple(errors), time.time(), None, {},
+                              None if execs is None else list(execs))
 
 
 def _order(cid="", stop_type="", trigger=None, side="buy", oid="1"):
@@ -378,17 +433,35 @@ def _order(cid="", stop_type="", trigger=None, side="buy", oid="1"):
             "reduce_only": True}
 
 
+def _exec(cid="", kind="Trade", qty="0.001"):
+    return {"client_id": cid, "order_id": "9", "exec_id": "e", "side": "sell", "qty": D(qty), "price": None,
+            "ts": 1, "kind": kind, "fee": D("0.01")}
+
+
 def test_foreign_pure():
-    book = {"net": D("-0.001"), "client_ids": {"tbot"}, "stop": D("70000"), "active": [], "uncertain": []}
-    assert ownership.foreign(_snap("-0.001", [_order("tbot"), _order(stop_type="StopLoss", trigger="70000")]),
-                             book) == []
-    assert ownership.foreign(_snap("-0.001", [_order(stop_type="StopLoss", trigger="70000", side="sell")]), book)
+    book = {"net": D("-0.001"), "client_ids": {"tbot", "tstop"}, "active": ["tstop"], "uncertain": [],
+            "stops": ["tstop"]}
+    assert ownership.foreign(_snap("-0.001", [_order("tbot"), _order("tstop", stop_type="Stop", trigger="70000")],
+                                   execs=[_exec("tbot"), _exec(kind="Funding")]), book) == []
+    assert ownership.foreign(_snap("-0.001", [_order(stop_type="StopLoss", trigger="70000")], execs=[]), book)
     assert ownership.foreign(_snap("-0.002", []), book)
     assert ownership.foreign(_snap("0", [_order(stop_type="StopLoss", trigger="70000")]), book)
     assert ownership.foreign(_snap("0", []), book) == [] and ownership.flat_external(_snap("0", []), book)
-    assert not ownership.flat_external(_snap("0", []), dict(book, active=["x"]))
+    assert not ownership.flat_external(_snap("0", []), dict(book, active=["x"]))      # незавершённый ордер не стоп
+    assert not ownership.flat_external(_snap("0", []), dict(book, uncertain=["tstop"]))
     assert ownership.foreign(_snap("0", [], errors=("позиция: 500",)), book) is None
     assert ownership.foreign(_snap("0", None), book) is None
+    # размер как у бота — ещё не доказательство: нужны исполнения с отметки сверки, чужое исполнение — чужое
+    assert ownership.foreign(_snap("-0.001", [], execs=None), book) is None
+    assert ownership.foreign(_snap("-0.001", [], execs=[], errors=("исполнения: 500",)), book) is None
+    liq = ownership.foreign(_snap("-0.001", [], execs=[_exec(kind="BustTrade"), _exec(cid="manual-1")]), book)
+    assert len(liq) == 2 and "BustTrade" in liq[0]
+    assert not ownership.owned_whole(_snap("-0.001", [], execs=[_exec()]), book)
+    assert ownership.owned_whole(_snap("-0.001", [], execs=[_exec("tbot")]), book)
+    # BingX: размер как у бота, знак обратный (TODO(api) знака positionAmt) — не угадываем
+    assert ownership.foreign(_snap("0.001", [], execs=[], venue="bingx"), book) is None
+    assert "знак" in ownership.unknown_why(_snap("0.001", [], execs=[], venue="bingx"), book)
+    assert ownership.foreign(_snap("0.001", [], execs=[]), book)                  # Bybit — просто чужая позиция
     snap = _snap("0", [])._replace(account=[{"raw_symbol": "DOGEUSDT", "symbol": None, "signed": D(5)},
                                             {"raw_symbol": "BTCUSDT", "symbol": "BTCUSDT", "signed": D("-0.001")}])
     assert ownership.foreign_account(snap, {"BTCUSDT": D("-0.001")}) == ["DOGEUSDT 5"]
@@ -436,8 +509,9 @@ def test_position_actions_only_for_bot_positions_from_exchange():
     assert [(p["symbol"], a) for p, a, _ in acts] == [("BTCUSDT", "reduce")]
     book.position["BTCUSDT"] -= D("0.002")                                    # владелец добавил к шорту бота
     marked = journal.own_positions(run(venues.positions(s, "bybit", CREDS))[0])
-    assert marked[0]["owned"] is False and marked[0]["bot_size"] == D("0.001")
-    assert risk.position_actions(marked) == []
+    assert marked[0]["owned"] is False and marked[0]["bot_size"] == D("0.001") and marked[0]["mismatch"] is True
+    acts = risk.position_actions(marked)                                      # не молча: тревога, без сокращения
+    assert [(p["symbol"], a) for p, a, _ in acts] == [("BTCUSDT", "alert")] and "не сокращает" in acts[0][2]
 
 
 def test_exposure_counts_fills_and_pending_opens():
