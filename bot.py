@@ -18,6 +18,7 @@ import accounts
 import calibration
 import favorites
 import alerts
+import backup
 import blacklist
 import fees
 import history
@@ -1246,6 +1247,7 @@ class Bot:
         self.quiet_hours = os.getenv("QUIET_HOURS", "01:00-08:00")   # окно тихих часов, МСК "HH:MM-HH:MM"
         self.quiet_on = os.getenv("QUIET_HOURS_ON", "0") == "1"      # тихие часы включены (кнопка в настройках)
         self.night_deals = {}    # (ex,asset,ex,asset) -> лучшая связка за тихие часы, для утреннего дайджеста
+        self.backup_task = None  # фоновая суточная копия баз (schedule_backup)
         self._was_quiet = False  # тихие часы были на прошлом скане — для разового дайджеста при выходе из них
         self.awaiting_amount = False  # ждём сумму текстом после «✏️ Своя сумма»
         self.awaiting_preset_name = False  # ждём имя пресета текстом после «💾 Сохранить как пресет»
@@ -2250,6 +2252,20 @@ class Bot:
         snap.cfg = cfg
         return await self.ev_rank(snap, cfg)
 
+    def schedule_backup(self):
+        """Раз в сутки — копия баз (backup.py) фоном в отдельном потоке; скан её не ждёт, вторая параллельно не идёт."""
+        if (self.backup_task is not None and not self.backup_task.done()) or not backup.due():
+            return
+        self.backup_task = asyncio.ensure_future(self.run_backup())
+
+    async def run_backup(self):
+        try:
+            dest, files = await asyncio.to_thread(backup.run)
+            if dest:
+                logger.info("резервная копия баз: %s (%d файлов)", dest, len(files))
+        except Exception as e:
+            logger.warning("backup: %s", e)
+
     async def scan_loop(self):
         while True:
             snap = None
@@ -2261,6 +2277,7 @@ class Bot:
                 self.track_liveness(self.last)
                 if history.record(snap, self.snap_cfg(snap).amount):   # не чаще раза в 5 минут, независимо от чата
                     history.cleanup()
+                self.schedule_backup()
 
                 if simmaker.enabled():   # бумажный мейкер (SIM_MAKER=1): только расчёт по снимку, объявлений нет
                     try:
