@@ -3,6 +3,7 @@
 следующий скан; ответа нет вовсе — данные площадки устарели (прошлый ответ не старше FRESH_WINDOW, Ad.stale): в /top
 видны с пометкой, но не идут в сигнал (и места в топ-N не занимают), серию LIVE_SCANS, сухой прогон, дайджест и алерты;
 скорость сканов и площадок (p50/p90) — в /status; снимки и replay помнят пометку."""
+from helpers import arun
 import asyncio
 import dataclasses
 import time
@@ -55,12 +56,12 @@ def _slow(monkeypatch, name="htx", delay=SLOW, calls=None):
 
 def _calm_scan(cfg):
     """Скан с большим сроком: все площадки успевают — есть прошлый ответ (медленная машина, -X dev)."""
-    return asyncio.run(p2p.scan(None, dataclasses.replace(cfg, venue_timeout=10.0)))
+    return arun(p2p.scan(None, dataclasses.replace(cfg, venue_timeout=10.0)))
 
 
 def _timed_scan(cfg):
     t0 = time.monotonic()
-    snap = asyncio.run(p2p.scan(None, cfg))
+    snap = arun(p2p.scan(None, cfg))
     return snap, time.monotonic() - t0
 
 
@@ -99,7 +100,7 @@ def test_slow_venue_never_backs_off_and_its_answer_arrives_next_scan(offline, mo
             await asyncio.sleep(TIMEOUT * 2)                               # INTERVAL: запрос успевает до скана
         return snaps
 
-    first, *rest = asyncio.run(go())
+    first, *rest = arun(go())
     assert not [a for a in first.ads if a.ex == "HTX"] and "htx/USDT" in first.errors
     for snap in rest:
         htx = [a for a in snap.ads if a.ex == "HTX"]
@@ -128,7 +129,7 @@ def test_request_in_flight_is_not_repeated(offline, monkeypatch):
         snaps.append(await p2p.scan(None, cfg))
         return snaps, n
 
-    snaps, during = asyncio.run(go())
+    snaps, during = arun(go())
     assert during == 2                                                    # один запрос на сторону за три скана
     assert [bool([a for a in s.ads if a.ex == "HTX"]) for s in snaps] == [False, False, False, True]
     assert len(calls) == 4 and not p2p._venue_paused_until("htx")         # дальше — снова запрос на скан
@@ -146,14 +147,14 @@ def test_request_over_hard_limit_is_error_and_backs_off(offline, monkeypatch):
         await asyncio.sleep(TIMEOUT * 2)
         return first, paused, await p2p.scan(None, cfg)
 
-    first, paused_after_first, second = asyncio.run(go())
+    first, paused_after_first, second = arun(go())
     assert paused_after_first is None and "таймаут" in first.errors["htx/USDT"]
     assert "нет ответа за" in second.errors["htx/USDT"] and p2p._venue_paused_until("htx")
 
     async def boom(s, cfg, side, asset):
         raise RuntimeError("down")
     monkeypatch.setitem(p2p.FETCHERS, "kucoin", boom)
-    asyncio.run(p2p.scan(None, cfg))
+    arun(p2p.scan(None, cfg))
     assert p2p._venue_paused_until("kucoin")
 
 
@@ -186,12 +187,12 @@ def test_previous_answer_older_than_window_or_other_amount_not_used(offline, mon
     _calm_scan(cfg)
     _slow(monkeypatch)
     old = _cfg(fresh_window=0.001)                                      # прошлый ответ уже старше окна
-    snap = asyncio.run(p2p.scan(None, old))
+    snap = arun(p2p.scan(None, old))
     assert not [a for a in snap.ads if a.ex == "HTX"]
     assert "не старше" in snap.errors["htx/USDT"]
     p2p._venue_backoff.clear()
     other = _cfg(amount=cfg.amount * 2)                                 # другая сумма круга — другие объявления
-    snap = asyncio.run(p2p.scan(None, other))
+    snap = arun(p2p.scan(None, other))
     assert not [a for a in snap.ads if a.ex == "HTX"]
 
 
@@ -199,12 +200,12 @@ def test_stale_alt_copies_leave_alt_cache_after_window(offline, monkeypatch):
     cfg = _cfg(assets=["USDT", "ETH"], exchanges=["bybit", "htx"], alt_interval=0)
     _calm_scan(cfg)                                    # ETH опрошена: прошлый ответ есть
     _slow(monkeypatch)
-    snap = asyncio.run(p2p.scan(None, cfg))
+    snap = arun(p2p.scan(None, cfg))
     eth = [a for a in snap.ads if a.ex == "HTX" and a.asset == "ETH"]
     assert eth and all(a.stale for a in eth)                            # копия легла и в кэш монет _alt
     p2p._venue_backoff.clear()
     cfg.alt_interval, cfg.fresh_window = 3600, 0.001                     # следующий скан берёт ETH из кэша _alt
-    snap = asyncio.run(p2p.scan(None, cfg))
+    snap = arun(p2p.scan(None, cfg))
     assert not [a for a in snap.ads if a.asset == "ETH" and a.ex == "HTX"]   # копия старше окна — не показываем
     assert [a for a in snap.ads if a.asset == "ETH" and a.ex == "Bybit"]
 
@@ -233,7 +234,7 @@ def test_slow_spot_rapira_and_networks_do_not_delay_scan(offline, monkeypatch):
         await asyncio.sleep(TIMEOUT * 3)                                  # справочник сетей дообновляется в фоне
         return snap, took
 
-    snap, took = asyncio.run(go())
+    snap, took = arun(go())
     assert took < TIMEOUT + EPS
     assert set(snap.spot["HTX"]) == {"USDT"} and "BTC" in snap.spot["Bybit"]   # спот HTX не успел, остальные — да
     assert snap.ref_src == "медиана P2P"                                  # Rapira не успела — ориентир по P2P, как при сбое
@@ -262,14 +263,14 @@ def test_bestchange_download_finishes_in_background_and_counts_fresh(offline, mo
         await asyncio.sleep(TIMEOUT * 3)
         return first, await p2p.scan(None, cfg)
 
-    first, second = asyncio.run(go())
+    first, second = arun(go())
     assert got and len(got) == 1                                          # скачали один раз, не оборвали и не повторили
     assert "таймаут" in first.errors["bestchange/USDT"] and not [a for a in first.ads if a.ex == "BestChange"]
     assert not p2p._venue_paused_until("bestchange")                     # докачка в фоне — не ошибка площадки
     bc = [d for d in second.deals if d[2].ex == "BestChange"]
     assert bc and "bestchange/USDT" not in second.errors
     assert all(not p2p.deal_stale(d) and p2p.deal_fresh(d, second) for d in bc)   # новые данные для этого скана
-    third = asyncio.run(p2p.scan(None, cfg))                              # та же выгрузка ещё раз — уже не новая
+    third = arun(p2p.scan(None, cfg))                              # та же выгрузка ещё раз — уже не новая
     assert not any(p2p.deal_fresh(d, third) for d in third.deals if d[2].ex == "BestChange")
 
 
@@ -287,7 +288,7 @@ def test_bestchange_background_error_raised_once_by_next_scan(monkeypatch):
                                  p2p.bestchange(None, cfg, "sell", "USDT"), return_exceptions=True)
         return a, await p2p.bestchange(None, cfg, "buy", "USDT")
 
-    first, again = asyncio.run(go())
+    first, again = arun(go())
     assert sum(isinstance(r, OSError) for r in first) == 1 and again == []   # ошибка — один раз, повтор не раньше минуты
     assert p2p._venue_paused_until("bestchange")                          # и бэкофф — по самой выгрузке
 
@@ -328,7 +329,7 @@ def test_bestchange_backoff_grows_when_dump_fails_after_scan_deadline(offline, m
             await asyncio.sleep(0.1)
         return delays
 
-    assert asyncio.run(go()) == [30, 60, 120, 240]
+    assert arun(go()) == [30, 60, 120, 240]
     assert "bestchange" not in p2p._venue_backoff                          # выгрузка удалась — пауза сброшена
 
 
@@ -347,7 +348,7 @@ def test_bestchange_time_is_stamped_after_parse(monkeypatch):
 
     monkeypatch.setattr(p2p, "_bc_fetch", fetch)
     monkeypatch.setattr(p2p, "_bc_parse", parse)
-    got = asyncio.run(p2p.bestchange(None, p2p.Config(bc_refresh=120), "buy", "USDT"))
+    got = arun(p2p.bestchange(None, p2p.Config(bc_refresh=120), "buy", "USDT"))
     assert got and got[0].fetched_ts >= parsed[0] and p2p._bc["t"] == got[0].fetched_ts
 
 
@@ -392,17 +393,17 @@ def test_stale_side_not_signalled_keeps_streak_and_card(monkeypatch):
     for ts in (1000.0, 1030.0):
         s = _snap([fresh], ts)
         bot.track_liveness(s, now=ts)
-    asyncio.run(bot.notify(s))
+    arun(bot.notify(s))
     assert len(captions(bot)) == 1                                        # подтверждённая связка — сигнал
     bot.out.clear()
     bot.sent.clear()                                                      # антидубль не мешает — дело только в данных
     stale = _snap([_stale_copy(fresh)], 1060.0)
     bot.track_liveness(stale, now=1060.0)
     assert bot.live[key]["streak"] == 2                                   # серию не продлевает и не сбрасывает
-    asyncio.run(bot.notify(stale))
+    arun(bot.notify(stale))
     assert not bot.out                                                    # ни сигнала, ни правки, ни «⌛ устарела»
     assert [r for _, _, r in bot.signal_reasons(stale, 0)] == ["stale"]
-    asyncio.run(bot.notify(_snap([fresh], 1090.0)))
+    arun(bot.notify(_snap([fresh], 1090.0)))
     assert len(captions(bot)) == 1                                        # данные снова свежие — сигнал
 
 
@@ -420,7 +421,7 @@ def test_stale_deal_does_not_take_a_top_slot(monkeypatch):
     s = paper_snap_of([stale, fresh])
     assert [_key(d) for d in bot._signal_deals(s)] == [_key(fresh)]
     bot.live_msg[_key(stale)] = {"message_id": 7, "photo": True, "last_edit": 0.0, "caption": "c", "stale": False}
-    asyncio.run(bot.notify(s))
+    arun(bot.notify(s))
     assert len(captions(bot)) == 1 and "HTX" in captions(bot)[0]          # сигнал — свежей связке
     assert not bot.live_msg[_key(stale)]["stale"]                         # карточку устаревшей не трогаем
     (cycle,) = paper.open_cycles()
@@ -436,9 +437,9 @@ def test_stale_deal_not_taken_by_paper(monkeypatch):
     bot = Stub(p2p.Config(min_profit=2.0))
     bot.live_scans = 1
     st = _stale_copy(good_deal())
-    asyncio.run(bot.notify(paper_snap_of([st])))
+    arun(bot.notify(paper_snap_of([st])))
     assert not paper.open_cycles()
-    asyncio.run(bot.notify(paper_snap_of([good_deal()])))
+    arun(bot.notify(paper_snap_of([good_deal()])))
     assert len(paper.open_cycles()) == 1
 
 
@@ -458,7 +459,7 @@ def test_snapshot_keeps_stale_and_since_and_replay_skips_stale(offline, monkeypa
     cfg = _cfg()
     _calm_scan(cfg)
     _slow(monkeypatch)
-    snap = asyncio.run(p2p.scan(None, cfg))
+    snap = arun(p2p.scan(None, cfg))
     assert any(p2p.deal_stale(d) for d in snap.deals) and snap.since > 0
     scan = snapshots.load(snapshots.save(snap, cfg))
     assert scan["since"] == snap.since and {tuple(k)[0] for k in scan["stale"]} == {"HTX"}
@@ -508,7 +509,7 @@ def test_status_shows_speed_and_timeout_reason(offline, monkeypatch, tmp_path):
     _slow(monkeypatch)
     for _ in range(3):
         t0 = time.time()
-        bot.last = asyncio.run(p2p.scan(None, bot.cfg))
+        bot.last = arun(p2p.scan(None, bot.cfg))
         bot.last_scan_ts, bot.last_scan_duration = time.time(), time.time() - t0
         bot.speed.add(bot.last, bot.last_scan_duration)
         p2p._venue_backoff.clear()
