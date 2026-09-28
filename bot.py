@@ -111,7 +111,7 @@ COMMANDS = [{"command": "best", "description": "Лучшая связка сей
             {"command": "blacklist", "description": "Скрытые мерчанты и обменники"},
             {"command": "traps", "description": "Последние отсеянные ловушки (обучение без риска)"},
             {"command": "maker", "description": "Цена мейкера на площадках, напр. /maker USDT"},
-            {"command": "banks", "description": "Объём по банкам на площадках, напр. /banks USDT"},
+            {"command": "banks", "description": "Банки: спред за 7 дней; /banks USDT — объём сейчас"},
             {"command": "balance", "description": "Баланс по подключённым биржам"},
             {"command": "payout", "description": "Выплата Cryptomus на адрес из белого списка, /payout history"},
             {"command": "fees", "description": "Комиссии вывода по сетям и возраст данных"},
@@ -735,6 +735,32 @@ def maker_book_lines(snap, cfg, ex, asset, post_side, price):
 
 BANKS_HELP = ("Формат: /banks USDT — сколько объявлений и какой объём (₽) по каждому банку/способу оплаты "
               "на каждой подключённой площадке, отдельно на покупку и на продажу.")
+BANK_HISTORY_DAYS = 7    # /banks без монеты — история спреда связок по банкам за столько дней
+BANK_HISTORY_ROWS = 8    # банков на сторону
+
+
+def bank_history_view(days=BANK_HISTORY_DAYS, stats=None):
+    """Текст «/banks» без монеты: через какие банки связки выгоднее за `days` дней (history.bank_spread_stats) —
+    отдельно банк, которым платим на покупке, и банк, куда получаем на продаже: средний лучший % связки в срезе
+    истории (раз в 5 минут), лучший %, доля срезов с плюсом."""
+    stats = history.bank_spread_stats(days) if stats is None else stats
+    lines = [f"🏦 <b>Спред связок по банкам за {days} дн.</b>", ""]
+    if not stats:
+        lines.append("Истории ещё нет — бот пишет её раз в 5 минут, пока есть связки.")
+    for side, label in (("buy", "Платим мерчанту (покупка)"), ("sell", "Получаем (продажа)")):
+        rows = stats.get(side)
+        if not rows:
+            continue
+        lines.append(f"<b>{label}</b>")
+        for bank, n, avg, best, pos in rows[:BANK_HISTORY_ROWS]:
+            name = "СБП (банк не указан)" if bank == "SBP" else trades.BANK_NAMES.get(bank, bank)
+            lines.append(f"• {html.escape(name)}: в среднем {avg:+.2f}%, лучшая {best:+.2f}%, в плюсе "
+                         f"{pos * 100:.0f}% срезов ({n})")
+        if len(rows) > BANK_HISTORY_ROWS:
+            lines.append(f"• …ещё {len(rows) - BANK_HISTORY_ROWS}")
+        lines.append("")
+    lines.append("Средний — лучшей связки, где банк есть у объявления, по срезам истории. " + BANKS_HELP)
+    return "\n".join(lines).rstrip()
 
 
 def banks_view(snap, cfg, asset):
@@ -2041,7 +2067,12 @@ class Bot:
         """/banks <монета>: объявления и объём по каждому банку на всех подключённых площадках."""
         asset = (arg or "").strip().upper()
         if not asset:
-            await self.send(BANKS_HELP)
+            try:
+                text = bank_history_view(stats=await asyncio.to_thread(history.bank_spread_stats, BANK_HISTORY_DAYS))
+            except Exception as e:
+                logger.warning("bank history: %s", e)
+                text = BANKS_HELP
+            await self.send(text)
             return
         if asset not in self.cfg.assets:
             await self.send(f"Монета {asset} не отслеживается ботом ({', '.join(self.cfg.assets)}).")
