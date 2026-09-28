@@ -205,6 +205,10 @@ ACCOUNT_POLL_INTERVAL_DEFAULT = 60  # опрос истории аккаунто
 LIVE_EDIT_INTERVAL = 30     # сек: не чаще обновляем карточку последнего сигнала вместо повторной отправки
 STALE_RETRY_BASE = 30       # сек: пометку «⌛ устарела» после 429/5xx/сбоя сети повторим не раньше (дальше ×2)
 STALE_RETRY_MAX = 600       # сек: потолок паузы между повторами пометки
+# отказы Telegram на правку сообщения, которые не про кнопки: повтор с обычными кнопками их не исправит, и цветные
+# кнопки из-за них выключать нельзя (Bot._fancy_failed)
+NOT_BUTTON_ERRORS = ("message is not modified", "message to edit not found", "message can't be edited",
+                     "message not found", "chat not found")
 MARKET_STATUS_INTERVAL = 60  # сек: не чаще обновляем закреплённое сообщение «Статус рынка»
 MSK = timezone(timedelta(hours=3))                    # тихие часы и /pause считаем по МСК, не по времени ПК
 PAUSE_PRESETS = {"30m": 1800, "1h": 3600, "3h": 3 * 3600}  # аргументы /pause -> секунды
@@ -1335,9 +1339,13 @@ class Bot:
 
     def _fancy_failed(self, r, markup):
         """Отправка с цветными кнопками/«📋» не удалась: дальше шлём обычные кнопки и повторяем. 429 и 5xx — не про
-        кнопки (перегрузка/сбой Telegram): цвета не выключаем, повтор — забота вызывающего (retry_after)."""
+        кнопки (перегрузка/сбой Telegram): цвета не выключаем, повтор — забота вызывающего (retry_after). Отказ правки
+        не из-за кнопок (NOT_BUTTON_ERRORS: подпись не изменилась, сообщения нет или его нельзя править) — тоже: иначе
+        одна правка живой карточки или «⌛ устарела» выключала бы цветные кнопки всему боту до перезапуска."""
         code = r.get("error_code") or 0
-        if r.get("ok") or not self.fancy or not is_fancy(markup) or code == 429 or code >= 500:
+        text = str(r.get("description") or "").lower()
+        if r.get("ok") or not self.fancy or not is_fancy(markup) or code == 429 or code >= 500 \
+                or any(x in text for x in NOT_BUTTON_ERRORS):
             return False
         self.fancy = False
         logger.warning("Telegram: цветные кнопки/copy_text не поддерживаются, дальше обычные: %s", r.get("description"))
