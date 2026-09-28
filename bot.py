@@ -2430,7 +2430,11 @@ class Bot:
         head = f"🌅 <b>Доброе утро! Итоги ночи</b> ({_hhmm_msk(since)}–{_hhmm_msk(now)} МСК)"
         signals = self.night_signal_lines(since, now)
         top = sorted(deals, key=lambda dc: dc[0][0], reverse=True)[:3]
-        paper_lines = self.paper_digest_lines(now)
+        try:
+            paper_lines = self.paper_digest_lines(now)
+        except Exception as e:   # paper.db занята/испорчена — дайджест со связками всё равно уходит
+            logger.warning("digest paper: %s", e)
+            paper_lines = []
 
         def build(full_deals, venues):
             parts = [head]

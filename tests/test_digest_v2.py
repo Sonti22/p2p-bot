@@ -164,3 +164,10 @@ def test_digest_window_falls_back_when_night_start_unknown(monkeypatch, tmp_path
     bot.quiet_since = None                       # бот перезапущен посреди ночи
     arun(bot.send_night_digest())
     assert f"({B._hhmm_msk(msk(9) - B.DIGEST_FALLBACK_WINDOW)}–09:00 МСК)" in texts(bot)[-1]
+
+
+def test_digest_still_sent_when_paper_db_fails(monkeypatch, tmp_path):
+    bot, _, _ = _bot(monkeypatch, tmp_path)
+    monkeypatch.setattr(B.paper, "summary_since", lambda since: (_ for _ in ()).throw(RuntimeError("database is locked")))
+    text = bot.night_digest_text([(deal(3.0), p2p.Config())], msk(23, 23), msk(9))
+    assert "Топ-3 связки за ночь" in text and "Сухой прогон" not in text
