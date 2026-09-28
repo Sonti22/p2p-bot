@@ -203,6 +203,7 @@ VENUE_NAMES = dict(EXCHANGE_NAMES, bestchange="BestChange")  # + обменни�
 ACCOUNT_NAMES = dict(EXCHANGE_NAMES, bingx="BingX", cryptomus="Cryptomus")
 ACCOUNT_ONLY = tuple(ex for ex in ACCOUNT_NAMES if ex not in VENUE_NAMES)   # ("bingx", "cryptomus")
 ACCOUNT_POLL_INTERVAL_DEFAULT = 60  # опрос истории аккаунтов, сек — если не задано в .env
+KEY_RECHECK_HOURS_DEFAULT = 1.0     # повторная проверка прав ключей бирж, часы — если не задано в .env
 LIVE_EDIT_INTERVAL = 30     # сек: не чаще обновляем карточку последнего сигнала вместо повторной отправки
 STALE_RETRY_BASE = 30       # сек: пометку «⌛ устарела» после 429/5xx/сбоя сети повторим не раньше (дальше ×2)
 STALE_RETRY_MAX = 600       # сек: потолок паузы между повторами пометки
@@ -223,6 +224,17 @@ def account_poll_interval():
     """Читаем ACCOUNT_POLL_INTERVAL при каждом обращении, а не при импорте модуля — иначе значение
     из .env не подхватывается: load_env() вызывается в main() уже после импорта bot.py."""
     return int(os.getenv("ACCOUNT_POLL_INTERVAL", ACCOUNT_POLL_INTERVAL_DEFAULT))
+
+
+def key_recheck_hours():
+    """KEY_RECHECK_HOURS — раз в сколько часов accounts_loop заново проверяет права сохранённых ключей бирж теми же
+    правилами, что и при старте (биржа могла перевыпустить ключ с торговлей/выводом, а процесс живёт неделями).
+    0 — только при старте; мусор или минус — значение по умолчанию. Читаем при каждом обращении."""
+    try:
+        v = float(os.getenv("KEY_RECHECK_HOURS", KEY_RECHECK_HOURS_DEFAULT))
+    except ValueError:
+        return KEY_RECHECK_HOURS_DEFAULT
+    return v if v >= 0 and v == v and v != float("inf") else KEY_RECHECK_HOURS_DEFAULT
 
 
 def signal_traps():
@@ -1229,6 +1241,7 @@ class Bot:
         self.fancy = os.getenv("FANCY_BUTTONS", "1") != "0"   # цветные кнопки и «📋»; сам выключится при ошибке API
         self.topics = {}          # ключ топика -> message_thread_id, если у бота включены топики в личке
         self.cur_thread = None    # топик, из которого пришла последняя команда/кнопка — туда и отвечаем
+        self.key_checked_ts = time.time()   # последняя проверка прав ключей (check_key_safety), для KEY_RECHECK_HOURS
         entries = {g.strip() for g in os.getenv("TG_GUESTS", "").split(",") if g.strip()}
         self.guests = {g for g in entries if not g.startswith("@")}          # id чатов гостей
         self.pending = {g.lower() for g in entries if g.startswith("@")}   # @ники: доступ откроется с первого сообщения
@@ -2979,6 +2992,12 @@ class Bot:
             await self.send(f"✅ автосопоставление сделки #{trade['id']}: факт {fact:+.2f}% чистыми{was} "
                             f"(расчёт был {trade['profit']:+.2f}%)", topic="journal")
 
+    def key_recheck_due(self, now=None):
+        """Пора ли повторно проверить права ключей: KEY_RECHECK_HOURS > 0 и с прошлой проверки прошло столько часов."""
+        hours = key_recheck_hours()
+        now = time.time() if now is None else now
+        return hours > 0 and now - self.key_checked_ts >= hours * 3600
+
     async def accounts_loop(self):
         while True:
             if self.chat_id:
@@ -2986,6 +3005,11 @@ class Bot:
                     await self.check_accounts()
                 except Exception as e:
                     logger.error("accounts_loop error: %s", e)
+                if self.key_recheck_due():
+                    try:
+                        await self.check_key_safety(periodic=True)
+                    except Exception as e:
+                        logger.error("key recheck error: %s", type(e).__name__)
             await asyncio.sleep(account_poll_interval())
 
     async def command_loop(self):
@@ -3709,13 +3733,17 @@ class Bot:
         await self.send(f"⚠️ {name}: ключ даёт больше, чем чтение ({html.escape(detail)}) — удалил его из бота.\n"
                         + advice + env_key_hint(ex))
 
-    async def check_key_safety(self):
-        """При старте: если сохранённый ключ биржи даёт торговать/выводить — удалить его и попросить read-only."""
+    async def check_key_safety(self, periodic=False):
+        """При старте и раз в KEY_RECHECK_HOURS (periodic=True, из accounts_loop): если сохранённый ключ биржи даёт
+        торговать/выводить — удалить его и попросить read-only. Не удалось проверить — ключ не трогаем, как при старте."""
+        self.key_checked_ts = time.time()
         for ex in accounts.ONBOARDABLE:
             if accounts.keys(ex) is None:
                 continue
             safe, detail = await accounts.api_permissions(self.s, ex)
             if not safe and allow_unsafe_keys():   # владелец оставил ключ сознательно — без удаления и без спама
+                if periodic and accounts.verify_status(ex) == ("unsafe", detail):
+                    continue                        # то же, что уже знаем: не писать в лог каждый час
                 accounts.set_verified(ex, "unsafe", detail)
                 logger.warning("%s: ключ даёт больше, чем чтение (%s) — оставлен, ALLOW_UNSAFE_KEYS=1", ex, detail)
             elif not safe:
