@@ -22,6 +22,7 @@ import bot as B
 import jsonstore
 import p2p
 import payouts
+from helpers import arun
 from payout_stubs import Stub, msg, sent
 
 MERCHANT, KEY = "11111111-2222-3333-4444-555555555555", "FAKEPAYOUTKEY0123456789ABCDEFGH"
@@ -142,7 +143,35 @@ def routes(over=None):
 
 
 def run(coro):
-    return asyncio.run(coro)
+    """Корутина на общем цикле событий тестов (helpers.arun). asyncio.run на каждый вызов — новый Proactor-цикл с парой
+    сокетов: за сотни вызовов на Windows кончались сокеты (WinError 10055) или socketpair зависал в accept."""
+    return arun(coro)
+
+
+async def until(ready, what, steps=1000):
+    """Ждать условия, отдавая ход циклу событий, — без настоящих пауз: сеть — заглушки, журнал — синхронный sqlite,
+    так что фоновая отправка продвигается только на этих шагах. Не дождались за steps шагов — тест красный."""
+    for _ in range(steps):
+        if ready():
+            return
+        await asyncio.sleep(0)
+    raise AssertionError(f"не дождались: {what}")
+
+
+class MskNoonClock:
+    """Часы payouts в тестах: настоящее время, сдвинутое так, что тест начинается ровно в 12:00 МСК. Дневной лимит
+    считается по суткам МСК (created_ts, used_today() без now): без сдвига тест, начатый за миг до полуночи МСК,
+    записал бы выплату во «вчера», а лимит сверил бы уже за «сегодня». Время идёт как настоящее; остальное из time —
+    настоящее."""
+    def __init__(self):
+        now = time.time()
+        self.offset = payouts.day_start(now) + 12 * 3600 - now
+
+    def time(self):
+        return time.time() + self.offset
+
+    def __getattr__(self, name):
+        return getattr(time, name)
 
 
 def write_whitelist(entries, path=None):
@@ -155,6 +184,11 @@ def _payout_env(tmp_path, monkeypatch):
     monkeypatch.setattr(payouts, "DB_PATH", str(tmp_path / "payouts.db"))
     monkeypatch.setattr(payouts, "WHITELIST_PATH", str(tmp_path / "payout_whitelist.json"))
     monkeypatch.setattr(payouts, "RETRY_DELAY", 0)
+    # цикл событий общий на все тесты: замок отправки и счётчик «⛔ Стоп» — свои у каждого теста (замок, оставшийся
+    # занятым в упавшем тесте, иначе подвесил бы все следующие отправки)
+    monkeypatch.setattr(payouts, "_lock", {"loop": None, "lock": None})
+    monkeypatch.setattr(payouts, "_stop", {"n": 0, "wake": set()})
+    monkeypatch.setattr(payouts, "time", MskNoonClock())
     monkeypatch.setenv("CRYPTOMUS_PAYOUT_API_KEY", MERCHANT)
     monkeypatch.setenv("CRYPTOMUS_PAYOUT_API_SECRET", KEY)
     monkeypatch.setenv("PAYOUTS", "1")
@@ -604,10 +638,10 @@ def test_restart_resumes_interrupted_and_pending_payouts():
 
 def test_poll_skips_old_pending_and_without_key(monkeypatch):
     row = _sent_row()
-    payouts._update(row["order_id"], created_ts=time.time() - (payouts.POLL_DAYS + 1) * 86400)
+    payouts._update(row["order_id"], created_ts=payouts.time.time() - (payouts.POLL_DAYS + 1) * 86400)
     s = Session(routes())
     assert run(payouts.poll(s)) == [] and s.calls == []
-    payouts._update(row["order_id"], created_ts=time.time())
+    payouts._update(row["order_id"], created_ts=payouts.time.time())
     monkeypatch.delenv("CRYPTOMUS_PAYOUT_API_KEY")
     assert run(payouts.poll(s)) == [] and s.calls == []
 
@@ -1045,8 +1079,7 @@ def test_stop_during_inflight_send_prevents_resends():
         s.routes[PAY] = lambda call: Gated(gate)
         # как command_loop: обработка «✅ Отправить» не ждёт ответа Cryptomus (иначе — зависание, тест падает)
         await asyncio.wait_for(bot.on_update(update(f"pay_ok:{token}")), 5)
-        for _ in range(20):
-            await asyncio.sleep(0)
+        await until(lambda: s.posts(), "первый POST висит")
         assert len(s.posts()) == 1 and not bot.payout_task.done()
         await bot.on_update(update("pay_stop"))
         gate.set()

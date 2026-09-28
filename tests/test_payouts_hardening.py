@@ -13,7 +13,7 @@ import bot as B
 import payouts
 from test_payouts import (ENTRIES, EVM, INFO, PAY, SERVICE_LIST, SERVICES, TRON2, Resp, Session,  # noqa: F401
                           _payout_env, _sent_row, echo, entry, info_for, owner, quote, rate, routes, run, svc,
-                          to_preview, write_whitelist)
+                          to_preview, until, write_whitelist)
 
 
 class GatedOK(Resp):
@@ -33,6 +33,25 @@ def _update(data):
                                                "message": {"message_id": 5, "chat": {"id": 1, "type": "private"}}}}
 
 
+def _calls(s, since=0):
+    """(метод, путь) запросов заглушки, начиная с номера since."""
+    return [(c["method"], c["path"]) for c in s.calls[since:]]
+
+
+def _sleeping():
+    """send спит в паузе перед /info или повтором — в той, что «⛔ Стоп» прерывает сразу."""
+    return bool(payouts._stop["wake"])
+
+
+def _then_long_pause(answer, monkeypatch):
+    """Ответ /info, после которого пауза отправки — 30 с. До /info пауза нулевая (RETRY_DELAY=0 из фикстуры), а в паузе
+    перед повтором send спит, пока его не разбудит «⛔ Стоп»: Стоп приходит точно в эту паузу, без гонки с часами."""
+    def reply(call):
+        monkeypatch.setattr(payouts, "RETRY_DELAY", 30)
+        return answer(call)
+    return reply
+
+
 def test_stop_during_services_recheck_sends_no_post():
     """Отправка перед POST заново берёт список сервисов. «⛔ Стоп», нажатый пока этот запрос идёт, — POST не уходит
     вовсе: выключатель проверяется ещё раз после ответа /v1/payout/services."""
@@ -43,10 +62,10 @@ def test_stop_during_services_recheck_sends_no_post():
     async def go():
         gate = asyncio.Event()
         s.routes[SERVICES] = lambda call: GatedOK(gate, 200, {"state": 0, "result": SERVICE_LIST})
+        before = len(s.calls)
         await asyncio.wait_for(bot.on_update(_update(f"pay_ok:{token}")), 5)
-        for _ in range(20):
-            await asyncio.sleep(0)
-        assert not bot.payout_task.done()
+        await until(lambda: _calls(s, before), "send ждёт ответа /v1/payout/services")
+        assert _calls(s, before) == [SERVICES] and not bot.payout_task.done()
         await bot.on_update(_update("pay_stop"))
         gate.set()
         await bot.payout_task
@@ -272,15 +291,13 @@ def _texts(bot):
 def test_stop_during_resend_delay_sends_no_second_post(monkeypatch):
     """Неясный исход → /info «не найдено» → пауза перед повтором. «⛔ Стоп» в этой паузе — повтор не уходит:
     выключатель проверяется сразу перед каждым POST, после каждого await (раньше — только до паузы)."""
-    monkeypatch.setattr(payouts, "RETRY_DELAY", 0.2)
-    s = Session(routes({PAY: [Resp(exc=asyncio.TimeoutError()), echo()], INFO: info_for({})}))
+    s = Session(routes({PAY: [Resp(exc=asyncio.TimeoutError()), echo()],
+                        INFO: _then_long_pause(info_for({}), monkeypatch)}))
     q = quote(s)
 
     async def go():
         task = asyncio.create_task(payouts.send(s, entry("w1"), Decimal("25"), q))
-        while not s.posts("/v1/payout/info"):
-            await asyncio.sleep(0.01)
-        await asyncio.sleep(0.03)                                   # send уже в паузе перед повтором
+        await until(lambda: s.posts("/v1/payout/info") and _sleeping(), "send спит в паузе перед повтором")
         payouts.disable()
         return await asyncio.wait_for(task, 5)
     res = run(go())
@@ -292,14 +309,13 @@ def test_stop_during_resend_delay_sends_no_second_post(monkeypatch):
 def test_stop_is_sticky_for_inflight_send_even_if_switch_flips_back(monkeypatch):
     """Стоп во время паузы, а потом PAYOUTS снова 1 (чем угодно в процессе) — эта отправка всё равно больше ничего не
     шлёт: кроме выключателя проверяется счётчик Стопа. Следующая выплата — уже по новому подтверждению — идёт."""
-    monkeypatch.setattr(payouts, "RETRY_DELAY", 0.2)
-    s = Session(routes({PAY: [Resp(exc=asyncio.TimeoutError()), echo()], INFO: info_for({})}))
+    s = Session(routes({PAY: [Resp(exc=asyncio.TimeoutError()), echo()],
+                        INFO: _then_long_pause(info_for({}), monkeypatch)}))
     q = quote(s)
 
     async def go():
         task = asyncio.create_task(payouts.send(s, entry("w1"), Decimal("25"), q))
-        while not s.posts("/v1/payout/info"):
-            await asyncio.sleep(0.01)
+        await until(lambda: s.posts("/v1/payout/info") and _sleeping(), "send спит в паузе перед повтором")
         payouts.disable()
         monkeypatch.setenv("PAYOUTS", "1")
         return await asyncio.wait_for(task, 5)
@@ -317,9 +333,7 @@ def test_stop_interrupts_sleeping_resend_at_once(monkeypatch):
 
     async def go():
         task = asyncio.create_task(payouts.send(s, entry("w1"), Decimal("25"), q))
-        while not s.posts():
-            await asyncio.sleep(0.01)
-        await asyncio.sleep(0.03)
+        await until(lambda: s.posts() and _sleeping(), "send спит в паузе перед /info")
         payouts.disable()
         return await asyncio.wait_for(task, 5)                      # без пробуждения — 30 с и таймаут теста
     res = run(go())
@@ -338,9 +352,7 @@ def test_stop_button_interrupts_background_resend(monkeypatch):
 
     async def go():
         await asyncio.wait_for(bot.on_update(_cb(1, f"pay_ok:{token}")), 5)
-        while not s.posts():
-            await asyncio.sleep(0.01)
-        await asyncio.sleep(0.03)
+        await until(lambda: s.posts() and _sleeping(), "фоновая отправка спит в паузе перед /info")
         await bot.on_update(_cb(1, "pay_stop"))
         await asyncio.wait_for(bot.payout_task, 5)
     run(go())
@@ -450,8 +462,7 @@ def test_stop_while_send_waits_for_lock_blocks_post_even_if_switch_flips_back(mo
         lock = payouts._send_lock()
         await lock.acquire()
         task = asyncio.create_task(payouts.send(s, entry("w1"), Decimal("25"), q))
-        for _ in range(10):
-            await asyncio.sleep(0)
+        await until(lambda: lock._waiters, "send ждёт замок")        # очередь ждущих asyncio.Lock
         payouts.disable()
         monkeypatch.setenv("PAYOUTS", "1")
         lock.release()
@@ -521,9 +532,9 @@ def test_everything_rechecked_after_rate_refresh(change):
     async def go():
         gate = asyncio.Event()
         s.routes[RATE_BTC] = lambda call: GatedOK(gate, 200, body)
+        before = len(s.calls)
         task = asyncio.create_task(payouts.send(s, entry("w2"), Decimal("0.01"), q))
-        for _ in range(50):
-            await asyncio.sleep(0)
+        await until(lambda: RATE_BTC in _calls(s, before), "send ждёт свежий курс")
         if change == "stop":
             payouts.disable()
         else:
@@ -585,9 +596,8 @@ def test_stop_during_services_request_starts_no_rate_request():
         s.routes[SERVICES] = lambda call: GatedOK(gate, 200, {"state": 0, "result": SERVICE_LIST})
         before = len(s.calls)
         task = asyncio.create_task(payouts.send(s, entry("w2"), Decimal("0.01"), q))
-        for _ in range(50):
-            await asyncio.sleep(0)
-        assert [(c["method"], c["path"]) for c in s.calls[before:]] == [SERVICES]   # send ждёт ответа сервисов
+        await until(lambda: _calls(s, before), "send начал запрос сервисов")
+        assert _calls(s, before) == [SERVICES]                     # send ждёт ответа сервисов
         payouts.disable()
         gate.set()
         return await asyncio.wait_for(task, 5), s.calls[before:]
