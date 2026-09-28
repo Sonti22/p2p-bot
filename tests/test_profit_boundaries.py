@@ -67,15 +67,15 @@ def test_stack_qty_skips_ad_when_remainder_just_below_its_minimum():
 # --- недобор глубины по сумме: до 0.01 ₽ — округление, больше — глубины не хватает ---
 
 def test_stack_rejects_shortfall_above_one_kopeck():
-    ad = make_ad("Bybit", "buy", 100.0, min_amt=0, max_amt=49999.5, avail=1000)
+    ad = make_ad("Bybit", "buy", 100.0, min_amt=0, max_amt=49999.98, avail=1000)   # недобор 0.02 ₽
     assert p2p._stack([ad], 50000) is None
 
 
 def test_stack_accepts_rounding_shortfall_within_one_kopeck():
-    ad = make_ad("Bybit", "buy", 100.0, min_amt=0, max_amt=49999.995, avail=1000)
+    ad = make_ad("Bybit", "buy", 100.0, min_amt=0, max_amt=49999.991, avail=1000)  # недобор 0.009 ₽
     st = p2p._stack([ad], 50000)
     assert st is not None
-    assert st.price == pytest.approx(50000 / (49999.995 / 100.0))
+    assert st.price == pytest.approx(50000 / (49999.991 / 100.0))
 
 
 # --- обменник → Bybit → стакан обменников: вывод с Bybit — на каждый из переводов ---
