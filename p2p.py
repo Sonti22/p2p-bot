@@ -1826,14 +1826,15 @@ def _ad_key(a):
 
 
 def _dedup(ads):
-    """Без повторов (_ad_key); из копий одного объявления — полученная позже (fetched_ts), на месте первой."""
+    """Без повторов (_ad_key); из копий одного объявления — полученная позже (fetched_ts), на месте первой. Время
+    равно (часы Windows тикают по ~16 мс) — берём копию, стоящую дальше в списке: вторая страница идёт после первой."""
     out, pos = [], {}
     for a in ads:
         k = _ad_key(a)
         if k not in pos:
             pos[k] = len(out)
             out.append(a)
-        elif a.fetched_ts > out[pos[k]].fetched_ts:
+        elif a.fetched_ts >= out[pos[k]].fetched_ts:
             out[pos[k]] = a
     return out
 
