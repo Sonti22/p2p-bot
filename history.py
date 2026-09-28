@@ -9,7 +9,8 @@
 
 Таблица signals (этап 1 «измерения») — эпизоды связок выше порога сигнала: связка непрерывно, скан за сканом,
 держится от порога — одна строка: первый и последний скан, сколько сканов, максимум прибыли, был ли сигнал (и когда)
-и, если не было, почему (последняя преграда: unconfirmed / max_signals / cooldown / quiet / trap / paused / unsent).
+и, если не было, почему (последняя преграда: unconfirmed / max_signals / cooldown / quiet / trap / paused / unsent /
+stale — данные площадки устарели: она не ответила за VENUE_TIMEOUT, это пропуск).
 Пишет бот после отправки сигналов (Bot.record_signals); доля «пропущенных» — signal_stats().
 """
 import os
@@ -94,7 +95,7 @@ def record(snap, amount=None, path=DB_PATH):
     return True
 
 
-SIGNAL_REASONS = ("unconfirmed", "max_signals", "cooldown", "quiet", "trap", "paused", "unsent")
+SIGNAL_REASONS = ("unconfirmed", "max_signals", "cooldown", "quiet", "trap", "paused", "unsent", "stale")
 
 
 def track_signals(rows, ts, open_ids, amount=None, min_profit=None, path=DB_PATH):

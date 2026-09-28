@@ -130,7 +130,8 @@ def rebuild(scan, cfg):
         return p2p.assemble(cfg, ads, ref=ref, ref_src=scan.get("ref_src", "-"),
                             spot=spot or None, errors=scan.get("errors"),
                             blocked=frozenset(tuple(x) for x in scan.get("blocked") or ()),
-                            over_banks=frozenset(scan.get("over_banks") or ()), ts=scan.get("ts", 0.0))
+                            over_banks=frozenset(scan.get("over_banks") or ()), ts=scan.get("ts", 0.0),
+                            since=scan.get("since") or 0.0)
 
 
 def build_side(scan, cfg, cal=None):
@@ -151,9 +152,10 @@ def above(snap, cfg):
 
 
 def signals(snap, cfg, top=DEFAULT_TOP):
-    """Связки, которые ушли бы сигналом (Bot._signal_deals при SIGNAL_TRAPS=0): выше порога, не ловушки, первые top
-    в порядке снимка."""
-    return [d for d in snap.deals if d[0] >= cfg.min_profit and p2p.reliability(d, cfg, snap)[0] != p2p.TRAP][:top]
+    """Связки, которые ушли бы сигналом (Bot._signal_deals при SIGNAL_TRAPS=0): выше порога, не ловушки и не по
+    устаревшим данным площадки (p2p.deal_stale — площадка не успела за VENUE_TIMEOUT), первые top в порядке снимка."""
+    return [d for d in snap.deals if d[0] >= cfg.min_profit and not p2p.deal_stale(d)
+            and p2p.reliability(d, cfg, snap)[0] != p2p.TRAP][:top]
 
 
 def _stored_above(scan, cfg):

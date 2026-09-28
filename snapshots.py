@@ -3,7 +3,8 @@
 
 scans — строка на записанный скан: id — мс от эпохи начала скана (известен до записи: круг сухого прогона
         запоминает его на старте, а снимок пишется после сигналов), ts, размер, zlib(JSON): замеры запросов (время,
-        «из кэша» и возраст кэша, ошибка), ошибки площадок, ориентиры и спот, настройки скана, связки с меткой/
+        «из кэша» и возраст кэша, ошибка; timeout — не успел за VENUE_TIMEOUT, stale — вместо ответа прошлые данные
+        площадки), ошибки площадок, ориентиры и спот, настройки скана, связки (стороны с пометкой stale) с меткой/
         индексом/причинами надёжности и серией «живости» бота, котировки перпов (Snapshot.perps — ставка фандинга,
         цены и PERP_LEVELS уровней стакана; для разбора хеджа кругов), ссылки на группы объявлений и справочник сетей.
 packs — группы объявлений (топ-20 по цене на площадку/сторону/монету/сеть, до фильтров) и справочник сетей
@@ -115,12 +116,12 @@ def _ad_row(a):
             a.terms, a.net, a.url]
 
 
-def ad_from_row(ex, side, asset, row, fetched_ts=0.0):
-    """Объявление (p2p.Ad) из строки группы снимка — для replay."""
+def ad_from_row(ex, side, asset, row, fetched_ts=0.0, stale=False):
+    """Объявление (p2p.Ad) из строки группы снимка — для replay; stale — группа из scan["stale"]."""
     d = dict(zip(AD_FIELDS, row))
     return p2p.Ad(ex, side, d["price"], d["min_amt"], d["max_amt"], d["avail"], list(d["pays"]), d["nick"],
                   d["orders"], d["rate"], d["url"], asset, d["net"], d["terms"], fetched_ts=fetched_ts,
-                  ad_id=d["ad_id"], online=d["online"])
+                  ad_id=d["ad_id"], online=d["online"], stale=stale)
 
 
 def _groups(ads):
@@ -141,7 +142,7 @@ def _side(a):
     """Сторона связки (стек объявлений _combined): total — объём в фиате, qty — в монете."""
     return {"ex": a.ex, "asset": a.asset, "price": a.price, "nick": a.nick, "nicks": list(a.nicks), "net": a.net,
             "parts": a.parts, "orders": a.orders, "rate": a.rate, "total": a.min_amt, "qty": a.avail,
-            "ft": a.fetched_ts}
+            "ft": a.fetched_ts, "stale": a.stale}
 
 
 def _perp_row(q):
@@ -187,7 +188,13 @@ def collect(snap, cfg, live=None):
             "errors": dict(snap.errors), "dropped": dict(snap.dropped), "jobs": [dict(j) for j in snap.jobs],
             "over_banks": sorted(snap.over_banks), "blocked": sorted(list(x) for x in snap.blocked),
             "deals": deals, "perps": [_perp_row(q) for _key, q in sorted(snap.perps.items())],
-            "extra": dict(snap.extra)}   # доп. запросы глубины скана (вторые страницы, под фишки сумм)
+            "extra": dict(snap.extra),   # доп. запросы глубины скана (вторые страницы, под фишки сумм)
+            "since": snap.since}         # конец сбора прошлого скана (deal_fresh; replay)
+    # группы — копии прошлого ответа площадки, не успевшей за VENUE_TIMEOUT (Ad.stale; ключ группы как в groups):
+    # replay помечает их объявления так же и не берёт такие связки в сигналы. Нет таких — ключа нет (снимок прежний)
+    stale = sorted({(a.ex, a.side, a.asset, a.net or "") for a in snap.ads if a.stale})
+    if stale:
+        scan["stale"] = [list(k) for k in stale]
     net = [[v, a, nets] for (v, a), nets in sorted(netstatus.STATUS.items(), key=lambda kv: (kv[0][0], str(kv[0][1])))]
     return {"id": int(ts * 1000), "ts": ts, "scan": scan, "groups": _groups(snap.ads), "net": net}
 
@@ -358,8 +365,10 @@ def ids(path=DB_PATH, since=0.0, until=None):
 
 
 def ads_of(scan):
-    """Все объявления снимка (p2p.Ad) из его групп — время получения у каждого своё, от группы."""
-    return [ad_from_row(ex, side, asset, row, g["ft"]) for g in scan["groups"]
+    """Все объявления снимка (p2p.Ad) из его групп — время получения у каждого своё, от группы; пометка Ad.stale — у
+    групп из scan["stale"] (у снимков до этапа 2.7 ключа нет — все свежие)."""
+    stale = {tuple(k) for k in scan.get("stale") or ()}
+    return [ad_from_row(ex, side, asset, row, g["ft"], tuple(g["k"]) in stale) for g in scan["groups"]
             for ex, side, asset, _net in [g["k"]] for row in g["ads"]]
 
 
