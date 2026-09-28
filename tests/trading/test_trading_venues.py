@@ -846,8 +846,9 @@ def test_account_positions_include_other_coins():
     book.other.append(("DOGEUSDT", Decimal("100")))
     s = Session(book.routes("bybit"))
     rows, why = run(venues.account_positions(s, "bybit", CREDS))
-    assert why == "" and rows == [{"raw_symbol": "BTCUSDT", "symbol": "BTCUSDT", "signed": Decimal("-0.01")},
-                                  {"raw_symbol": "DOGEUSDT", "symbol": None, "signed": Decimal("100")}]
+    assert why == "" and rows == [
+        {"raw_symbol": "BTCUSDT", "symbol": "BTCUSDT", "signed": Decimal("-0.01"), "isolated": None},
+        {"raw_symbol": "DOGEUSDT", "symbol": None, "signed": Decimal("100"), "isolated": None}]
     assert s.calls[0]["query"] == {"category": "linear", "settleCoin": "USDT", "limit": "200"}
     bad = Session({("GET", "/v5/position/list"): bybit_ok({"list": [{"symbol": "X", "side": "Buy", "size": "?"}]})})
     assert run(venues.account_positions(bad, "bybit", CREDS))[0] is None

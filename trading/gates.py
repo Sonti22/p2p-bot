@@ -15,8 +15,11 @@ data/gates_backtest.json): путь внутри data/ бота (data/ — в .g
 который её посчитал, и он совпадает с кодом research/ сейчас. Это привязка к коду, а НЕ подпись: кто может писать в
 data/ на ПК владельца, может вписать туда любые цифры с текущим sha — защита от подделки здесь только в том, что data/
 локальна и не приходит из git. Словарь или другой объект вместо загруженного файла — не бэктест: порог не пройден.
-Нет нужной цифры, NaN или не число — порог не пройден (fail closed). Статистика бумаги и реальной торговли — словари от
-кода бумаги/журнала; здесь только сравнения и простая математика (Sharpe, PF, просадка, 90% ДИ).
+Проверка «не в git» — без учёта регистра (Windows), и любой путь индекса под data/ — «в git».
+Нет нужной цифры, NaN или не число — порог не пройден (fail closed). Статистика бумаги и реальной торговли для жёсткой
+границы (journal) — тоже только из локальных файлов владельца data/gates_paper.json и data/gates_live.json
+(`load_paper`, `load_live`; реальную journal ещё сверяет со своей базой); чистые сравнения здесь принимают словари.
+Здесь только сравнения и простая математика (Sharpe, PF, просадка, 90% ДИ).
 """
 import hashlib
 import json
@@ -28,6 +31,9 @@ from collections import namedtuple
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BACKTEST_FILE = "gates_backtest.json"    # в data/ бота
 BACKTEST_VERSION = 1
+PAPER_FILE = "gates_paper.json"          # статистика бумаги — тоже только локальный файл владельца в data/
+LIVE_FILE = "gates_live.json"            # статистика реальной торговли (journal сверяет со своей базой)
+STATS_VERSION = 1
 RESEARCH_DIR = "research"
 SHORT_PAPER_FLAG = "TRADING_SHORT_PAPER"
 _FLAGS = {"short_paper": False}          # только из .env на ПК при старте (flags_from_file)
@@ -217,7 +223,9 @@ def index_entries(data, gitdir=None):
 
 
 def _tracked(root, rel):
-    """rel в индексе git бота: True / False или None — индекс не прочитать или не разобрать."""
+    """rel в индексе git бота: True / False или None — индекс не прочитать или не разобрать. Без учёта регистра (на
+    Windows «DATA/gates_backtest.json» из git ложится в data/ владельца), и любой путь индекса под data/ — «в git»
+    (data/ бота в git не бывает: там только локальное)."""
     gitdir = _gitdir(root)
     index = _git_index(root)
     if index is None:
@@ -226,7 +234,37 @@ def _tracked(root, rel):
         paths, dirs = index_entries(index, gitdir)
     except (ValueError, IndexError, OSError):
         return None
-    return rel in paths or any(rel == d or rel.startswith(d + "/") for d in dirs)
+    low = rel.casefold()
+    for p in paths:
+        c = p.casefold()
+        if c == low or c == "data" or c.startswith("data/"):
+            return True
+    return any(low == d.casefold() or low.startswith(d.casefold() + "/") or d.casefold() == "data"
+               or d.casefold().startswith("data/") for d in dirs)
+
+
+def _read_local(name, what, path, root):
+    """Локальный файл статистики владельца в data/ бота, которого нет в индексе git → (JSON, настоящий путь, rel, "")
+    или (None, None, rel, причина)."""
+    path = path or os.path.join(root, "data", name)
+    real, data_dir = os.path.realpath(path), os.path.realpath(os.path.join(root, "data"))
+    if not real.startswith(data_dir + os.sep):
+        return None, None, None, f"статистика {what} — только из локального файла в data/ бота (не из репозитория)"
+    rel = os.path.relpath(real, os.path.realpath(root)).replace(os.sep, "/")
+    tracked = _tracked(root, rel)
+    if tracked is None:
+        return None, None, rel, ("не проверить, что файл статистики не из git (нет индекса git или он не разобран) — "
+                                 "порог не пройден")
+    if tracked:
+        return None, None, rel, f"{rel} есть в git — закоммиченная статистика {what} порог не проходит"
+    try:
+        with open(real, encoding="utf-8") as f:
+            raw = json.load(f)
+    except FileNotFoundError:
+        return None, None, rel, f"нет локального файла статистики {what} ({rel})"
+    except (OSError, ValueError):
+        return None, None, rel, f"{rel}: не прочитан или битый JSON"
+    return raw, real, rel, ""
 
 
 def load_backtest(strategy, path=None, root=None, now=None):
@@ -235,24 +273,9 @@ def load_backtest(strategy, path=None, root=None, now=None):
     Годен, только если лежит внутри data/ бота, его нет в индексе git, sha кода research/ совпадает с нынешним и время
     создания не из будущего."""
     root = root or ROOT
-    path = path or os.path.join(root, "data", BACKTEST_FILE)
-    real, data_dir = os.path.realpath(path), os.path.realpath(os.path.join(root, "data"))
-    if not real.startswith(data_dir + os.sep):
-        return None, "статистика бэктеста — только из локального файла в data/ бота (не из репозитория)"
-    rel = os.path.relpath(real, os.path.realpath(root)).replace(os.sep, "/")
-    tracked = _tracked(root, rel)
-    if tracked is None:
-        return None, ("не проверить, что файл статистики не из git (нет индекса git или он не разобран) — порог не "
-                      "пройден")
-    if tracked:
-        return None, f"{rel} есть в git — закоммиченная статистика бэктеста порог не проходит"
-    try:
-        with open(real, encoding="utf-8") as f:
-            raw = json.load(f)
-    except FileNotFoundError:
-        return None, f"нет локального файла статистики бэктеста ({rel})"
-    except (OSError, ValueError):
-        return None, f"{rel}: не прочитан или битый JSON"
+    raw, real, rel, why = _read_local(BACKTEST_FILE, "бэктеста", path, root)
+    if why:
+        return None, why
     if not isinstance(raw, dict) or raw.get("version") != BACKTEST_VERSION:
         return None, f"{rel}: не та версия формата"
     try:
@@ -268,6 +291,44 @@ def load_backtest(strategy, path=None, root=None, now=None):
     if not isinstance(stats, dict):
         return None, f"{rel}: нет статистики стратегии {strategy}"
     return Backtest(strategy, dict(stats), sha, ts, real, _TOKEN), ""
+
+
+class Stats:
+    """Статистика бумаги или реальной торговли стратегии из локального файла владельца (load_paper / load_live)."""
+    __slots__ = ("kind", "strategy", "stats", "generated_at", "path", "_token")
+
+    def __init__(self, kind, strategy, stats, generated_at, path, token):
+        self.kind, self.strategy, self.stats = kind, strategy, stats
+        self.generated_at, self.path, self._token = generated_at, path, token
+
+
+def _load_stats(kind, name, what, strategy, path, root, now):
+    root = root or ROOT
+    raw, real, rel, why = _read_local(name, what, path, root)
+    if why:
+        return None, why
+    if not isinstance(raw, dict) or raw.get("version") != STATS_VERSION:
+        return None, f"{rel}: не та версия формата"
+    ts, now = raw.get("generated_at"), time.time() if now is None else now
+    if not isinstance(ts, (int, float)) or isinstance(ts, bool) or not ts <= now + 300:
+        return None, f"{rel}: нет или неверное время создания"
+    stats = (raw.get("strategies") or {}).get(strategy) if isinstance(raw.get("strategies"), dict) else None
+    if not isinstance(stats, dict):
+        return None, f"{rel}: нет статистики стратегии {strategy}"
+    return Stats(kind, strategy, dict(stats), ts, real, _TOKEN), ""
+
+
+def load_paper(strategy, path=None, root=None, now=None):
+    """Статистика бумаги стратегии — только из локального файла владельца data/gates_paper.json (не в git; формат как у
+    бэктеста без research_sha: {"version": 1, "generated_at", "strategies": {стратегия: {...}}}) → (Stats, "") или
+    (None, причина). Словари вызывающего жёсткая граница (journal) не принимает."""
+    return _load_stats("paper", PAPER_FILE, "бумаги", strategy, path, root, now)
+
+
+def load_live(strategy, path=None, root=None, now=None):
+    """Статистика реальной торговли — только из локального файла владельца data/gates_live.json (как load_paper);
+    journal ещё сверяет её со своей базой (дни, сделки, unknown дольше 10 мин, нарушения лимитов)."""
+    return _load_stats("live", LIVE_FILE, "реальной торговли", strategy, path, root, now)
 
 
 def flags_from_file(path):
