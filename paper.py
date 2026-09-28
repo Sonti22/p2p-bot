@@ -912,6 +912,37 @@ def stats(path=DB_PATH, now=None):
     return out
 
 
+def summary_since(since, path=DB_PATH, notes=3):
+    """Итог кругов, завершённых (result IS NOT NULL) с начала `since` — для утреннего дайджеста «за сутки»: как
+    stats() за период, плюс profit_rub — сумма результата исполнившихся кругов в ₽ (amount × realized_pct), и
+    top_notes — до `notes` самых частых пояснений срывов [(текст, сколько раз)] (пустые не считаем)."""
+    out = {"total": 0, "done": 0, "failed": 0, "failed_by_reason": {}, "avg_diff": None, "profit_rub": 0.0,
+           "top_notes": []}
+    if not os.path.exists(path):
+        return out
+    con = _connect(path)
+    rows = con.execute(f"SELECT result, {_PLAN_CMP}, realized_pct, amount, note FROM cycles "
+                       "WHERE result IS NOT NULL AND ts_start >= ?", (since,)).fetchall()
+    con.close()
+    diffs, counts = [], {}
+    for res, plan, real, amount, note in rows:
+        out["total"] += 1
+        if res == "done":
+            out["done"] += 1
+            if plan is not None and real is not None:
+                diffs.append(real - plan)
+            out["profit_rub"] += (amount or 0) * (real or 0) / 100
+            continue
+        out["failed"] += 1
+        out["failed_by_reason"][res] = out["failed_by_reason"].get(res, 0) + 1
+        note = (note or "").strip()
+        if note:
+            counts[note] = counts.get(note, 0) + 1
+    out["avg_diff"] = sum(diffs) / len(diffs) if diffs else None
+    out["top_notes"] = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[:notes]
+    return out
+
+
 def _median(values):
     """Медиана списка чисел; пустой список — None."""
     if not values:

@@ -198,6 +198,32 @@ def _merged_episodes(rows, gap):
     return out
 
 
+def venue_signals(since, until=None, path=DB_PATH, cooldown=None):
+    """Связки выше порога за окно [since, until] по направлениям площадок — для утреннего дайджеста:
+    {(buy_ex, sell_ex): {"episodes": эпизодов, "best": лучший %}}. Эпизод — появление связки (buy_ex, монета, sell_ex,
+    монета) над порогом; просела на скан и вернулась быстрее cooldown — тот же эпизод (как signal_stats). Разные монеты
+    одного направления складываются. Базы нет — {}."""
+    until = time.time() if until is None else until
+    gap = _cooldown() if cooldown is None else cooldown
+    if not os.path.exists(path):
+        return {}
+    con = _connect(path)
+    rows = con.execute("SELECT buy_ex, buy_asset, sell_ex, sell_asset, first_seen, last_seen, signalled, "
+                       "reason_not_signalled, max_profit FROM signals WHERE last_seen >= ? AND first_seen <= ? "
+                       "ORDER BY buy_ex, buy_asset, sell_ex, sell_asset, first_seen, id", (since, until)).fetchall()
+    con.close()
+    best = {}
+    for r in rows:
+        k = (r[0], r[2])
+        best[k] = max(best.get(k, r[8]), r[8])
+    out = {}
+    for ep in _merged_episodes([(r[:4], *r[4:8]) for r in rows], gap):
+        k = (ep["key"][0], ep["key"][2])
+        rec = out.setdefault(k, {"episodes": 0, "best": best[k]})
+        rec["episodes"] += 1
+    return out
+
+
 def signal_stats(path=DB_PATH, days=7, now=None, min_minutes=3, cooldown=None):
     """Сводка эпизодов signals за `days` дней: всего, с сигналом, «долгие» (держались ≥ min_minutes от первого до
     последнего скана) и сколько из них прошло без сигнала — доля пропущенных связок (цель этапа 2 — ≤ 10%), и
