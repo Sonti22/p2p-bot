@@ -234,6 +234,15 @@ def parse_offline_min(text):
     return value if math.isfinite(value) and value > 0 else None
 
 
+VENUE_TIMEOUT_DEFAULT = 8.0     # сек: запрос площадки в скане дольше — таймаут, скан её не ждёт (VENUE_TIMEOUT)
+FRESH_WINDOW_DEFAULT = 180.0    # сек: прошлый ответ площадки старше — после таймаута не показываем (FRESH_WINDOW)
+
+
+def parse_seconds(text):
+    """VENUE_TIMEOUT / FRESH_WINDOW → секунды больше нуля (можно дробные, «7,5»); мусор, 0, минус, nan/inf — None."""
+    return parse_offline_min(text)
+
+
 def _offline_mode_env():
     raw = os.getenv("MERCHANT_OFFLINE", "")
     mode = parse_offline_mode(raw) if raw.strip() else "reason"
@@ -270,6 +279,8 @@ class Config:
     # EV_RANK: связки скана по убыванию ожидаемой прибыли (calibration.rank_snapshot — бот после скана, replay.py для
     # B), в карточке «EV … (p=…)»; False — порядок по score(), как раньше
     ev_rank: bool = False
+    venue_timeout: float = VENUE_TIMEOUT_DEFAULT   # VENUE_TIMEOUT: сек на запрос площадки в скане (collect)
+    fresh_window: float = FRESH_WINDOW_DEFAULT     # FRESH_WINDOW: сек — прошлый ответ площадки годен после таймаута
 
     def merchant_thresholds(self, ex):
         """(мин. сделок, мин. %) мерчанта площадки ex (как в Ad.ex): из MERCHANT_MIN, иначе MIN_ORDERS/MIN_RATE."""
@@ -305,6 +316,8 @@ class Config:
             merchant_offline=_offline_mode_env(),
             merchant_offline_min=_env_parsed("MERCHANT_OFFLINE_MIN", parse_offline_min, MERCHANT_OFFLINE_MIN_DEFAULT),
             ev_rank=os.getenv("EV_RANK", "0").strip().lower() in ("1", "true", "yes", "on"),
+            venue_timeout=_env_parsed("VENUE_TIMEOUT", parse_seconds, VENUE_TIMEOUT_DEFAULT),
+            fresh_window=_env_parsed("FRESH_WINDOW", parse_seconds, FRESH_WINDOW_DEFAULT),
         )
 
 
@@ -338,6 +351,9 @@ class Ad:
     # сколько монеты взято из каждого объявления стакана (_combined): у обменников это отдельные переводы, и минимум
     # вывода биржи проверяется для каждого (_leg_share); пусто — размеры частей неизвестны
     legs: tuple = field(default=(), compare=False)
+    # данные площадки устарели: в этом скане она не ответила за VENUE_TIMEOUT, объявление — копия её прошлого ответа
+    # (не старше FRESH_WINDOW). Показываем с пометкой, но не в сигнал, не в серию LIVE_SCANS и не в сухой прогон
+    stale: bool = field(default=False, compare=False)
 
 
 # Публичные запросы без ключей (объявления, справочники оплат и монет, спот-тикеры, сети монет): (метод, хост, путь).
@@ -537,8 +553,8 @@ async def lbank(s, cfg, side, asset, page=1):
     return out
 
 
-_bc = {"t": 0.0, "ads": [], "local": None}   # local — локальный адрес, с которого выгрузка дошла в обход VPN
-_bc_lock = asyncio.Lock()
+# local — локальный адрес, с которого выгрузка дошла в обход VPN; task — идущее скачивание (bestchange)
+_bc = {"t": 0.0, "ads": [], "local": None}
 BC_URL = "http://api.bestchange.ru/info.zip"
 # без ответа за 10 с — путь закрыт (VPN-выход бывает в бане у BestChange: пакет уходит, ответа нет вообще)
 BC_TIMEOUT = aiohttp.ClientTimeout(total=60, sock_connect=6, sock_read=10)
@@ -630,19 +646,49 @@ async def _bc_fetch(s):
     raise last
 
 
+async def _bc_refresh(s):
+    """Скачать и разобрать выгрузку BestChange в кэш _bc. Бэкофф площадки считает здесь — по самому скачиванию:
+    сбор скана видит выгрузку только через кэш (ответ из кэша — не запрос, таймаут скана — не итог), поэтому ошибка,
+    пришедшая после срока скана, тоже растит паузу (30 с → 10 мин), а сбрасывает её только удачная выгрузка."""
+    try:
+        data = await _bc_fetch(s)
+        ads = await asyncio.to_thread(_bc_parse, data)
+    except Exception:
+        _venue_backoff_fail("bestchange")
+        raise
+    got = time.time()   # после разбора: так её сверяет с концом сбора прошлого скана deal_fresh (Snapshot.since)
+    for a in ads:   # время выгрузки: следующие сканы берут эти же объявления из кэша
+        a.fetched_ts = got
+    _bc["ads"] = ads
+    _bc["t"] = got
+    _venue_backoff_ok("bestchange")
+
+
+def _forget(task):
+    """Итог задачи, которую уже никто не ждёт (снята по таймауту, докачивается в фоне): забрать исключение, чтобы
+    asyncio не писал «Task exception was never retrieved»."""
+    if not task.cancelled():
+        task.exception()
+
+
 async def bestchange(s, cfg, side, asset):
-    async with _bc_lock:   # все стороны и монеты скана делят одну выгрузку
-        now = time.time()
-        # после сбоя не повторяем минуту: иначе каждая пара монета×сторона ждёт свой таймаут
-        if now - _bc["t"] > cfg.bc_refresh and now - _bc.get("tried", 0) > 60:
-            _bc["tried"] = now
-            data = await _bc_fetch(s)
-            got = time.time()
-            ads = await asyncio.to_thread(_bc_parse, data)
-            for a in ads:   # время скачивания выгрузки: следующие сканы берут эти же объявления из кэша
-                a.fetched_ts = got
-            _bc["ads"] = ads
-            _bc["t"] = time.time()
+    """Все стороны и монеты скана делят одну выгрузку: её скачивает одна задача (_bc["task"]), остальные ждут её.
+    Скан ждёт не дольше VENUE_TIMEOUT, а сама выгрузка не обрывается — докачивается в фоне и достаётся следующему
+    скану. Ошибку скачивания поднимает первый, кто увидел итог, — один раз, как раньше (бэкофф — в _bc_refresh)."""
+    now = time.time()
+    task = _bc.get("task")
+    # после сбоя не повторяем минуту: иначе каждая пара монета×сторона ждёт свой таймаут
+    if task is None and now - _bc["t"] > cfg.bc_refresh and now - _bc.get("tried", 0) > 60:
+        _bc["tried"] = now
+        task = _bc["task"] = asyncio.ensure_future(_bc_refresh(s))
+        task.add_done_callback(_forget)
+    if task is not None:
+        if not task.done():
+            await asyncio.wait({task})   # снятие этого ожидания (таймаут скана) выгрузку не отменяет
+        if _bc.get("task") is task:
+            _bc["task"] = None
+            if not task.cancelled() and task.exception() is not None:
+                raise task.exception()
     return [a for a in _bc["ads"] if a.side == side and a.asset == asset]
 
 
@@ -676,9 +722,15 @@ SPOT_SOURCES = {
 }
 
 
-async def spot_prices(s, assets):
-    """{площадка: {монета: (bid, ask)}} к USDT на споте Bybit, MEXC, HTX, KuCoin (одним запросом на биржу)."""
-    res = await asyncio.gather(*(_json(s, "GET", SPOT_SOURCES[v][0]) for v in SPOT_VENUES), return_exceptions=True)
+async def spot_prices(s, assets, call=None):
+    """{площадка: {монета: (bid, ask)}} к USDT на споте Bybit, MEXC, HTX, KuCoin (одним запросом на биржу). call(ключ,
+    запрос) — как ждать запрос биржи (collect: к сроку скана VENUE_TIMEOUT, _scan_call); не успела — как ошибка,
+    остальные биржи её не ждут. Без call — просто ждём."""
+    def request(v):
+        return lambda: _json(s, "GET", SPOT_SOURCES[v][0])
+
+    res = await asyncio.gather(*(call(("spot", v), request(v)) if call else request(v)() for v in SPOT_VENUES),
+                               return_exceptions=True)
     out, errors = {}, []
     for venue, j in zip(SPOT_VENUES, res):
         out[venue] = {"USDT": (1.0, 1.0)}
@@ -864,7 +916,7 @@ def _combined(used, price, total, qty, legs=()):
               nicks=tuple(n for a in used for n in (a.nicks or (a.nick,))),
               fetched_ts=min(a.fetched_ts for a in used), ad_id=used[0].ad_id if one else "",
               online=online, last_seen=min((a.last_seen for a in used if a.last_seen), default=0.0),
-              legs=tuple(legs))
+              legs=tuple(legs), stale=any(a.stale for a in used))
 
 
 def _net_parts(grp):
@@ -1502,6 +1554,7 @@ class Snapshot:
     # копия Config, по которой собран снимок (bot.fresh_scan): % связок, сумма круга на карточке и в журнале — из неё;
     # None — снимок собран не ботом (replay, тесты)
     cfg: Config = None
+    since: float = 0.0   # конец сбора прошлого скана: данные, полученные позже, — новые и для этого скана (deal_fresh)
 
 
 # key — (монеты, площадки, сумма круга), под которые собран кэш; jobs — замеры запросов, которыми он собран
@@ -1561,12 +1614,78 @@ def traps_log():
     return list(reversed(TRAPS_LOG))
 
 
+REQUEST_MAX = 15.0   # сек: предел запроса скана, как общий таймаут HTTP-сессии бота; дольше — ошибка площадки
+
+
+class VenueTimeout(Exception):
+    """Запрос не успел к сроку скана (VENUE_TIMEOUT): скан его больше не ждёт, сам запрос идёт дальше (_scan_call)."""
+
+
+async def _stamped(coro, cap):
+    """(время ответа, значение) запроса; дольше cap сек (None — без предела) — TimeoutError, это ошибка площадки."""
+    if cap is None:
+        return time.time(), await coro
+    t0 = time.monotonic()
+    try:
+        value = await asyncio.wait_for(coro, cap)
+    except asyncio.TimeoutError:
+        if time.monotonic() - t0 < cap * 0.99:
+            raise   # таймаут самого запроса (aiohttp) раньше предела — как есть
+        raise TimeoutError(f"нет ответа за {cap:g} с") from None
+    return time.time(), value
+
+
+# запросы скана в полёте: ключ (площадка, сторона, монета, сумма круга; ("spot", биржа); ("rapira",)) -> задача
+# _stamped. Не успевший к сроку скана запрос не снимается: идёт в фоне (не дольше REQUEST_MAX), его итог забирает
+# следующий скан; пока он идёт, новый по тому же ключу не шлём — не больше одного запроса на ключ
+_inflight = {}
+
+
+async def _scan_call(key, make, timeout, deadline, cap=REQUEST_MAX, keep=True):
+    """Запрос make() по ключу key к сроку скана deadline (unix-время). Возвращает (время ответа, значение, late):
+    late=False — ответ этого скана; late=True — запрос этого скана не успел, и взят ответ прошлого запроса по ключу,
+    пришедший уже после срока своего скана (свежесть проверяет вызывающий). Ничего нет — VenueTimeout: ни ошибка, ни
+    успех — запрос ещё идёт. Ошибка запроса прошлого скана, пришедшая после его срока, поднимается сейчас (бэкофф
+    площадки), новый запрос по ключу в этом скане не шлём. keep=False (/calc — разовый скан под свою сумму): не
+    успевший запрос снимается, запросы прошлых сканов не берутся."""
+    task = _inflight.get(key) if keep else None
+    late = None
+    if task is not None and task.done():
+        _inflight.pop(key, None)
+        late, task = (None if task.cancelled() else task), None
+        if late is not None and late.exception() is not None:
+            raise late.exception()
+    if task is None:
+        task = asyncio.ensure_future(_stamped(make(), cap))
+        task.add_done_callback(_forget)   # итог, который никто не заберёт (площадку выключили), — без warning
+        if keep:
+            _inflight[key] = task
+    try:
+        done, _ = await asyncio.wait({task}, timeout=max(0.0, deadline - time.time()))
+    except asyncio.CancelledError:
+        if not keep:
+            task.cancel()
+        raise
+    if done:
+        if _inflight.get(key) is task:
+            del _inflight[key]
+        return (*task.result(), False)
+    if not keep:
+        task.cancel()
+    if late is not None:
+        return (*late.result(), True)
+    raise VenueTimeout(f"таймаут {timeout:g} с")
+
+
 async def _timed(coro, rec):
-    """Замер одного запроса скана: rec получает t0/t1 (unix-время начала и конца) и err — текст ошибки;
-    исключение идёт дальше, как без замера."""
+    """Замер одного запроса скана: rec получает t0/t1 (unix-время начала и конца) и err — текст ошибки (таймаут
+    VENUE_TIMEOUT — ещё timeout=True); исключение идёт дальше, как без замера."""
     rec["t0"] = time.time()
     try:
         return await coro
+    except VenueTimeout as e:
+        rec.update(err=str(e), timeout=True)
+        raise
     except Exception as e:
         rec["err"] = f"{type(e).__name__}: {e}"[:120]
         raise
@@ -1577,26 +1696,65 @@ async def _timed(coro, rec):
 def _job_done(rec, ads, data_ts=0.0):
     """Итог запроса площадки в замере: объявлениям без времени получения ставим конец запроса (кэш BestChange
     проставил своё при скачивании). «Из кэша» — данные старше начала запроса; data_ts — время данных, если
-    объявлений нет (выгрузка BestChange)."""
+    объявлений нет (выгрузка BestChange). Возвращает время данных."""
     for a in ads:
         if not a.fetched_ts:
             a.fetched_ts = rec["t1"]
     ts = min((a.fetched_ts for a in ads), default=0.0) or data_ts or rec["t1"]
     rec.update(n=len(ads), cached=ts < rec["t0"], age=round(rec["t1"] - ts, 1))
+    return ts
 
 
-def ad_fresh(a, since):
-    """Объявление получено с площадки в этом скане (не раньше его начала since): не из кэша монет `_alt` и не из
-    выгрузки BestChange, скачанной раньше. Время неизвестно (0 — объявление собрано не сканом) или у скана нет
-    времени — считаем свежим, как раньше."""
-    return not since or not a.fetched_ts or a.fetched_ts >= since
+# последний ответ по каждому запросу скана: (площадка, сторона, монета) -> (сумма круга, время данных, объявления) —
+# копию берёт скан, в котором площадка не успела за VENUE_TIMEOUT (_stale_copy); /calc (force_alt) его не пишет
+_venue_last = {}
+_collect_end = {"t": 0.0}   # конец сбора последнего обычного скана — Snapshot.since следующего
+
+
+def _stale_copy(key, cfg, now):
+    """Прошлый ответ по запросу key для скана, где площадка не успела за VENUE_TIMEOUT: (возраст данных, копии
+    объявлений с пометкой stale), если он получен при той же сумме круга и не старше FRESH_WINDOW; иначе None."""
+    last = _venue_last.get(key)
+    if not last or last[0] != cfg.amount:
+        return None
+    age = now - last[1]
+    if age > cfg.fresh_window:
+        return None
+    return age, [dataclasses.replace(a, stale=True) for a in last[2]]
+
+
+def ad_fresh(a, since, after=0.0):
+    """Объявление — новые данные для этого скана: получено с площадки в этом скане (не раньше его начала since) или
+    уже после конца сбора прошлого скана after (выгрузка BestChange, докачанная в фоне после таймаута скана). Не из
+    кэша монет `_alt`, не из выгрузки BestChange, которую видел прошлый скан, и не копия прошлого ответа площадки,
+    не успевшей за VENUE_TIMEOUT (Ad.stale — не свежее никогда). Время неизвестно (0 — объявление собрано не сканом)
+    или у скана нет времени — считаем свежим, как раньше."""
+    if a.stale:
+        return False
+    return not since or not a.fetched_ts or a.fetched_ts >= since or bool(after) and a.fetched_ts > after
 
 
 def deal_fresh(deal, snap):
-    """Обе стороны связки получены в этом скане (у стека _combined время — самое старое из его объявлений):
-    только такой скан продлевает серию «живости» LIVE_SCANS (bot.track_liveness)."""
+    """Обе стороны связки — новые данные этого скана (ad_fresh; у стека _combined время — самое старое из его
+    объявлений, stale — если устарело хоть одно): только такой скан продлевает серию «живости» LIVE_SCANS
+    (bot.track_liveness)."""
     _, b, s, _ = deal
-    return ad_fresh(b, snap.ts) and ad_fresh(s, snap.ts)
+    return ad_fresh(b, snap.ts, snap.since) and ad_fresh(s, snap.ts, snap.since)
+
+
+STALE_REASON = "данные площадки устарели"
+
+
+def deal_stale(deal):
+    """Хоть одна сторона связки — копия прошлого ответа площадки, не успевшей за VENUE_TIMEOUT (Ad.stale): такую
+    связку показываем, но сигналом не шлём, в сухой прогон не берём."""
+    return deal[1].stale or deal[2].stale
+
+
+def stale_note(deal):
+    """«⏳ данные площадки устарели (покупка: Bybit) — сигналом не придёт»; пусто, если обе стороны свежие."""
+    sides = [f"{name}: {ad.ex}" for ad, name in ((deal[1], "покупка"), (deal[2], "продажа")) if ad.stale]
+    return f"⏳ {STALE_REASON} ({', '.join(sides)}) — сигналом не придёт" if sides else ""
 
 
 # Глубина стакана (план, этап 2.3). Номер страницы уже есть в публичном запросе этих площадок (page/currPage/pageNo) —
@@ -1668,14 +1826,15 @@ def _ad_key(a):
 
 
 def _dedup(ads):
-    """Без повторов (_ad_key); из копий одного объявления — полученная позже (fetched_ts), на месте первой."""
+    """Без повторов (_ad_key); из копий одного объявления — полученная позже (fetched_ts), на месте первой. Время
+    равно (часы Windows тикают по ~16 мс) — берём копию, стоящую дальше в списке: вторая страница идёт после первой."""
     out, pos = [], {}
     for a in ads:
         k = _ad_key(a)
         if k not in pos:
             pos[k] = len(out)
             out.append(a)
-        elif a.fetched_ts > out[pos[k]].fetched_ts:
+        elif a.fetched_ts >= out[pos[k]].fetched_ts:
             out[pos[k]] = a
     return out
 
@@ -1824,11 +1983,38 @@ async def depth_for_deal(s, cfg, snap, deal, amounts=None):
 async def collect(s, cfg, force_alt=False, blocked=frozenset()):
     """Сбор данных скана по сети: объявления площадок (с кэшами _alt и BestChange, бэкоффом площадок), ориентир
     Rapira, спот, справочник сетей, замеры запросов. Возвращает словарь аргументов assemble(): ts, ads, ref (None —
-    Rapira не ответила), ref_src, spot, errors, jobs, extra (доп. запросы глубины). force_alt — как у scan().
+    Rapira не ответила), ref_src, spot, errors, jobs, extra (доп. запросы глубины), since. force_alt — как у scan().
     Сторона, где стек годных объявлений полной первой страницы меньше DEPTH_PAGE2 × сумма круга, получает вторую
     страницу (не больше DEPTH_PAGE2_MAX за скан, раунд — не дольше DEPTH_TIMEOUT; монеты кроме USDT — только когда их
-    опрос по ALT_INTERVAL и так идёт; площадка, упавшая в этом скане, — нет); blocked — блэклист для этой оценки."""
+    опрос по ALT_INTERVAL и так идёт; площадка, упавшая в этом скане, — нет); blocked — блэклист для этой оценки.
+
+    Каждый запрос площадки (площадка × сторона × монета), Rapira и спот каждой биржи — своя задача, скан ждёт их до
+    срока cfg.venue_timeout (VENUE_TIMEOUT): медленная площадка не задерживает остальные. Не успевший запрос не
+    снимается и не считается ошибкой: он идёт в фоне (не дольше REQUEST_MAX, дольше — ошибка), а его ответ берёт
+    следующий скан как новые данные, если тот не старше FRESH_WINDOW (_scan_call; пока запрос идёт, новый по тому же
+    ключу не шлём — лишних запросов нет). Ответа к сроку нет вовсе — площадка в этом скане устарела: причина — в errors
+    («таймаут …») и в замере (timeout, stale), вместо ответа — копия её прошлого ответа не старше FRESH_WINDOW с пометкой
+    Ad.stale (_stale_copy): видна в /top, но не идёт в сигналы, серию LIVE_SCANS и сухой прогон. Бэкофф площадки —
+    только по ошибкам и успехам запросов; у BestChange — по самой выгрузке (_bc_refresh). Справочник сетей скан ждёт до
+    того же срока, дальше он обновляется в фоне. Вторая страница — только площадкам, ответившим к сроку."""
     t_scan = time.time()
+    since = _collect_end["t"]
+    timeout = cfg.venue_timeout
+    deadline, keep, cap = t_scan + timeout, not force_alt, max(REQUEST_MAX, timeout)
+
+    async def recent(key, make, rec):
+        """Значение запроса к сроку скана; не успел, но есть ответ прошлого запроса не старше FRESH_WINDOW — он."""
+        ts, value, late = await _scan_call(key, make, timeout, deadline, cap, keep)
+        if late:
+            if time.time() - ts > cfg.fresh_window:
+                raise VenueTimeout(f"таймаут {timeout:g} с")
+            rec.update(timeout=True, late=True)
+        return value
+
+    def job(n, side, asset):
+        return _scan_call((n, side, asset, cfg.amount), lambda: FETCHERS[n](s, cfg, side, asset), timeout, deadline,
+                          None if n == "bestchange" else cap, keep)   # выгрузку ограничивает свой BC_TIMEOUT
+
     names_all = [n for n in cfg.exchanges if n in FETCHERS]
     key = (tuple(cfg.assets), tuple(names_all), cfg.amount)   # площадки фильтруют объявления по сумме
     if not force_alt and _alt["key"] != key:   # сменили монеты/площадки/сумму — старый кэш не годится, опросить заново
@@ -1841,32 +2027,73 @@ async def collect(s, cfg, force_alt=False, blocked=frozenset()):
             for asset in (["USDT"] if "USDT" in cfg.assets else []) + (alts if alt_due or n == "bestchange" else [])
             for side in ("buy", "sell")]
     recs = [{"ex": n, "side": side, "asset": asset} for n, side, asset in jobs]   # замеры запросов (Snapshot.jobs)
-    ref_rec, spot_rec, net_rec = {"ex": "rapira"}, {"ex": "spot"}, {"ex": "networks"}
-    ref_task = asyncio.ensure_future(_timed(rapira_mid(s), ref_rec)) if cfg.fiat == "RUB" else None
-    spot_task = asyncio.ensure_future(_timed(spot_prices(s, cfg.assets), spot_rec))
-    net_task = asyncio.ensure_future(_timed(netstatus.refresh_if_due(s, cfg.assets, cfg.exchanges, _json), net_rec))
-    res = await asyncio.gather(*(_timed(FETCHERS[n](s, cfg, side, asset), rec)
-                                 for (n, side, asset), rec in zip(jobs, recs)), return_exceptions=True)
-    try:
-        net_res = await net_task
-        net_rec["cached"] = net_res is None   # справочник сетей обновляется раз в netstatus.TTL
-        net_errors = net_res or {}
-    except Exception as e:
+    ref_rec, spot_rec, net_rec = {"ex": "rapira"}, {"ex": "spot"}, {"ex": "networks", "t0": t_scan}
+    ref_task = asyncio.ensure_future(_timed(recent(("rapira",), lambda: rapira_mid(s), ref_rec), ref_rec)) \
+        if cfg.fiat == "RUB" else None
+    spot_task = asyncio.ensure_future(_timed(spot_prices(s, cfg.assets, lambda k, make: recent(k, make, spot_rec)),
+                                             spot_rec))
+    net_task = asyncio.ensure_future(netstatus.refresh_if_due(s, cfg.assets, cfg.exchanges, _json))
+    res = await asyncio.gather(*(_timed(job(n, side, asset), rec) for (n, side, asset), rec in zip(jobs, recs)),
+                               return_exceptions=True)
+    if not net_task.done():   # справочник сетей — не дольше срока площадок, дальше обновляется в фоне
+        await asyncio.wait({net_task}, timeout=max(0.0, deadline - time.time()))
+    net_rec["t1"] = time.time()
+    net_errors = {}
+    if not net_task.done():
+        net_task.add_done_callback(_forget)
+        net_rec.update(cached=False, timeout=True, err=f"таймаут {timeout:g} с — справочник обновится в фоне")
+    elif net_task.cancelled() or net_task.exception() is not None:
+        e = asyncio.CancelledError() if net_task.cancelled() else net_task.exception()
+        net_rec["err"] = f"{type(e).__name__}: {e}"[:120]
         net_errors = {"сети": f"{type(e).__name__}: {e}"[:80]}
+    else:
+        net_rec["cached"] = net_task.result() is None   # справочник сетей обновляется раз в netstatus.TTL
+        net_errors = net_task.result() or {}
 
+    now = time.time()
     ads, errors, alt_ads, alt_errors = [], {}, [], {}
-    venue_seen, venue_failed = set(), set()
-    results = {}   # (площадка, сторона, монета) -> объявления первой страницы (ответившие запросы этого скана)
+    venue_seen, venue_failed, venue_ok = set(), set(), set()
+    results = {}   # (площадка, сторона, монета) -> объявления первой страницы (ответившие к сроку запросы скана)
+    data_ts = {}   # тот же ключ -> время данных ответа (_venue_last)
     for (n, side, asset), r, rec in zip(jobs, res, recs):
         venue_seen.add(n)
         cached = asset != "USDT" and n != "bestchange"   # не-USDT монеты кэшируем на alt_interval
-        if isinstance(r, Exception):
+        if isinstance(r, tuple):   # ответ; late — этот запрос не успел, ответ прошлого, пришедший после его срока
+            done_ts, r, late = r
+            if late and now - done_ts > cfg.fresh_window:
+                r = VenueTimeout(f"таймаут {timeout:g} с")
+            else:
+                for a in r:   # время ответа запроса, а не этого скана: ответ из фона — не «этого скана»
+                    if not a.fetched_ts:
+                        a.fetched_ts = done_ts
+                if late:
+                    rec.update(timeout=True, late=True)
+        if isinstance(r, VenueTimeout):   # запрос ещё идёт — ни ошибка, ни успех для бэкоффа
+            rec.update(err=str(r), timeout=True)
+            got = None if force_alt else _stale_copy((n, side, asset), cfg, now)
+            if got:
+                age, old = got
+                rec.update(n=len(old), cached=True, age=round(age, 1), stale=True)
+                (alt_ads if cached else ads).extend(old)
+                reason = f"{r} — данные устарели, в сигналы не идут"
+            else:
+                rec.update(n=0, cached=False, age=None, stale=False)
+                reason = f"{r} — ответа не старше {cfg.fresh_window:g} с нет"
+            (alt_errors if cached else errors).setdefault(f"{n}/{asset}", reason)
+        elif isinstance(r, Exception):
             venue_failed.add(n)
             rec.update(n=0, cached=False, age=None)
             (alt_errors if cached else errors)[f"{n}/{asset}"] = f"{type(r).__name__}: {r}"[:120]
         else:
-            _job_done(rec, r, _bc["t"] if n == "bestchange" else 0.0)
-            results[(n, side, asset)] = list(r)
+            venue_ok.add(n)
+            ts = _job_done(rec, r, _bc["t"] if n == "bestchange" else 0.0)
+            if rec.get("late"):   # ответ из фона: площадка медленная — второй страницы не просим
+                (alt_ads if cached else ads).extend(r)
+                if not force_alt:
+                    _venue_last[(n, side, asset)] = (cfg.amount, ts, list(r))
+            else:
+                results[(n, side, asset)] = list(r)
+                data_ts[(n, side, asset)] = ts
 
     ref, ref_src = None, "-"
     if ref_task:
@@ -1895,8 +2122,15 @@ async def collect(s, cfg, force_alt=False, blocked=frozenset()):
 
     for (n, side, asset), r in results.items():
         (alt_ads if asset != "USDT" and n != "bestchange" else ads).extend(r)
-    for n in venue_seen:   # бэкофф по площадке: сбрасываем на успехе, растим паузу на ошибке
-        (_venue_backoff_fail if n in venue_failed else _venue_backoff_ok)(n)
+        if not force_alt:
+            _venue_last[(n, side, asset)] = (cfg.amount, data_ts[(n, side, asset)], r)
+    # бэкофф по площадке: растим паузу на ошибке, сбрасываем на ответе; только таймауты — запрос ещё идёт, не
+    # трогаем. BestChange — по самой выгрузке (_bc_refresh): ответ из её кэша — не запрос
+    for n in venue_seen - {"bestchange"}:
+        if n in venue_failed:
+            _venue_backoff_fail(n)
+        elif n in venue_ok:
+            _venue_backoff_ok(n)
     for n in limited:   # 403/429 на второй странице — одна пауза без роста (после сброса бэкоффа первой страницы)
         _venue_pause(n)
     for n, until in paused.items():
@@ -1907,19 +2141,22 @@ async def collect(s, cfg, force_alt=False, blocked=frozenset()):
     elif not force_alt:   # монеты из кэша _alt: замеры тех запросов, которыми он собран, с пометкой и возрастом
         now = time.time()
         recs += [dict(r, cached=True, age=round(now - r.get("t1", _alt["t"]), 1)) for r in _alt.get("jobs", [])]
-    ads += alt_ads if force_alt else _alt["ads"]
+    # копии прошлого ответа (площадка не успела) живут в кэше монет, только пока не старше FRESH_WINDOW
+    ads += [a for a in (alt_ads if force_alt else _alt["ads"]) if not a.stale or now - a.fetched_ts <= cfg.fresh_window]
     errors.update(alt_errors if force_alt else _alt["errors"])
 
     if spot_err:
         errors["spot"] = spot_err
     recs += ([ref_rec] if ref_task else []) + [spot_rec, net_rec]
     errors.update({f"сети/{k}": v for k, v in net_errors.items()})
+    if not force_alt:
+        _collect_end["t"] = time.time()
     return {"ts": t_scan, "ads": ads, "ref": ref, "ref_src": ref_src, "spot": spot, "errors": errors, "jobs": recs,
-            "extra": {"page2": page2}}
+            "extra": {"page2": page2}, "since": since}
 
 
 def assemble(cfg, ads, ref=None, ref_src="-", spot=None, errors=None, blocked=frozenset(), over_banks=frozenset(),
-             ts=0.0, jobs=(), extra=None):
+             ts=0.0, jobs=(), extra=None, since=0.0):
     """Сборка снимка из данных скана без сети и файлов: ориентиры (ref None — медиана P2P USDT), фильтры и отсев
     аномалий, стаканы, связки, сортировка «прибыль × надёжность». blocked — блэклист (ex, nick), over_banks — свои
     банки за лимитом СБП; отсеянные ловушки — в snap.traps (в TRAPS_LOG их кладёт scan). Справочник сетей —
@@ -1991,7 +2228,8 @@ def assemble(cfg, ads, ref=None, ref_src="-", spot=None, errors=None, blocked=fr
             if d:
                 deals.append(d)
     snap = Snapshot(ref or 0, ref_src, refs, best, [], networks, dropped, errors, groups, spot, over_banks, book,
-                    ts=ts, jobs=list(jobs), ads=ads, blocked=frozenset(blocked), traps=traps, extra=dict(extra or {}))
+                    ts=ts, jobs=list(jobs), ads=ads, blocked=frozenset(blocked), traps=traps, extra=dict(extra or {}),
+                    since=since)
     # сортировка «прибыль × надёжность» — score(): каждая единица веса риска снимает risk_penalty п.п. с профита
     deals.sort(key=lambda d: score(d, cfg, snap), reverse=True)
     # обменники разных сетей дают по связке на одну и ту же пару площадок; бот сигналит по паре
@@ -2019,6 +2257,53 @@ async def scan(s, cfg, force_alt=False):
     # assemble: сборка остаётся чистой — replay старых снимков живые котировки не читает
     snap.perps = perp.quotes()
     return snap
+
+
+SPEED_SCANS = 100   # сканов в кольцевом буфере скорости (/status)
+
+
+def _pct(values, q):
+    """Перцентиль q (0–1) по ближайшему рангу; пусто — None."""
+    xs = sorted(values)
+    return xs[max(0, math.ceil(q * len(xs)) - 1)] if xs else None
+
+
+class ScanSpeed:
+    """Скорость последних SPEED_SCANS сканов — в памяти, для /status: длительность скана и задержка каждого источника
+    (площадки, Rapira, спот, справочник сетей) по замерам запросов скана (Snapshot.jobs). Задержка источника в скане —
+    его самый долгий запрос этого скана (запросы идут параллельно — столько он держит скан); ответы из кэша (монеты
+    _alt, выгрузка BestChange, справочник сетей до срока) — не запрос, в счёт не идут; не успел за VENUE_TIMEOUT —
+    задержка = срок, скан считается в таймауты источника."""
+
+    def __init__(self, size=SPEED_SCANS):
+        self.scans = deque(maxlen=size)
+
+    def add(self, snap, duration):
+        """Скан в буфер: duration — сколько секунд он шёл целиком (сбор и сборка)."""
+        venues, timeouts = {}, set()
+        for j in snap.jobs:
+            t0, t1 = j.get("t0"), j.get("t1")
+            if t0 is None or t1 is None or t0 < snap.ts or (j.get("cached") and not j.get("timeout")):
+                continue   # замер из кэша монет с прошлого скана или ответ из кэша — не запрос этого скана
+            venues[j["ex"]] = max(venues.get(j["ex"], 0.0), t1 - t0)
+            if j.get("timeout"):
+                timeouts.add(j["ex"])
+        self.scans.append({"dur": duration, "venues": venues, "timeouts": timeouts})
+
+    def summary(self):
+        """{"n": сканов, "scan": (p50, p90) сек, "venues": {источник (ex из замера): {"p50", "p90", "n" — сканов с
+        запросом, "timeouts" — сканов с таймаутом}}}; сканов ещё не было — None."""
+        if not self.scans:
+            return None
+        by = {}
+        for sc in self.scans:
+            for ex, sec in sc["venues"].items():
+                by.setdefault(ex, []).append(sec)
+        durations = [sc["dur"] for sc in self.scans]
+        return {"n": len(self.scans), "scan": (_pct(durations, 0.5), _pct(durations, 0.9)),
+                "venues": {ex: {"p50": _pct(v, 0.5), "p90": _pct(v, 0.9), "n": len(v),
+                                "timeouts": sum(1 for sc in self.scans if ex in sc["timeouts"])}
+                           for ex, v in by.items()}}
 
 
 DEPTH_AMOUNTS = (50_000, 100_000, 300_000)   # суммы круга для разбивки прибыли в карточке связки
@@ -2200,6 +2485,8 @@ def fmt_deal(d, cfg, snap=None):
         ev = ev_of(d, snap)
         if ev:
             text += "📐 " + fmt_ev(ev) + "\n"
+        if deal_stale(d):
+            text += html.escape(stale_note(d)) + "\n"
         prem = premium_line(b, s, snap)
         if prem:
             text += html.escape(prem) + "\n"
@@ -2256,6 +2543,8 @@ def fmt_signal(d, cfg, snap=None, limit=SIGNAL_MAX):
             lines += [f"  – {html.escape(r)}" for r in reasons[:2]] if why else []
         if ev:   # EV_RANK=1 и калибровка активна
             lines.append("📐 " + fmt_ev(ev))
+        if deal_stale(d):
+            lines.append(html.escape(stale_note(d)))
         lines += ["", f"<b>{KEYCAPS[0]} Купить {b.asset} на {b.ex}</b> по {_price(b.price)} ₽"]
         lines += _signal_ad(b, "Продавец", "Оплатить через", terms)
         for i, st in enumerate(acts, 1):
@@ -2302,6 +2591,8 @@ def fmt_top(snap, cfg, n=5):
         line += f" / продать {s.price:.2f}" if s else " / продать —"
         if b and s:
             line += f" → спред {(b.price / s.price - 1) * 100:.2f}%"
+        if (b and b.stale) or (s and s.stale):
+            line += f" ⏳ {STALE_REASON}"
         lines.append(line)
     alts = [a for a in cfg.assets if a != "USDT"]
     if alts:

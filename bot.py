@@ -38,7 +38,7 @@ from p2p import ALL_EXCHANGES, AMOUNT_MAX, AMOUNT_MIN, DEFAULT_ASSETS, ENV_PATH,
     MIN_PROFIT_MIN, TRAP, Config, fmt_signal, sell_step_number, _money, _price, _route_qty, bank_liquidity, book_spread, deal_amounts, \
     deal_for_amount, deal_fresh, fmt_ad, fmt_breakeven, fmt_deal, fmt_top, load_env, maker_neighbors, maker_place, maker_quote, \
     maker_round_fee, parse_amount, parse_min_profit, profit_breakdown, reliability, reliability_index, route_hops, scan, \
-    score, setup_logging, spot_url, traps_log, venue_url
+    score, setup_logging, spot_url, traps_log, venue_url, ScanSpeed, deal_stale
 from p2p import depth_for_deal, depth_settings
 
 logger = logging.getLogger(__name__)
@@ -118,7 +118,7 @@ COMMANDS = [{"command": "best", "description": "Лучшая связка сей
             {"command": "pause", "description": "Пауза сигналов: /pause 30m|1h|3h|до утра"},
             {"command": "resume", "description": "Снять паузу сигналов"},
             {"command": "dev", "description": "Как развивается бот: версия, изменения, план"},
-            {"command": "status", "description": "Версия, аптайм, последний скан, ошибки площадок"},
+            {"command": "status", "description": "Версия, аптайм, последний скан, скорость, ошибки площадок"},
             {"command": "logs", "description": "Последние строки лога (logs/bot.log)"},
             {"command": "guests", "description": "Гости: кому ещё слать сигналы (/allow id, /deny id)"},
             {"command": "safety", "description": "Безопасность: 115-ФЗ, блокировки карт, правила сделки"},
@@ -205,6 +205,10 @@ ACCOUNT_POLL_INTERVAL_DEFAULT = 60  # опрос истории аккаунто
 LIVE_EDIT_INTERVAL = 30     # сек: не чаще обновляем карточку последнего сигнала вместо повторной отправки
 STALE_RETRY_BASE = 30       # сек: пометку «⌛ устарела» после 429/5xx/сбоя сети повторим не раньше (дальше ×2)
 STALE_RETRY_MAX = 600       # сек: потолок паузы между повторами пометки
+# отказы Telegram на правку сообщения, которые не про кнопки: повтор с обычными кнопками их не исправит, и цветные
+# кнопки из-за них выключать нельзя (Bot._fancy_failed)
+NOT_BUTTON_ERRORS = ("message is not modified", "message to edit not found", "message can't be edited",
+                     "message not found", "chat not found")
 MARKET_STATUS_INTERVAL = 60  # сек: не чаще обновляем закреплённое сообщение «Статус рынка»
 MSK = timezone(timedelta(hours=3))                    # тихие часы и /pause считаем по МСК, не по времени ПК
 PAUSE_PRESETS = {"30m": 1800, "1h": 3600, "3h": 3 * 3600}  # аргументы /pause -> секунды
@@ -1178,6 +1182,24 @@ def backtest_view(cfg):
     return "\n".join(lines)
 
 
+SPEED_NAMES = {"rapira": "Rapira (ориентир)", "spot": "спот", "networks": "справочник сетей"}
+
+
+def speed_lines(speed, timeout):
+    """Строки «⏱ Скорость» для /status из ScanSpeed.summary(): p50/p90 длительности скана и задержки каждого источника
+    (медленные первыми), сколько сканов он не успел за VENUE_TIMEOUT."""
+    n = speed["n"]
+    p50, p90 = speed["scan"]
+    lines = [f"⏱ <b>Скорость</b> — последние {n} скан(ов), таймаут площадки {timeout:g} с:",
+             f"скан: p50 {p50:.1f} с · p90 {p90:.1f} с"]
+    for ex, v in sorted(speed["venues"].items(), key=lambda kv: (-kv[1]["p90"], kv[0])):
+        line = f"• {html.escape(SPEED_NAMES.get(ex) or VENUE_NAMES.get(ex, ex))}: p50 {v['p50']:.1f} с · p90 {v['p90']:.1f} с"
+        if v["timeouts"]:
+            line += f" · таймаут в {v['timeouts']} из {n}"
+        lines.append(line)
+    return lines
+
+
 def market_status_view(snap, cfg):
     """Текст закреплённого сообщения «Статус рынка»: ориентир курса, лучшая связка, площадки ок/недоступны."""
     lines = ["📌 <b>Статус рынка</b>", "", f"Ориентир USDT: {snap.ref:.2f} ₽ ({html.escape(snap.ref_src)})"]
@@ -1251,6 +1273,7 @@ class Bot:
         self.next_deal_id = int(self.start_ts * 1000)
         self.last_scan_ts = 0.0         # unix-время окончания последнего скана
         self.last_scan_duration = 0.0   # сколько секунд занял последний скан
+        self.speed = ScanSpeed()        # длительность сканов и задержка площадок за последние сканы (/status)
         self.market_msg_id = None       # id закреплённого сообщения «Статус рынка»
         self.market_status_ts = 0.0     # unix-время последнего обновления статуса рынка
         self.paper_ladder_alerted_ts = 0.0   # unix-время последнего предложения лестницы суммы сухого прогона
@@ -1316,9 +1339,13 @@ class Bot:
 
     def _fancy_failed(self, r, markup):
         """Отправка с цветными кнопками/«📋» не удалась: дальше шлём обычные кнопки и повторяем. 429 и 5xx — не про
-        кнопки (перегрузка/сбой Telegram): цвета не выключаем, повтор — забота вызывающего (retry_after)."""
+        кнопки (перегрузка/сбой Telegram): цвета не выключаем, повтор — забота вызывающего (retry_after). Отказ правки
+        не из-за кнопок (NOT_BUTTON_ERRORS: подпись не изменилась, сообщения нет или его нельзя править) — тоже: иначе
+        одна правка живой карточки или «⌛ устарела» выключала бы цветные кнопки всему боту до перезапуска."""
         code = r.get("error_code") or 0
-        if r.get("ok") or not self.fancy or not is_fancy(markup) or code == 429 or code >= 500:
+        text = str(r.get("description") or "").lower()
+        if r.get("ok") or not self.fancy or not is_fancy(markup) or code == 429 or code >= 500 \
+                or any(x in text for x in NOT_BUTTON_ERRORS):
             return False
         self.fancy = False
         logger.warning("Telegram: цветные кнопки/copy_text не поддерживаются, дальше обычные: %s", r.get("description"))
@@ -2215,6 +2242,7 @@ class Bot:
                 t0 = time.time()
                 snap = self.last = await self.fresh_scan()
                 self.last_scan_ts, self.last_scan_duration = time.time(), time.time() - t0
+                self.speed.add(self.last, self.last_scan_duration)
                 self.track_liveness(self.last)
                 if history.record(snap, self.snap_cfg(snap).amount):   # не чаще раза в 5 минут, независимо от чата
                     history.cleanup()
@@ -2278,8 +2306,9 @@ class Bot:
                 logger.error("%s: %s", name, e)
 
     def status_view(self, status_path=DEV_STATUS):
-        """Текст «/status»: версия, аптайм, время/длительность последнего скана, ошибки площадок,
-        сколько связок сейчас выше порога сигнала."""
+        """Текст «/status»: версия, аптайм, время/длительность последнего скана, ошибки площадок (и таймауты: площадка
+        не успела за VENUE_TIMEOUT — её данные в этом скане устарели), сколько связок сейчас выше порога сигнала;
+        скорость — p50/p90 длительности скана и задержки площадок за последние сканы (ScanSpeed)."""
         st = _dev_status(status_path)
         lines = ["📟 <b>Статус бота</b>", "",
                  f"Версия: <code>{html.escape(st.get('version', '?'))}</code>",
@@ -2303,6 +2332,9 @@ class Bot:
             lines += [f"• {html.escape(k)}: {html.escape(e)}" for k, e in snap.errors.items()]
         else:
             lines.append("Ошибок нет — все площадки отвечают.")
+        speed = self.speed.summary()
+        if speed:
+            lines += [""] + speed_lines(speed, self.cfg.venue_timeout)
         return "\n".join(lines)
 
     async def update_market_status(self, snap):
@@ -2341,7 +2373,8 @@ class Bot:
 
     def collect_night_deals(self, snap):
         """Запомнить связки выше порога за тихие часы — по одной, лучшей по прибыли, на пару площадок, вместе с
-        настройками её снимка (snap_cfg): сумму могли сменить до утра, а % посчитан на сумму снимка."""
+        настройками её снимка (snap_cfg): сумму могли сменить до утра, а % посчитан на сумму снимка. Связку по
+        устаревшим данным площадки (не ответила за VENUE_TIMEOUT) _signal_deals не отдаёт — как и сигналом."""
         cfg = None
         for d in self._signal_deals(snap):
             _, b, s, _ = d
@@ -2408,8 +2441,9 @@ class Bot:
     def signal_reasons(self, snap, since, quiet=False, paused=False):
         """Связки выше порога и почему по каждой не ушёл сигнал в этом скане: [(ключ, связка, причина)], причина
         None — сигнал ушёл (антидубль отмечен не раньше since). Иначе — первая преграда в порядке notify: quiet /
-        paused → trap (🪤 не шлём, SIGNAL_TRAPS=0) → max_signals (вне топ-N и не ⭐ избранная) → unconfirmed
-        (держится меньше LIVE_SCANS сканов) → cooldown (антидубль) → unsent (не доставлено)."""
+        paused → trap (🪤 не шлём, SIGNAL_TRAPS=0) → stale (данные площадки устарели: не ответила за VENUE_TIMEOUT,
+        p2p.deal_stale; места в топ-N не занимает) → max_signals (вне топ-N и не ⭐ избранная) → unconfirmed (держится
+        меньше LIVE_SCANS сканов) → cooldown (антидубль) → unsent (не доставлено)."""
         top = {self._deal_key(d) for d in self._signal_deals(snap)}
         favs, fav_min = favorites.keys(), favorites.fav_min_profit()
         traps = signal_traps()
@@ -2425,6 +2459,8 @@ class Bot:
                 reason = "quiet" if quiet else "paused"
             elif not traps and reliability(d, self.cfg, snap)[0] == TRAP:
                 reason = "trap"
+            elif deal_stale(d):
+                reason = "stale"
             elif key not in top and not (favorites.key_str(key) in favs and d[0] >= fav_min):
                 reason = "max_signals"
             elif not self.is_confirmed(d):
@@ -2496,10 +2532,11 @@ class Bot:
 
     def _signal_deals(self, snap, traps=None):
         """Связки выше порога в порядке сканера (p2p.score; EV_RANK=1 — по EV, Bot.ev_rank), не больше MAX_SIGNALS.
-        Сначала порог и отсев «🪤 ловушек», потом топ-N: надёжная связка ниже порога или ловушка, стоящая выше
-        в списке, не должна закрывать связки за ней. traps — брать и ловушки (None — по SIGNAL_TRAPS)."""
+        Сначала порог и отсев «🪤 ловушек» и связок по устаревшим данным площадки (p2p.deal_stale: не ответила за
+        VENUE_TIMEOUT — в /top видны с пометкой), потом топ-N: надёжная связка ниже порога, ловушка или устаревшая,
+        стоящая выше в списке, не должна закрывать связки за ней. traps — брать и ловушки (None — по SIGNAL_TRAPS)."""
         traps = signal_traps() if traps is None else traps
-        return [d for d in snap.deals if d[0] >= self.cfg.min_profit
+        return [d for d in snap.deals if d[0] >= self.cfg.min_profit and not deal_stale(d)
                 and (traps or reliability(d, self.cfg, snap)[0] != TRAP)][:self.max_signals]
 
     def track_liveness(self, snap, now=None):
@@ -2557,8 +2594,8 @@ class Bot:
         psnap = dataclasses.replace(snap, over_banks=over)
         picked = None   # лучшая по p2p.score уже на сумме прогона, а не первая в списке (тот отсортирован на AMOUNT)
         for deal in deals:
-            if not self.is_confirmed(deal):
-                continue   # сигнала о ней ещё не было — выброс одного скана не берём
+            if not self.is_confirmed(deal) or deal_stale(deal):
+                continue   # сигнала о ней ещё не было (выброс одного скана) или данные площадки устарели — не берём
             if not paper.simple_route(deal):
                 continue   # через спот/межмонетные — пока нет, условия возврата в ROADMAP (межмонетные, часть 2)
             d = deal_for_amount(deal, self.cfg, psnap, settings["amount"])
@@ -2718,6 +2755,9 @@ class Bot:
         await self.maybe_start_paper_cycle(self._signal_deals(snap, traps=True) if paper.settings()["traps"]
                                            else deals, snap)
         active = {self._deal_key(d) for d in deals}   # заранее: обрыв отправки не делает связки «устаревшими»
+        # связки по устаревшим данным площадки (не ответила за VENUE_TIMEOUT) не шлём и карточку по ним не правим, но и
+        # «⌛ связка устарела» не ставим: связка на месте, данных просто нет в этом скане
+        active |= {self._deal_key(d) for d in snap.deals if d[0] >= self.cfg.min_profit and deal_stale(d)}
         for d in deals:
             profit = d[0]
             key = self._deal_key(d)
@@ -2763,6 +2803,8 @@ class Bot:
             if not traps and reliability(d, self.cfg, snap)[0] == TRAP:
                 continue
             active.add(key)
+            if deal_stale(d):
+                continue   # данные площадки устарели (VENUE_TIMEOUT) — не шлём, карточка остаётся как есть
             prev = self.sent.get(key)
             if prev and now - prev[0] < self.cooldown and d[0] < prev[1] + self.repeat_step:
                 await self.update_live_card(key, d, snap, now)
