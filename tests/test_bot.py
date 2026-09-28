@@ -98,6 +98,7 @@ def _patch_paper_db(monkeypatch, db):
     monkeypatch.setattr(B.paper, "get_balance", functools.partial(B.paper.get_balance, path=db))
     monkeypatch.setattr(B.paper, "balance_change", functools.partial(B.paper.balance_change, path=db))
     monkeypatch.setattr(B.paper, "stats", functools.partial(B.paper.stats, path=db))
+    monkeypatch.setattr(B.paper, "summary_since", functools.partial(B.paper.summary_since, path=db))
     monkeypatch.setattr(B.paper, "ladder_suggestion", functools.partial(B.paper.ladder_suggestion, path=db))
     monkeypatch.setattr(B.paper, "banks_this_month", functools.partial(B.paper.banks_this_month, path=db))
     monkeypatch.setattr(B.paper, "report_rows", functools.partial(B.paper.report_rows, path=db))
