@@ -1247,7 +1247,6 @@ class Bot:
         self.quiet_hours = os.getenv("QUIET_HOURS", "01:00-08:00")   # окно тихих часов, МСК "HH:MM-HH:MM"
         self.quiet_on = os.getenv("QUIET_HOURS_ON", "0") == "1"      # тихие часы включены (кнопка в настройках)
         self.night_deals = {}    # (ex,asset,ex,asset) -> лучшая связка за тихие часы, для утреннего дайджеста
-        self.rep_task = None     # фоновый пересчёт меток репутации мерчантов (schedule_reputation)
         self._was_quiet = False  # тихие часы были на прошлом скане — для разового дайджеста при выходе из них
         self.awaiting_amount = False  # ждём сумму текстом после «✏️ Своя сумма»
         self.awaiting_preset_name = False  # ждём имя пресета текстом после «💾 Сохранить как пресет»
@@ -1262,6 +1261,7 @@ class Bot:
         self.signal_rows = {}   # (ex,asset,ex,asset) -> id открытого эпизода в history.signals (связка выше порога)
         self.snapshot_scans = 0      # сканов с запуска — снимок пишется каждый SNAPSHOT_EVERY-й
         self.snapshot_keep = set()   # id сканов, на которых стартовал круг сухого прогона: их снимок пишется всегда
+        self.rep_task = None         # фоновый пересчёт меток репутации мерчантов (schedule_reputation)
         self.cal = None              # EV_RANK=1: калибровка (calibration.build) и когда собрана — пересборка раз в
         self.cal_ts = 0.0            # calibration.REFRESH сек, в отдельном потоке
         self.live_msg = {}   # (ex,asset,ex,asset) -> последнее сообщение сигнала для «живой карточки» (editMessage)
