@@ -73,10 +73,32 @@ def test_failures_and_gone_counted_on_merchants_own_stage(tmp_path):
     assert (s1["cycles"], s1["failed"], s1["gone"]) == (5, 3, 2)   # «цена ушла» — срыв, но не «ушёл до оплаты»
     assert out[("Bybit", "seller2")] == {"cycles": 1, "failed": 1, "gone": 1, "changes": 0, "hours": 0.0}
     b1 = out[("MEXC", "buyer1")]
-    assert (b1["cycles"], b1["failed"], b1["gone"]) == (5, 1, 0)   # срывы покупки мерчанту продажи не в счёт
+    assert (b1["cycles"], b1["failed"], b1["gone"]) == (5, 0, 0)   # нехватка глубины — не вина мерчанта продажи
     assert reputation.label_text(s1) == "🧾 срывы 3 из 5 кругов, ушёл до оплаты ×2"
-    assert reputation.label_text(b1) is None                        # 1 из 5 — ниже порога
+    assert reputation.label_text(b1) is None
     assert reputation.from_paper(0, str(tmp_path / "none.db")) == {}
+
+
+def test_failures_not_caused_by_merchant_are_not_counted(tmp_path):
+    db = str(tmp_path / "paper.db")
+    for note in ("площадка Bybit недоступна", "нет свежей котировки BestChange по USDT (не старше 5 мин)",
+                 "стакана покупки не хватает на сумму круга"):
+        _cycle(db, "failed_buy", note)
+    s1 = reputation.from_paper(0, db)[("Bybit", "seller1")]
+    assert (s1["cycles"], s1["failed"], s1["gone"]) == (3, 0, 0)
+    assert reputation.label_text(s1) is None
+
+
+def test_two_ads_of_one_merchant_are_not_price_changes(tmp_path):
+    """У Bybit/HTX/… нет id объявления: два объявления мерчанта на одной стороне с разными постоянными ценами не
+    должны давать «смену цены» в каждом снимке."""
+    path = str(tmp_path / "snapshots.db")
+    snapshots._seen.clear()
+    for i in range(7):
+        ts = T0 + i * 600
+        write_scan(path, ts, [ad("Bybit", "buy", 85.0, "two", "", ts), ad("Bybit", "buy", 85.5, "two", "", ts)])
+    rec = reputation.from_snapshots(T0 - 1, T0 + 7200, path)[("Bybit", "two")]
+    assert rec["changes"] == 0 and abs(rec["hours"] - 1.0) < 1e-6
 
 
 def test_failure_share_needs_minimum_cycles():

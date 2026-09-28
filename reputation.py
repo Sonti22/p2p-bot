@@ -23,6 +23,9 @@ CHANGES_PER_HOUR = 6.0    # смен цены в час, с которой по�
 MIN_HOURS = 1.0           # частота смены цены — только после стольких часов присутствия в снимках
 GONE_MARKS = ("исчезл", "мерчантов покупки ушл")   # срыв «мерчант пропал» (пояснения paper.check_buy_stage), не
 # «цена ушла» — это смена цены, а не уход мерчанта
+# срывы по вине мерчанта: пропал или поднял цену. «Площадка недоступна», «нет свежей котировки BestChange», «стакана
+# не хватает», «конвертация недоступна» — не его вина и в его счёт не идут
+FAULT_MARKS = GONE_MARKS + ("цена ушла",)
 
 LABELS = {}               # (площадка, ник) -> текст метки; пишет refresh, читает p2p.fmt_signal
 _state = {"ts": 0.0}
@@ -53,13 +56,15 @@ def from_paper(since, path=None):
             nicks = json.loads(buy_nicks or "[]") or [buy_nick]
         except ValueError:
             nicks = [buy_nick]
-        gone = any(m in (note or "").lower() for m in GONE_MARKS)
+        low = (note or "").lower()
+        gone = any(m in low for m in GONE_MARKS)
+        fault = any(m in low for m in FAULT_MARKS)
         sides = [(buy_ex, n, "failed_buy") for n in dict.fromkeys(nicks) if n] + \
                 ([(sell_ex, sell_nick, "failed_sell")] if sell_nick else [])
         for ex, nick, stage in sides:
             rec = out.setdefault((ex, nick), _empty())
             rec["cycles"] += 1
-            if result == stage:
+            if result == stage and fault:
                 rec["failed"] += 1
                 rec["gone"] += 1 if gone else 0
     return out
@@ -82,16 +87,21 @@ def from_snapshots(since, until=None, path=None, max_scans=MAX_SCANS):
         if not scan:
             continue
         ts = scan.get("ts") or sid / 1000
-        for a in snapshots.ads_of(scan):
-            if not a.nick or a.ex == "BestChange":
+        prices = {}   # ключ -> лучшая цена в этом снимке: у бирж без id объявления (Bybit, HTX, …) несколько
+        for a in snapshots.ads_of(scan):   # объявлений мерчанта на одной стороне — один ключ, иначе их разные цены
+            if not a.nick or a.ex == "BestChange":   # чередовались бы и считались «сменой цены»
                 continue
             key = (a.ex, a.side, a.asset, a.nick, a.ad_id or "")
+            best = prices.get(key)
+            if best is None or (a.price < best if a.side == "buy" else a.price > best):
+                prices[key] = a.price
+        for key, price in prices.items():
             rec = seen.get(key)
             if rec is None:
-                seen[key] = [a.price, ts, ts, 0]
+                seen[key] = [price, ts, ts, 0]
                 continue
-            if a.price != rec[0]:
-                rec[0], rec[3] = a.price, rec[3] + 1
+            if price != rec[0]:
+                rec[0], rec[3] = price, rec[3] + 1
             rec[2] = ts
     out = {}
     for (ex, _side, _asset, nick, _ad), (_p, first, last, changes) in seen.items():
@@ -135,10 +145,10 @@ def compute(now=None, paper_path=None, snap_path=None):
 def refresh(now=None, paper_path=None, snap_path=None):
     """Пересчитать LABELS (вызывать в отдельном потоке); возвращает число мерчантов с меткой. Время отмечаем до
     чтения баз: сбой не повторяется каждый скан, а ждёт следующего REFRESH."""
+    global LABELS
     _state["ts"] = time.time() if now is None else now
     labels = compute(now, paper_path, snap_path)
-    LABELS.clear()
-    LABELS.update(labels)
+    LABELS = labels   # одной заменой: цикл событий читает LABELS из другого потока и не увидит его пустым
     return len(labels)
 
 
