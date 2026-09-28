@@ -204,6 +204,7 @@ class Book:
         self.closed = []          # Bybit closed-pnl
         self.leverage = "2"
         self.margin = {"bybit": "ISOLATED_MARGIN", "bingx": "ISOLATED"}
+        self.cross = set()        # BingX: символы биржи с кросс-маржой (режим маржи у BingX — по символу)
         self.equity = "10000"
         self.dual = "false"
         self.marks = dict(MARKS)
@@ -389,7 +390,8 @@ class Book:
     def _bingx_row(self, sym, size):
         return {"symbol": sym, "positionSide": "BOTH", "positionAmt": str(size), "avgPrice": self.marks.get(sym, "1"),
                 "markPrice": self.marks.get(sym, "1"), "liquidationPrice": self.liq.get(sym, "0"),
-                "leverage": int(self.leverage), "isolated": self.margin["bingx"] == "ISOLATED"}
+                "leverage": int(self.leverage),
+                "isolated": self.margin["bingx"] == "ISOLATED" and sym not in self.cross}
 
     def bingx_positions(self, call):
         sym = call["query"].get("symbol")
@@ -432,7 +434,8 @@ class Book:
                  ("GET", "/openApi/swap/v1/positionSide/dual"): lambda c: bingx_ok({"dualSidePosition": self.dual}),
                  ("GET", "/openApi/swap/v2/trade/leverage"): lambda c: bingx_ok(
                      {"longLeverage": int(self.leverage), "shortLeverage": int(self.leverage)}),
-                 ("GET", "/openApi/swap/v2/trade/marginType"): lambda c: bingx_ok({"marginType": self.margin["bingx"]}),
+                 ("GET", "/openApi/swap/v2/trade/marginType"): lambda c: bingx_ok(
+                     {"marginType": "CROSSED" if c["query"].get("symbol") in self.cross else self.margin["bingx"]}),
                  ("GET", "/openApi/swap/v2/quote/ticker"): self.bingx_ticker,
                  ("GET", "/openApi/swap/v2/quote/contracts"): self.bingx_contracts}
         for k, v in over.items():

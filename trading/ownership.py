@@ -14,7 +14,8 @@
   id бота (ликвидация, ADL, ручная сделка владельца) — чужое (`foreign_executions`);
 - BingX, односторонний режим: знак positionAmt (TODO(api)) — размер как у бота, а знак обратный — не угадываем;
 - что-то не прочитали — `foreign` None (`unknown_why` — почему): не знаем — не открываем и не трогаем.
-Для кросс-маржи — все позиции аккаунта на общем залоге (`foreign_account`).
+Для кросс-маржи — все позиции аккаунта на общем залоге (`foreign_account`); у BingX (режим маржи — по символу) позиции
+аккаунта читаются всегда: кросс-позиция владельца на другом символе живёт на том же балансе (`owner_cross`).
 Здесь только чтение (GET через venues) и чистые сравнения; решения — journal/risk.
 """
 import asyncio
@@ -55,8 +56,8 @@ async def fetch(s, venue, category, symbol, venue_sym, creds, market=True, setti
         margin, why = await venues.margin_mode(s, venue, venue_sym, creds)
         if why:
             errors.append(f"режим маржи: {why}")
-        if margin == "cross":
-            account, why = await venues.account_positions(s, venue, creds)
+        if margin == "cross" or venue == venues.BINGX:   # BingX: режим маржи — по символу, кросс владельца на
+            account, why = await venues.account_positions(s, venue, creds)   # другом символе — на том же балансе
             if why:
                 errors.append(f"позиции аккаунта: {why}")
     if market:
@@ -201,7 +202,24 @@ def foreign_account(snap, books):
         return None
     out = []
     for p in snap.account:
-        bot = books.get(p["symbol"]) if p["symbol"] else None
+        bot = (books or {}).get(p["symbol"]) if p["symbol"] else None
         if bot is None or p["signed"] != bot:
+            out.append(f"{p['raw_symbol']} {venues.fmt(p['signed'])}")
+    return out
+
+
+def owner_cross(snap, books):
+    """BingX (режим маржи — по символу): позиции владельца с кросс-маржой на аккаунте ([] — нет) или None — позиции
+    аккаунта не прочитаны. Изолированная маржа бота берётся из того же доступного баланса USDT-M, на котором живёт
+    кросс-позиция владельца, — открытие её задело бы. Позиция без признака isolated — считается кросс (TODO(api):
+    поле isolated в /openApi/swap/v2/user/positions сверить на живом ключе). books — {символ: сальдо бота}."""
+    if snap.account is None:
+        return None
+    out = []
+    for p in snap.account:
+        bot = (books or {}).get(p["symbol"]) if p["symbol"] else None
+        if bot is not None and p["signed"] == bot:
+            continue   # позиция бота
+        if p.get("isolated") is not True:
             out.append(f"{p['raw_symbol']} {venues.fmt(p['signed'])}")
     return out

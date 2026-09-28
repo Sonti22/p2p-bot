@@ -4,10 +4,12 @@
 - Жёсткие потолки — в коде (HARD); переменные .env (ENV_CAPS) могут их только понизить: значение выше потолка —
   потолок, мусор или отрицательное — 0 (то есть открытий нет).
 - Режим minlot (решение владельца 2026-09-27: «кнопка с минимальным лотом» сразу после хорошего бэктеста): ≤ 50 USDT
-  на позицию, ≤ 5 USDT дневного убытка, плечо ≤ 2, у направленной — только изолированная маржа.
+  на позицию, ≤ 5 USDT дневного убытка, плечо ≤ 2, у направленной — только изолированная маржа. Режим не confirm/auto
+  (paper — торговля выключена, неизвестный) — те же, самые строгие потолки (смена плеча).
 - Чужое не трогаем (решение владельца: ключи на ОСНОВНОМ аккаунте): по символу с ручной позицией или ордером владельца
-  (ctx.foreign — trading/ownership.py) открытий нет; внутри бота — ни встречной стороны, ни второго ключа со стопом на
-  одном символе биржи.
+  (ctx.foreign — trading/ownership.py) открытий нет; внутри бота — ни встречной стороны другого ключа журнала, ни
+  второго ключа со стопом на одном символе биржи, ни открытия против своей же позиции ключа (это закрытие). Ключ
+  журнала — (стратегия, метка группы); у направленной метки нет (journal.submit её отбрасывает).
 - Размер — по ИТОГОВОЙ позиции: открытое + ожидающие ордера на открытие (ctx.positions — journal.exposure()) + этот
   ордер; на ногу (биржа, символ, стратегия), суммарно (по свежим ценам), хедж ≤ монета круга × 1.05 — по всей группе.
   Группы считаются так, чтобы меткой их не обойти: направленная — по ноге (биржа, символ), метка не в счёт, и весь
@@ -93,11 +95,12 @@ def _env_cap(name, hard, environ=None):
 
 
 def limits(strategy, mode, environ=None):
-    """Действующие лимиты стратегии в режиме: потолки плана, понижения .env, потолки minlot."""
+    """Действующие лимиты стратегии в режиме: потолки плана, понижения .env, потолки minlot. Режим не confirm/auto
+    (minlot, paper — торговля выключена, неизвестный) — самые строгие потолки: minlot."""
     lev = min(HARD["leverage"][strategy], _env_cap("TRADING_MAX_LEVERAGE", HARD["leverage"][strategy], environ))
     pos = _env_cap("TRADING_MAX_POSITION_USDT", HARD["position_usdt"][strategy], environ)
     loss = _env_cap("TRADING_DAILY_LOSS_USDT", HARD["daily_loss_usdt"], environ)
-    if mode == "minlot":
+    if mode not in ("confirm", "auto"):
         lev = min(lev, MINLOT["leverage"])
         pos = min(pos, _env_cap("TRADING_MINLOT_POSITION_USDT", MINLOT["position_usdt"], environ))
         loss = min(loss, _env_cap("TRADING_MINLOT_DAILY_LOSS_USDT", MINLOT["daily_loss_usdt"], environ))
@@ -285,10 +288,16 @@ def _gid(venue, symbol, group, strategy=None):
     return str(group)
 
 
+def _group_label(strategy, group):
+    """Метка группы ключа журнала: у направленной — всегда пусто (ключ — нога биржа:символ, как её группа в _gid;
+    journal.submit метку направленной отбрасывает), у остальных — как есть."""
+    return "" if strategy == "directional" else str(group or "")
+
+
 def _key_of(p):
-    """(биржа, перп?, символ, стратегия, группа) строки journal.exposure."""
-    return (p.get("venue"), _perp(p.get("category")), p.get("symbol"), p.get("strategy"),
-            _gid(p.get("venue"), p.get("symbol"), p.get("group"), p.get("strategy")))
+    """(биржа, перп?, символ, стратегия, метка) строки journal.exposure — ровно ключ журнала: у каждого ключа свой стоп
+    и своя позиция (метка направленной из базы ранней версии — тоже отдельный ключ)."""
+    return (p.get("venue"), _perp(p.get("category")), p.get("symbol"), p.get("strategy"), str(p.get("group") or ""))
 
 
 def _row_entry(p):
@@ -315,8 +324,9 @@ def _row_worst(p):
 def stop_budget(rows, venue, category, symbol, strategy, group, side, qty, entry, stop):
     """Худший убыток по стопам после открытия: (итоговая позиция ключа — уже открытое и ожидающее того же ключа + этот
     ордер по среднему входу, со стопом ордера или, если его нет, стопом ключа; остальные позиции бота со стопами).
-    Итогового стопа нет — (None, остальные)."""
-    me = (venue, _perp(category), symbol, strategy, _gid(venue, symbol, group, strategy))
+    Итогового стопа нет — (None, остальные). «Тот же ключ» — ровно ключ журнала (_key_of), не группа _gid: у
+    направленной с другой меткой (база ранней версии) — свой стоп, в «остальных»."""
+    me = (venue, _perp(category), symbol, strategy, _group_label(strategy, group))
     have_q, cost, key_stop, others = D(0), D(0), None, D(0)
     for p in rows or ():
         q = _d(p.get("qty"), "размер позиции бота")
@@ -372,18 +382,22 @@ def _perp(category):
 
 def netting_conflicts(rows, venue, symbol, strategy, group, side, has_stop):
     """Причины не открывать перп из-за своих же перп-позиций бота на том же символе биржи (односторонний режим
-    сальдирует; спот — отдельные монеты, не сальдируется): другая стратегия/группа со встречной стороной —
-    сальдирование; с той же стороной, если у кого-то есть стоп, — два ключа со стопами на одной позиции символа
-    (перекрывающиеся стопы: чей стоп закроет чью часть, биржа не знает)."""
+    сальдирует; спот — отдельные монеты, не сальдируется): другой ключ журнала (стратегия, метка) со встречной стороной
+    — сальдирование; с той же стороной, если у кого-то есть стоп, — два ключа со стопами на одной позиции символа
+    (перекрывающиеся стопы: чей стоп закроет чью часть, биржа не знает). «Свой» — только ровно тот же ключ журнала (не
+    группа _gid: у направленной метка в группу не входит, а ключ журнала с другой меткой — другой)."""
     want = "long" if side == "buy" else "short"
-    me = (strategy, _gid(venue, symbol, group, strategy))
+    me = (strategy, _group_label(strategy, group))
     out = []
     for p in rows or ():
         if p.get("venue") != venue or p.get("symbol") != symbol or not _perp(p.get("category")):
             continue
-        if (p.get("strategy"), _gid(p.get("venue"), p.get("symbol"), p.get("group"), p.get("strategy"))) == me:
-            continue
         if _d(p.get("qty"), "размер позиции бота") <= 0:
+            continue
+        if (p.get("strategy"), str(p.get("group") or "")) == me:
+            if _row_side(p) != want:
+                out.append(f"открытие против своей же позиции ключа ({p.get('strategy')}) — это закрытие: только "
+                           f"purpose close")
             continue
         if _row_side(p) != want:
             out.append(f"встречная позиция бота на том же символе ({p.get('strategy')}) — сальдирование запрещено")

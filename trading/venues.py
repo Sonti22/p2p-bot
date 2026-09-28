@@ -1062,9 +1062,10 @@ async def _bybit_borrows(s, creds):
 
 
 async def account_positions(s, venue, creds):
-    """Все ненулевые позиции аккаунта на общем залоге (для кросс-маржи): ([{raw_symbol, symbol (канонический или None —
-    не позиция бота), signed}], "") или (None, причина). Bybit UTA — USDT- и USDC-перпы, inverse, option и займы
-    спот-маржи; BingX — USDT-M перпы. Битая строка или не прочитали хоть что-то — ошибка (кросс запрещён)."""
+    """Все ненулевые позиции аккаунта на общем залоге (для кросс-маржи; у BingX — всегда): ([{raw_symbol, symbol
+    (канонический или None — не позиция бота), signed, isolated (BingX: режим маржи позиции; иначе None)}], "") или
+    (None, причина). Bybit UTA — USDT- и USDC-перпы, inverse, option и займы спот-маржи; BingX — USDT-M перпы. Битая
+    строка или не прочитали хоть что-то — ошибка (кросс запрещён)."""
     lists = BYBIT_ACCOUNT_LISTS if venue == BYBIT else ((None, None),)
     out = []
     for category, settle in lists:
@@ -1086,8 +1087,9 @@ async def account_positions(s, venue, creds):
             if signed:
                 ours = venue != BYBIT or (category, settle) == ("linear", "USDT")
                 raw = it["symbol"] if ours else f"{it['symbol']} ({category}{' ' + settle if settle else ''})"
+                iso = it.get("isolated") if venue == BINGX else None   # BingX: режим маржи позиции (по символу)
                 out.append({"raw_symbol": raw, "symbol": canonical_symbol(venue, it["symbol"]) if ours else None,
-                            "signed": signed})
+                            "signed": signed, "isolated": iso if isinstance(iso, bool) else None})
     if venue == BYBIT:
         borrows, why = await _bybit_borrows(s, creds)
         if why:

@@ -312,7 +312,7 @@ def test_precheck_runs_under_lock_after_snapshot_and_refuses_before_insert():
         seen.append(journal.state_lock().locked())
         return "дневной стоп"
     res = submit(s, BY(), precheck=precheck)
-    assert res == {"state": "refused", "row": None, "reason": "дневной стоп", "event": None}
+    assert res == {"state": "refused", "row": None, "reason": "дневной стоп", "event": None, "filled": Decimal(0)}
     assert seen == [True] and not creates(s) and journal.history() == []
 
 
