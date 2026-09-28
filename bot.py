@@ -28,6 +28,7 @@ import paper
 import payouts
 import perp
 import presets
+import reputation
 import simdirectional
 import simfunding
 import simmaker
@@ -1387,6 +1388,7 @@ class Bot:
         self.signal_rows = {}   # (ex,asset,ex,asset) -> id открытого эпизода в history.signals (связка выше порога)
         self.snapshot_scans = 0      # сканов с запуска — снимок пишется каждый SNAPSHOT_EVERY-й
         self.snapshot_keep = set()   # id сканов, на которых стартовал круг сухого прогона: их снимок пишется всегда
+        self.rep_task = None         # фоновый пересчёт меток репутации мерчантов (schedule_reputation)
         self.cal = None              # EV_RANK=1: калибровка (calibration.build) и когда собрана — пересборка раз в
         self.cal_ts = 0.0            # calibration.REFRESH сек, в отдельном потоке
         self.live_msg = {}   # (ex,asset,ex,asset) -> последнее сообщение сигнала для «живой карточки» (editMessage)
@@ -2451,6 +2453,20 @@ class Bot:
         snap.cfg = cfg
         return await self.ev_rank(snap, cfg)
 
+    def schedule_reputation(self):
+        """Раз в reputation.REFRESH — пересчёт меток мерчантов (paper.db + snapshots.db) фоном в отдельном потоке:
+        скан его не ждёт, прошлый пересчёт ещё идёт — новый не запускаем."""
+        if not reputation.due() or (self.rep_task is not None and not self.rep_task.done()):
+            return
+        self.rep_task = asyncio.ensure_future(self.refresh_reputation())
+
+    async def refresh_reputation(self):
+        try:
+            n = await asyncio.to_thread(reputation.refresh)
+            logger.info("репутация мерчантов: меток %d", n)
+        except Exception as e:
+            logger.warning("reputation: %s", e)
+
     async def scan_loop(self):
         while True:
             snap = None
@@ -2462,6 +2478,7 @@ class Bot:
                 self.track_liveness(self.last)
                 if history.record(snap, self.snap_cfg(snap).amount):   # не чаще раза в 5 минут, независимо от чата
                     history.cleanup()
+                self.schedule_reputation()
 
                 if simmaker.enabled():   # бумажный мейкер (SIM_MAKER=1): только расчёт по снимку, объявлений нет
                     try:
