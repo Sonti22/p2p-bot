@@ -1,4 +1,5 @@
 import os
+import sqlite3
 import time
 
 import pytest
@@ -342,6 +343,62 @@ def test_finish_cycle_missing_id_returns_false_and_no_balance_change(tmp_path):
     paper.init_balance(10000, path=db)
     assert paper.finish_cycle(999, "done", realized_pct=5.0, path=db) is False
     assert paper.get_balance(path=db) == 10000
+
+
+def test_finish_cycle_twice_credits_balance_once(tmp_path):
+    """Повторное завершение того же круга (второй проход обработки) — False, баланс и итог первого не меняются."""
+    db = str(tmp_path / "paper.db")
+    paper.init_balance(10000, path=db)
+    buy, sell = make_ad("Bybit", "buy", 85.0), make_ad("MEXC", "sell", 90.0)
+    cid = paper.start_cycle(10000, buy, sell, "route", 2.0, path=db)
+    assert paper.finish_cycle(cid, "done", realized_pct=1.0, note="ок", path=db, ts=3000.0) is True
+    assert paper.finish_cycle(cid, "done", realized_pct=1.0, path=db, ts=4000.0) is False
+    assert paper.finish_cycle(cid, "failed_sell", note="цена ушла", path=db, ts=5000.0) is False
+    assert paper.get_balance(path=db) == 10100
+    c = paper.get_cycle(cid, path=db)
+    assert c["result"] == "done" and c["realized_pct"] == 1.0 and c["note"] == "ок" and c["ts_stage"] == 3000.0
+
+
+class _FailOnBalance:
+    """Соединение SQLite, у которого падает запись баланса, — сбой между итогом круга и балансом."""
+
+    def __init__(self, con):
+        self._con = con
+
+    def execute(self, sql, *args):
+        if sql.startswith("UPDATE balance"):
+            raise sqlite3.OperationalError("database is locked")
+        return self._con.execute(sql, *args)
+
+    def __getattr__(self, name):
+        return getattr(self._con, name)
+
+    def __enter__(self):
+        self._con.__enter__()
+        return self
+
+    def __exit__(self, *exc):
+        return self._con.__exit__(*exc)
+
+
+def test_finish_cycle_error_rolls_back_result_and_balance(tmp_path, monkeypatch):
+    """Сбой на записи баланса откатывает и итог круга: круг остаётся открытым (следующий скан завершит его снова),
+    баланс не тронут — а не «done +100» в журнале при прежнем балансе."""
+    db = str(tmp_path / "paper.db")
+    paper.init_balance(10000, path=db)
+    buy, sell = make_ad("Bybit", "buy", 85.0), make_ad("MEXC", "sell", 90.0)
+    cid = paper.start_cycle(10000, buy, sell, "route", 2.0, path=db)
+    real = paper._connect
+    monkeypatch.setattr(paper, "_connect", lambda path: _FailOnBalance(real(path)))
+    with pytest.raises(sqlite3.OperationalError):
+        paper.finish_cycle(cid, "done", realized_pct=1.0, path=db)
+    monkeypatch.setattr(paper, "_connect", real)
+    c = paper.get_cycle(cid, path=db)
+    assert c["result"] is None and c["realized_pct"] is None and c["ts_buy_done"] is None
+    assert [o["id"] for o in paper.open_cycles(path=db)] == [cid]
+    assert paper.get_balance(path=db) == 10000
+    assert paper.finish_cycle(cid, "done", realized_pct=1.0, path=db) is True   # повтор после сбоя — как надо
+    assert paper.get_balance(path=db) == 10100
 
 
 def test_stats_empty_db(tmp_path):
