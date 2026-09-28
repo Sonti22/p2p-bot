@@ -3,7 +3,7 @@
 Торговое ядро живёт только в trading/ (этап 4 плана) — защищённом пакете с ручным мержем. Здесь проверяется, что
 остальной код его не обходит:
 1) guard (scripts/guard.py): любая добавленная/удалённая строка торгового кода вне trading/ — ручная проверка; такие
-   строки в нынешнем коде запинены (TRADING_LINES_APPROVED, сейчас пусто) — новая без пина краснит и смоук launcher;
+   строки в нынешнем коде запинены (TRADING_LINES_APPROVED — хуки ядра в bot.py) — новая без пина краснит и launcher;
 2) AST всех модулей вне trading/ (тесты не в счёт — у них списки запретных путей нарочно): нет эндпоинтов ордеров и
    позиций и ключей *_trade; во всём коде, включая trading/ и research/, нет вывода, переводов, P2P
    «отпустить»/«оплачено»; выплаты Cryptomus — только в payouts.py; отправлять запросы (.post/.put/.delete/.patch/
@@ -175,10 +175,37 @@ def test_guard_trading_code_ignores(line):
 
 
 # Строки торгового кода вне trading/ (как их видит guard), которые владелец проверил и принял: {путь: [строка без
-# отступов, …]} — сейчас ни одной. Guard не пускает такие строки в автомерж, а этот пин держит их и на ПК: новая строка
+# отступов, …]} — хуки подключения ядра в bot.py (импорт, выключатель из .env при старте, старт, цикл сверки, /trading и
+# кнопки trd_*) и настройки торговли в .env.example. Guard не пускает такие строки в автомерж, а этот пин держит их и на ПК: новая строка
 # TRADING/trd_*/import trading… в bot.py или accounts.py без записи здесь — красный тест, значит и смоук launcher, и
 # обновление не встанет, пока владелец не впишет её сюда (защищённый файл — на ПК только с --approve), даже если CI обойдён.
-TRADING_LINES_APPROVED = {}
+TRADING_LINES_APPROVED = {   # подключение ядра к боту (ветка cloud/s2-trading-wiring, решение владельца 2026-09-28)
+    '.env.example': [
+        '# владельца бот не трогает. Launcher после каждого обновления кода пишет TRADING=0 — включает снова только владелец.',
+        '# TRADING=1 — торговля включена (только строкой в этом файле: окружение Windows её не включит); иначе новых открытий нет',
+        'TRADING=0',
+        'TRADING_MODE=paper',
+        'TRADING_SHORT_PAPER=0',
+        'TRADING_MAX_LEVERAGE=',
+        'TRADING_MAX_POSITION_USDT=',
+        'TRADING_MAX_TOTAL_USDT=',
+        'TRADING_DAILY_LOSS_USDT=',
+        'TRADING_MAX_ORDERS_PER_MIN=',
+        'TRADING_MAX_ORDERS_PER_DAY=',
+        'TRADING_MINLOT_POSITION_USDT=',
+        'TRADING_MINLOT_DAILY_LOSS_USDT=',
+    ],
+    'bot.py': [
+        'import trading.wiring',
+        'await trading.wiring.callback(self, cq, data, save_env)',
+        'await trading.wiring.command(self, arg)',
+        'trading.switch.switch_from_file(ENV_PATH)   # торговля: TRADING и TRADING_MODE — только из .env, извне не поднять',
+        'trading.gates.flags_from_file(ENV_PATH)     # флаг владельца TRADING_SHORT_PAPER — тоже только из файла .env',
+        'await trading.wiring.startup(bot)',
+        'trading.switch.disable()',
+        'bot.trading_task = asyncio.ensure_future(trading.wiring.loop(bot))   # сверка ядра — своим циклом',
+    ],
+}
 
 
 def current_trading_lines():
@@ -201,7 +228,8 @@ def current_trading_lines():
 
 def test_trading_lines_outside_trading_are_pinned():
     """Срабатывания guard на нынешнем коде вне trading/ (accounts.py, bot.py, paper.py, .env.example…) — ровно
-    TRADING_LINES_APPROVED. Сейчас их нет: ложных срабатываний на обычном коде тоже нет."""
+    TRADING_LINES_APPROVED: хуки подключения ядра в bot.py и настройки в .env.example; ложных срабатываний на обычном
+    коде нет."""
     now = current_trading_lines()
     assert now == TRADING_LINES_APPROVED, (
         "Строки торгового кода вне trading/ изменились. Проверить и вписать их в TRADING_LINES_APPROVED в "

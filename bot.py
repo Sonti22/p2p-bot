@@ -36,6 +36,7 @@ import hedge_plans
 import simperp
 import snapshots
 import trades
+import trading.wiring
 from cards import deal_card, history_card, history_compare_card, portfolio_card, top_chart
 from p2p import ALL_EXCHANGES, AMOUNT_MAX, AMOUNT_MIN, DEFAULT_ASSETS, ENV_PATH, LOG_PATH, MIN_PROFIT_MAX, \
     MIN_PROFIT_MIN, TRAP, Config, fmt_signal, sell_step_number, _money, _price, _route_qty, bank_liquidity, book_spread, deal_amounts, \
@@ -3695,6 +3696,9 @@ class Bot:
         if data.startswith("fav:"):
             await self.toggle_favorite(cq, data)
             return
+        if data.startswith("trd_"):   # торговля: сюда доходит только владелец в личном чате (_owner_gate)
+            await trading.wiring.callback(self, cq, data, save_env)
+            return
         if data != "amt_custom":
             self.awaiting_amount = False   # любая другая кнопка сбрасывает ожидание суммы
         if not data.startswith("acc_add:"):
@@ -3995,6 +3999,8 @@ class Bot:
             await self.cmd_pause(arg)
         elif cmd == "/resume":
             await self.cmd_resume()
+        elif cmd == "/trading" and REPLY_CHAT.get() is None:   # только владелец (гость сюда и не доходит: GUEST_CMDS)
+            await trading.wiring.command(self, arg)
         elif REPLY_CHAT.get() is not None:   # гостю — справка одним сообщением (кнопки разделов — у владельца)
             await self.send(GUIDE, markup=LINKS)
         else:   # /help и незнакомая команда — оглавление справки с кнопками разделов
@@ -4200,6 +4206,8 @@ async def main():
     setup_logging()
     load_env()
     payouts.switch_from_file(ENV_PATH)   # выключатель выплат — только из .env: PAYOUTS=1 извне его не перебьёт
+    trading.switch.switch_from_file(ENV_PATH)   # торговля: TRADING и TRADING_MODE — только из .env, извне не поднять
+    trading.gates.flags_from_file(ENV_PATH)     # флаг владельца TRADING_SHORT_PAPER — тоже только из файла .env
     token = os.getenv("TG_TOKEN", "").strip()
     if not token:
         raise SystemExit("TG_TOKEN не задан: создай бота у @BotFather и пропиши токен в .env")
@@ -4217,6 +4225,12 @@ async def main():
             await bot.setup_topics()
             await bot.check_key_safety()
         bot.perp_task = asyncio.ensure_future(bot.perp_loop())   # публичные данные перпов — своим циклом (perp.py)
+        try:   # торговое ядро: ключи, предупреждения — одно сообщение владельцу; сбой бот не роняет
+            await trading.wiring.startup(bot)
+        except Exception as e:
+            trading.switch.disable()
+            logger.error("trading startup: %s", type(e).__name__)
+        bot.trading_task = asyncio.ensure_future(trading.wiring.loop(bot))   # сверка ядра — своим циклом
         logger.info("Бот запущен: каждые %ss, порог %g%%, биржи %s", cfg.interval, cfg.min_profit,
                     ', '.join(cfg.exchanges))
         await asyncio.gather(bot.scan_loop(), bot.command_loop(), bot.accounts_loop(), bot.payouts_loop())
