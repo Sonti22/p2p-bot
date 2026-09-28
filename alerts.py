@@ -147,7 +147,7 @@ def due(snap, cfg, path=DB_PATH, now=None):
         # иначе лучшая по цене, но без объёма/надёжности, заслоняет подходящую вторую
         best_ad = None
         for (ex, ad_side, ad_asset), ad in snap.best.items():
-            if ad_side != side or ad_asset != asset:
+            if ad_side != side or ad_asset != asset or ad.stale:   # stale — площадка не ответила за VENUE_TIMEOUT
                 continue
             if not _candidate_ok(snap, cfg, ad, side, asset, rate, min_volume, require_reliable):
                 continue
