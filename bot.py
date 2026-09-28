@@ -1268,6 +1268,29 @@ def speed_lines(speed, timeout):
     return lines
 
 
+STATS_DIRECTIONS = 8   # направлений в /stats, остальные — «…ещё N»
+
+
+def direction_lines(rows, limit=STATS_DIRECTIONS):
+    """Строки /stats «По направлениям за месяц» из trades.by_direction: какие пары площадок реально приносят деньги —
+    по факту (₽ и средний %), где факта нет — только расчёт. [] — сделок за месяц нет."""
+    if not rows:
+        return []
+    lines = ["", "<b>По направлениям за месяц</b> (покупка → продажа):"]
+    for d in rows[:limit]:
+        line = (f"• {html.escape(d['buy_ex'])} → {html.escape(d['sell_ex'])}: {d['count']} сд., "
+                f"{_money(d['amount'])} ₽, расчёт {d['avg_profit']:+.2f}%")
+        if d["fact_count"]:
+            rub = f"{d['fact_rub']:+,.0f}".replace(",", " ")
+            line += f", факт {d['avg_fact']:+.2f}% (у {d['fact_count']}) ≈ {rub} ₽"
+        else:
+            line += ", факта нет"
+        lines.append(line)
+    if len(rows) > limit:
+        lines.append(f"• …ещё {len(rows) - limit}")
+    return lines
+
+
 def market_status_view(snap, cfg):
     """Текст закреплённого сообщения «Статус рынка»: ориентир курса, лучшая связка, площадки ок/недоступны."""
     lines = ["📌 <b>Статус рынка</b>", "", f"Ориентир USDT: {snap.ref:.2f} ₽ ({html.escape(snap.ref_src)})"]
@@ -1786,6 +1809,7 @@ class Bot:
                 lines.append(line)
             else:
                 lines.append(f"{label}: сделок нет")
+        lines += direction_lines(trades.by_direction(trades.period_start("month")))
         banks = trades.month_banks()
         if banks:   # только информация: сколько разных мерчантов было по каждой своей карте
             lines += ["", f"Контрагенты по картам (ориентир ЦБ 16-МР: &gt;{trades.COUNTERPARTY_DAY} в день, "
