@@ -20,6 +20,8 @@ python scripts/merchant_suggest.py data/snapshots.db   # предложение 
 
 ## Команды бота
 
+Подробно для владельца — команды, кнопки, метки, режимы `.env`, launcher и `--approve`: [docs/owner-guide.md](docs/owner-guide.md).
+
 Рыночные (доступны и гостям из `TG_GUESTS`):
 - `/top` — топ связок картинкой-графиком.
 - `/best` — лучшая связка сейчас.
