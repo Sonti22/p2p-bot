@@ -21,6 +21,7 @@ import os
 import statistics
 import time
 
+import p2p
 import paper
 import perp
 
@@ -280,6 +281,89 @@ def report(path=paper.DB_PATH):
     return out
 
 
+# Пороги «бумага → кнопка» для хеджа (решение владельца: те же, что заложены для стратегии «hedge» в защищённом
+# торговом ядре, — здесь они только считаются по бумаге; ядро бот не импортирует): закрытых хеджей не меньше 50 и
+# данных не меньше 14 дней, коэффициент хеджа 1 ± 0.1 не меньше чем в 95% кругов, фактическая стоимость хеджа не
+# больше 0.6 запаса на курс монеты (RISK_BUFFER), σ(факт − план) с хеджем не больше половины σ без хеджа.
+GATE_MIN_COUNT = 50
+GATE_MIN_DAYS = 14
+GATE_RATIO_BAND = 0.1
+GATE_RATIO_SHARE = 0.95
+GATE_COST_TO_BUFFER = 0.6
+GATE_SIGMA_RATIO = 0.5
+
+
+def risk_buffers():
+    """Запас на курс по монетам, % (RISK_BUFFER, как в p2p.Config)."""
+    return p2p._fees(os.getenv("RISK_BUFFER", p2p.DEFAULT_RISK))
+
+
+def gate_stats(path=paper.DB_PATH, now=None, buffers=None):
+    """Статистика бумажного хеджа для порогов «бумага → кнопка»: {"count" — закрытых хеджей с итогом, "days" — дней
+    с первого хеджа, "ratio_ok_share" — доля хеджей (открытых и закрытых) с коэффициентом 1 ± GATE_RATIO_BAND,
+    "cost_to_buffer" — средняя фактическая стоимость хеджа / запас на курс его монеты, "sigma_ratio" — σ(факт − план)
+    с хеджем / без хеджа по исполненным кругам (нужно ≥ 2), "pairs" — сколько таких кругов}. Нет данных — None."""
+    now = time.time() if now is None else now
+    buffers = risk_buffers() if buffers is None else buffers
+    rows = _rows(f"SELECT buy_asset, result, {paper._PLAN_CMP} AS plan, realized_pct, amount, hedge_fees, "
+                 "hedge_funding, hedge_state FROM cycles WHERE hedge_state != ''", path=path)
+    starts, ratios, costs, diffs_u, diffs_h, count = [], [], [], [], [], 0
+    for r in rows:
+        try:
+            st = json.loads(r["hedge_state"] or "{}")
+        except ValueError:
+            continue
+        if st.get("status") not in ("open", "closed"):
+            continue
+        if st.get("ts_open"):
+            starts.append(st["ts_open"])
+        ratios.append(abs((st.get("ratio") or 0.0) - 1) <= GATE_RATIO_BAND + 1e-9)
+        if st.get("status") != "closed" or st.get("pnl_pct") is None:
+            continue
+        count += 1
+        fact, buf = fact_cost_pct(r, st), buffers.get((r.get("buy_asset") or "").upper(), 0.0)
+        if fact is not None and buf > 0:
+            costs.append(fact / buf)
+        if r["result"] == "done" and r["plan"] is not None and r["realized_pct"] is not None:
+            diffs_u.append(r["realized_pct"] - r["plan"])
+            diffs_h.append(r["realized_pct"] + st["pnl_pct"] - (r["plan"] - (st.get("exp_cost_pct") or 0.0)))
+    sigma = None
+    if len(diffs_u) >= 2:
+        su, sh = statistics.pstdev(diffs_u), statistics.pstdev(diffs_h)
+        sigma = sh / su if su > 0 else None
+    return {"count": count, "days": (now - min(starts)) / 86400 if starts else 0.0,
+            "ratio_ok_share": sum(ratios) / len(ratios) if ratios else None,
+            "cost_to_buffer": sum(costs) / len(costs) if costs else None,
+            "sigma_ratio": sigma, "pairs": len(diffs_u)}
+
+
+def gate_check(st):
+    """Пороги «бумага → кнопка» по gate_stats: [(выполнен ли, строка)] — по порядку, без данных — не выполнен."""
+    def num(x, fmt):
+        return "нет данных" if x is None else format(x, fmt)
+    ratio, cost, sigma = st["ratio_ok_share"], st["cost_to_buffer"], st["sigma_ratio"]
+    return [
+        (st["count"] >= GATE_MIN_COUNT, f"закрытых хеджей {st['count']} (нужно ≥ {GATE_MIN_COUNT})"),
+        (st["days"] >= GATE_MIN_DAYS, f"данных {st['days']:.1f} дн. (нужно ≥ {GATE_MIN_DAYS})"),
+        (ratio is not None and ratio >= GATE_RATIO_SHARE,
+         f"коэффициент 1 ± {GATE_RATIO_BAND:g} в {num(None if ratio is None else ratio * 100, '.0f')}% кругов "
+         f"(нужно ≥ {GATE_RATIO_SHARE * 100:.0f}%)"),
+        (cost is not None and cost <= GATE_COST_TO_BUFFER,
+         f"стоимость хеджа {num(cost, '.2f')} запаса на курс (нужно ≤ {GATE_COST_TO_BUFFER:g})"),
+        (sigma is not None and sigma <= GATE_SIGMA_RATIO,
+         f"σ(факт − план) с хеджем {num(sigma, '.2f')} от σ без хеджа (нужно ≤ {GATE_SIGMA_RATIO:g}; кругов "
+         f"{st['pairs']})"),
+    ]
+
+
+def gate_lines(path=paper.DB_PATH, now=None):
+    """Строки «пороги бумага → кнопка: выполнено X из Y» и по строке на порог (✅/❌) — для /paper report."""
+    checks = gate_check(gate_stats(path, now))
+    done = sum(1 for ok, _ in checks if ok)
+    return [f"пороги бумага → кнопка: выполнено {done} из {len(checks)}"] + \
+        [f"{'✅' if ok else '❌'} {text}" for ok, text in checks]
+
+
 def report_lines(path=paper.DB_PATH):
     """Строки для /paper report; хеджей не было — пусто."""
     r = report(path)
@@ -300,4 +384,6 @@ def report_lines(path=paper.DB_PATH):
         lines.append(f"коэффициент хеджа в полосе 1 ± {settings()['band']:g}: {r['ratio_ok'] * 100:.0f}% кругов")
     for note, n in sorted(r["none"].items(), key=lambda kv: -kv[1])[:3]:
         lines.append(f"без хеджа {n}×: {note}")
+    if r["open"] or r["closed"]:
+        lines += gate_lines(path)
     return lines
