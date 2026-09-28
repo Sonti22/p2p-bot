@@ -123,7 +123,7 @@ COMMANDS = [{"command": "best", "description": "Лучшая связка сей
             {"command": "logs", "description": "Последние строки лога (logs/bot.log)"},
             {"command": "guests", "description": "Гости: кому ещё слать сигналы (/allow id, /deny id)"},
             {"command": "safety", "description": "Безопасность: 115-ФЗ, блокировки карт, правила сделки"},
-            {"command": "help", "description": "Как работать с сигналами"}]
+            {"command": "help", "description": "Справка по разделам: сигнал, метки, команды"}]
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEV_STATUS = os.path.join(HERE, ".dev_status.json")   # пишет launcher.py при каждом запуске
 PERP_LOOP_TICK = 5   # сек: как часто perp_loop проверяет, пора ли опросить перпы (сам интервал — PERP_INTERVAL)
@@ -164,6 +164,73 @@ LINKS = {"inline_keyboard": [
     [{"text": "Bybit P2P", "url": "https://www.bybit.com/fiat/trade/otc/?actionType=1&token=USDT&fiat=RUB"},
      {"text": "MEXC P2P", "url": "https://www.mexc.com/ru-RU/buy-crypto/p2p?fiat=RUB"}],
     [{"text": "BestChange", "url": "https://www.bestchange.ru/"}, {"text": "BitPapa", "url": "https://bitpapa.com/ru"}]]}
+
+
+# /help владельца — разделы кнопками (как docs/owner-guide.md): ключ → (кнопка, текст). Раздел открывается правкой того
+# же сообщения. Гостю — прежняя справка одним сообщением (GUIDE): его кнопки обрабатывает запиненный on_guest_callback.
+_GUIDE_PARTS = GUIDE_BODY.split("\n\n<b>")
+HELP_SECTIONS = {
+    "signal": ("📨 Сигнал", _GUIDE_PARTS[0]),
+    "safety": ("🛡 Безопасность", "<b>" + _GUIDE_PARTS[1]),
+    "costs": ("🧮 Что учтено в %", "<b>" + "\n\n<b>".join(_GUIDE_PARTS[2:]).rstrip()),
+    "labels": ("🏷 Метки", "<b>Метки надёжности</b>\n"
+               "✅ надёжно — причин риска нет; ⚠️ риск — 1–2 причины (в скобках); 🪤 ловушка — 3 и больше, сигналом "
+               "не приходит (SIGNAL_TRAPS=0), в /top и /best видна с меткой.\n"
+               "Надёжность N/10 — 10 минус веса причин; оценка ±X — прибыль минус штраф за риск, по ней сортировка.\n\n"
+               "<b>Причины риска</b>: цена далеко от ориентира, мерчант у порога фильтров, рискованные условия, мерчант "
+               "офлайн, 2+ перевода или конвертации, волатильная монета, спред ≥ 5%, «обменник → обменник».\n\n"
+               "<b>Отсеивается совсем</b>: цена дальше MAX_DEV (видно в /traps), стоп-фразы в условиях (третьи лица, "
+               "мессенджеры), мерчанты ниже MIN_ORDERS / MIN_RATE / MERCHANT_MIN, блэклист."),
+    "market": ("📊 Рынок", "<b>Рынок</b>\n"
+               "/best — лучшая связка сейчас\n/top — топ связок графиком, «📄 Подробно» — текстом\n"
+               "/calc 20000 — расчёт под свою сумму (20к, 1,5 млн), настройки не меняет\n"
+               "/maker USDT — цена, чтобы встать первым объявлением, место в стакане\n"
+               "/banks USDT — объём объявлений по банкам\n/fees — комиссии вывода по сетям\n"
+               "/history — лучшее время суток и хитмап спреда за 7 дней\n"
+               "/backtest — сколько раз связки были выше порога по истории\n/safety — 115-ФЗ, блокировки, правила"),
+    "journal": ("🧾 Сделки", "<b>Сделки и журнал</b>\n"
+                "/stats — журнал за день, неделю, месяц: сделки, сумма, расчёт против факта\n"
+                "/export (month / year / prev) — журнал в CSV для банка и 3-НДФЛ\n"
+                "/mybanks — свои банки и бесплатные лимиты СБП\n/fav — избранные маршруты\n"
+                "/alert USDT sell 92 7d, /alerts — алерты на курс\n"
+                "/blacklist, /blacklist note &lt;id&gt; &lt;текст&gt; — скрытые мерчанты\n"
+                "/balance — баланс подключённых бирж, итог в ₽\n/traps — последние отсеянные ловушки"),
+    "paper": ("🧪 Сухой прогон", "<b>Сухой прогон и бумажные симуляции (без денег)</b>\n"
+              "/paper — открытый круг, итоги, план против факта, виртуальный баланс\n"
+              "/paper on / off — включить / выключить\n/paper amount 20000 — сумма круга\n"
+              "/paper report — отчёт по площадкам и парам + CSV\n/paper reset — обнулить (с подтверждением)\n"
+              "/funding — бумажный арбитраж фандинга\n/futures — бумажная стратегия EMA 20/100\n"
+              "/maker paper — бумажный мейкер\n/calibration — поправка факт − план (CALIBRATION=1)"),
+    "settings": ("⚙️ Настройки", "<b>Настройки и служебное</b>\n"
+                 "/settings — порог, сумма, фильтры, мои биржи и банки, тихие часы, пауза, пресеты (всё в .env)\n"
+                 "/amount 100000, /min 1.5 — сумма круга и порог сигнала\n"
+                 "/pause 30m / 1h / 3h / до утра, /resume — пауза сигналов\n"
+                 "/status — скан, ошибки, скорость; «📋 Подробно» — всё\n/logs — хвост logs/bot.log\n"
+                 "/dev — версия, изменения, план, CI\n/allow, /deny, /guests — гости"),
+    "keys": ("🔑 Биржи", "<b>Биржи — только чтение</b>\n"
+             "«⚙️ Настройки → 🔑 Мои биржи → ➕ Подключить». Ключ — только для чтения: сообщение с ним бот сразу "
+             "удалит, проверит права и будет показывать баланс и движения. Ключ с правами торговли или вывода бот "
+             "удалит сразу (если не ALLOW_UNSAFE_KEYS=1)."),
+}
+HELP_INTRO = ("❓ <b>Справка</b>\n\nБот ищет P2P-связки за рубли и присылает карточку: что купить, куда перевести, "
+              "где продать и сколько останется чистыми. Деньги он не трогает — сделки делаешь ты.\n\n"
+              "Выбери раздел кнопкой ниже. Законы, документы для банка, блокировки карт — /safety. "
+              "Площадки — ссылками внизу.")
+
+
+def help_view(section=None):
+    """(текст, кнопки) «/help»: без section — вступление и кнопки разделов; с section — текст раздела и те же кнопки
+    (открытый раздел отмечен), неизвестный раздел — вступление. Внизу — ссылки на площадки (LINKS)."""
+    keys = list(HELP_SECTIONS)
+    if section not in keys:
+        section = None
+    text = HELP_INTRO if section is None else HELP_SECTIONS[section][1] + "\n\n<i>Разделы — кнопками ниже.</i>"
+    buttons = [{"text": ("• " if k == section else "") + HELP_SECTIONS[k][0], "callback_data": f"help:{k}"}
+               for k in keys]
+    rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
+    if section is not None:
+        rows.append([{"text": "⬅️ Оглавление", "callback_data": "help:"}])
+    return text, {"inline_keyboard": rows + LINKS["inline_keyboard"]}
 # «🛡 Безопасность» (/safety) — общая справка, доступна и гостям; только факты, без советов по обходу контроля банков.
 SAFETY = ("🛡 <b>Безопасность P2P</b> — справка, не юридическая консультация.\n\n"
           "<b>115-ФЗ.</b> Банк может запросить документы по операциям и ограничить их. Храни историю ордеров "
@@ -2320,6 +2387,49 @@ class Bot:
             except Exception as e:
                 logger.error("%s: %s", name, e)
 
+    async def open_help(self, cq, section):
+        """Кнопка раздела /help: правим то же сообщение; не вышло — шлём новым."""
+        text, kb = help_view(section or None)
+        msg = cq.get("message") or {}
+        r = await self.call("editMessageText", chat_id=self.chat_id, message_id=msg.get("message_id"), text=text,
+                            parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
+        if not r.get("ok") and "message is not modified" not in r.get("description", ""):
+            await self.send(text, markup=kb)
+
+    def status_brief(self, status_path=DEV_STATUS):
+        """(текст, кнопки) «/status» коротко: версия и аптайм, последний скан (жив ли, длительность, p50/p90),
+        ошибки площадок одной строкой, связок выше порога. «📋 Подробно» — полный status_view."""
+        st = _dev_status(status_path)
+        lines = [f"📟 <b>Статус</b> · <code>{html.escape(st.get('version', '?'))}</code> · аптайм "
+                 f"{_uptime_str(time.time() - self.start_ts)}"]
+        if self.last_scan_ts:
+            age = time.time() - self.last_scan_ts
+            fresh = age <= max(3 * self.cfg.interval, 60)
+            when = datetime.fromtimestamp(self.last_scan_ts).strftime("%H:%M:%S")
+            line = f"{'🟢' if fresh else '🔴'} Скан {when} ({self.last_scan_duration:.1f} с)"
+            speed = self.speed.summary()
+            if speed:
+                p50, p90 = speed["scan"]
+                line += f" · p50 {p50:.1f} / p90 {p90:.1f} с"
+            if not fresh:
+                line += f" — {int(age // 60)} мин назад"
+            lines.append(line)
+        else:
+            lines.append("⏳ Скана ещё не было")
+        snap = self.last
+        if snap is not None:
+            if snap.errors:
+                names = ", ".join(html.escape(k) for k in list(snap.errors)[:4])
+                more = f" +{len(snap.errors) - 4}" if len(snap.errors) > 4 else ""
+                lines.append(f"⚠️ Ошибки площадок ({len(snap.errors)}): {names}{more}")
+            else:
+                lines.append("✅ Ошибок нет — все площадки отвечают")
+            above = sum(1 for d in snap.deals if d[0] >= self.cfg.min_profit)
+            lines.append(f"🔔 Связок выше порога {self.cfg.min_profit:g}%: {above}")
+        kb = {"inline_keyboard": [[{"text": "📋 Подробно", "callback_data": "status_full"},
+                                   {"text": "🔄 Обновить", "callback_data": "status"}]]}
+        return "\n".join(lines), kb
+
     def status_view(self, status_path=DEV_STATUS):
         """Текст «/status»: версия, аптайм, время/длительность последнего скана, ошибки площадок (и таймауты: площадка
         не успела за VENUE_TIMEOUT — её данные в этом скане устарели), сколько связок сейчас выше порога сигнала;
@@ -3287,7 +3397,12 @@ class Bot:
             text, kb = dev_view()
             await self.send(text, markup=kb)
         elif data == "status":
+            text, kb = self.status_brief()
+            await self.send(text, markup=kb)
+        elif data == "status_full":
             await self.send(self.status_view())
+        elif data.startswith("help:"):
+            await self.open_help(cq, data[5:])
         elif data == "paper":
             await self.send(self.paper_view(), markup=self.paper_markup())
         elif data.startswith(("paper_set:", "paper_amt:")):
@@ -3518,7 +3633,8 @@ class Bot:
             text, kb = dev_view()
             await self.send(text, markup=kb)
         elif cmd == "/status":
-            await self.send(self.status_view())
+            text, kb = self.status_brief()
+            await self.send(text, markup=kb)
         elif cmd == "/logs":
             await self.send(logs_view(LOG_PATH))
         elif cmd == "/amount" and arg:
@@ -3539,8 +3655,11 @@ class Bot:
             await self.cmd_pause(arg)
         elif cmd == "/resume":
             await self.cmd_resume()
-        else:
-            await self.send(GUIDE if REPLY_CHAT.get() is not None else OWNER_GUIDE, markup=LINKS)
+        elif REPLY_CHAT.get() is not None:   # гостю — справка одним сообщением (кнопки разделов — у владельца)
+            await self.send(GUIDE, markup=LINKS)
+        else:   # /help и незнакомая команда — оглавление справки с кнопками разделов
+            text, kb = help_view()
+            await self.send(text, markup=kb)
 
     async def cmd_payout(self, arg):
         """/payout — выплата Cryptomus на адрес из белого списка; /payout history — последние 10 выплат.
