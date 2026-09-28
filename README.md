@@ -15,6 +15,7 @@ cp .env.example .env        # вписать TG_TOKEN от @BotFather
 python p2p.py               # разовый срез в консоль
 python bot.py               # бот (или run.bat); напиши ему /start в личку — chat_id запишется в .env сам
                             # (владелец — только личный чат: группа или канал владельцем не станут)
+python scripts/merchant_suggest.py data/snapshots.db   # предложение MERCHANT_MIN по снимкам (только чтение базы)
 ```
 
 ## Команды бота
