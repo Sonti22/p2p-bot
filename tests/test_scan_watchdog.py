@@ -37,7 +37,7 @@ def test_no_successful_scan_since_start_and_error_text():
     bot = _bot()
     bot.scan_errors, bot.scan_error = 7, "ValueError: <bad>"
     text = bot.watchdog_message(now=1000.0 + 10 * 60)
-    assert "с запуска успешных сканов нет, 10 мин назад" in text
+    assert "с запуска (10 мин) ни одного успешного скана" in text
     assert "Ошибок скана подряд: 7, последняя: ValueError: &lt;bad&gt;" in text
     assert bot.watchdog_message(now=1000.0 + 11 * 60) is None           # восстановления без скана нет
 
@@ -94,3 +94,22 @@ def test_watchdog_loop_sends_to_dev_topic(monkeypatch):
         arun(bot.watchdog_loop())
     assert ticks == [B.WATCHDOG_TICK, B.WATCHDOG_TICK]
     assert any(t.startswith("⚠️ Скан стоит") for t in texts(bot))
+
+
+def test_watchdog_waits_for_owner_chat(monkeypatch):
+    """Чата владельца ещё нет — алерт не «тратится»: появился чат — приходит."""
+    bot = _bot()
+    bot.chat_id = ""
+    calls = []
+
+    async def fake_sleep(t):
+        calls.append(t)
+        if len(calls) == 2:
+            bot.chat_id = "1"
+        if len(calls) > 2:
+            raise asyncio.CancelledError
+    monkeypatch.setattr(B.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(B.time, "time", lambda: 1000.0 + 30 * 60)
+    with pytest.raises(asyncio.CancelledError):
+        arun(bot.watchdog_loop())
+    assert [t for t in texts(bot) if t.startswith("⚠️ Скан стоит")]

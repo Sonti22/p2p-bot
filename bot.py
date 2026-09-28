@@ -2313,8 +2313,10 @@ class Bot:
             if self.stall_alerted:
                 return None
             self.stall_alerted = True
-            what = "последний успешный скан" if self.last_scan_ts else "с запуска успешных сканов нет,"
-            text = f"⚠️ Скан стоит: {what} {int(idle // 60)} мин назад — сигналы не приходят."
+            ago = f"{int(idle // 60)} мин"
+            what = (f"последний успешный скан {ago} назад" if self.last_scan_ts
+                    else f"с запуска ({ago}) ни одного успешного скана")
+            text = f"⚠️ Скан стоит: {what} — сигналы не приходят."
             if self.scan_errors:
                 text += f"\nОшибок скана подряд: {self.scan_errors}, последняя: {html.escape(self.scan_error)}"
             else:
@@ -2330,9 +2332,11 @@ class Bot:
         пошёл снова — сообщение о восстановлении. Своя задача, а не шаг scan_loop: зависший скан её не остановит."""
         while True:
             await asyncio.sleep(WATCHDOG_TICK)
+            if not self.chat_id:
+                continue   # владельца ещё нет — не «тратим» алерт впустую, проверим, когда он появится
             try:
                 text = self.watchdog_message()
-                if text and self.chat_id:
+                if text:
                     await self.send(text, topic="dev")
             except Exception as e:
                 logger.error("watchdog: %s", e)
