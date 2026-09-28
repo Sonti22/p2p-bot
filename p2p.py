@@ -5,6 +5,7 @@ One-off snapshot:  python p2p.py
 """
 import asyncio
 import dataclasses
+import functools
 import html
 import io
 import json
@@ -815,7 +816,17 @@ def terms_flags(text):
 def terms_hits(text):
     """Стоп-фразы в условиях объявления: [(причина, сработавший фрагмент)] — по тем же TERMS_BLOCK и с тем же вырезанием
     отрицаний, что terms_flags; для журнала отсева (TERMS_LOG, /traps, /status)."""
-    t = _TERMS_NEG_THIRD.sub(" ", (text or "").lower())
+    return list(_terms_hits_cached(text or ""))
+
+
+TERMS_HITS_CACHE = 4096   # разных текстов условий в кэше terms_hits: мерчант повторяет свой текст из скана в скан
+
+
+@functools.lru_cache(maxsize=TERMS_HITS_CACHE)
+def _terms_hits_cached(text):
+    """terms_hits по тексту, кэш с вытеснением давних: assemble идёт в цикле событий бота на каждом скане по всем
+    объявлениям — регулярки по одним и тем же условиям каждый раз заново держали бы цикл. Кортеж — кэш не изменить."""
+    t = _TERMS_NEG_THIRD.sub(" ", text.lower())
     out = []
     for pat, label in TERMS_BLOCK:
         m = re.search(pat, t, re.I)
@@ -824,7 +835,7 @@ def terms_hits(text):
             while end < len(t) and t[end].isalnum():   # фрагмент до конца слова: «третьи лиц» → «третьи лица»
                 end += 1
             out.append((label, t[m.start():end].strip()))
-    return out
+    return tuple(out)
 
 
 def merchant_offline(a, cfg):

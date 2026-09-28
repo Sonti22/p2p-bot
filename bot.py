@@ -720,49 +720,56 @@ def blacklist_view(now=None):
     return "\n".join(lines), {"inline_keyboard": kb}
 
 
+TERMS_LOG_SHOW = 10
+TRAPS_TEXT_MAX = 4000   # одно сообщение /traps: лимит Telegram 4096 символов, с запасом
+
+
+def fit_lines(head, rows, room=TRAPS_TEXT_MAX):
+    """head + сколько строк rows влезет в room символов (с переводами строк); не влезшие — одной строкой «… и ещё N».
+    Длиннее 4096 символов Telegram сообщение не примет (400 «message is too long») — команда молча не ответит."""
+    text = "\n".join(head)
+    for i, line in enumerate(rows):
+        left = len(rows) - i - 1
+        tail = f"\n{_more_note(left)}" if left else ""   # место под пометку, если следующие строки не влезут
+        if len(text) + 1 + len(line) + len(tail) > room:
+            return f"{text}\n{_more_note(len(rows) - i)}"
+        text += "\n" + line
+    return text
+
+
+def _more_note(n):
+    return f"… и ещё {n} — не влезли в сообщение Telegram"
+
+
 def traps_view():
-    """Текст «/traps»: последние отсеянные аномальные объявления — обучение видеть ловушки без риска."""
+    """Текст «/traps»: последние отсеянные аномальные объявления — обучение видеть ловушки без риска. Журнал стоп-фраз
+    условий — отдельным сообщением (terms_view): вместе с полным журналом ловушек он не влезает в лимит Telegram."""
     rows = traps_log()
     if not rows:
         return ("🪤 <b>Ловушки</b>\n\nПока ни одной: объявление с ценой намного выгоднее рынка (отсев по "
-                "MAX_DEV) автоматически отсеивается и в сигналы не попадает — здесь появятся примеры."
-                + "\n".join(terms_log_lines(room=TRAPS_TEXT_MAX - 300)))
-    lines = ["🪤 <b>Отсеянные ловушки</b>", "",
-              "Цена выглядит заманчиво, но слишком далека от рынка — скан такие объявления отсеивает "
-              "и в сигнал не пускает. Ниже — последние примеры, без риска.", ""]
-    for t in rows:
-        when = datetime.fromtimestamp(t["ts"]).strftime("%d.%m %H:%M")
-        lines.append(f"{when} — {html.escape(t['reason'])}")
-    text = "\n".join(lines)
-    return text + "\n".join(terms_log_lines(room=TRAPS_TEXT_MAX - len(text)))
+                "MAX_DEV) автоматически отсеивается и в сигналы не попадает — здесь появятся примеры.")
+    head = ["🪤 <b>Отсеянные ловушки</b>", "",
+            "Цена выглядит заманчиво, но слишком далека от рынка — скан такие объявления отсеивает "
+            "и в сигнал не пускает. Ниже — последние примеры, без риска.", ""]
+    lines = [f"{datetime.fromtimestamp(t['ts']).strftime('%d.%m %H:%M')} — {html.escape(t['reason'])}" for t in rows]
+    return fit_lines(head, lines)
 
 
-TERMS_LOG_SHOW = 10
-TRAPS_TEXT_MAX = 3900   # /traps одним сообщением: лимит Telegram 4096 символов, с запасом
-
-
-def terms_log_lines(limit=TERMS_LOG_SHOW, room=TRAPS_TEXT_MAX):
-    """Раздел «/traps»: последние мерчанты, отсеянные стоп-фразами условий (p2p.terms_log), — сверить, не режет ли
-    список нормальных. Не длиннее room символов (с переводами строк): /traps уходит одним сообщением, длиннее 4096
-    Telegram его не примет — лишние строки раздела не показываем. Журнала нет или места нет — пусто."""
+def terms_view(limit=TERMS_LOG_SHOW):
+    """Второе сообщение «/traps»: последние мерчанты, отсеянные стоп-фразами условий (p2p.terms_log), — сверить, не
+    режет ли список нормальных. Журнала нет — None, сообщение не шлём."""
     rows = terms_log()
     if not rows:
-        return []
+        return None
     merchants = len({(r["ex"], r["nick"]) for r in rows})
-    lines = ["", f"🚫 <b>Отсеяны стоп-фразами в условиях</b> — {merchants} мерчантов с запуска, последние:"]
-    used = sum(len(x) + 1 for x in lines)
-    if used > room:
-        return []
+    head = [f"🚫 <b>Отсеяны стоп-фразами в условиях</b> — {merchants} мерчантов с запуска, последние:", ""]
+    lines = []
     for r in rows[:limit]:
         when = datetime.fromtimestamp(r["last"]).strftime("%d.%m %H:%M")
         side = "покупка" if r["side"] == "buy" else "продажа"
-        line = (f"{when} — {html.escape(r['ex'])} {html.escape(r['nick'])} ({side} {html.escape(r['asset'])}): "
-                f"{html.escape(r['label'])}, фраза «{html.escape(r['phrase'])}», сканов {r['scans']}")
-        if used + len(line) + 1 > room:
-            break
-        lines.append(line)
-        used += len(line) + 1
-    return lines if len(lines) > 2 else []
+        lines.append(f"{when} — {html.escape(r['ex'])} {html.escape(r['nick'])} ({side} {html.escape(r['asset'])}): "
+                     f"{html.escape(r['label'])}, фраза «{html.escape(r['phrase'])}», сканов {r['scans']}")
+    return fit_lines(head, lines)
 
 
 NETS_ROWS = 30   # строк в /nets
@@ -1319,11 +1326,12 @@ def chips_line(amounts):
 
 
 def _lean(snap):
-    """Снимок без полного стакана (Snapshot.book), всех объявлений скана (Snapshot.ads) и котировок перпов
-    (Snapshot.perps): они нужны только /maker и записи снимка (snapshots.py) по свежему скану — запомненные сделки
-    (до 200) и живые карточки их не держат."""
-    if snap is not None and (snap.book or snap.ads or snap.jobs or snap.perps):
-        return dataclasses.replace(snap, book={}, ads=[], jobs=[], perps={})
+    """Снимок без полного стакана (Snapshot.book), всех объявлений скана (Snapshot.ads), котировок перпов
+    (Snapshot.perps) и срабатываний стоп-фраз (Snapshot.terms_hits): они нужны только /maker, записи снимка
+    (snapshots.py) и журналу отсева (p2p.TERMS_LOG, его пишет scan) по свежему скану — запомненные сделки (до 200) и
+    живые карточки их не держат."""
+    if snap is not None and (snap.book or snap.ads or snap.jobs or snap.perps or snap.terms_hits):
+        return dataclasses.replace(snap, book={}, ads=[], jobs=[], perps={}, terms_hits=[])
     return snap
 
 
@@ -3945,6 +3953,9 @@ class Bot:
                 await self.send(text, markup=kb)
         elif cmd == "/traps":
             await self.send(traps_view())
+            terms = terms_view()
+            if terms:
+                await self.send(terms)
         elif cmd == "/nets":
             await self.send(unmapped_nets_view())
         elif cmd == "/maker":
