@@ -198,26 +198,6 @@ def _merged_episodes(rows, gap):
     return out
 
 
-def bank_spread_stats(days=7, path=DB_PATH, now=None):
-    """Спред связок по банкам за `days` дней (bank_spreads): {side: [(банк, срезов, средний лучший %, лучший %,
-    доля срезов с плюсом)]}, внутри стороны — по убыванию среднего. side: "buy" — чем платим мерчанту на покупке,
-    "sell" — куда получаем на продаже. Базы или данных нет — {}."""
-    now = time.time() if now is None else now
-    if not os.path.exists(path):
-        return {}
-    con = _connect(path)
-    rows = con.execute("SELECT side, bank, COUNT(*), AVG(profit), MAX(profit), "
-                       "SUM(CASE WHEN profit > 0 THEN 1 ELSE 0 END) FROM bank_spreads WHERE ts >= ? "
-                       "GROUP BY side, bank", (now - days * 86400,)).fetchall()
-    con.close()
-    out = {}
-    for side, bank, n, avg, best, pos in rows:
-        out.setdefault(side, []).append((bank, n, avg, best, pos / n if n else 0.0))
-    for side in out:
-        out[side].sort(key=lambda r: (-r[2], r[0]))
-    return out
-
-
 def signal_stats(path=DB_PATH, days=7, now=None, min_minutes=3, cooldown=None):
     """Сводка эпизодов signals за `days` дней: всего, с сигналом, «долгие» (держались ≥ min_minutes от первого до
     последнего скана) и сколько из них прошло без сигнала — доля пропущенных связок (цель этапа 2 — ≤ 10%), и
@@ -364,3 +344,23 @@ def median_vs_bestchange(path=DB_PATH, days=30, now=None):
     p2p = [statistics.median(by_day[d]["p2p"]) if by_day[d]["p2p"] else None for d in order]
     bc = [statistics.median(by_day[d]["bc"]) if by_day[d]["bc"] else None for d in order]
     return labels, p2p, bc
+
+
+def bank_spread_stats(days=7, path=DB_PATH, now=None):
+    """Спред связок по банкам за `days` дней (bank_spreads): {side: [(банк, срезов, средний лучший %, лучший %,
+    доля срезов с плюсом)]}, внутри стороны — по убыванию среднего. side: "buy" — чем платим мерчанту на покупке,
+    "sell" — куда получаем на продаже. Базы или данных нет — {}."""
+    now = time.time() if now is None else now
+    if not os.path.exists(path):
+        return {}
+    con = _connect(path)
+    rows = con.execute("SELECT side, bank, COUNT(*), AVG(profit), MAX(profit), "
+                       "SUM(CASE WHEN profit > 0 THEN 1 ELSE 0 END) FROM bank_spreads WHERE ts >= ? "
+                       "GROUP BY side, bank", (now - days * 86400,)).fetchall()
+    con.close()
+    out = {}
+    for side, bank, n, avg, best, pos in rows:
+        out.setdefault(side, []).append((bank, n, avg, best, pos / n if n else 0.0))
+    for side in out:
+        out[side].sort(key=lambda r: (-r[2], r[0]))
+    return out
