@@ -290,6 +290,11 @@ PAPER_RESET_MARKUP = {"inline_keyboard": [[{"text": "🗑 Да, обнулить
                                            {"text": "Отмена", "callback_data": "paper_reset:no"}]]}
 
 
+DIGEST_MAX = 4000                  # утренний дайджест — одно сообщение, предел Telegram 4096 с запасом
+DIGEST_VENUES = 8                  # направлений площадок в дайджесте, остальные — «…ещё N»
+DIGEST_FALLBACK_WINDOW = 12 * 3600  # начало ночи неизвестно (бот перезапущен в тихие часы) — окно 12 ч до конца
+
+
 def account_poll_interval():
     """Читаем ACCOUNT_POLL_INTERVAL при каждом обращении, а не при импорте модуля — иначе значение
     из .env не подхватывается: load_env() вызывается в main() уже после импорта bot.py."""
@@ -1413,6 +1418,7 @@ class Bot:
         self.quiet_hours = os.getenv("QUIET_HOURS", "01:00-08:00")   # окно тихих часов, МСК "HH:MM-HH:MM"
         self.quiet_on = os.getenv("QUIET_HOURS_ON", "0") == "1"      # тихие часы включены (кнопка в настройках)
         self.night_deals = {}    # (ex,asset,ex,asset) -> лучшая связка за тихие часы, для утреннего дайджеста
+        self.quiet_since = None  # когда начались текущие тихие часы (для окна утреннего дайджеста)
         self._was_quiet = False  # тихие часы были на прошлом скане — для разового дайджеста при выходе из них
         self.awaiting_amount = False  # ждём сумму текстом после «✏️ Своя сумма»
         self.awaiting_preset_name = False  # ждём имя пресета текстом после «💾 Сохранить как пресет»
@@ -2725,25 +2731,77 @@ class Bot:
                     cfg = copy.deepcopy(self.snap_cfg(snap))
                 self.night_deals[key] = (d, cfg)
 
-    async def send_night_digest(self):
-        """Дайджест по окончании тихих часов: топ-3 связки за ночь по прибыли, одним сообщением; сумма круга у
-        каждой — та, на которую её посчитали (из её снимка), а не текущая."""
-        deals, self.night_deals = list(self.night_deals.values()), {}
-        if not deals:
-            await self.send("🌅 Тихие часы закончились — связок выше порога не было.", topic="signals")
-            return
-        top = sorted(deals, key=lambda dc: dc[0][0], reverse=True)[:3]
-        parts = [f"{i}) {fmt_deal(d, cfg)}" for i, (d, cfg) in enumerate(top, 1)]
-        await self.send("🌅 <b>Доброе утро! Топ-3 связки за ночь</b>\n\n" + "\n\n".join(parts), topic="signals")
+    def night_signal_lines(self, since, now, limit=DIGEST_VENUES):
+        """Строки дайджеста «сколько было связок выше порога по направлениям площадок» за ночь (history.signals):
+        сначала направления с большим числом эпизодов, не больше limit строк, остальное — «…ещё N»."""
+        try:
+            counts = history.venue_signals(since, now)
+        except Exception as e:
+            logger.warning("digest signals: %s", e)
+            return []
+        if not counts:
+            return []
+        total = sum(v["episodes"] for v in counts.values())
+        order = sorted(counts.items(), key=lambda kv: (-kv[1]["episodes"], -kv[1]["best"], kv[0]))
+        lines = [f"📡 <b>Связки выше порога</b>: {total} по {len(counts)} направл."]
+        lines += [f"• {html.escape(b)} → {html.escape(s)}: {v['episodes']} (лучшая {v['best']:+.2f}%)"
+                  for (b, s), v in order[:limit]]
+        if len(order) > limit:
+            lines.append(f"• …ещё {len(order) - limit} направл.")
+        return lines
 
-    def paper_digest_line(self):
-        """Одна строка сводки сухого прогона за сутки для утреннего дайджеста — то же, что «За сегодня»
-        в /paper. None — сухой прогон выключен или за сутки не было ни одного завершённого круга (не слать)."""
+    def night_digest_text(self, deals, since, now):
+        """Утренний дайджест одним сообщением (до DIGEST_MAX символов): связки выше порога по площадкам за ночь,
+        топ-3 связки ночи и итог сухого прогона за сутки. deals — [(связка, cfg её снимка)] из night_deals."""
+        head = f"🌅 <b>Доброе утро! Итоги ночи</b> ({_hhmm_msk(since)}–{_hhmm_msk(now)} МСК)"
+        signals = self.night_signal_lines(since, now)
+        top = sorted(deals, key=lambda dc: dc[0][0], reverse=True)[:3]
+        paper_lines = self.paper_digest_lines(now)
+
+        def build(full_deals, venues):
+            parts = [head]
+            if signals:
+                parts.append("\n".join(signals[:venues + 1] if venues < len(signals) - 1 else signals))
+            if top:
+                items = [f"{i}) {fmt_deal(d, cfg)}" if full_deals else f"{i}) {html.escape(d[1].ex)} → "
+                         f"{html.escape(d[2].ex)} {html.escape(d[1].asset)}/{html.escape(d[2].asset)} "
+                         f"<b>{d[0]:+.2f}%</b>" for i, (d, cfg) in enumerate(top, 1)]
+                parts.append("🏆 <b>Топ-3 связки за ночь</b>\n\n" + "\n\n".join(items))
+            else:
+                parts.append("Тихие часы закончились — связок выше порога не было.")
+            if paper_lines:
+                parts.append("\n".join(paper_lines))
+            return "\n\n".join(parts)
+
+        text = build(True, len(signals))
+        if len(text) > DIGEST_MAX:
+            text = build(False, len(signals))    # топ-3 одной строкой вместо полной карточки
+        venues = len(signals)
+        while len(text) > DIGEST_MAX and venues > 1:
+            venues -= 1                          # меньше направлений — первая строка (итог) остаётся
+            text = build(False, venues)
+        return text[:DIGEST_MAX]
+
+    async def send_night_digest(self):
+        """Дайджест по окончании тихих часов — одно сообщение (night_digest_text): связки по площадкам за ночь, топ-3
+        по прибыли и сухой прогон за сутки; сумма круга у каждой связки — та, на которую её посчитали (из её
+        снимка), а не текущая."""
+        deals, self.night_deals = list(self.night_deals.values()), {}
+        now = time.time()
+        since = self.quiet_since or now - DIGEST_FALLBACK_WINDOW
+        self.quiet_since = None
+        await self.send(self.night_digest_text(deals, since, now), topic="signals")
+
+    def paper_digest_lines(self, now=None):
+        """Сводка сухого прогона за последние сутки для утреннего дайджеста: строка итогов (как «За сегодня» в /paper,
+        но за 24 ч до now), результат исполнившихся в ₽ и самые частые причины срывов. [] — прогон выключен или за
+        сутки не завершилось ни одного круга."""
         if not paper.settings()["on"]:
-            return None
-        p = paper.stats()["day"]
+            return []
+        now = time.time() if now is None else now
+        p = paper.summary_since(now - 86400)
         if not p["total"]:
-            return None
+            return []
         line = f"🧪 Сухой прогон за сутки: {p['total']} кругов, исполнилось {p['done']}"
         if p["failed"]:
             reasons = ", ".join(f"{paper.FAIL_LABELS.get(r, r)} {n}" for r, n in p["failed_by_reason"].items())
@@ -2755,23 +2813,28 @@ class Bot:
             change = paper.balance_change()
             change_str = f"{change:+,.0f}".replace(",", " ")
             line += f", баланс {_money(balance)} ₽ ({change_str} ₽)"
-        return line
+        lines = [line]
+        if p["done"]:
+            lines.append(f"Итог исполнившихся за сутки: {p['profit_rub']:+,.0f} ₽".replace(",", " "))
+        if p["top_notes"]:
+            lines.append("Причины срывов: " + "; ".join(f"{html.escape(n[:80])} ×{c}" for n, c in p["top_notes"]))
+        return lines
 
-    async def send_paper_digest(self):
-        """Отправить строку `paper_digest_line()` в топик «Сигналы», если есть что показать."""
-        line = self.paper_digest_line()
-        if line:
-            await self.send(line, topic="signals")
+    def paper_digest_line(self):
+        """Первая строка paper_digest_lines() — итоги сухого прогона за сутки; None — показывать нечего."""
+        lines = self.paper_digest_lines()
+        return lines[0] if lines else None
 
     async def quiet_and_pause_tick(self, snap):
         """Тихие часы копят связки для утреннего дайджеста вместо отправки; обычная пауза (ручная или
         по /pause) просто не шлёт сигналы. Дайджест уходит один раз — в момент выхода из тихих часов."""
         quiet = self.is_quiet_now()
         if quiet:
+            if not self._was_quiet and self.quiet_since is None:
+                self.quiet_since = time.time()   # начало ночи — окно для «связок по площадкам» в дайджесте
             self.collect_night_deals(snap)
         elif self._was_quiet:
             await self.send_night_digest()
-            await self.send_paper_digest()
         self._was_quiet = quiet
         paused = self.paused or (self.pause_until and time.time() < self.pause_until)
         since = time.time()   # отправленное notify в этом скане отмечено в self.sent не раньше
