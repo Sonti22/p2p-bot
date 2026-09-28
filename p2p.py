@@ -1556,6 +1556,9 @@ class Snapshot:
     # None — снимок собран не ботом (replay, тесты)
     cfg: Config = None
     since: float = 0.0   # конец сбора прошлого скана: данные, полученные позже, — новые и для этого скана (deal_fresh)
+    # резервы обменников по стаканам снимка (_bc_reserves): считаются один раз на снимок, не на каждую связку;
+    # (groups, карта) — пересчёт, если снимку подставили другие стаканы. Не в __init__: replace() даёт новому снимку пустой
+    bc_reserves: tuple = field(default=None, init=False, repr=False, compare=False)
 
 
 # key — (монеты, площадки, сумма круга), под которые собран кэш; jobs — замеры запросов, которыми он собран
@@ -2371,31 +2374,70 @@ BC_RESERVE_MARGIN = 1.5
 BC_STALE_MIN = 10.0
 
 
+def _bc_reserves(snap):
+    """Резервы обменников в стаканах снимка: {(сторона, монета, сеть): {ник: {банк: резерв в монете}}} — один раз на
+    снимок (Snapshot.bc_reserves), а не на каждую связку. В выгрузке у обменника строка на каждый банк с одним и тем же
+    резервом, поэтому по банку — наибольший из строк, а не сумма (сумма завысила бы резерв во столько раз, сколько
+    банков). У объявления стакана avail — резерв обменника (у стека связки — только взятый объём)."""
+    cached = snap.bc_reserves
+    if cached is not None and cached[0] is snap.groups:
+        return cached[1]
+    out = {}
+    for (ex, side, asset), grp in snap.groups.items():
+        if ex != "BestChange":
+            continue
+        for a in grp:
+            banks = out.setdefault((side, asset, a.net), {}).setdefault(a.nick, {})
+            for p in a.pays or ("",):
+                banks[p] = max(banks.get(p, 0.0), a.avail)
+    snap.bc_reserves = (snap.groups, out)
+    return out
+
+
+def _bc_reserve(ad, snap):
+    """Резерв обменников стороны ad в монете (None — их нет в стакане снимка): по каждому обменнику (нику) — резерв
+    в банке связки (ad.pays), банка нет среди его строк — наибольший по его строкам; по обменникам стека — сумма."""
+    per = _bc_reserves(snap).get((ad.side, ad.asset, ad.net), {})
+    pays = set(ad.pays or ())
+    rows = [per[n] for n in dict.fromkeys(ad.nicks or (ad.nick,)) if n in per]
+    if not rows:
+        return None
+    return sum(max([v for p, v in r.items() if p in pays] or r.values()) for r in rows)
+
+
+def _bc_stale(b, s, snap):
+    """Старая выгрузка BestChange — одна причина на связку (обе стороны-обменника из одной выгрузки: по причине на
+    сторону «обменник → обменник» сразу набирал бы 3 причины, ловушку, на каждой задержке выгрузки). [] или
+    [(1, причина)] с возрастом самой старой стороны-обменника; время неизвестно (0) — не считаем старой."""
+    if not snap.ts:
+        return []
+    old = [(snap.ts - ad.fetched_ts, side) for ad, side in ((b, "покупка"), (s, "продажа"))
+           if ad.ex == "BestChange" and ad.fetched_ts and snap.ts - ad.fetched_ts > BC_STALE_MIN * 60]
+    if not old:
+        return []
+    return [(1, f"{' и '.join(side for _, side in old)}: выгрузка BestChange {int(max(old)[0] // 60)} мин назад — "
+                f"курс и резерв могли уйти")]
+
+
 def _bc_risks(ad, side, cfg, snap):
-    """Риски стороны-обменника (ex == BestChange): [(вес, причина)] — выгрузка старая, резерв впритык. Резерв —
-    сумма avail обменников этой стороны в стакане снимка (у обменника avail — его резерв в монете; у стека связки —
-    только взятый объём), нужно — объём круга cfg.amount / цена."""
+    """Риск стороны-обменника (ex == BestChange): [(вес, причина)] — резерв впритык: резерв обменников стороны
+    (_bc_reserve) меньше BC_RESERVE_MARGIN объёмов круга cfg.amount / цена. Старая выгрузка — на связку (_bc_stale)."""
     if ad.ex != "BestChange":
         return []
-    out = []
-    if snap.ts and ad.fetched_ts and snap.ts - ad.fetched_ts > BC_STALE_MIN * 60:
-        out.append((1, f"{side}: выгрузка BestChange {int((snap.ts - ad.fetched_ts) // 60)} мин назад — курс и "
-                       f"резерв могли уйти"))
-    nicks = set(ad.nicks or (ad.nick,))
-    own = [a for a in snap.groups.get((ad.ex, ad.side, ad.asset), []) if a.nick in nicks and a.net == ad.net]
     need = cfg.amount / ad.price if ad.price > 0 else 0.0
-    reserve = sum(a.avail for a in own)
-    if own and need > 0 and reserve < need * BC_RESERVE_MARGIN:
-        out.append((1, f"{side}: резерв обменника впритык ({reserve / need:.1f}× объёма круга) — может кончиться "
-                       f"до перевода"))
-    return out
+    reserve = _bc_reserve(ad, snap)
+    if reserve is not None and need > 0 and reserve < need * BC_RESERVE_MARGIN:
+        return [(1, f"{side}: резерв обменника впритык ({reserve / need:.1f}× объёма круга) — может кончиться "
+                    f"до перевода")]
+    return []
 
 
 def _risks(deal, cfg, snap):
     """Риски связки: [(вес, причина)] — отклонение цены от ориентира (ближе к отсеву — тяжелее), мерчант у
     порога фильтра по сделкам/отзывам, рискованные условия, мерчант офлайн (merchant_offline), число
     переводов/конвертаций, волатильная монета, спред ≥5% и «обменник → обменник» (оба конца на BestChange: курсы
-    с условиями, AML-проверки и заморозки); у обменника — старая выгрузка и резерв впритык (_bc_risks)."""
+    с условиями, AML-проверки и заморозки); у обменника — резерв впритык (_bc_risks), на связку — старая выгрузка
+    BestChange (_bc_stale)."""
     profit, b, s, route = deal
     risks = []
     for ad, side in ((b, "покупка"), (s, "продажа")):
@@ -2418,6 +2460,7 @@ def _risks(deal, cfg, snap):
         if risky:
             risks.append((2, f"{side}: условия — {', '.join(risky)}"))
         risks += _bc_risks(ad, side, cfg, snap)
+    risks += _bc_stale(b, s, snap)
     steps = route.split(" → ") if route else []
     transfers = sum(1 for st in steps if "перевод" in st or "спот" in st or "через" in st)
     if transfers >= 2:

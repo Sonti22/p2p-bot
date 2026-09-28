@@ -1,5 +1,6 @@
 """Метка надёжности, часть 3 (BestChange-факторы): старая выгрузка и резерв обменника впритык — причины риска у
 стороны-обменника; биржи не затронуты. И scripts/bc_fields.py — разбор полей info.zip без сети."""
+import dataclasses
 import io
 import os
 import sys
@@ -75,6 +76,74 @@ def test_factors_lower_index_and_score():
     snap = _snap({("BestChange", "sell", "USDT"): [s]})
     assert p2p.risk_weight(deal, _cfg(), snap) == 2
     assert p2p.reliability_index(deal, _cfg(), snap) == 8
+
+
+def _banks(side, price, reserve_coin, banks, nick="ex1 [TRC20]"):
+    """Строки выгрузки одного обменника — по строке на банк, в каждой его резерв целиком."""
+    out = []
+    for bank in banks:
+        a = _bc(side, price, reserve_coin, nick)
+        a.pays = [bank]
+        out.append(a)
+    return out
+
+
+def test_reserve_of_an_exchanger_in_several_banks_is_not_multiplied():
+    banks = ["Сбербанк", "T-Bank", "Альфа-Банк", "ВТБ"]
+    rows = _banks("sell", 92.0, 600.0, banks)                          # нужно 50 000 / 92 ≈ 543, резерв 600 — 1.1×
+    snap = _snap({("BestChange", "sell", "USDT"): rows})
+    s = p2p._stack_qty(rows, 543.0)
+    assert s.parts == 1 and s.pays == ["Сбербанк"]
+    b = make_ad("Bybit", "buy", 89.0, orders=5000)
+    reasons = _reasons((2.0, b, s, ""), snap)
+    assert "продажа: резерв обменника впритык (1.1× объёма круга) — может кончиться до перевода" in reasons   # не 4.4×
+    assert p2p._bc_reserve(s, snap) == 600.0
+    # в банке связки резерв меньше, чем в других строках обменника, — берётся банк связки
+    rows[0].avail = 300.0
+    snap = _snap({("BestChange", "sell", "USDT"): rows})
+    assert p2p._bc_reserve(rows[0], snap) == 300.0
+    other_bank = _bc("sell", 92.0, 1.0)
+    other_bank.pays = ["Райффайзен"]                                   # банка связки нет в строках — наибольший из них
+    assert p2p._bc_reserve(other_bank, snap) == 600.0
+    # стек двух обменников: по каждому — один резерв, по обменникам — сумма
+    two = rows + _banks("sell", 91.9, 400.0, banks, "ex2 [TRC20]")
+    snap = _snap({("BestChange", "sell", "USDT"): two})
+    stack = p2p._combined([rows[1], two[4]], 92.0, 50_000, 543.0)
+    assert p2p._bc_reserve(stack, snap) == 1000.0                      # 600 + 400, а не сумма всех 8 строк
+
+
+def test_stale_dump_is_one_reason_per_route_not_per_side():
+    old_b = _bc("buy", 88.0, 100_000.0, "ex1 [TRC20]", fetched=TS - 25 * 60)
+    old_s = _bc("sell", 92.0, 100_000.0, "ex2 [TRC20]", fetched=TS - 25 * 60)
+    snap = _snap({("BestChange", "buy", "USDT"): [old_b], ("BestChange", "sell", "USDT"): [old_s]})
+    deal = (2.0, old_b, old_s, "")
+    reasons = _reasons(deal, snap)
+    assert [r for r in reasons if "выгрузка" in r] == [
+        "покупка и продажа: выгрузка BestChange 25 мин назад — курс и резерв могли уйти"]
+    # задержка выгрузки + «обменник → обменник» — риск, а не ловушка
+    label, why = p2p.reliability(deal, _cfg(), snap)
+    assert label == p2p.RISKY and len(why) == 2
+    fresh_b = _bc("buy", 88.0, 100_000.0, "ex1 [TRC20]", fetched=TS - 60)
+    assert p2p._bc_stale(fresh_b, old_s, snap) == [
+        (1, "продажа: выгрузка BestChange 25 мин назад — курс и резерв могли уйти")]
+    assert p2p._bc_stale(fresh_b, make_ad("Bybit", "sell", 90.0), snap) == []
+
+
+def test_reserves_are_computed_once_per_snapshot():
+    rows = _banks("sell", 92.0, 600.0, ["Сбербанк", "T-Bank"])
+    snap = _snap({("BestChange", "sell", "USDT"): rows, ("Bybit", "buy", "USDT"): [make_ad(orders=5000)]})
+    first = p2p._bc_reserves(snap)
+    assert first == {("sell", "USDT", "TRC20"): {"ex1 [TRC20]": {"Сбербанк": 600.0, "T-Bank": 600.0}}}
+    b = make_ad("Bybit", "buy", 89.0, orders=5000)
+    for s in rows:
+        p2p._risks((2.0, b, s, ""), _cfg(), snap)
+    assert p2p._bc_reserves(snap) is first                              # не пересчитывается на каждой связке
+    # новый снимок с другими стаканами (replace, как в depth_for_deal) — своя карта
+    more = dataclasses.replace(snap, groups={("BestChange", "sell", "USDT"): _banks("sell", 92.0, 900.0, ["ВТБ"])})
+    assert p2p._bc_reserves(more) == {("sell", "USDT", "TRC20"): {"ex1 [TRC20]": {"ВТБ": 900.0}}}
+    assert p2p._bc_reserves(snap) is first
+    snap.groups = {}                                                    # подставили другие стаканы — пересчёт
+    assert p2p._bc_reserves(snap) == {}
 
 
 def _zip(exch):
