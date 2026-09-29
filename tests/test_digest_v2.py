@@ -171,3 +171,91 @@ def test_digest_still_sent_when_paper_db_fails(monkeypatch, tmp_path):
     monkeypatch.setattr(B.paper, "summary_since", lambda since: (_ for _ in ()).throw(RuntimeError("database is locked")))
     text = bot.night_digest_text([(deal(3.0), p2p.Config())], msk(23, 23), msk(9))
     assert "Топ-3 связки за ночь" in text and "Сухой прогон" not in text
+
+
+# --- правки по ревью координатора: сбой сводки прогона, повтор недоставленного дайджеста, обрезка по строкам ---
+
+def test_paper_digest_lines_empty_when_summary_fails(monkeypatch, tmp_path):
+    bot, _, _ = _bot(monkeypatch, tmp_path)
+    monkeypatch.setattr(B.paper, "summary_since", lambda since: (_ for _ in ()).throw(RuntimeError("locked")))
+    assert bot.paper_digest_lines(msk(9)) == []
+
+
+class Flaky(Stub):
+    """sendMessage отвечает по очереди из replies; остальные вызовы — ok."""
+    def __init__(self, cfg, replies):
+        super().__init__(cfg)
+        self.replies = list(replies)
+
+    async def call(self, method, **p):
+        self.out.append((method, p))
+        if method == "sendMessage" and self.replies:
+            return self.replies.pop(0)
+        return {"ok": True, "result": {"message_id": 1}}
+
+
+def _night(monkeypatch, bot):
+    monkeypatch.setattr(B, "in_quiet_hours", lambda hours: B.time.time() < msk(9))
+    monkeypatch.setattr(B.time, "time", lambda: msk(2))
+    arun(bot.quiet_and_pause_tick(p2p.Snapshot(88.0, "t", {}, {}, [deal(4.0)], {}, {}, {})))
+    assert bot.night_deals and bot.quiet_since == msk(2)
+
+
+def test_undelivered_digest_keeps_night_data_and_retries_later(monkeypatch, tmp_path):
+    _bot(monkeypatch, tmp_path, paper_on=False)
+    bot = Flaky(p2p.Config(min_profit=1.0), [{"ok": False, "error_code": 502, "description": "Bad Gateway"}])
+    bot.quiet_on = True
+    _night(monkeypatch, bot)
+    empty = p2p.Snapshot(88.0, "t", {}, {}, [], {}, {}, {})
+    monkeypatch.setattr(B.time, "time", lambda: msk(9))
+    arun(bot.quiet_and_pause_tick(empty))                     # 502 — не доставлено
+    assert bot.night_deals and bot.quiet_since == msk(2) and bot.digest_pending
+    monkeypatch.setattr(B.time, "time", lambda: msk(9) + 60)
+    arun(bot.quiet_and_pause_tick(empty))                     # повтор не на каждом скане
+    assert len([m for m, _ in bot.out if m == "sendMessage"]) == 1
+    monkeypatch.setattr(B.time, "time", lambda: msk(9) + B.DIGEST_RETRY)
+    arun(bot.quiet_and_pause_tick(empty))                     # после паузы — ушёл, данные очищены
+    sent = [p["text"] for m, p in bot.out if m == "sendMessage"]
+    assert len(sent) == 2 and "+4.00%" in sent[-1] and "(02:00–09:10 МСК)" in sent[-1]   # начало ночи сохранено
+    assert bot.night_deals == {} and bot.quiet_since is None and not bot.digest_pending
+    arun(bot.quiet_and_pause_tick(empty))
+    assert len([m for m, _ in bot.out if m == "sendMessage"]) == 2
+
+
+def test_digest_build_error_keeps_data(monkeypatch, tmp_path):
+    _bot(monkeypatch, tmp_path, paper_on=False)
+    bot = Flaky(p2p.Config(min_profit=1.0), [])
+    bot.quiet_on = True
+    _night(monkeypatch, bot)
+    monkeypatch.setattr(B.Bot, "night_digest_text", lambda self, d, a, b: (_ for _ in ()).throw(ValueError("x")))
+    monkeypatch.setattr(B.time, "time", lambda: msk(9))
+    arun(bot.quiet_and_pause_tick(p2p.Snapshot(88.0, "t", {}, {}, [], {}, {}, {})))
+    assert bot.night_deals and bot.digest_pending and bot.digest_retry_at == msk(9) + B.DIGEST_RETRY
+
+
+def test_digest_refused_permanently_is_dropped_not_retried_forever(monkeypatch, tmp_path):
+    _bot(monkeypatch, tmp_path, paper_on=False)
+    bot = Flaky(p2p.Config(min_profit=1.0), [{"ok": False, "error_code": 400, "description": "can't parse entities"}])
+    bot.quiet_on = True
+    _night(monkeypatch, bot)
+    monkeypatch.setattr(B.time, "time", lambda: msk(9))
+    arun(bot.quiet_and_pause_tick(p2p.Snapshot(88.0, "t", {}, {}, [], {}, {}, {})))
+    assert bot.night_deals == {} and not bot.digest_pending
+
+
+def test_cut_lines_keeps_whole_lines_and_tags_balanced():
+    text = "\n".join(f"<b>строка {i}</b> &amp; " + "x" * 50 for i in range(200))
+    out = B.cut_lines(text, B.DIGEST_MAX)
+    assert len(out) <= B.DIGEST_MAX and out.endswith("\n…")
+    assert out.count("<b>") == out.count("</b>") and "&amp" in out and not out.rstrip("…\n").endswith("&")
+    assert B.cut_lines("короткий", 100) == "короткий"
+    one = B.cut_lines("<b>" + "a&amp;b" * 1000 + "</b>", 50)            # одна длинная строка — без тегов
+    assert len(one) <= 50 and "<b>" not in one and one.endswith("…") and "&amp;" in one
+
+
+def test_digest_text_over_limit_is_cut_by_lines(monkeypatch, tmp_path):
+    bot, _, _ = _bot(monkeypatch, tmp_path, paper_on=False)
+    monkeypatch.setattr(B.Bot, "paper_digest_lines",
+                        lambda self, now=None: [f"<b>причина {i}</b> — " + "y" * 60 for i in range(100)])
+    text = bot.night_digest_text([(deal(3.0), p2p.Config())], msk(23, 23), msk(9))
+    assert len(text) <= B.DIGEST_MAX and text.count("<b>") == text.count("</b>") and text.endswith("…")
