@@ -342,6 +342,10 @@ def build_backtest(result, assets, mins, venues=("bybit",), sha="", now=None):
     return doc, notes
 
 
+_run_process = subprocess.run              # процессы запускаются только здесь; тесты подменяют эту ссылку
+_ProcessTimeout = subprocess.TimeoutExpired
+
+
 def _child_env(environ=None):
     """Окружение для research.report: только PATH, SYSTEMROOT, TEMP/TMP, USERPROFILE и PYTHONIOENCODING. Остальное
     (ключи, токены, любые чужие переменные из .env) бэктесту не нужно и в дочерний процесс не идёт."""
@@ -355,8 +359,8 @@ def _run_report(cmd, cwd):
     """Запуск research.report отдельным процессом (вывод — в консоль владельца) с минимальным окружением и таймаутом
     REPORT_TIMEOUT; код возврата. Таймаут — ValueError: процесс остановлен, ничего не записывается."""
     try:
-        return subprocess.run(cmd, cwd=cwd, check=False, env=_child_env(), timeout=REPORT_TIMEOUT).returncode
-    except subprocess.TimeoutExpired:
+        return _run_process(cmd, cwd=cwd, check=False, env=_child_env(), timeout=REPORT_TIMEOUT).returncode
+    except _ProcessTimeout:
         raise ValueError(f"research.report не уложился в {REPORT_TIMEOUT} с и остановлен — ничего не записано")
 
 

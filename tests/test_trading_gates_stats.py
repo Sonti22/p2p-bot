@@ -750,8 +750,8 @@ def test_backtest_timeout_writes_nothing(tmp_path, capsys, monkeypatch):
 
     def slow(cmd, **kw):
         seen.update(kw)
-        raise tgs.subprocess.TimeoutExpired(cmd, kw.get("timeout"))
-    monkeypatch.setattr(tgs.subprocess, "run", slow)
+        raise tgs._ProcessTimeout(cmd, kw.get("timeout"))
+    monkeypatch.setattr(tgs, "_run_process", slow)
     assert run_main(root, "--backtest") == 2                                    # runner не задан — настоящий _run_report
     out = capsys.readouterr().out
     assert seen["timeout"] == 900 == tgs.REPORT_TIMEOUT and seen["check"] is False and seen["cwd"] == root
@@ -761,7 +761,7 @@ def test_backtest_timeout_writes_nothing(tmp_path, capsys, monkeypatch):
 
 def test_child_env_is_minimal_no_keys(monkeypatch):
     for name, value in (("BYBIT_API_KEY", "k-test"), ("BYBIT_API_SECRET", "s-test"), ("TELEGRAM_BOT_TOKEN", "t-test"),
-                        ("FOO", "bar"), ("HTTPS_PROXY", "http://proxy.invalid"), ("PYTHONPATH", "x"),
+                        ("FOO", "bar"), ("HTTPS_PROXY", "proxy-test"), ("PYTHONPATH", "x"),
                         ("PATH", "p-test"), ("SYSTEMROOT", "r-test"), ("TEMP", "t1"), ("TMP", "t2"), ("USERPROFILE", "u")):
         monkeypatch.setenv(name, value)
     env = tgs._child_env()
@@ -786,7 +786,7 @@ def test_default_runner_passes_minimal_env_and_command(tmp_path, monkeypatch):
         with open(os.path.join(cmd[cmd.index("--out") + 1], "backtest_report.json"), "w", encoding="utf-8") as f:
             json.dump({"hedge": synthetic_result()}, f)
         return Done()
-    monkeypatch.setattr(tgs.subprocess, "run", fake_run)
+    monkeypatch.setattr(tgs, "_run_process", fake_run)
     assert run_main(root, "--backtest") == 0
     assert got["timeout"] == 900 and got["cwd"] == root and got["cmd"][:3] == [sys.executable, "-m", "research.report"]
     assert "BYBIT_API_KEY" not in got["env"] and "FOO" not in got["env"] and "PYTHONPATH" not in got["env"]
