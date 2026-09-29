@@ -17,7 +17,8 @@ from datetime import datetime, timezone, timedelta
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(HERE, "data")
 FILES = ("trades.db", "blacklist.db", "alerts.db", "history.db", "paper.db", "favorites.json", "presets.json",
-         "hedge_circles.db")   # хеджи кругов (trading/hedge.py): открытые шорты и их итог
+         "hedge_circles.db",   # хеджи кругов (trading/hedge.py): открытые шорты и их итог
+         "trading.db")         # журнал ордеров торгового ядра: позиции бота, результат дня (WAL — копия через backup API)
 KEEP_DEFAULT = 7
 EVERY = 86400                     # сек — не чаще раза в сутки
 MSK = timezone(timedelta(hours=3))

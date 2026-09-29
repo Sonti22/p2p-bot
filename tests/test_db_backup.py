@@ -58,6 +58,37 @@ def test_run_copies_hedge_circles_db(tmp_path, monkeypatch):
     con.close()
 
 
+def test_run_copies_core_journal_in_wal_with_a_live_writer(tmp_path, monkeypatch):
+    """Журнал ордеров ядра (data/trading.db) — в WAL, и бот держит его открытым и пишет. sqlite3 backup API снимает
+    согласованную копию: закоммиченное (ещё в -wal, без checkpoint) — есть, незакоммиченное пишущего — нет; копия не
+    ждёт и не ломает пишущего, а его коммит после копии проходит."""
+    _fresh(monkeypatch)
+    monkeypatch.delenv("BACKUP_KEEP", raising=False)
+    data = _data(tmp_path)
+    src = os.path.join(data, "trading.db")
+    writer = sqlite3.connect(src, isolation_level=None, timeout=0)
+    try:
+        assert writer.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+        writer.execute("PRAGMA wal_autocheckpoint=0")                         # всё закоммиченное — только в -wal
+        writer.execute("CREATE TABLE orders (client_id TEXT, state TEXT)")
+        writer.execute("INSERT INTO orders VALUES ('t1', 'filled')")
+        assert os.path.getsize(src + "-wal") > 0
+        writer.execute("BEGIN IMMEDIATE")                                    # пишущий держит транзакцию во время копии
+        writer.execute("INSERT INTO orders VALUES ('t2', 'sending')")
+        dest, files = backup.run(NOW, data)
+        writer.execute("COMMIT")                                             # и спокойно её завершает
+        assert writer.execute("SELECT COUNT(*) FROM orders").fetchone()[0] == 2
+    finally:
+        writer.close()
+    assert "trading.db" in files
+    copy = sqlite3.connect(os.path.join(dest, "trading.db"))
+    try:
+        assert copy.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert copy.execute("SELECT client_id, state FROM orders").fetchall() == [("t1", "filled")]
+    finally:
+        copy.close()
+
+
 def test_rotation_keeps_last_n_and_ignores_foreign_dirs(tmp_path, monkeypatch):
     monkeypatch.setenv("BACKUP_KEEP", "2")
     data = _data(tmp_path)
