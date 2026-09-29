@@ -1396,6 +1396,28 @@ def direction_lines(rows, limit=STATS_DIRECTIONS):
     return lines
 
 
+OUTAGE_DAYS = 7            # /status «Подробно»: недоступность площадок за столько дней
+OUTAGE_MIN_SECONDS = 60    # короче — разовый сбой скана, в сводку не идёт
+
+
+def _dur(sec):
+    sec = int(sec)
+    return f"{sec // 3600} ч {sec % 3600 // 60} мин" if sec >= 3600 else f"{max(1, sec // 60)} мин"
+
+
+def outage_lines(stats, days=OUTAGE_DAYS):
+    """Строки «Недоступность площадок за N дн.» из history.outage_stats: сначала дольше всех недоступные. [] — простоев
+    не было."""
+    if not stats:
+        return []
+    lines = ["", f"📉 <b>Недоступность площадок за {days} дн.</b> (простои от {OUTAGE_MIN_SECONDS // 60} мин):"]
+    for venue, r in sorted(stats.items(), key=lambda kv: (-kv[1]["total"], kv[0])):
+        name = VENUE_NAMES.get(venue, venue)
+        lines.append(f"• {html.escape(name)}: {r['count']} раз, всего {_dur(r['total'])}, дольше всего "
+                     f"{_dur(r['longest'])}" + (f", с алертом {r['alerted']}" if r["alerted"] else ""))
+    return lines
+
+
 def market_status_view(snap, cfg):
     """Текст закреплённого сообщения «Статус рынка»: ориентир курса, лучшая связка, площадки ок/недоступны."""
     lines = ["📌 <b>Статус рынка</b>", "", f"Ориентир USDT: {snap.ref:.2f} ₽ ({html.escape(snap.ref_src)})"]
@@ -2708,6 +2730,10 @@ class Bot:
         speed = self.speed.summary()
         if speed:
             lines += [""] + speed_lines(speed, self.cfg.venue_timeout)
+        try:
+            lines += outage_lines(history.outage_stats(OUTAGE_DAYS, min_seconds=OUTAGE_MIN_SECONDS))
+        except Exception as e:
+            logger.warning("outage stats: %s", e)
         return "\n".join(lines)
 
     async def update_market_status(self, snap):
@@ -2967,15 +2993,22 @@ class Bot:
             st = self.venue.setdefault(ex, {"streak": 0, "down_since": None, "alerted_at": None})
             if ex in failed:
                 st["streak"] += 1
+                st["reason"] = failed[ex]
                 st["down_since"] = st["down_since"] or now
                 trouble = st["streak"] >= VENUE_FAIL_STREAK or now - st["down_since"] > VENUE_DOWN_AFTER
                 if trouble and (not st["alerted_at"] or now - st["alerted_at"] > VENUE_ALERT_COOLDOWN):
                     st["alerted_at"] = now
                     await self.send(f"⚠️ {ex}: недоступна ({failed[ex]})", topic="dev")
             else:
+                if st["down_since"]:   # эпизод простоя закончился — в историю (после рестарта счётчики обнуляются)
+                    try:
+                        history.record_outage(ex, st["down_since"], now, st["streak"], bool(st["alerted_at"]),
+                                              st.get("reason", ""))
+                    except Exception as e:
+                        logger.warning("outage history: %s", e)
                 if st["alerted_at"]:
                     await self.send(f"✅ {ex}: снова доступна", topic="dev")
-                st.update(streak=0, down_since=None, alerted_at=None)
+                st.update(streak=0, down_since=None, alerted_at=None, reason="")
 
     @staticmethod
     def _deal_key(d):
