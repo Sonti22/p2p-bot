@@ -3,19 +3,23 @@
 Решение владельца: торговля на ОСНОВНЫХ аккаунтах Bybit и BingX отдельными торговыми ключами без вывода и переводов;
 ручные позиции и ордера владельца бот не трогает (проверки владения — в journal/ownership).
 
-- `startup` — при старте: выключатель и режим уже взяты из .env (bot.main → switch.switch_from_file); journal.resume;
-  проверка прав торговых ключей у самих бирж (keys.startup_check). Ключ с лишними правами (вывод, переводы…) — торговля
-  выключена (TRADING=0 в процессе); TRADING=1, а годного ключа нет — тоже. Режим маржи (Bybit — на аккаунт) и
-  risk.startup_warnings — одним сообщением владельцу.
-- `loop` — отдельной задачей бота: раз в INTERVAL с journal.reconcile (если есть проверенные ключи), дневной стоп —
-  событием, доставка outbox владельцу понятным текстом (доставленным событие помечается только после ok Telegram),
-  trading_state.json для launcher. Сбой ядра бота не роняет: лог, одна тревога, пауза FAIL_PAUSE.
+- `run` — отдельной задачей бота (bot.main): `startup`, затем `loop`. Запросы к биржам при старте не задерживают скан,
+  команды и выплаты.
+- `startup` — при старте: выключатель и режим уже взяты из .env (bot.main → switch.switch_from_file); journal.resume
+  (если база журнала есть); проверка прав торговых ключей у самих бирж (keys.startup_check). Ключ с лишними правами
+  (вывод, переводы…) — торговля выключена (TRADING=0 в процессе); TRADING=1, а годного ключа нет — тоже. Режим маржи
+  (Bybit — на аккаунт), risk.startup_warnings и лимиты выше этапа владельца — одним сообщением владельцу.
+- `loop` — раз в INTERVAL с: выключатель заново из .env (только выключает/понижает: launcher пишет TRADING=0, пока
+  старый бот работает), journal.reconcile (если есть проверенные ключи), дневной стоп — событием, trading_state.json
+  для launcher, доставка outbox владельцу понятным текстом в «📒 Журнал» (доставленным событие помечается только после
+  ok Telegram; доставка идёт, даже если шаг до неё упал). Сбой ядра бота не роняет: лог, одна тревога, пауза
+  FAIL_PAUSE.
 - `command` (/trading) и `callback` (кнопки trd_*) — только владельцу: их вызывает bot.py после _owner_gate (личный чат
   владельца); гостю и группе они недоступны.
 - `request_order` — единственный путь реального открытия из бота: карточка владельцу с точным ордером и кнопками
   trd_ok/trd_no. Токен одноразовый, живёт TOKEN_TTL, привязан к намерению (ордер, стратегия, группа) и к сообщению с
-  кнопками. По «✅» — journal.submit фоновой задачей (ядро само ещё раз проверяет выключатель, режим, ключ, лимиты и
-  чужое). Стратегий здесь нет: request_order никто в боте пока не вызывает.
+  кнопками. По «✅» — выключатель заново из .env, затем journal.submit фоновой задачей (ядро само ещё раз проверяет
+  выключатель, режим, ключ, лимиты и чужое). Стратегий здесь нет: request_order никто в боте пока не вызывает.
 - «⛔ Стоп торговли» — switch.stop_and_persist (TRADING=0, TRADING_MODE=paper в .env) и отмена всех висящих токенов.
   Режим из Telegram — только понизить (switch.lower_and_persist).
 """
@@ -31,11 +35,17 @@ from trading import journal, keys, risk, switch, venues
 
 logger = logging.getLogger(__name__)
 
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ENV_PATH = os.path.join(ROOT, ".env")   # тот же файл, что bot.ENV_PATH: выключатель перечитывается на лету (только вниз)
 INTERVAL = 30          # сек между сверками (journal.reconcile)
 FAIL_PAUSE = 300       # сек паузы после сбоя ядра
 TOKEN_TTL = 120        # сек жизни кнопки подтверждения ордера
 RECHECK_AFTER = keys.CHECK_TTL // 2   # сек: проверка прав ключа старше — перепроверить у биржи (живёт CHECK_TTL)
 RECHECK_RETRY = 600    # сек: перепроверка не удалась — следующая попытка не раньше
+TOPIC = "journal"      # события, тревоги и итоги ордеров — в «📒 Журнал» (как выплаты), а не туда, где писали последним
+# этап владельца (решение 2026-09-28): confirm, лот ~20–50 USDT, дневной убыток 5 USDT. Потолки кода для confirm/auto
+# выше (risk.HARD) — если .env их не понизил, владельцу предупреждение при старте и в /trading
+STAGE = {"position_usdt": Decimal(50), "daily_loss_usdt": Decimal(5)}
 VENUE_NAMES = {venues.BYBIT: "Bybit", venues.BINGX: "BingX"}
 MODE_NAMES = {"paper": "бумага (реальных ордеров нет)", "minlot": "минимальный лот, по кнопке",
               "confirm": "по кнопке", "auto": "автомат"}
@@ -110,11 +120,28 @@ async def _margin_modes(s, usable):
     return out
 
 
+def stage_warnings():
+    """Режим confirm/auto, а потолки позиции или дневного убытка выше этапа владельца (STAGE) — .env их не понизил
+    (TRADING_MAX_POSITION_USDT, TRADING_DAILY_LOSS_USDT): предупреждение. Другие режимы — потолки minlot, пусто."""
+    mode = switch.mode()
+    if mode not in ("confirm", "auto"):
+        return []
+    pos = max(risk.limits(st, mode)["position_usdt"] for st in risk.STRATEGIES)
+    loss = risk.limits("hedge", mode)["daily_loss_usdt"]
+    if pos <= STAGE["position_usdt"] and loss <= STAGE["daily_loss_usdt"]:
+        return []
+    return [f"режим {mode}: действуют потолки кода — позиция до {venues.fmt(pos)} USDT, дневной убыток до "
+            f"{venues.fmt(loss)} USDT; решение владельца — лот 20–50 USDT и 5 USDT в день: задайте в .env на ПК "
+            f"TRADING_MAX_POSITION_USDT={venues.fmt(STAGE['position_usdt'])} и "
+            f"TRADING_DAILY_LOSS_USDT={venues.fmt(STAGE['daily_loss_usdt'])} (см. .env.example)"]
+
+
 async def startup(bot):
     """Старт подключения; → текст сообщения владельцу (он же отправляется, если есть чат) или ""."""
     link = link_of(bot)
     try:
-        journal.resume()
+        if os.path.exists(journal.DB_PATH):   # новой базе разбирать нечего — без торговли её не создаём
+            journal.resume()
     except Exception as e:   # noqa: BLE001 — база занята/испорчена: торговля выключена, бот работает
         switch.disable()
         link.warnings.append(f"журнал ордеров не открылся ({type(e).__name__}) — торговля выключена")
@@ -138,13 +165,33 @@ async def startup(bot):
         lines.append("⛔ TRADING=1, но проверенного торгового ключа нет — торговля выключена. Ключ вводится на ПК: "
                      "python scripts/trading_keys.py.")
     link.warnings += risk.startup_warnings(await _margin_modes(bot.s, usable), link.checks)
+    # торговля осталась включённой — лимиты выше этапа владельца видны сразу (в /trading — по текущему режиму)
+    stage = stage_warnings() if switch.enabled() else []
     if not (have or switch.enabled() or lines or link.warnings):
         return ""
     head = f"🤖 <b>Торговое ядро</b>: {status_line()}"
-    text = "\n".join([head] + lines + [f"• {_esc(w)}" for w in link.warnings])
+    text = "\n".join([head] + lines + [f"• {_esc(w)}" for w in link.warnings + stage])
     if bot.chat_id:
-        await bot.send(text)
+        try:
+            await bot.send(text, topic=TOPIC)
+        except Exception as e:   # noqa: BLE001 — сеть/Telegram: торговлю из-за этого не выключаем (всё видно в /trading)
+            logger.warning("trading startup message: %s", type(e).__name__)
     return text
+
+
+async def run(bot):
+    """Задача бота (bot.main): старт подключения, затем цикл сверки. Старт — здесь, а не до циклов бота: проверка
+    ключей и режима маржи у бирж (до REQUEST_TIMEOUT на запрос) не задерживает скан, команды и выплаты. Кнопок
+    подтверждения до старта нет (request_order никто не вызывает, токены после перезапуска не живут), а сверка идёт
+    только после старта. Сбой старта — торговля выключена, цикл всё равно идёт (сопровождение позиций бота)."""
+    try:
+        await startup(bot)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:   # noqa: BLE001 — ядро не должно ронять бота
+        switch.disable()
+        logger.error("trading startup: %s", type(e).__name__)
+    await loop(bot)
 
 
 def status_line():
@@ -174,7 +221,7 @@ async def deliver(bot, limit=20):
     done = 0
     for ev in journal.pending_events(limit):
         try:
-            r = await bot.send(event_text(ev))
+            r = await bot.send(event_text(ev), topic=TOPIC)
         except Exception as e:   # noqa: BLE001 — сеть: попробуем в следующем цикле
             logger.warning("trading event send: %s", type(e).__name__)
             break
@@ -216,6 +263,25 @@ def sweep_tokens(link, now=None):
         link.tokens.pop(t, None)
 
 
+def reread_switch(link):
+    """TRADING и TRADING_MODE заново из .env на ПК: launcher пишет туда TRADING=0 перед обновлением, пока старый бот
+    ещё работает (смоук — минуты, а при провале — до перезапуска). switch.switch_from_file только выключает и
+    понижает — поднять режим из файла на лету нельзя. Открывать нельзя — висящие кнопки подтверждения гасим. Сбой
+    чтения — торговля выключена (fail closed). → (можно ли открывать, причина)."""
+    was = switch.can_open()[0]
+    try:
+        switch.switch_from_file(ENV_PATH)
+    except Exception as e:   # noqa: BLE001 — разбор файла сам ловит OSError/ValueError; прочее — выключить
+        switch.disable()
+        logger.error("trading switch reread: %s", type(e).__name__)
+    ok, why = switch.can_open()
+    if not ok:
+        if was:
+            logger.warning("trading: .env turned opening off (%s)", "TRADING" if not switch.enabled() else "mode")
+        link.tokens.clear()
+    return ok, why
+
+
 async def refresh_keys(bot, now=None):
     """Перепроверить у биржи права ключей, проверка которых старше RECHECK_AFTER, не прошла или ключ заменён (keys —
     fail closed: через CHECK_TTL без перепроверки ключом не пользуется никто, и сверка позиций бота встала бы).
@@ -248,23 +314,49 @@ async def refresh_keys(bot, now=None):
 
 
 async def tick(bot, now=None):
-    """Один шаг цикла: перепроверка устаревших ключей, сверка (если есть проверенные ключи; позиции есть, а ключей нет —
-    тревога), дневной стоп, состояние для launcher, доставка событий."""
+    """Один шаг цикла: выключатель из .env, перепроверка устаревших ключей, сверка (если есть проверенные ключи;
+    позиции есть, а ключей нет — тревога), дневной стоп, состояние для launcher, доставка событий. Доставка идёт, даже
+    если шаг до неё упал: иначе сбой записи trading_state.json или сверки навсегда держал бы в outbox stop_breached,
+    foreign и прочее. Сбой ключей или сверки — после доставки исключением в loop (одна тревога, пауза); сбой дневного
+    стопа или trading_state.json — только лог."""
     now = time.time() if now is None else now
     link = link_of(bot)
     sweep_tokens(link, now)
-    raw = any(keys.raw_credentials(v) for v in venues.VENUES)
+    reread_switch(link)
+    failed = None
+    try:
+        raw = any(keys.raw_credentials(v) for v in venues.VENUES)
+    except Exception as e:   # noqa: BLE001 — ключи не прочитать (DPAPI и т. п.): события всё равно доставим
+        raw, failed = None, e
     if not raw and not os.path.exists(journal.DB_PATH):
+        if failed is not None:
+            raise failed
         return   # торговлей не пользовались: базу журнала не создаём
     if raw:
-        await refresh_keys(bot, now)
-    if has_keys():
-        await journal.reconcile(bot.s, creds_for)
-    elif journal.active() or journal._exposure_symbols():
-        journal.emit("unmanaged", "", dedup=f"unmanaged|{int(now // 3600)}")
-    check_day_stop()
-    write_state()
+        try:
+            await refresh_keys(bot, now)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:   # noqa: BLE001 — перепроверка не удалась: сверка по ещё годным ключам идёт
+            failed = e
+    if raw is not None:
+        try:
+            if has_keys():
+                await journal.reconcile(bot.s, creds_for)
+            elif journal.active() or journal._exposure_symbols():
+                journal.emit("unmanaged", "", dedup=f"unmanaged|{int(now // 3600)}")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:   # noqa: BLE001
+            failed = failed or e
+    for step in (check_day_stop, write_state):
+        try:
+            step()
+        except Exception as e:   # noqa: BLE001 — не прерывает тик: доставка ниже
+            logger.error("trading %s: %s", step.__name__, type(e).__name__)
     await deliver(bot)
+    if failed is not None:
+        raise failed
     link.alarmed = False
 
 
@@ -285,7 +377,7 @@ async def loop(bot):
                 try:
                     await bot.send(f"⚠️ <b>Торговое ядро</b>: сбой сверки ({_esc(type(e).__name__)}) — повторю через "
                                    f"{FAIL_PAUSE // 60} мин. Новые открытия ядро само запрещает, пока сверка не "
-                                   "пройдёт.")
+                                   "пройдёт.", topic=TOPIC)
                 except Exception:   # noqa: BLE001
                     pass
         await asyncio.sleep(FAIL_PAUSE)
@@ -331,8 +423,9 @@ def view(bot):
     if pnl <= -lim:
         block.append("дневной стоп")
     lines += ["", "<b>Блокировки</b>: " + ("нет" if not block else "")] + [f"• {_esc(b)}" for b in block]
-    if link.warnings:
-        lines += ["", "<b>Предупреждения</b>:"] + [f"• {_esc(w)}" for w in link.warnings]
+    warns = link.warnings + stage_warnings()
+    if warns:
+        lines += ["", "<b>Предупреждения</b>:"] + [f"• {_esc(w)}" for w in warns]
     lines += ["", "<b>Пороги</b> (самый рискованный режим, который они разрешают):"]
     for st in risk.STRATEGIES:
         try:
@@ -414,26 +507,28 @@ def take_token(link, token, message_id, now=None):
     return rec, ""
 
 
-async def _submit(bot, rec):
+async def _submit(bot, rec, thread=None):
+    """Фоновая отправка подтверждённого ордера; итог — владельцу в thread (топик, где нажали «✅»: cur_thread к концу
+    отправки мог смениться)."""
     order = rec["order"]
-    ok, why = switch.can_open()
+    ok, why = reread_switch(link_of(bot))   # .env мог стать TRADING=0 между нажатием и отправкой
     creds = creds_for(order.venue)
     if not ok or not creds:
-        await bot.send(f"✖️ Ордер не отправлен: {_esc(why or 'нет проверенного торгового ключа')}")
+        await bot.send(f"✖️ Ордер не отправлен: {_esc(why or 'нет проверенного торгового ключа')}", thread=thread)
         return None
     try:
         res = await journal.submit(bot.s, order, creds, purpose="open", strategy=rec["strategy"], group=rec["group"],
                                    mode=switch.mode())
     except Exception as e:   # noqa: BLE001
         logger.error("trading submit: %s", type(e).__name__)
-        await bot.send(f"⚠️ Ордер: сбой отправки ({_esc(type(e).__name__)}) — исход выяснит сверка")
+        await bot.send(f"⚠️ Ордер: сбой отправки ({_esc(type(e).__name__)}) — исход выяснит сверка", thread=thread)
         return None
     state = res.get("state")
     icon = {"open": "✅", "filled": "✅", "closed": "✅", "refused": "✖️", "rejected": "↩️"}.get(state, "❓")
     text = f"{icon} Ордер: {_esc(state)}\n{order_text(order, rec['strategy'], rec['group'])}"
     if res.get("reason"):
         text += f"\n{_esc(res['reason'])}"
-    await bot.send(text)
+    await bot.send(text, thread=thread)
     return res
 
 
@@ -455,18 +550,18 @@ async def callback(bot, cq, data, save_env):
     msg = cq.get("message") or {}
     toast = ""
     if data.startswith("trd_ok:"):
-        rec, why = take_token(link_of(bot), data[7:], msg.get("message_id"))
-        if rec is None:
+        link = link_of(bot)
+        ok, _ = reread_switch(link)   # TRADING=0 в .env (launcher, владелец) — кнопки погашены, ничего не уходит
+        rec, why = take_token(link, data[7:], msg.get("message_id"))
+        if not ok:
+            toast = "торговля выключена — ордер не отправлен"
+        elif rec is None:
             toast = why
         else:
-            ok, why = switch.can_open()
-            if not ok:
-                toast = "торговля выключена — ордер не отправлен"
-            else:
-                toast = "отправляю ордер"
-                task = asyncio.ensure_future(_submit(bot, rec))
-                link_of(bot).tasks.add(task)
-                task.add_done_callback(link_of(bot).tasks.discard)
+            toast = "отправляю ордер"
+            task = asyncio.ensure_future(_submit(bot, rec, bot.thread_for(None)))
+            link.tasks.add(task)
+            task.add_done_callback(link.tasks.discard)
     elif data.startswith("trd_no:"):
         link_of(bot).tokens.pop(data[7:], None)
         toast = "ордер отменён"

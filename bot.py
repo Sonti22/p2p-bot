@@ -4363,12 +4363,8 @@ async def main():
             await bot.setup_topics()
             await bot.check_key_safety()
         bot.perp_task = asyncio.ensure_future(bot.perp_loop())   # публичные данные перпов — своим циклом (perp.py)
-        try:   # торговое ядро: ключи, предупреждения — одно сообщение владельцу; сбой бот не роняет
-            await trading.wiring.startup(bot)
-        except Exception as e:
-            trading.switch.disable()
-            logger.error("trading startup: %s", type(e).__name__)
-        bot.trading_task = asyncio.ensure_future(trading.wiring.loop(bot))   # сверка ядра — своим циклом
+        # торговое ядро: старт (ключи у бирж, предупреждения — одно сообщение) и сверка — своей задачей, скан не ждёт
+        bot.trading_task = asyncio.ensure_future(trading.wiring.run(bot))
         bot.watchdog_task = asyncio.ensure_future(bot.watchdog_loop())   # «скан стоит» — своей задачей
         logger.info("Бот запущен: каждые %ss, порог %g%%, биржи %s", cfg.interval, cfg.min_profit,
                     ', '.join(cfg.exchanges))

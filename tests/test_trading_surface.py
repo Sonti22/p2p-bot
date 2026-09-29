@@ -186,10 +186,10 @@ TRADING_LINES_APPROVED = {   # подключение ядра к боту (ве
         'TRADING=0',
         'TRADING_MODE=paper',
         'TRADING_SHORT_PAPER=0',
-        'TRADING_MAX_LEVERAGE=',
-        'TRADING_MAX_POSITION_USDT=',
-        'TRADING_MAX_TOTAL_USDT=',
-        'TRADING_DAILY_LOSS_USDT=',
+        'TRADING_MAX_LEVERAGE=2',          # этап владельца (confirm): плечо 2, лот 50, всего 100, день 5 USDT
+        'TRADING_MAX_POSITION_USDT=50',
+        'TRADING_MAX_TOTAL_USDT=100',
+        'TRADING_DAILY_LOSS_USDT=5',
         'TRADING_MAX_ORDERS_PER_MIN=',
         'TRADING_MAX_ORDERS_PER_DAY=',
         'TRADING_MINLOT_POSITION_USDT=',
@@ -201,9 +201,7 @@ TRADING_LINES_APPROVED = {   # подключение ядра к боту (ве
         'await trading.wiring.command(self, arg)',
         'trading.switch.switch_from_file(ENV_PATH)   # торговля: TRADING и TRADING_MODE — только из .env, извне не поднять',
         'trading.gates.flags_from_file(ENV_PATH)     # флаг владельца TRADING_SHORT_PAPER — тоже только из файла .env',
-        'await trading.wiring.startup(bot)',
-        'trading.switch.disable()',
-        'bot.trading_task = asyncio.ensure_future(trading.wiring.loop(bot))   # сверка ядра — своим циклом',
+        'bot.trading_task = asyncio.ensure_future(trading.wiring.run(bot))',   # старт и сверка — своей задачей
     ],
 }
 
