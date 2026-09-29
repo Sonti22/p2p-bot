@@ -195,6 +195,10 @@ TRADING_LINES_APPROVED = {   # подключение ядра к боту (ве
         'TRADING_MINLOT_POSITION_USDT=',
         'TRADING_MINLOT_DAILY_LOSS_USDT=',
     ],
+    'backup.py': [   # суточная копия журнала ордеров ядра (sqlite3 backup API, база в WAL), ревью этапа 5
+        '"trading.db")         # журнал ордеров торгового ядра: позиции бота, результат дня (WAL — копия через backup '
+        'API)',
+    ],
     'bot.py': [
         'import trading.wiring',
         # хедж кругов (этап 5, решение владельца 29.09): карточка после «✅ Сделал» — вызов целиком одной строкой (сумма,

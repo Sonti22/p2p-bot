@@ -1095,3 +1095,153 @@ def test_opened_message_shows_filled_not_planned_qty():
 
     hid = arun(go())
     assert "шорт 0.0006 BTC" in texts(bot)[-1] and hedge.get(hid)["filled_qty"] == "0.0006"
+
+
+# --- ревью 2: восстановление частичного закрытия циклом, CAS по close_cid, снятое закрытие, биржа для «сироты» ---
+
+def test_partial_close_recovered_by_ticks_after_restart(monkeypatch):
+    """Процесс «умер» между исполнением частичного закрытия и разбором итога: строка осталась «закрывается» с id
+    ордера. Дальше — только цикл: снова «открыт», остаток закрыт, позиция 0, лишних ордеров нет."""
+    quotes()
+    book, s = _partial_exchange()
+    bot = Stub(s)
+    real = hedge._after_close
+
+    async def died(bot_, hid, res, reason, thread=None):                  # успели записать только id ордера закрытия
+        hedge._set(hid, close_cid=(res.get("row") or {}).get("client_id") or "")
+        return "died"
+
+    async def go():
+        hid = await opened(bot)
+        monkeypatch.setattr(hedge, "_after_close", died)
+        await bot.on_update(press(f"trd_hedge_close:{hid}"))
+        await settle(bot)
+        monkeypatch.setattr(hedge, "_after_close", real)
+        row = hedge.get(hid)
+        assert row["status"] == "closing" and row["close_cid"] and book.position["BTCUSDT"] == Decimal("-0.0006")
+        await hedge.tick(bot)                                              # ордер окончательный, шорт остался
+        assert hedge.get(hid)["status"] == "open" and hedge.get(hid)["close_req"] == "sold"
+        for _ in range(4):                                                 # остаток — и больше ничего
+            await hedge.tick(bot)
+        return hid
+
+    hid = arun(go())
+    bodies = [body(c) for c in creates(s)]
+    assert len(bodies) == 3 and bodies[2]["qty"] == "0.0006" and bodies[2]["reduceOnly"] is True
+    assert hedge.get(hid)["status"] == "closed" and book.position["BTCUSDT"] == 0      # ни остатка, ни лонга
+    assert len([t for t in texts(bot) if "исполнилось частично" in t]) == 1
+
+
+def test_reopen_needs_the_close_cid_the_caller_saw():
+    quotes()
+    bot = Stub(exchange()[1])
+
+    async def go():
+        hid = await offer_btc(bot)
+        db_set(hid, status="closing", nonce="", close_cid="tnewer00000000000001", close_reason="sold")
+        stale = dict(hedge.get(hid), close_cid="tolder00000000000001")   # снимок до новой попытки закрытия
+        n = len(texts(bot))
+        ok = await hedge._reopen(bot, stale, Decimal("-0.001"), Decimal("0.0004"))
+        assert len(texts(bot)) == n
+        return hid, ok
+
+    hid, ok = arun(go())
+    row = hedge.get(hid)
+    assert ok is False and row["status"] == "closing" and row["close_cid"] == "tnewer00000000000001"
+    assert row["close_req"] == ""
+    assert arun(hedge._reopen(bot, hedge.get(hid), Decimal("-0.001"), Decimal("0.0004")))   # актуальный — можно
+    assert hedge.get(hid)["status"] == "open"
+
+
+@pytest.mark.parametrize("auto", [True, False], ids=["auto_timeout", "button"])
+def test_zero_fill_cancelled_close_keeps_intent_and_retries_after_auto_retry(auto):
+    quotes()
+    book = Book()
+    seq = [book.bybit_create(status="Filled"), book.bybit_create(status="Cancelled"),
+           book.bybit_create(status="Filled")]
+    s = Session(book.routes("bybit", **{"POST /v5/order/create": seq, "POST /v5/position/set-leverage": bybit_ok({})}))
+    bot = Stub(s)
+
+    async def go():
+        hid = await opened(bot)
+        if auto:
+            db_set(hid, filled_ts=time.time() - 7 * 3600)
+            await hedge.tick(bot)                                          # авто-закрытие — биржа сняла без исполнения
+        else:
+            await bot.on_update(press(f"trd_hedge_close:{hid}"))
+            await settle(bot)
+        row = hedge.get(hid)
+        assert row["status"] == "open" and row["close_req"] == ("auto_timeout" if auto else "sold")
+        for _ in range(3):                                                 # не каждые 30 с
+            await hedge.tick(bot)
+        assert len(creates(s)) == 2
+        db_set(hid, auto_ts=time.time() - hedge.AUTO_RETRY - 1)
+        await hedge.tick(bot)
+        return hid
+
+    hid = arun(go())
+    assert hedge.get(hid)["status"] == "closed" and len(creates(s)) == 3 and book.position["BTCUSDT"] == 0
+    assert any("не исполнилось (ордер снят биржей)" in t for t in texts(bot))
+
+
+def _orphan(bot, circle=12):
+    async def go():
+        hid = await offer_btc(bot, circle)
+        old = time.time() - hedge.ORPHAN_AFTER - 1
+        db_set(hid, status="unknown", nonce="", open_cid="", sent_ts=old, unknown_ts=old)
+        await hedge.tick(bot)
+        await hedge.tick(bot)
+        return hid
+
+    return arun(go())
+
+
+def test_orphan_with_short_on_exchange_is_not_failed():
+    quotes()
+    book, s = exchange()
+    book.position["BTCUSDT"] = Decimal("-0.001")                          # на бирже шорт, журнал о нём не знает
+    bot = Stub(s)
+    hid = _orphan(bot)
+    assert hedge.get(hid)["status"] == "unknown" and creates(s) == []
+    alerts = [t for t in texts(bot) if "журнал не знает" in t]
+    assert len(alerts) == 1 and "-0.001" in alerts[0]
+
+
+def test_orphan_with_unreadable_exchange_is_not_failed():
+    quotes()
+    _, s = exchange(**{"GET /v5/position/list": Resp(502, b"")})
+    bot = Stub(s)
+    hid = _orphan(bot)
+    assert hedge.get(hid)["status"] == "unknown" and creates(s) == []
+    assert len([t for t in texts(bot) if "прочитать не удалось" in t]) == 1
+
+
+def test_orphan_with_flat_exchange_and_no_journal_row_fails():
+    quotes()
+    _, s = exchange()
+    bot = Stub(s)
+    hid = _orphan(bot)
+    assert hedge.get(hid)["status"] == "failed" and s.sent("GET", "/v5/position/list")
+    assert len([t for t in texts(bot) if "ни на бирже" in t]) == 1
+
+
+def test_auto_close_timer_falls_back_to_created_ts():
+    quotes()
+    _, s = exchange()
+    bot = Stub(s)
+
+    async def go():
+        hid = await opened(bot)
+        db_set(hid, filled_ts=None, sent_ts=None, created_ts=time.time() - 7 * 3600)
+        await hedge.tick(bot)
+        return hid
+
+    hid = arun(go())
+    assert hedge.get(hid)["status"] == "closed" and hedge.get(hid)["close_reason"] == "auto_timeout"
+
+
+def test_max_hours_minimum_is_0_1(monkeypatch):
+    assert hedge._max_hours("0.0001") == 6 and hedge._max_hours("0.09") == 6
+    assert hedge._max_hours("0.1") == 0.1 and hedge._max_hours("48") == 48 and hedge._max_hours("48.1") == 6
+    monkeypatch.setenv("HEDGE_MAX_HOURS", "0.0001")
+    assert hedge.settings()["max_hours"] == 6
