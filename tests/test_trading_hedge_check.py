@@ -146,12 +146,14 @@ def levels(checks):
 def test_happy_path_all_ok_and_read_only(tmp_path):
     s = FakeSession(routes())
     checks, errors = run(s, tmp=tmp_path)
-    assert all(c.level == thc.OK for c in checks), [(c.title, c.level, c.detail) for c in checks if c.level != thc.OK]
+    # всё ✅, кроме постоянного ⚠️: свободный USDT ядро отдельно не читает (см. test_free_usdt_is_always_a_warning)
+    rest = [(c.title, c.level) for c in checks if c.level != thc.OK]
+    assert rest == [("Свободный USDT под маржу: не проверен", thc.WARN)], rest
     assert not s.violations and not errors
     titles = [c.title for c in checks]
     for expect in ("Права ключа", "Привязка ключа к IP", "Режим маржи аккаунта: Isolated", "Режим позиций: One-Way",
-                   "Деньги на фьючерсном аккаунте", "Инструмент BTCUSDT", "Инструмент ETHUSDT", "Инструмент TONUSDT",
-                   "Ваши ручные позиции", "Часы ПК"):
+                   "Деньги на фьючерсном аккаунте", "Свободный USDT", "Инструмент BTCUSDT", "Инструмент ETHUSDT",
+                   "Инструмент TONUSDT", "Ваши ручные позиции", "Часы ПК"):
         assert any(t.startswith(expect) for t in titles), expect
     # ничего кроме чтения: пути только из списка проверки
     allowed = {"/v5/user/query-api", "/v5/account/info", "/v5/account/wallet-balance", "/v5/position/list",
@@ -167,6 +169,8 @@ def test_happy_path_render_and_exit_code(tmp_path, capsys):
     out = capsys.readouterr().out
     assert rc == 0
     assert "✅" in out and "❌ нет" in out and "Итог" in out
+    # ⚠️ есть (свободный USDT не проверен) — «готов к хеджу» без оговорки печатать нельзя
+    assert "⚠️ 1" in out and "готов, но есть предупреждения" in out and "готов к хеджу" not in out
     assert KEY not in out and SECRET not in out
     assert not s.violations
     # итог проверки ключа писался во временный файл, а не в data/ бота
@@ -311,6 +315,28 @@ def test_funds_unreadable_is_fail(tmp_path):
     assert c.level == thc.FAIL and "не прочитан" in c.detail
 
 
+def test_funds_check_says_it_compares_total_equity(tmp_path):
+    c = by_title(run(FakeSession(routes(equity="1000")), tmp=tmp_path)[0], "Деньги на фьючерсном")
+    assert c.level == thc.OK
+    assert "ОБЩИЙ капитал" in c.detail and "totalEquity" in c.detail and "свободный USDT отдельно не проверялся" in c.detail
+
+
+def test_free_usdt_is_always_a_warning(tmp_path):
+    # даже при огромном капитале: доступный баланс ядро не отдаёт (в ответе кошелька есть только totalEquity)
+    checks, _ = run(FakeSession(routes(equity="100000")), tmp=tmp_path)
+    c = by_title(checks, "Свободный USDT")
+    assert c.level == thc.WARN and "не проверен" in c.title
+    assert "125.00" in c.fix and "150–200" in c.fix and "глазами" in c.fix
+    assert by_title(checks, "Деньги на фьючерсном").level == thc.OK
+    # без ключа приватных данных нет: там уже ❌ «не проверено», отдельного ⚠️ не добавляем
+    assert not any(c.title.startswith("Свободный USDT") for c in run(FakeSession(routes()), creds=(), tmp=tmp_path)[0])
+
+
+def test_free_usdt_follows_position_and_leverage(tmp_path):
+    c = by_title(run(FakeSession(routes()), tmp=tmp_path, position=D(1000), leverage=D(2))[0], "Свободный USDT")
+    assert "500.00" in c.fix
+
+
 # --- инструменты ------------------------------------------------------------------------------------------------------
 
 def test_instrument_facts_are_reported(tmp_path):
@@ -386,6 +412,36 @@ def test_no_manual_positions_is_ok(tmp_path):
     assert by_title(run(FakeSession(routes()), tmp=tmp_path)[0], "Ваши ручные").level == thc.OK
 
 
+def test_foreign_unknown_ownership_is_never_ok_orders_unreadable(tmp_path):
+    # мутант M16: «чьё это» не решить (ордера не прочитаны) → пункт не должен быть ✅
+    s = FakeSession(routes())
+    s.routes["/v5/order/realtime"] = bybit(code=10001, msg="no orders for you")
+    c = by_title(run(s, tmp=tmp_path)[0], "Ваши ручные")
+    assert c.level == thc.FAIL and "не прочитано" in c.detail and "BTCUSDT" in c.detail and c.fix
+
+
+def test_foreign_unknown_ownership_is_never_ok_position_unreadable(tmp_path):
+    s = FakeSession(routes())
+    s.routes["/v5/position/list"] = bybit(code=10001, msg="no positions for you")
+    c = by_title(run(s, tmp=tmp_path)[0], "Ваши ручные")
+    assert c.level == thc.FAIL and "не прочитано" in c.detail
+
+
+def test_foreign_unknown_beats_found_and_ok(tmp_path):
+    # у ETH чужая позиция (⚠️), у BTC чтение не удалось: побеждает «не знаем» (❌), а не ⚠️ и не ✅
+    rows = {"ETHUSDT": [dict(flat_row("ETHUSDT"), size="0.4", side="Buy", avgPrice="2000", markPrice="2000")]}
+    s = FakeSession(routes(rows=rows))
+    ok_orders = s.routes["/v5/order/realtime"]
+    s.routes["/v5/order/realtime"] = lambda q: (bybit(code=10001, msg="no") if q["symbol"] == "BTCUSDT" else ok_orders(q))
+    c = by_title(run(s, tmp=tmp_path)[0], "Ваши ручные")
+    assert c.level == thc.FAIL and "BTCUSDT" in c.detail
+
+
+def test_foreign_check_pure_missing_snapshot_is_fail():
+    c = thc.foreign_check(["BTCUSDT"], {})
+    assert c.level == thc.FAIL and "не читалось" in c.detail and c.level != thc.OK
+
+
 # --- часы -------------------------------------------------------------------------------------------------------------
 
 def test_clock_skew_error_is_fail_with_sync_fix(tmp_path):
@@ -429,6 +485,31 @@ def test_render_shows_fix_for_fail_and_warn_only(tmp_path):
     assert text.count("Что сделать:") == sum(1 for c in checks if c.level != thc.OK and c.fix)
     assert "❌" in lines[-3] or any(line.startswith("Итог: ❌") for line in lines)
     assert "Скрипт только читает" in lines[-1]
+
+
+OK_CHECK = thc.Check(thc.OK, "Проверка А", "всё хорошо", "")
+WARN_CHECK = thc.Check(thc.WARN, "Проверка Б", "не блокирует", "Прочтите.")
+FAIL_CHECK = thc.Check(thc.FAIL, "Проверка В", "плохо", "Исправьте.")
+
+
+def test_render_ready_only_without_warnings():
+    text = "\n".join(thc.render([OK_CHECK, OK_CHECK]))
+    assert "Аккаунт Bybit готов к хеджу." in text and "предупрежд" not in text
+    warned = "\n".join(thc.render([OK_CHECK, WARN_CHECK]))
+    assert "готов, но есть предупреждения" in warned and "готов к хеджу" not in warned and "⚠️ 1" in warned
+    failed = "\n".join(thc.render([OK_CHECK, WARN_CHECK, FAIL_CHECK]))
+    assert "готов" not in failed and "TRADING=1 включать рано" in failed
+    assert "Как включать хедж" not in failed   # при ❌ инструкции по включению не показываем
+
+
+def test_render_ladder_matches_core_gates():
+    # gates.max_mode: пороги бумаги → сразу confirm; один сильный бэктест → minlot с РЕАЛЬНЫМИ ордерами
+    text = "\n".join(thc.render([OK_CHECK]))
+    assert "САМ разрешает РЕАЛЬНЫЕ ордера minlot (до 50 USDT)" in text
+    assert "СРАЗУ, минуя minlot" in text and "confirm не ставьте" in text
+    assert "10–20 реальных кругов" in text and "TRADING_MODE=paper" in text and "--backtest" in text
+    # старая ошибочная версия («пока по бумаге меньше 14 дней … остаётся на бумаге», «сначала minlot») не вернулась
+    assert "остаётся на бумаге" not in text and "TRADING_MODE=confirm (после" not in text
 
 
 # --- main -------------------------------------------------------------------------------------------------------------

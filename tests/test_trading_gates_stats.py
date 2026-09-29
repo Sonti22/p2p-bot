@@ -15,7 +15,7 @@ import paper
 import simperp
 from helpers import make_ad
 from research import hedge_bt as hb
-from trading import gates
+from trading import gates, hedge
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "scripts"))
@@ -29,11 +29,15 @@ BT_OK = dict(PAPER_OK)
 BT_WEAK = dict(PAPER_OK, cost_to_buffer=0.61)
 
 
+BT_BUFFER = "BTC:1.0,ETH:0.5,TON:0.7"   # запас в synthetic_result() (BTC 1%) и по умолчанию у research (ETH, TON)
+
+
 @pytest.fixture(autouse=True)
 def _env(monkeypatch):
     monkeypatch.setattr(gates, "_FLAGS", {"short_paper": False})
     for name in ("HEDGE_ASSETS", "HEDGE_MIN_AMOUNT_RUB", "RISK_BUFFER"):
         monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("RISK_BUFFER", BT_BUFFER)      # не ниже запаса бэктеста — иначе скрипт бэктест не запишет
 
 
 # --- «папка бота»: research/, data/, индекс git ------------------------------------------------------------------------
@@ -110,6 +114,19 @@ def fill(db, n, days, **kw):
         _hedge(db, NOW - days * DAY + i * 600, x=(1.0 if i % 2 else -1.0), **kw)
 
 
+def fill_none(db, n, asset="BTC", amount=10000):
+    """Круги, по которым хедж не строился (статус none: плана нет)."""
+    for _ in range(n):
+        b = make_ad("Bybit", "buy", 6_000_000.0, asset=asset)
+        cid = paper.start_cycle(amount, b, make_ad("Bybit", "sell", 90.0), "спот", 1.0, path=db, ts=NOW - DAY,
+                                planned_raw=1.0)
+        con = sqlite3.connect(db)
+        con.execute("UPDATE cycles SET hedge_state = ? WHERE id = ?",
+                    (json.dumps({"status": "none", "note": "нет плана"}), cid))
+        con.commit()
+        con.close()
+
+
 def sha(path):
     with open(path, "rb") as f:
         return hashlib.sha256(f.read()).hexdigest()
@@ -117,13 +134,37 @@ def sha(path):
 
 # --- разбор настроек и чистые функции ---------------------------------------------------------------------------------
 
-def test_parse_min_amounts():
-    assert tgs.parse_min_amounts(None) == ({"ETH": 20000.0}, [])
-    assert tgs.parse_min_amounts("") == ({"ETH": 20000.0}, [])
-    assert tgs.parse_min_amounts("eth:5000, TON:1000") == ({"ETH": 5000.0, "TON": 1000.0}, [])
-    got, bad = tgs.parse_min_amounts("ETH:abc,BTC:nan,:5,TON,SOL:-1,BTC:300")
-    assert got == {"BTC": 300.0} and bad == ["ETH:abc", "BTC:nan", ":5", "TON", "SOL:-1"]
-    assert tgs.parse_min_amounts("garbage") == ({"ETH": 20000.0}, ["garbage"])   # ни одной понятной — умолчание
+INF = float("inf")
+# те же входы, что в tests/trading/test_trading_hedge.py (settings/min_amount) — ответ должен совпасть с ядром слово в слово
+MIN_AMOUNT_CASES = [
+    (None, {"ETH": 20000.0}),                                            # переменной нет — умолчание ядра
+    ("", {}),                                                            # пустая строка — без минимума (не умолчание!)
+    ("ETH:abc", {"ETH": INF}),
+    ("ETH:25000, BTC:abc,TON:5 000,junk", {"ETH": 25000.0, "BTC": INF, "TON": 5000.0, "JUNK": INF}),
+    (":5000,ETH:20000", {"ETH": 20000.0}),
+    ("ETH", {"ETH": INF}), ("ETH=20000", {"ETH": INF}), ("eth:", {"ETH": INF}), ("ETH:20 000 руб", {"ETH": INF}),
+    ("BTC:5000,ETH", {"BTC": 5000.0, "ETH": INF}),
+]
+
+
+@pytest.mark.parametrize("raw,expected", MIN_AMOUNT_CASES)
+def test_min_amounts_are_exactly_what_the_core_parses(monkeypatch, raw, expected):
+    if raw is None:
+        monkeypatch.delenv("HEDGE_MIN_AMOUNT_RUB", raising=False)
+    else:
+        monkeypatch.setenv("HEDGE_MIN_AMOUNT_RUB", raw)
+    assets, mins = tgs.hedge_config()
+    assert mins == expected == hedge.settings()["min_amount"]
+    assert assets == hedge.settings()["assets"]
+    assert not hasattr(tgs, "parse_min_amounts")                          # своего разбора нет — расходиться нечему
+
+
+def test_eligible_follows_core_offer_rule():
+    assets = ["BTC", "ETH"]
+    assert tgs._eligible("ETH", 20000, assets, {"ETH": 20000.0}) and not tgs._eligible("ETH", 19999.99, assets, {"ETH": 20000.0})
+    assert tgs._eligible("btc", 1, assets, {"ETH": 20000.0}) and not tgs._eligible("SOL", 10 ** 9, assets, {})
+    assert not tgs._eligible("ETH", 10 ** 12, assets, {"ETH": INF})       # мусор в настройке — монету не хеджируем
+    assert tgs._eligible("ETH", 5, assets, {}) and not tgs._eligible("ETH", None, assets, {"ETH": 1.0})
 
 
 def test_build_paper_writes_zero_and_omits_missing():
@@ -148,20 +189,50 @@ def test_paper_stats_filters_cycles_and_never_touches_source(tmp_path):
     fill(db, 2, 5, asset="ETH", amount=19999.5)        # чуть меньше — нет
     fill(db, 2, 5, asset="SOL", amount=50000)          # монеты нет в HEDGE_ASSETS
     before = sha(db)
-    st, info = tgs.paper_stats(db, ["BTC", "ETH", "TON"], {"ETH": 20000.0}, now=NOW)
-    assert info == {"db": True, "kept": 5, "dropped": 8} and st["count"] == 5
+    per, info = tgs.paper_stats(db, ["BTC", "ETH", "TON"], {"ETH": 20000.0}, now=NOW)
+    assert info == {"db": True, "kept": 5, "dropped": 8}
+    assert list(per) == ["BTC", "ETH", "TON"] and "SOL" not in per          # по каждой монете отдельно
+    assert (per["BTC"]["count"], per["ETH"]["count"], per["TON"]["count"]) == (3, 2, 0)
+    assert per["TON"]["days"] == 0.0 and per["TON"]["ratio_ok_share"] is None
     assert sha(db) == before                             # оригинал не менялся
-    st2, info2 = tgs.paper_stats(db, ["BTC", "ETH", "TON"], {}, now=NOW)   # без минимума ETH — все ETH в счёт
-    assert info2["kept"] == 11 and st2["count"] == 11
-    st3, info3 = tgs.paper_stats(db, ["BTC"], {"ETH": 20000.0}, now=NOW)
-    assert info3["kept"] == 3 and st3["count"] == 3
+    per2, info2 = tgs.paper_stats(db, ["BTC", "ETH", "TON"], {}, now=NOW)   # без минимума ETH — все ETH в счёт
+    assert info2["kept"] == 11 and per2["ETH"]["count"] == 8
+    per3, info3 = tgs.paper_stats(db, ["BTC"], {"ETH": 20000.0}, now=NOW)
+    assert info3["kept"] == 3 and list(per3) == ["BTC"] and per3["BTC"]["count"] == 3
 
 
 def test_paper_stats_missing_db_is_not_created(tmp_path):
     db = str(tmp_path / "sub" / "paper.db")
-    st, info = tgs.paper_stats(db, ["BTC"], {}, now=NOW)
-    assert info == {"db": False, "kept": 0, "dropped": 0} and st["count"] == 0 and st["days"] == 0.0
+    per, info = tgs.paper_stats(db, ["BTC"], {}, now=NOW)
+    assert info == {"db": False, "kept": 0, "dropped": 0} and per["BTC"]["count"] == 0 and per["BTC"]["days"] == 0.0
     assert not os.path.exists(db) and not os.path.exists(os.path.dirname(db))
+
+
+def test_paper_stats_counts_hedged_and_none_circles(tmp_path):
+    db = str(tmp_path / "paper.db")
+    fill(db, 6, 5, asset="BTC")
+    fill(db, 2, 5, asset="BTC", closed=False)            # открытые хеджи — хеджированы, но ещё без итога
+    fill_none(db, 3, asset="BTC")
+    fill_none(db, 4, asset="ETH", amount=10000)           # ETH меньше 20 000 ₽ — не в счёт вовсе
+    per, info = tgs.paper_stats(db, ["BTC", "ETH"], {"ETH": 20000.0}, now=NOW)
+    assert per["BTC"]["count"] == 6 and per["BTC"]["hedged"] == 8 and per["BTC"]["none"] == 3
+    assert per["ETH"]["none"] == 0 and info["kept"] == 11 and info["dropped"] == 4
+    assert "3 из 11 (27%)" in tgs.none_note(per)
+    assert "пока нет" in tgs.none_note({"BTC": {"none": 0, "hedged": 0}})
+
+
+def test_aggregate_paper_worst_coin_and_few_data_excluded():
+    good = {"count": 60, "days": 20.0, "ratio_ok_share": 0.99, "cost_to_buffer": 0.2, "sigma_ratio": 0.1}
+    bad = {"count": 8, "days": 16.0, "ratio_ok_share": 0.96, "cost_to_buffer": 0.9, "sigma_ratio": 0.4}
+    few = {"count": 4, "days": 30.0, "ratio_ok_share": 0.1, "cost_to_buffer": 9.0, "sigma_ratio": 9.0}
+    out, few_coins = tgs.aggregate_paper({"BTC": good, "ETH": bad, "TON": few})
+    assert few_coins == ["TON"]                                            # мало данных — не в счёт и не портит худший случай
+    assert out == {"count": 68, "days": 16.0, "ratio_ok_share": 0.96, "cost_to_buffer": 0.9, "sigma_ratio": 0.4}
+    assert tgs.aggregate_paper({"BTC": few}) == ({"count": 0, "days": 0.0}, ["BTC"])   # ни одной монеты с данными
+    assert tgs.aggregate_paper({}) == ({"count": 0, "days": 0.0}, [])
+    no_sigma = dict(bad, sigma_ratio=None)                                 # у монеты в счёте нет числа — ключа нет
+    assert "sigma_ratio" not in tgs.aggregate_paper({"BTC": good, "ETH": no_sigma})[0]
+    assert tgs.aggregate_paper({"BTC": dict(good, count=5)})[1] == []      # ровно 5 — уже в счёт
 
 
 # --- бумага целиком: main -> файл -> gates -----------------------------------------------------------------------------
@@ -180,6 +251,9 @@ def test_main_without_paper_db_writes_honest_zero(tmp_path, capsys):
     assert "count 0" in out and "нет данных" in out and "paper: только бумага" in out
     assert "Бэктеста нет" in out and "gates_live.json" in out and "TRADING_SHORT_PAPER=1" in out
     assert "50 USDT" in out
+    # файл бумаги не стареет сам — скрипт прямо говорит про generated_at и про перезапуск перед confirm
+    assert "generated_at = " in out and "перезапускай перед включением confirm; файл сам не стареет" in out
+    assert "gates_backtest.json не тронут: без --backtest пишется только gates_paper.json" in out
 
 
 def test_main_below_thresholds_stays_paper(tmp_path, capsys):
@@ -196,7 +270,9 @@ def test_main_below_thresholds_stays_paper(tmp_path, capsys):
     assert gates.max_mode(HEDGE, paper=p.stats) == "paper"
     assert "❌ дней бумаги: 3.0 (нужно ≥ 14)" in out and "❌ хеджей: 10 (нужно ≥ 50)" in out
     assert "✅ доля хеджей с коэффициентом 0.9–1.1: 100.0%" in out
-    assert "Закрытых с итогом: 10" in out and "чуть оптимистичнее" in out
+    assert "BTC: закрытых 10" in out and "ETH: мало данных" in out and "TON: мало данных" in out
+    assert "чуть оптимистичнее" in out
+    assert "круги без хеджа (none): 0 из 10 (0%) — в ratio_ok_share не входят" in out   # эффект выжившего — справкой
 
 
 def test_main_above_thresholds_allows_confirm(tmp_path, capsys):
@@ -209,26 +285,50 @@ def test_main_above_thresholds_allows_confirm(tmp_path, capsys):
     assert p.stats["count"] == 50 and p.stats["days"] >= 14 and p.stats["ratio_ok_share"] == 1.0
     assert p.stats["cost_to_buffer"] <= 0.6 and p.stats["sigma_ratio"] <= 0.5
     assert gates.max_mode(HEDGE, paper=p.stats, backtest=b) == "confirm"
-    assert "confirm: открытие по вашей кнопке" in out and "верьте боту" not in out
+    assert "confirm: РЕАЛЬНЫЕ ордера по вашей кнопке" in out and "верьте боту" not in out
     assert "❌" not in out.split("Пороги «бумага → кнопка»")[1].split("Бэктеста нет")[0]
+    assert "бот разрешит confirm сразу, без minlot" in out and "Мало данных: ETH, TON" in out
+
+
+def test_main_trust_the_bot_when_its_mode_differs_from_the_numbers(tmp_path, capsys, monkeypatch):
+    # по цифрам скрипта — confirm, а бот (gates.max_mode по файлам) считает иначе: последнее слово за ботом
+    root = bot_root(tmp_path)
+    fill(os.path.join(root, "data", "paper.db"), 50, 15)
+    monkeypatch.setattr(tgs.gates, "max_mode", lambda *a, **kw: "paper")
+    assert run_main(root) == 0
+    out = capsys.readouterr().out
+    assert "⚠ Расчёт по цифрам даёт confirm, бот — paper: верьте боту." in out
+    assert "Разрешённый режим по порогам сейчас: paper: только бумага" in out   # итоговая строка — режим бота
+
+
+def test_main_no_trust_line_when_bot_did_not_accept_paper_file(tmp_path, capsys, monkeypatch):
+    # файл бумаги бот не принял → «статистики для него нет», сравнивать режимы не с чем: строки «верьте боту» нет
+    root = bot_root(tmp_path)
+    fill(os.path.join(root, "data", "paper.db"), 50, 15)
+    monkeypatch.setattr(tgs.gates, "load_paper", lambda *a, **kw: (None, "тест: файл не принят"))
+    assert run_main(root) == 0
+    out = capsys.readouterr().out
+    assert "Бот принял gates_paper.json: НЕТ — тест: файл не принят" in out
+    assert "бот не принял файл бумаги" in out and "верьте боту" not in out
 
 
 def test_main_eligibility_notes_and_env(tmp_path, capsys, monkeypatch):
     root = bot_root(tmp_path)
     db = os.path.join(root, "data", "paper.db")
-    fill(db, 3, 5, asset="BTC")
+    fill(db, 6, 5, asset="BTC")
     fill(db, 4, 5, asset="ETH", amount=10000)
-    fill(db, 2, 5, asset="ETH", amount=20000)
+    fill(db, 6, 5, asset="ETH", amount=20000)
     assert run_main(root) == 0
     out = capsys.readouterr().out
-    assert "подходящих хеджей в счёт — 5, не в счёт — 4" in out and "ETH от 20000 ₽" in out
-    assert data_file(root, "gates_paper.json")["strategies"][HEDGE]["count"] == 5
-    monkeypatch.setenv("HEDGE_MIN_AMOUNT_RUB", "ETH:5000,BTC:xx")
+    assert "подходящих хеджей в счёт — 12, не в счёт — 4" in out and "ETH от 20000 ₽" in out
+    assert data_file(root, "gates_paper.json")["strategies"][HEDGE]["count"] == 12
+    monkeypatch.setenv("HEDGE_MIN_AMOUNT_RUB", "ETH:5000,BTC:xx")      # BTC:xx — бот эту монету не хеджирует вовсе
     monkeypatch.setenv("HEDGE_ASSETS", "BTC,ETH")
     assert run_main(root) == 0
     out = capsys.readouterr().out
-    assert "непонятно, пропущено: BTC:xx" in out and "не в счёт — 0" in out
-    assert data_file(root, "gates_paper.json")["strategies"][HEDGE]["count"] == 9
+    assert "для BTC значение непонятно — бот эту монету не хеджирует" in out and "не в счёт — 6" in out
+    assert "Хеджируемые монеты (HEDGE_ASSETS): ETH;" in out
+    assert data_file(root, "gates_paper.json")["strategies"][HEDGE]["count"] == 10    # только ETH, от 5000 ₽
 
 
 def test_dry_run_writes_nothing(tmp_path, capsys):
@@ -398,8 +498,10 @@ def test_main_backtest_roundtrip_minlot_then_confirm(tmp_path, capsys, monkeypat
     assert b is not None, why_b                                                # бот принял: вне git, sha сошёлся
     assert b.research_sha == gates.research_sha(root) and b.stats["count"] > 900
     assert gates.max_mode(HEDGE, paper=p.stats, backtest=b) == "minlot"
-    assert "minlot: минимальный лот" in out and "Бот принял gates_backtest.json: да" in out
+    assert "minlot: РЕАЛЬНЫЕ ордера, позиция не больше 50 USDT" in out and "Бот принял gates_backtest.json: да" in out
     assert "не больше 50 USDT" in out and "Бэктеста нет" not in out
+    assert tgs.BACKTEST_UNLOCK in out and "⚠⚠⚠ ВНИМАНИЕ" in out                 # громкое предупреждение: файл открывает minlot
+    assert "generated_at = " in out and "файл сам не стареет" in out
     # тонкая бумага + сильный бэктест: TRADING_SHORT_PAPER для хеджа ничего не сокращает (SHORT_PAPER days == 14)
     assert gates.SHORT_PAPER[HEDGE]["days"] == 14 and "ничего не сокращает" in out
     fill(os.path.join(root, "data", "paper.db"), 50, 15)                       # набрана бумага — confirm
@@ -424,6 +526,7 @@ def test_main_backtest_missing_coin_leaves_no_thresholds(tmp_path, capsys):
     assert b.stats == {}                                                       # ни одного порога — не по одной BTC
     assert gates.max_mode(HEDGE, paper=data_file(root, "gates_paper.json")["strategies"][HEDGE], backtest=b) == "paper"
     assert "Нет данных по ETH, TON" in out and "уберите их из HEDGE_ASSETS" in out
+    assert tgs.BACKTEST_UNLOCK not in out                                      # порогов нет — и открывать нечего
 
 
 def test_stale_research_sha_is_rejected(tmp_path, monkeypatch):
@@ -484,7 +587,9 @@ def test_backtest_dry_run_writes_nothing(tmp_path, capsys, monkeypatch):
         return 0
     assert run_main(root, "--backtest", "--dry-run", runner=runner) == 0
     out = capsys.readouterr().out
-    assert "--dry-run: файлы не записаны" in out and "minlot: минимальный лот" in out
+    assert "--dry-run: файлы не записаны" in out and "minlot: РЕАЛЬНЫЕ ордера" in out
+    assert "разрешил бы реальные ордера minlot (до 50 USDT)" in out and "файл не записан" in out
+    assert tgs.BACKTEST_UNLOCK not in out                                      # в сухом прогоне — только «разрешил бы»
     assert os.listdir(os.path.join(root, "data")) == []
 
 
@@ -494,6 +599,238 @@ def test_runner_not_called_without_backtest_flag(tmp_path):
     def runner(cmd, cwd):
         raise AssertionError("research.report без --backtest не запускается")
     assert run_main(root, runner=runner) == 0
+
+
+# --- худшая монета: одна плохая монета не прячется в среднем -------------------------------------------------------------
+
+def test_one_bad_coin_flips_confirm_to_paper(tmp_path, capsys):
+    root = bot_root(tmp_path)
+    db = os.path.join(root, "data", "paper.db")
+    fill(db, 50, 15, asset="BTC")                                  # BTC: 50 хороших хеджей за 15 дней — пороги проходят
+    assert run_main(root) == 0
+    p, why, b, _ = load(root)
+    assert p is not None, why
+    assert gates.max_mode(HEDGE, paper=p.stats, backtest=b) == "confirm"
+    capsys.readouterr()
+    fill(db, 6, 15, asset="ETH", amount=20000, fees=2.5)          # ETH: 6 хеджей, комиссия ≈ 1.1% круга, а запас на курс 0.5%
+    per, _ = tgs.paper_stats(db, ["BTC", "ETH", "TON"], {"ETH": 20000.0}, now=NOW)
+    assert per["ETH"]["cost_to_buffer"] > 0.6 > per["BTC"]["cost_to_buffer"]
+    pooled = simperp.gate_stats(db, now=NOW)
+    assert pooled["cost_to_buffer"] <= 0.6                         # старый подсчёт «по всем сразу»: плохая ETH тонет в BTC
+    assert run_main(root) == 0
+    out = capsys.readouterr().out
+    p, why, b, _ = load(root)
+    assert p is not None, why
+    assert p.stats["count"] == 56 and p.stats["cost_to_buffer"] == per["ETH"]["cost_to_buffer"]   # худшая монета, не среднее
+    assert p.stats["cost_to_buffer"] > 0.6
+    assert gates.max_mode(HEDGE, paper=p.stats, backtest=b) == "paper"                            # было confirm
+    assert "❌ стоимость хеджа / запас на курс" in out and "ETH: закрытых 6" in out
+    assert "paper: только бумага" in out.split("Разрешённый режим по порогам сейчас:")[1]
+
+
+def test_coin_with_few_hedges_is_excluded_and_listed(tmp_path, capsys):
+    root = bot_root(tmp_path)
+    db = os.path.join(root, "data", "paper.db")
+    fill(db, 50, 15, asset="BTC")
+    fill(db, 4, 15, asset="ETH", amount=20000, fees=2.5)          # 4 < 5: мало данных — не в count и не в худший случай
+    assert run_main(root) == 0
+    out = capsys.readouterr().out
+    p, why, b, _ = load(root)
+    assert p is not None, why
+    assert p.stats["count"] == 50 and p.stats["cost_to_buffer"] <= 0.6        # 4 плохих хеджа ETH не считаются
+    assert gates.max_mode(HEDGE, paper=p.stats, backtest=b) == "confirm"
+    assert "ETH: мало данных — закрытых хеджей 4 (нужно ≥ 5)" in out and "TON: мало данных — закрытых хеджей 0" in out
+    assert "Мало данных: ETH, TON" in out and "уберите их из HEDGE_ASSETS" in out
+    fill(db, 1, 15, asset="ETH", amount=20000, fees=2.5)                        # пятый хедж — ETH уже в счёт
+    assert run_main(root) == 0
+    p, _, b, _ = load(root)
+    assert p.stats["count"] == 55 and gates.max_mode(HEDGE, paper=p.stats, backtest=b) == "paper"
+
+
+def test_paper_report_shows_none_share_next_to_ratio(tmp_path, capsys):
+    root = bot_root(tmp_path)
+    db = os.path.join(root, "data", "paper.db")
+    fill(db, 6, 5, asset="BTC")
+    fill_none(db, 4, asset="BTC")
+    assert run_main(root) == 0
+    out = capsys.readouterr().out
+    assert "BTC: закрытых 6" in out and "без хеджа none: 4 из 10" in out
+    assert "круги без хеджа (none): 4 из 10 (40%) — в ratio_ok_share не входят" in out
+    assert "✅ доля хеджей с коэффициентом 0.9–1.1: 100.0% (нужно ≥ 95%) · круги без хеджа (none): 4 из 10" in out
+    assert data_file(root, "gates_paper.json")["strategies"][HEDGE]["count"] == 6   # none в файл не идут
+
+
+# --- бэктест: запас на курс, таймаут, окружение ------------------------------------------------------------------------
+
+def _runner(cmd, cwd):
+    with open(os.path.join(cmd[cmd.index("--out") + 1], "backtest_report.json"), "w", encoding="utf-8") as f:
+        json.dump({"hedge": synthetic_result()}, f)      # запас бэктеста по BTC — 1.0%
+    return 0
+
+
+def _strong_file_root(tmp_path, monkeypatch):
+    monkeypatch.setenv("HEDGE_ASSETS", "BTC")
+    root = bot_root(tmp_path)
+    assert run_main(root, "--backtest", runner=_runner) == 0                   # RISK_BUFFER = запас бэктеста — пишется
+    b, why = gates.load_backtest(HEDGE, root=root)
+    assert b is not None and gates.evaluate(gates.BACKTEST_STRONG[HEDGE], b.stats).passed, why
+    return root
+
+
+def test_lower_risk_buffer_refuses_and_disarms_old_file(tmp_path, capsys, monkeypatch):
+    root = _strong_file_root(tmp_path, monkeypatch)
+    capsys.readouterr()
+    monkeypatch.setenv("RISK_BUFFER", "BTC:0.5")                                # ниже 1.0% бэктеста
+    assert run_main(root, "--backtest", "--dry-run", runner=_runner) == 2
+    out = capsys.readouterr().out
+    assert "⛔ BTC: RISK_BUFFER = 0.5% ниже запаса бэктеста (1%)" in out and "не записан" in out
+    assert "--dry-run: старый gates_backtest.json не тронут" in out
+    assert gates.load_backtest(HEDGE, root=root)[0].stats["count"] > 900         # dry-run старое не трогает
+    assert run_main(root, "--backtest", runner=_runner) == 2                     # без dry-run
+    out = capsys.readouterr().out
+    assert "Старый gates_backtest.json заменён пустым" in out
+    b, why = gates.load_backtest(HEDGE, root=root)
+    assert b is not None, why
+    assert b.stats == {} and gates.max_mode(HEDGE, paper={"count": 0, "days": 0.0}, backtest=b) == "paper"   # minlot закрыт
+    assert data_file(root, "gates_paper.json")["strategies"][HEDGE]["count"] == 0    # бумага в этот раз не пишется (fail closed)
+
+
+def test_lower_risk_buffer_without_old_file_writes_nothing(tmp_path, capsys, monkeypatch):
+    monkeypatch.setenv("HEDGE_ASSETS", "BTC")
+    monkeypatch.setenv("RISK_BUFFER", "BTC:0.3")
+    root = bot_root(tmp_path)
+    assert run_main(root, "--backtest", runner=_runner) == 2
+    out = capsys.readouterr().out
+    assert "ниже запаса бэктеста" in out and "Старого gates_backtest.json нет" in out
+    assert os.listdir(os.path.join(root, "data")) == []
+
+
+def test_higher_or_missing_risk_buffer_only_warns(tmp_path, capsys, monkeypatch):
+    monkeypatch.setenv("HEDGE_ASSETS", "BTC")
+    monkeypatch.setenv("RISK_BUFFER", "BTC:2.0")
+    root = bot_root(tmp_path)
+    assert run_main(root, "--backtest", runner=_runner) == 0
+    out = capsys.readouterr().out
+    assert "⚠ BTC: RISK_BUFFER = 2% выше запаса бэктеста (1%)" in out and "⛔" not in out
+    assert os.path.exists(os.path.join(root, "data", "gates_backtest.json"))
+    monkeypatch.setenv("RISK_BUFFER", "ETH:0.5")                                # BTC в RISK_BUFFER нет — бот возьмёт запас круга
+    assert run_main(root, "--backtest", runner=_runner) == 0
+    out = capsys.readouterr().out
+    assert "⚠ BTC: в RISK_BUFFER запаса нет" in out and "⛔" not in out
+
+
+def test_malformed_risk_buffer_fails_closed(tmp_path, capsys, monkeypatch):
+    monkeypatch.setenv("HEDGE_ASSETS", "BTC")
+    monkeypatch.setenv("RISK_BUFFER", "BTC:abc")
+    root = bot_root(tmp_path)                                                   # базы нет — бумага не читает RISK_BUFFER
+    assert run_main(root, "--backtest", runner=_runner) == 2
+    assert "RISK_BUFFER не разобрать" in capsys.readouterr().out
+    assert os.listdir(os.path.join(root, "data")) == []
+    fill(os.path.join(root, "data", "paper.db"), 6, 3)                         # с базой ошибка ловится уже на бумаге
+    assert run_main(root) == 2
+    assert "⛔ RISK_BUFFER не разобрать" in capsys.readouterr().out
+    assert sorted(os.listdir(os.path.join(root, "data"))) == ["paper.db"]
+
+
+def test_buffer_check_units():
+    res = {"coins": {"BTC": {"buffer_pct": 0.3}, "ETH": {}, "TON": {"buffer_pct": "nan"}}}
+    refuse, warn = tgs.buffer_check(res, ["BTC", "ETH", "TON"], {"BTC": 0.3, "ETH": 0.4, "TON": 0.7})
+    assert [r.split(":")[0] for r in refuse] == ["ETH"]                          # ETH: по умолчанию research 0.5, в .env 0.4
+    assert not warn                                                              # BTC равен, TON: buffer_pct мусор — умолчание 0.7
+    refuse, warn = tgs.buffer_check(res, ["BTC"], {"BTC": 0.5})
+    assert not refuse and len(warn) == 1 and "выше" in warn[0]
+    refuse, warn = tgs.buffer_check(res, ["BTC"], {})
+    assert not refuse and len(warn) == 1 and "запаса нет" in warn[0]
+
+
+def test_backtest_timeout_writes_nothing(tmp_path, capsys, monkeypatch):
+    monkeypatch.setenv("HEDGE_ASSETS", "BTC")
+    root = bot_root(tmp_path)
+    seen = {}
+
+    def slow(cmd, **kw):
+        seen.update(kw)
+        raise tgs.subprocess.TimeoutExpired(cmd, kw.get("timeout"))
+    monkeypatch.setattr(tgs.subprocess, "run", slow)
+    assert run_main(root, "--backtest") == 2                                    # runner не задан — настоящий _run_report
+    out = capsys.readouterr().out
+    assert seen["timeout"] == 900 == tgs.REPORT_TIMEOUT and seen["check"] is False and seen["cwd"] == root
+    assert "не уложился в 900 с" in out and "⛔ бэктест не получился" in out
+    assert os.listdir(os.path.join(root, "data")) == []                          # даже бумага не пишется: fail closed
+
+
+def test_child_env_is_minimal_no_keys(monkeypatch):
+    for name, value in (("BYBIT_API_KEY", "k-test"), ("BYBIT_API_SECRET", "s-test"), ("TELEGRAM_BOT_TOKEN", "t-test"),
+                        ("FOO", "bar"), ("HTTPS_PROXY", "http://proxy.invalid"), ("PYTHONPATH", "x"),
+                        ("PATH", "p-test"), ("SYSTEMROOT", "r-test"), ("TEMP", "t1"), ("TMP", "t2"), ("USERPROFILE", "u")):
+        monkeypatch.setenv(name, value)
+    env = tgs._child_env()
+    assert set(env) <= set(tgs.CHILD_ENV_KEYS) | {"PYTHONIOENCODING"}
+    assert env["PYTHONIOENCODING"] == "utf-8" and env["PATH"] == "p-test" and env["USERPROFILE"] == "u"
+    assert not any(k for k in env if any(w in k.upper() for w in ("KEY", "SECRET", "TOKEN", "PROXY", "PYTHONPATH", "FOO")))
+    assert tgs._child_env({"PATH": "a", "ZZZ": "b"}) == {"PATH": "a", "PYTHONIOENCODING": "utf-8"}   # что нет в окружении — не выдумываем
+
+
+def test_default_runner_passes_minimal_env_and_command(tmp_path, monkeypatch):
+    monkeypatch.setenv("HEDGE_ASSETS", "BTC")
+    monkeypatch.setenv("BYBIT_API_KEY", "k-test")
+    monkeypatch.setenv("FOO", "bar")
+    root = bot_root(tmp_path)
+    got = {}
+
+    class Done:
+        returncode = 0
+
+    def fake_run(cmd, **kw):
+        got.update(cmd=cmd, **kw)
+        with open(os.path.join(cmd[cmd.index("--out") + 1], "backtest_report.json"), "w", encoding="utf-8") as f:
+            json.dump({"hedge": synthetic_result()}, f)
+        return Done()
+    monkeypatch.setattr(tgs.subprocess, "run", fake_run)
+    assert run_main(root, "--backtest") == 0
+    assert got["timeout"] == 900 and got["cwd"] == root and got["cmd"][:3] == [sys.executable, "-m", "research.report"]
+    assert "BYBIT_API_KEY" not in got["env"] and "FOO" not in got["env"] and "PYTHONPATH" not in got["env"]
+    assert got["env"]["PYTHONIOENCODING"] == "utf-8"
+
+
+def test_backtest_report_says_depth_of_history_not_independent_hedges(tmp_path, capsys, monkeypatch):
+    monkeypatch.setenv("HEDGE_ASSETS", "BTC")
+    root = bot_root(tmp_path)
+    assert run_main(root, "--backtest", runner=_runner) == 0
+    out = capsys.readouterr().out
+    n = data_file(root, "gates_backtest.json")["strategies"][HEDGE]["count"]
+    assert f"count и days — глубина истории, не независимые хеджи: 60-минутные окна перекрываются, {n} окон — это не {n} хеджей" in out
+    assert "— окон истории, не независимые хеджи" in out and "— глубина истории" in out    # и в строках порогов
+
+
+def test_backtest_file_warning_is_loud_and_only_when_strong(tmp_path, capsys, monkeypatch):
+    monkeypatch.setenv("HEDGE_ASSETS", "BTC")
+    root = bot_root(tmp_path)
+    assert run_main(root, "--backtest", runner=_runner) == 0
+    out = capsys.readouterr().out
+    line = next(x for x in out.splitlines() if "ВНИМАНИЕ" in x)
+    assert line.startswith("⚠⚠⚠ ВНИМАНИЕ: бэктест разрешает реальные ордера minlot (до 50 USDT) при TRADING=1 и TRADING_MODE=minlot")
+    assert "TRADING_MODE=paper" in line
+    weak = synthetic_result()
+    weak["coins"]["BTC"]["windows"]["bybit"][1]["cost_to_buffer"] = 0.9        # бэктест не сильный — тревоги нет
+    weak_root = bot_root(tmp_path / "weak")
+
+    def weak_runner(cmd, cwd):
+        with open(os.path.join(cmd[cmd.index("--out") + 1], "backtest_report.json"), "w", encoding="utf-8") as f:
+            json.dump({"hedge": weak}, f)
+        return 0
+    assert run_main(weak_root, "--backtest", runner=weak_runner) == 0
+    assert "ВНИМАНИЕ" not in capsys.readouterr().out
+
+
+def test_old_strong_backtest_file_is_flagged_without_backtest_flag(tmp_path, capsys, monkeypatch):
+    root = _strong_file_root(tmp_path, monkeypatch)
+    capsys.readouterr()
+    assert run_main(root) == 0                                                  # без --backtest: файл от прошлого запуска
+    out = capsys.readouterr().out
+    assert "старый gates_backtest.json действует: бэктест разрешает реальные ордера minlot" in out
+    assert "gates_backtest.json не тронут: без --backtest пишется только gates_paper.json" in out
+    assert "(файл от прошлого запуска, он продолжает действовать)" in out
 
 
 # --- вердикт против gates.max_mode -------------------------------------------------------------------------------------
@@ -528,7 +865,12 @@ def test_verdict_lines_are_honest_about_thresholds_and_flag():
     strong = tgs.verdict(PAPER_OK, BT_OK, True)
     text = "\n".join(tgs.verdict_lines(strong))
     assert strong["short_active"] and "TRADING_SHORT_PAPER=1 включён и бэктест сильный" in text
-    assert "confirm: открытие по вашей кнопке" in text
+    assert "confirm: РЕАЛЬНЫЕ ордера по вашей кнопке" in text
+    assert "бот разрешит confirm сразу, без minlot" in text and "confirm не ставьте, не увидев" in text
+    only_bt = "\n".join(tgs.verdict_lines(tgs.verdict({"count": 0, "days": 0.0}, BT_OK, False)))
+    assert "minlot: РЕАЛЬНЫЕ ордера, позиция не больше 50 USDT" in only_bt
+    assert "БЕЗ единого дня бумажной истории" in only_bt and "минуя minlot" in only_bt   # лестница режимов без прикрас
+    assert "trading_hedge_check.py → TRADING_MODE=paper → --backtest → TRADING_MODE=minlot" in only_bt
     idle = "\n".join(tgs.verdict_lines(tgs.verdict(PAPER_OK, BT_WEAK, True)))
     assert "не действует: бэктест не сильный или его нет" in idle
 

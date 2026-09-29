@@ -11,8 +11,10 @@
 3. Режим маржи аккаунта — Isolated (venues.margin_mode). У Bybit UTA он один на весь аккаунт; бот его НЕ меняет —
    переключает владелец сам в настройках Bybit.
 4. Режим позиций — односторонний (One-Way): по позициям BTCUSDT/ETHUSDT/TONUSDT (venues.symbol_positions).
-5. Деньги на фьючерсном аккаунте против маржи позиции: позиция / плечо (250 USDT при 2× = 125 USDT) — venues.capital
-   (капитал единого аккаунта, totalEquity; свободного USDT отдельно ядро пока не читает — это указано в строке).
+5. Деньги на фьючерсном аккаунте против маржи позиции: позиция / плечо (250 USDT при 2× = 125 USDT) — venues.capital.
+   Сравнивается ОБЩИЙ капитал единого аккаунта (totalEquity: все монеты в пересчёте на USDT, вместе с уже занятой
+   маржой и нереализованным результатом), а не свободный USDT: ядро отдельно доступный баланс не читает, поэтому
+   следом идёт постоянное ⚠️ «Свободный USDT не проверен» — глазами в кошельке Bybit.
 6. Инструменты ETHUSDT / BTCUSDT / TONUSDT (TON — после проверки символа resolve_symbols): шаг лота, минимальное
    количество, минимальный номинал (venues.instrument + mark_price): помещается ли минимальный ордер в лимит позиции.
 7. Ваши ручные позиции и ордера по этим символам (ownership.foreign с пустой книгой бота) — бот их не трогает, но и
@@ -51,6 +53,20 @@ IP_CODE = "10010"                        # Bybit: IP не из белого сп
 KEY_CODES = ("10003", "10004", "10005")  # ключ не найден / подпись неверна / нет права
 
 Check = namedtuple("Check", "level title detail fix")
+
+# Как боевой режим хеджа включается на самом деле (trading/gates.py: max_mode). Здесь только текст.
+LADDER_LINES = [
+    "Как включать хедж (в .env: TRADING=1 и TRADING_MODE=…; после каждого обновления бота launcher сбрасывает TRADING в 0 "
+    "— включайте заново):",
+    "  1) оставьте TRADING_MODE=paper и запустите: python scripts/trading_gates_stats.py --backtest (покажет, что "
+    "разрешают цифры);",
+    "  2) осторожно: записанный gates_backtest.json САМ разрешает РЕАЛЬНЫЕ ордера minlot (до 50 USDT) — как только в .env "
+    "TRADING=1 и TRADING_MODE=minlot (или confirm/auto: они тогда тоже дадут только minlot); бумажной истории для этого не "
+    "нужно;",
+    "  3) поставьте TRADING_MODE=minlot на первые 10–20 реальных кругов и посмотрите, как они прошли;",
+    "  4) только потом confirm (каждый ордер по вашей кнопке). Если пороги бумаги (14 дней, 50 закрытых хеджей…) пройдены, "
+    "бот допускает confirm СРАЗУ, минуя minlot — поэтому confirm не ставьте, не увидев, что minlot работает.",
+]
 
 SETTINGS_WAY = ("в Bybit откройте настройки торговли (шестерёнка на странице фьючерсов USDT) → режим маржи аккаунта")
 FIX_NO_KEY = ("Создайте в Bybit API-ключ: права только Contract (Orders, Positions); вывод, переводы, P2P и Earn "
@@ -193,7 +209,8 @@ def funds_check(equity, why, position, leverage):
     title = f"Деньги на фьючерсном аккаунте: маржа {_usdt(need)} USDT"
     basis = (f"для позиции {_usdt(position)} USDT при плече {leverage.normalize():f}× нужно {_usdt(need)} USDT маржи; "
              f"с запасом на комиссии и ход цены — {low:.0f}–{high:.0f} USDT")
-    caveat = " (это капитал всего единого аккаунта, вместе с любыми монетами на нём — свободный USDT ядро отдельно не читает)"
+    caveat = (" (сравнивается ОБЩИЙ капитал всего единого аккаунта — totalEquity, вместе с любыми монетами на нём и уже "
+              "занятой маржой; свободный USDT отдельно не проверялся)")
     fix = (f"Пополните фьючерсный (единый торговый) аккаунт Bybit вручную на {low:.0f}–{high:.0f} USDT: бот переводов "
            f"между счетами не делает.")
     if equity is None:
@@ -203,6 +220,18 @@ def funds_check(equity, why, position, leverage):
     if equity < low:
         return Check(WARN, title, f"на аккаунте {_usdt(equity)} USDT{caveat} — хватает впритык; {basis}", fix)
     return Check(OK, title, f"на аккаунте {_usdt(equity)} USDT{caveat}; {basis}", "")
+
+
+def free_usdt_check(position, leverage):
+    """Свободный (доступный) USDT под маржу ядро не читает: venues.capital отдаёт только totalEquity. Поэтому это ⚠️ всегда
+    — пока ядро не научится читать доступный баланс (своих запросов в этом скрипте нет намеренно)."""
+    need = position / leverage
+    return Check(WARN, "Свободный USDT под маржу: не проверен",
+                 f"ядро читает только общий капитал аккаунта (строка выше), доступный баланс отдельно — нет; часть "
+                 f"капитала может лежать в других монетах или уже быть под маржой, тогда свободного USDT меньше",
+                 f"Откройте в Bybit кошелёк единого торгового аккаунта и убедитесь глазами, что доступного USDT не меньше "
+                 f"{_usdt(need)} (лучше {need * TOPUP_FROM:.0f}–{need * TOPUP_TO:.0f}); иначе переведите USDT из других "
+                 f"монет или пополните аккаунт.")
 
 
 def _inactive(check, coin, active):
@@ -326,6 +355,7 @@ async def run_checks(s, position=DEFAULT_POSITION_USDT, leverage=DEFAULT_LEVERAG
         checks.append(position_mode_check(reads))
         equity, why_c = await venues.capital(s, BYBIT, creds)
         checks.append(funds_check(equity, why_c, position, leverage))
+        checks.append(free_usdt_check(position, leverage))
         if why_c:
             errors.append(why_c)
     else:
@@ -361,11 +391,9 @@ def render(checks, creds=None):
     if bad:
         lines.append(f"Итог: ❌ {bad} — исправьте и запустите проверку снова. Пока есть ❌, TRADING=1 включать рано.")
     else:
-        lines.append("Итог: ❌ нет" + (f", ⚠️ {warn} — прочтите «Что сделать» выше." if warn else ".")
-                     + " Аккаунт Bybit готов к хеджу. Включается он в .env: TRADING=1 и TRADING_MODE=confirm (после "
-                     "каждого обновления бота launcher сбрасывает TRADING в 0 — включайте заново). Режим самого "
-                     "хеджа при этом задают пороги: пока по бумаге меньше 14 дней и 50 закрытых хеджей, он остаётся "
-                     "на бумаге (python scripts/trading_gates_stats.py покажет, сколько не хватает).")
+        lines.append("Итог: ❌ нет" + (f", ⚠️ {warn} — прочтите «Что сделать» выше. Аккаунт Bybit готов, но есть "
+                                       "предупреждения." if warn else ". Аккаунт Bybit готов к хеджу."))
+        lines += LADDER_LINES
     lines.append("Скрипт только читает: ордеров, переводов и выводов он не делает. Бот сам перечитывает всё это "
                  "перед каждым открытием — эта проверка его решений не заменяет.")
     return [_clean(x, creds) for x in lines]
