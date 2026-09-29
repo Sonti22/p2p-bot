@@ -43,7 +43,7 @@ from p2p import ALL_EXCHANGES, AMOUNT_MAX, AMOUNT_MIN, DEFAULT_ASSETS, ENV_PATH,
     deal_for_amount, deal_fresh, fmt_ad, fmt_breakeven, fmt_deal, fmt_top, load_env, maker_neighbors, maker_place, maker_quote, \
     maker_round_fee, parse_amount, parse_min_profit, profit_breakdown, reliability, reliability_index, route_hops, scan, \
     score, setup_logging, spot_url, traps_log, venue_url, ScanSpeed, deal_stale
-from p2p import depth_for_deal, depth_settings
+from p2p import depth_for_deal, depth_settings, terms_log, terms_summary
 
 logger = logging.getLogger(__name__)
 
@@ -264,6 +264,8 @@ AMOUNT_PRESETS = (25000, 50000, 100000, 200000)
 VENUE_DOWN_AFTER = 900      # сек: площадка отдаёт ошибку дольше — алерт, даже если сканы не подряд
 VENUE_FAIL_STREAK = 3       # или столько сканов подряд с ошибкой
 VENUE_ALERT_COOLDOWN = 3600  # не чаще раза в час на площадку
+SCAN_STALL_MINUTES_DEFAULT = 5   # мин без успешного скана — алерт «скан стоит» (SCAN_STALL_MINUTES)
+WATCHDOG_TICK = 60                # сек между проверками watchdog
 LADDER_ALERT_COOLDOWN = 86400  # предложение лестницы суммы сухого прогона — не чаще раза в сутки
 EXCHANGE_NAMES = {"bybit": "Bybit", "mexc": "MEXC", "htx": "HTX", "kucoin": "KuCoin", "bitpapa": "BitPapa",
                   "lbank": "LBank"}
@@ -282,6 +284,11 @@ STALE_RETRY_MAX = 600       # сек: потолок паузы между по�
 # кнопки из-за них выключать нельзя (Bot._fancy_failed)
 NOT_BUTTON_ERRORS = ("message is not modified", "message to edit not found", "message can't be edited",
                      "message not found", "chat not found")
+# признаки отказа из-за самой разметки кнопок («can't parse inline keyboard button», «can't parse reply keyboard
+# markup», BUTTON_TYPE_INVALID, REPLY_MARKUP_INVALID) — только так сервер или клиент не принимает цвета (style) и «📋»
+# (copy_text). Отказ без них (403 «bot was blocked by the user», «message is too long», «can't parse entities»)
+# повтор с обычными кнопками не исправит, и цветные кнопки из-за него выключать нельзя (Bot._fancy_failed)
+BUTTON_ERRORS = ("button", "keyboard", "markup")
 MARKET_STATUS_INTERVAL = 60  # сек: не чаще обновляем закреплённое сообщение «Статус рынка»
 MSK = timezone(timedelta(hours=3))                    # тихие часы и /pause считаем по МСК, не по времени ПК
 PAUSE_PRESETS = {"30m": 1800, "1h": 3600, "3h": 3 * 3600}  # аргументы /pause -> секунды
@@ -745,19 +752,56 @@ def blacklist_view(now=None):
     return "\n".join(lines), {"inline_keyboard": kb}
 
 
+TERMS_LOG_SHOW = 10
+TRAPS_TEXT_MAX = 4000   # одно сообщение /traps: лимит Telegram 4096 символов, с запасом
+
+
+def fit_lines(head, rows, room=TRAPS_TEXT_MAX):
+    """head + сколько строк rows влезет в room символов (с переводами строк); не влезшие — одной строкой «… и ещё N».
+    Длиннее 4096 символов Telegram сообщение не примет (400 «message is too long») — команда молча не ответит."""
+    text = "\n".join(head)
+    for i, line in enumerate(rows):
+        left = len(rows) - i - 1
+        tail = f"\n{_more_note(left)}" if left else ""   # место под пометку, если следующие строки не влезут
+        if len(text) + 1 + len(line) + len(tail) > room:
+            return f"{text}\n{_more_note(len(rows) - i)}"
+        text += "\n" + line
+    return text
+
+
+def _more_note(n):
+    return f"… и ещё {n} — не влезли в сообщение Telegram"
+
+
 def traps_view():
-    """Текст «/traps»: последние отсеянные аномальные объявления — обучение видеть ловушки без риска."""
+    """Текст «/traps»: последние отсеянные аномальные объявления — обучение видеть ловушки без риска. Журнал стоп-фраз
+    условий — отдельным сообщением (terms_view): вместе с полным журналом ловушек он не влезает в лимит Telegram."""
     rows = traps_log()
     if not rows:
         return ("🪤 <b>Ловушки</b>\n\nПока ни одной: объявление с ценой намного выгоднее рынка (отсев по "
                 "MAX_DEV) автоматически отсеивается и в сигналы не попадает — здесь появятся примеры.")
-    lines = ["🪤 <b>Отсеянные ловушки</b>", "",
-              "Цена выглядит заманчиво, но слишком далека от рынка — скан такие объявления отсеивает "
-              "и в сигнал не пускает. Ниже — последние примеры, без риска.", ""]
-    for t in rows:
-        when = datetime.fromtimestamp(t["ts"]).strftime("%d.%m %H:%M")
-        lines.append(f"{when} — {html.escape(t['reason'])}")
-    return "\n".join(lines)
+    head = ["🪤 <b>Отсеянные ловушки</b>", "",
+            "Цена выглядит заманчиво, но слишком далека от рынка — скан такие объявления отсеивает "
+            "и в сигнал не пускает. Ниже — последние примеры, без риска.", ""]
+    lines = [f"{datetime.fromtimestamp(t['ts']).strftime('%d.%m %H:%M')} — {html.escape(t['reason'])}" for t in rows]
+    return fit_lines(head, lines)
+
+
+def terms_view(limit=TERMS_LOG_SHOW):
+    """Второе сообщение «/traps»: последние мерчанты, отсеянные стоп-фразами условий (p2p.terms_log), — сверить, не
+    режет ли список нормальных. Журнала нет — None, сообщение не шлём."""
+    rows = terms_log()
+    if not rows:
+        return None
+    merchants = len({(r["ex"], r["nick"]) for r in rows})
+    head = [f"🚫 <b>Отсеяны стоп-фразами в условиях</b> — {merchants} мерчантов с запуска, последние:", ""]
+    lines = []
+    for r in rows[:limit]:
+        when = datetime.fromtimestamp(r["last"]).strftime("%d.%m %H:%M")
+        side = "покупка" if r["side"] == "buy" else "продажа"
+        lines.append(f"{when} — {html.escape(r['ex'])} {html.escape(r['nick'])} ({side} {html.escape(r['asset'])}): "
+                     f"{html.escape(r['label'])}, фраза «{html.escape(r['phrase'])}», сканов {r['scans']}")
+    return fit_lines(head, lines)
 
 
 NETS_ROWS = 30   # строк в /nets
@@ -1314,11 +1358,12 @@ def chips_line(amounts):
 
 
 def _lean(snap):
-    """Снимок без полного стакана (Snapshot.book), всех объявлений скана (Snapshot.ads) и котировок перпов
-    (Snapshot.perps): они нужны только /maker и записи снимка (snapshots.py) по свежему скану — запомненные сделки
-    (до 200) и живые карточки их не держат."""
-    if snap is not None and (snap.book or snap.ads or snap.jobs or snap.perps):
-        return dataclasses.replace(snap, book={}, ads=[], jobs=[], perps={})
+    """Снимок без полного стакана (Snapshot.book), всех объявлений скана (Snapshot.ads), котировок перпов
+    (Snapshot.perps) и срабатываний стоп-фраз (Snapshot.terms_hits): они нужны только /maker, записи снимка
+    (snapshots.py) и журналу отсева (p2p.TERMS_LOG, его пишет scan) по свежему скану — запомненные сделки (до 200) и
+    живые карточки их не держат."""
+    if snap is not None and (snap.book or snap.ads or snap.jobs or snap.perps or snap.terms_hits):
+        return dataclasses.replace(snap, book={}, ads=[], jobs=[], perps={}, terms_hits=[])
     return snap
 
 
@@ -1472,6 +1517,11 @@ class Bot:
         self.deals_by_id = {}   # id -> (d, снимок cfg, snap на момент сигнала) для кнопок «✅ Сделал»/«📝 Инструкция»; не переживает рестарт
         self.acc_seen = {}   # ex -> set известных ключей истории; None пока не было первого опроса
         self.start_ts = time.time()     # для аптайма в /status
+        self.scan_error = ""            # текст последней ошибки скана — для watchdog
+        self.scan_errors = 0            # ошибок скана подряд
+        self.stall_alerted = False      # watchdog уже сообщил «скан стоит» (Telegram принял) — ждём восстановления
+        self.watchdog_prev_tick = 0.0   # время прошлого тика watchdog — заметить сон ПК между тиками
+        self.watchdog_wake_ts = 0.0     # когда watchdog заметил пробуждение ПК: простой скана считается от него
         # id сигналов от времени старта в мс: после рестарта старая кнопка did:N не попадёт на новую связку
         self.next_deal_id = int(self.start_ts * 1000)
         self.last_scan_ts = 0.0         # unix-время окончания последнего скана
@@ -1541,14 +1591,15 @@ class Bot:
         return markup if self.fancy or not markup else plain_markup(markup)
 
     def _fancy_failed(self, r, markup):
-        """Отправка с цветными кнопками/«📋» не удалась: дальше шлём обычные кнопки и повторяем. 429 и 5xx — не про
-        кнопки (перегрузка/сбой Telegram): цвета не выключаем, повтор — забота вызывающего (retry_after). Отказ правки
-        не из-за кнопок (NOT_BUTTON_ERRORS: подпись не изменилась, сообщения нет или его нельзя править) — тоже: иначе
-        одна правка живой карточки или «⌛ устарела» выключала бы цветные кнопки всему боту до перезапуска."""
+        """Отправка с цветными кнопками/«📋» не удалась из-за самих кнопок (BUTTON_ERRORS): дальше шлём обычные кнопки
+        и повторяем. Остальные отказы — не про кнопки, цвета не выключаем: 429 и 5xx (перегрузка/сбой Telegram, повтор —
+        забота вызывающего, retry_after), 403 (гость заблокировал бота), «message is too long», «can't parse entities»,
+        отказ правки из NOT_BUTTON_ERRORS (подпись не изменилась, сообщения нет или его нельзя править) — иначе один
+        такой отказ выключал бы цветные кнопки всему боту до перезапуска."""
         code = r.get("error_code") or 0
         text = str(r.get("description") or "").lower()
-        if r.get("ok") or not self.fancy or not is_fancy(markup) or code == 429 or code >= 500 \
-                or any(x in text for x in NOT_BUTTON_ERRORS):
+        if r.get("ok") or not self.fancy or not is_fancy(markup) or code in (403, 429) or code >= 500 \
+                or any(x in text for x in NOT_BUTTON_ERRORS) or not any(x in text for x in BUTTON_ERRORS):
             return False
         self.fancy = False
         logger.warning("Telegram: цветные кнопки/copy_text не поддерживаются, дальше обычные: %s", r.get("description"))
@@ -2551,6 +2602,7 @@ class Bot:
                 t0 = time.time()
                 snap = self.last = await self.fresh_scan()
                 self.last_scan_ts, self.last_scan_duration = time.time(), time.time() - t0
+                self.scan_errors = 0
                 self.speed.add(self.last, self.last_scan_duration)
                 self.track_liveness(self.last)
                 if history.record(snap, self.snap_cfg(snap).amount):   # не чаще раза в 5 минут, независимо от чата
@@ -2574,10 +2626,88 @@ class Bot:
                     await self.update_market_status(self.last)
             except Exception as e:
                 logger.error("scan error: %s", e)
+                if snap is None:   # сам скан не прошёл (а не шаг после него) — для watchdog
+                    self.scan_error, self.scan_errors = f"{type(e).__name__}: {e}"[:200], self.scan_errors + 1
             if snap is not None:   # после сигналов: снимок для разбора не задерживает их
                 await self.save_snapshot(snap)
                 self.schedule_backup()   # суточная копия баз — фоном, скан не ждёт
             await asyncio.sleep(self.cfg.interval)
+
+    def scan_stall_limit(self):
+        """Сколько секунд без успешного скана — уже «скан стоит»: SCAN_STALL_MINUTES (по умолчанию 5 мин), но не
+        меньше трёх интервалов скана (INTERVAL) — иначе редкий опрос давал бы ложные алерты."""
+        try:
+            minutes = float(os.getenv("SCAN_STALL_MINUTES", SCAN_STALL_MINUTES_DEFAULT))
+        except ValueError:
+            minutes = SCAN_STALL_MINUTES_DEFAULT
+        if not minutes > 0:
+            minutes = SCAN_STALL_MINUTES_DEFAULT
+        return max(minutes * 60, 3 * self.cfg.interval)
+
+    def watchdog_awake(self, now):
+        """Запоминает время тика watchdog. False — с прошлого тика прошло больше 3×WATCHDOG_TICK: ПК спал (или цикл
+        событий стоял) и скан не мог идти — тик пропускаем, простой скана дальше считаем от пробуждения, а не от
+        последнего скана до сна (иначе сразу после сна — ложное «⚠️ Скан стоит… 480 мин», а за ним «✅ снова идёт»)."""
+        prev, self.watchdog_prev_tick = self.watchdog_prev_tick, now
+        if prev and now - prev > 3 * WATCHDOG_TICK:
+            self.watchdog_wake_ts = now
+            return False
+        return True
+
+    def watchdog_message(self, now=None):
+        """Проверка watchdog: текст алерта или сообщения о восстановлении, None — сообщать нечего. Отдельная площадка
+        (check_venues) тут ни при чём: смотрим, идёт ли скан целиком — он мог зависнуть или падать каждый раз
+        (исключение вне адаптеров), и тогда бот молчит, пока владелец не заметит отсутствие сигналов. Состояние
+        алерта (stall_alerted) не меняет — это делает watchdog_check, когда Telegram принял сообщение."""
+        now = time.time() if now is None else now
+        if not self.watchdog_awake(now):
+            return None
+        scanned = self.last_scan_ts and self.last_scan_ts >= self.watchdog_wake_ts   # был скан после пробуждения
+        since = self.last_scan_ts if scanned else max(self.start_ts, self.watchdog_wake_ts)
+        idle = now - since
+        if idle > self.scan_stall_limit():
+            if self.stall_alerted:
+                return None
+            ago = f"{int(idle // 60)} мин"
+            if scanned:
+                what = f"последний успешный скан {ago} назад"
+            elif self.watchdog_wake_ts > self.start_ts:
+                what = f"после пробуждения ПК ({ago}) ни одного успешного скана"
+            else:
+                what = f"с запуска ({ago}) ни одного успешного скана"
+            text = f"⚠️ Скан стоит: {what} — сигналы не приходят."
+            if self.scan_errors:
+                text += f"\nОшибок скана подряд: {self.scan_errors}, последняя: {html.escape(self.scan_error)}"
+            else:
+                text += "\nОшибок нет — похоже, скан завис. Проверьте /logs, при необходимости перезапустите бота."
+            return text
+        if self.stall_alerted and scanned:
+            return "✅ Скан снова идёт."
+        return None
+
+    async def watchdog_check(self, now=None):
+        """Один тик watchdog: сообщение — в топик «Разработка»; stall_alerted меняется, только если Telegram его принял
+        (r["ok"]), — не дошло, повторим на следующем тике, а не замолчим до восстановления."""
+        text = self.watchdog_message(now)
+        if not text:
+            return
+        alert = not self.stall_alerted   # без алерта сообщение — только алерт, после него — только восстановление
+        r = await self.send(text, topic="dev")
+        if (r or {}).get("ok"):
+            self.stall_alerted = alert
+
+    async def watchdog_loop(self):
+        """Раз в WATCHDOG_TICK: скан целиком стоит дольше SCAN_STALL_MINUTES — один алерт владельцу (топик «Разработка»),
+        пошёл снова — сообщение о восстановлении. Своя задача, а не шаг scan_loop: зависший скан её не остановит."""
+        while True:
+            await asyncio.sleep(WATCHDOG_TICK)
+            if not self.chat_id:
+                self.watchdog_awake(time.time())   # тики идут и без чата — сон ПК в это время тоже заметим
+                continue   # владельца ещё нет — не «тратим» алерт впустую, проверим, когда он появится
+            try:
+                await self.watchdog_check()
+            except Exception as e:
+                logger.error("watchdog: %s", e)
 
     def schedule_backup(self):
         """Раз в сутки — копия баз (backup.py) фоном в отдельном потоке; скан её не ждёт, вторая параллельно не идёт."""
@@ -2698,6 +2828,11 @@ class Bot:
             return "\n".join(lines)
         above = sum(1 for d in snap.deals if d[0] >= self.cfg.min_profit)
         lines.append(f"Связок выше порога {self.cfg.min_profit:g}%: {above}")
+        terms = terms_summary()
+        if terms:
+            top = ", ".join(f"{label} {n}" for label, n in sorted(terms.items(), key=lambda kv: -kv[1]))
+            merchants = len({(r["ex"], r["nick"]) for r in terms_log()})
+            lines.append(f"Отсеяно стоп-фразами в условиях: {merchants} мерчантов с запуска ({top}) — /traps")
         extra, lim = snap.extra, depth_settings()
         lines.append(f"Доп. запросы глубины в скане: вторые страницы {extra.get('page2', 0)} (лимит "
                      f"{lim['page2_max']}), под суммы {extra.get('amounts', 0)} (лимит {lim['chips_max']})")
@@ -3958,6 +4093,9 @@ class Bot:
                 await self.send(text, markup=kb)
         elif cmd == "/traps":
             await self.send(traps_view())
+            terms = terms_view()
+            if terms:
+                await self.send(terms)
         elif cmd == "/nets":
             await self.send(unmapped_nets_view())
         elif cmd == "/maker":
@@ -4231,6 +4369,7 @@ async def main():
             trading.switch.disable()
             logger.error("trading startup: %s", type(e).__name__)
         bot.trading_task = asyncio.ensure_future(trading.wiring.loop(bot))   # сверка ядра — своим циклом
+        bot.watchdog_task = asyncio.ensure_future(bot.watchdog_loop())   # «скан стоит» — своей задачей
         logger.info("Бот запущен: каждые %ss, порог %g%%, биржи %s", cfg.interval, cfg.min_profit,
                     ', '.join(cfg.exchanges))
         await asyncio.gather(bot.scan_loop(), bot.command_loop(), bot.accounts_loop(), bot.payouts_loop())
