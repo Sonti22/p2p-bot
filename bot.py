@@ -295,6 +295,30 @@ PAPER_RESET_MARKUP = {"inline_keyboard": [[{"text": "🗑 Да, обнулить
 DIGEST_MAX = 4000                  # утренний дайджест — одно сообщение, предел Telegram 4096 с запасом
 DIGEST_VENUES = 8                  # направлений площадок в дайджесте, остальные — «…ещё N»
 DIGEST_FALLBACK_WINDOW = 12 * 3600  # начало ночи неизвестно (бот перезапущен в тихие часы) — окно 12 ч до конца
+DIGEST_RETRY = 600                  # сек — повтор недоставленного дайджеста не чаще
+
+
+def cut_lines(text, limit):
+    """Обрезать HTML-текст до limit символов целыми строками (теги в строках закрыты — разметку не рвём); что не
+    влезло — «…» последней строкой. Одна строка длиннее limit — без тегов, по символам."""
+    if len(text) <= limit:
+        return text
+    kept, size = [], 2   # 2 — «\n…»
+    for line in text.split("\n"):
+        if size + len(line) + 1 > limit:
+            break
+        kept.append(line)
+        size += len(line) + 1
+    if not kept:
+        plain = html.unescape(re.sub(r"<[^>]+>", "", text))
+        out = ""
+        for ch in plain:   # экранируем посимвольно: срез не разорвёт «&amp;»
+            esc = html.escape(ch)
+            if len(out) + len(esc) > limit - 1:
+                break
+            out += esc
+        return out + "…"
+    return "\n".join(kept) + "\n…"
 
 
 def account_poll_interval():
@@ -1421,6 +1445,8 @@ class Bot:
         self.quiet_on = os.getenv("QUIET_HOURS_ON", "0") == "1"      # тихие часы включены (кнопка в настройках)
         self.night_deals = {}    # (ex,asset,ex,asset) -> лучшая связка за тихие часы, для утреннего дайджеста
         self.quiet_since = None  # когда начались текущие тихие часы (для окна утреннего дайджеста)
+        self.digest_pending = False  # дайджест не ушёл (сеть, 429/5xx) — повторить после DIGEST_RETRY
+        self.digest_retry_at = 0.0
         self._was_quiet = False  # тихие часы были на прошлом скане — для разового дайджеста при выходе из них
         self.awaiting_amount = False  # ждём сумму текстом после «✏️ Своя сумма»
         self.awaiting_preset_name = False  # ждём имя пресета текстом после «💾 Сохранить как пресет»
@@ -2870,17 +2896,31 @@ class Bot:
         while len(text) > DIGEST_MAX and venues > 1:
             venues -= 1                          # меньше направлений — первая строка (итог) остаётся
             text = build(False, venues)
-        return text[:DIGEST_MAX]
+        return cut_lines(text, DIGEST_MAX)
 
     async def send_night_digest(self):
         """Дайджест по окончании тихих часов — одно сообщение (night_digest_text): связки по площадкам за ночь, топ-3
         по прибыли и сухой прогон за сутки; сумма круга у каждой связки — та, на которую её посчитали (из её
-        снимка), а не текущая."""
-        deals, self.night_deals = list(self.night_deals.values()), {}
+        снимка), а не текущая. Ночные связки и начало ночи очищаются только после доставки (или отказа Telegram,
+        который повтор не исправит — delivery_final); сбой сборки, сети, 429/5xx — данные остаются, повтор не раньше
+        чем через DIGEST_RETRY сек (digest_pending держит quiet_and_pause_tick). True — дайджест закрыт."""
         now = time.time()
+        if now < self.digest_retry_at:
+            return False
         since = self.quiet_since or now - DIGEST_FALLBACK_WINDOW
-        self.quiet_since = None
-        await self.send(self.night_digest_text(deals, since, now), topic="signals")
+        try:
+            r = await self.send(self.night_digest_text(list(self.night_deals.values()), since, now), topic="signals")
+        except Exception as e:
+            logger.warning("night digest: %s", accounts.api_error_text(e))
+            r = {}
+        if not delivery_final(r):
+            self.digest_retry_at = now + DIGEST_RETRY
+            logger.warning("night digest not sent, retry in %ss: %s", DIGEST_RETRY, r.get("description"))
+            return False
+        if not r.get("ok"):
+            logger.warning("night digest refused: %s", r.get("description"))
+        self.night_deals, self.quiet_since, self.digest_retry_at = {}, None, 0.0
+        return True
 
     def paper_digest_lines(self, now=None):
         """Сводка сухого прогона за последние сутки для утреннего дайджеста: строка итогов (как «За сегодня» в /paper,
@@ -2889,7 +2929,11 @@ class Bot:
         if not paper.settings()["on"]:
             return []
         now = time.time() if now is None else now
-        p = paper.summary_since(now - 86400)
+        try:
+            p = paper.summary_since(now - 86400)
+        except Exception as e:   # paper.db занята/испорчена — дайджест уходит без сводки прогона
+            logger.warning("digest paper: %s", e)
+            return []
         if not p["total"]:
             return []
         line = f"🧪 Сухой прогон за сутки: {p['total']} кругов, исполнилось {p['done']}"
@@ -2923,8 +2967,8 @@ class Bot:
             if not self._was_quiet and self.quiet_since is None:
                 self.quiet_since = time.time()   # начало ночи — окно для «связок по площадкам» в дайджесте
             self.collect_night_deals(snap)
-        elif self._was_quiet:
-            await self.send_night_digest()
+        elif self._was_quiet or self.digest_pending:
+            self.digest_pending = not await self.send_night_digest()
         self._was_quiet = quiet
         paused = self.paused or (self.pause_until and time.time() < self.pause_until)
         since = time.time()   # отправленное notify в этом скане отмечено в self.sent не раньше
