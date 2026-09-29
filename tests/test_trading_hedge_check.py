@@ -502,6 +502,32 @@ def test_render_ready_only_without_warnings():
     assert "Как включать хедж" not in failed   # при ❌ инструкции по включению не показываем
 
 
+def test_render_lists_warnings_next_to_the_verdict():
+    other = thc.Check(thc.WARN, "Проверка Г", "", "Тоже прочтите.")
+    lines = thc.render([OK_CHECK, WARN_CHECK, other])
+    i = next(n for n, x in enumerate(lines) if x.startswith("Итог:"))
+    assert "готов, но есть предупреждения:" in lines[i] and "⚠️ 2" in lines[i]
+    assert lines[i + 1] == "   ⚠️ Проверка Б: не блокирует" and lines[i + 2] == "   ⚠️ Проверка Г"   # сразу под итогом, по порядку
+    assert "Проверка А" not in "\n".join(lines[i:])                                                   # ✅ в список не попадают
+    assert not any(x.startswith("   ⚠️") for x in thc.render([OK_CHECK]))
+    assert not any(x.startswith("   ⚠️") for x in thc.render([WARN_CHECK, FAIL_CHECK])[-6:])       # при ❌ списка нет: итог и так про ❌
+
+
+def test_unconfirmed_one_way_is_repeated_next_to_the_verdict(tmp_path):
+    rows = {sym: [dict(flat_row(sym), positionIdx=1), dict(flat_row(sym), positionIdx=2)]
+            for sym in ("BTCUSDT", "ETHUSDT", "GRAMUSDT")}
+    for r in rows.values():
+        for x in r:
+            x["leverage"] = ""
+    checks, _ = run(FakeSession(routes(rows=rows)), tmp=tmp_path)
+    lines = thc.render(checks, CREDS)
+    i = next(n for n, x in enumerate(lines) if x.startswith("Итог:"))
+    tail = "\n".join(lines[i:])
+    assert "готов, но есть предупреждения:" in lines[i]
+    assert "   ⚠️ Режим позиций: One-Way: односторонний режим не подтверждён" in tail                # главное предупреждение не потеряно
+    assert sum(x.startswith("   ⚠️") for x in lines[i + 1:]) == 2                                   # плюс «свободный USDT»: всего два ⚠️
+
+
 def test_render_ladder_matches_core_gates():
     # gates.max_mode: пороги бумаги → сразу confirm; один сильный бэктест → minlot с РЕАЛЬНЫМИ ордерами
     text = "\n".join(thc.render([OK_CHECK]))
