@@ -3697,6 +3697,8 @@ class Bot:
             else:
                 await self.handle(text)
         elif who == "refuse":
+            if (msg.get("from") or {}).get("is_bot"):
+                return   # служебное сообщение самого бота («закреплено» после pinChatMessage): не команда, шума в логе не надо
             text = (msg.get("text") or "").strip()
             logger.warning("команда владельца не из его личного чата (чат %s, %s, от %s) — отказ",
                            chat, msg.get("chat", {}).get("type"), (msg.get("from") or {}).get("id"))

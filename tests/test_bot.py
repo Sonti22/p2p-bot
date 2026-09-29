@@ -3344,3 +3344,22 @@ def test_scan_loop_records_last_scan_timestamp_and_duration(monkeypatch):
     except asyncio.CancelledError:
         pass
     assert bot.last_scan_ts > 0 and bot.last_scan_duration >= 0
+
+
+def test_own_service_message_in_owner_chat_is_silently_ignored(caplog):
+    bot = Stub(p2p.Config())
+    bot.chat_id = "1"
+    svc = {"message": {"chat": {"id": 1, "type": "private"}, "from": {"id": 99, "is_bot": True},
+                       "pinned_message": {"message_id": 5}, "message_id": 6}}
+    with caplog.at_level("WARNING"):
+        arun(bot.on_update(svc))
+    assert "отказ" not in caplog.text and not bot.out
+
+
+def test_other_sender_in_owner_chat_still_refused_and_logged(caplog):
+    bot = Stub(p2p.Config())
+    bot.chat_id = "1"
+    with caplog.at_level("WARNING"):
+        arun(bot.on_update({"message": {"chat": {"id": 1, "type": "private"}, "from": {"id": 99, "is_bot": False},
+                                        "text": "/settings", "message_id": 7}}))
+    assert "отказ" in caplog.text
