@@ -57,16 +57,20 @@ def estimate(q, qty, hold_hours, now=None):
             "windows": windows, "cost": fees + spread - funding}
 
 
-def choose(asset, coin_qty, amount, ref, coin_rub, risk=0.0, now=None):
+def choose(asset, coin_qty, amount, ref, coin_rub, risk=0.0, now=None, venues=None):
     """Хедж круга: (план или None, причина, почему без хеджа). coin_qty — монета круга, amount — сумма круга ₽,
-    ref — ₽ за USDT (snap.ref; 0 — оценка по цене покупки coin_rub и mid перпа), risk — запас на курс монеты, %."""
+    ref — ₽ за USDT (snap.ref; 0 — оценка по цене покупки coin_rub и mid перпа), risk — запас на курс монеты, %.
+    venues — только эти площадки perp.VENUES (без учёта регистра: «bybit»); None — все."""
     st = settings()
     asset = (asset or "").upper()
     if not st["on"] or not perp.settings()["on"] or asset not in st["assets"] or coin_qty <= 0 or amount <= 0:
         return None, ""   # PERPS=0 — котировок не будет: не хеджируем и не пишем «нет котировки» в каждый круг
     now = time.time() if now is None else now
     plans, notes = [], []
+    wanted = None if venues is None else {str(v).lower() for v in venues}
     for venue in perp.VENUES:
+        if wanted is not None and venue.lower() not in wanted:
+            continue
         sym = perp.venue_symbol(venue, asset)   # TON: GRAMUSDT там, где он торгуется
         q = perp.quote(venue, sym, now)
         if q is None:

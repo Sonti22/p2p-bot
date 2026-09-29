@@ -186,9 +186,9 @@ TRADING_LINES_APPROVED = {   # подключение ядра к боту (ве
         'TRADING=0',
         'TRADING_MODE=paper',
         'TRADING_SHORT_PAPER=0',
-        'TRADING_MAX_LEVERAGE=2',          # этап владельца (confirm): плечо 2, лот 50, всего 100, день 5 USDT
-        'TRADING_MAX_POSITION_USDT=50',
-        'TRADING_MAX_TOTAL_USDT=100',
+        'TRADING_MAX_LEVERAGE=2',          # этап владельца (хедж кругов, confirm, 29.09): плечо 2, позиция и всего
+        'TRADING_MAX_POSITION_USDT=250',   # до 250 USDT (ETH-круг от 20 000 ₽ ≈ 220 USDT), день 5 USDT
+        'TRADING_MAX_TOTAL_USDT=250',
         'TRADING_DAILY_LOSS_USDT=5',
         'TRADING_MAX_ORDERS_PER_MIN=',
         'TRADING_MAX_ORDERS_PER_DAY=',
@@ -197,8 +197,11 @@ TRADING_LINES_APPROVED = {   # подключение ядра к боту (ве
     ],
     'bot.py': [
         'import trading.wiring',
+        # хедж кругов (этап 5, решение владельца 29.09): карточка после «✅ Сделал» и /hedge
+        'await trading.hedge.offer(self, "trade", trade_id, d[1].asset, hedge_plans.coin_qty(d, cfg.amount),',
         'await trading.wiring.callback(self, cq, data, save_env)',
         'await trading.wiring.command(self, arg)',
+        'await trading.wiring.hedge_command(self, arg)',
         'trading.switch.switch_from_file(ENV_PATH)   # торговля: TRADING и TRADING_MODE — только из .env, извне не поднять',
         'trading.gates.flags_from_file(ENV_PATH)     # флаг владельца TRADING_SHORT_PAPER — тоже только из файла .env',
         'bot.trading_task = asyncio.ensure_future(trading.wiring.run(bot))',   # старт и сверка — своей задачей

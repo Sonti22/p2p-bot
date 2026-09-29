@@ -22,6 +22,8 @@
   выключатель, режим, ключ, лимиты и чужое). Стратегий здесь нет: request_order никто в боте пока не вызывает.
 - «⛔ Стоп торговли» — switch.stop_and_persist (TRADING=0, TRADING_MODE=paper в .env) и отмена всех висящих токенов.
   Режим из Telegram — только понизить (switch.lower_and_persist).
+- Хедж кругов (trading/hedge.py, этап 5): карточку предлагает bot.mark_done (hedge.offer), кнопки trd_hedge_* идут сюда
+  же в callback (тот же _owner_gate бота, что у trd_ok), hedge.tick — в каждом tick после сверки, /hedge — hedge_command.
 """
 import asyncio
 import html
@@ -31,7 +33,7 @@ import secrets
 import time
 from decimal import Decimal
 
-from trading import journal, keys, risk, switch, venues
+from trading import hedge, journal, keys, risk, switch, venues
 
 logger = logging.getLogger(__name__)
 
@@ -43,9 +45,11 @@ TOKEN_TTL = 120        # сек жизни кнопки подтверждени
 RECHECK_AFTER = keys.CHECK_TTL // 2   # сек: проверка прав ключа старше — перепроверить у биржи (живёт CHECK_TTL)
 RECHECK_RETRY = 600    # сек: перепроверка не удалась — следующая попытка не раньше
 TOPIC = "journal"      # события, тревоги и итоги ордеров — в «📒 Журнал» (как выплаты), а не туда, где писали последним
-# этап владельца (решение 2026-09-28): confirm, лот ~20–50 USDT, дневной убыток 5 USDT. Потолки кода для confirm/auto
-# выше (risk.HARD) — если .env их не понизил, владельцу предупреждение при старте и в /trading
-STAGE = {"position_usdt": Decimal(50), "daily_loss_usdt": Decimal(5)}
+# этап владельца (решение 29.09, хедж кругов в confirm): позиция и всего открыто до 250 USDT, дневной убыток 5 USDT —
+# круг 10 000 ₽ ≈ 110 USDT (BTC/TON), ETH хеджируется с 20 000 ₽ ≈ 220 USDT (потолок 120 пропустил бы только круги до
+# ~10 000 ₽). Потолки кода для confirm/auto выше (risk.HARD) — если .env их не понизил, владельцу предупреждение при
+# старте и в /trading
+STAGE = {"position_usdt": Decimal(250), "total_usdt": Decimal(250), "daily_loss_usdt": Decimal(5)}
 VENUE_NAMES = {venues.BYBIT: "Bybit", venues.BINGX: "BingX"}
 MODE_NAMES = {"paper": "бумага (реальных ордеров нет)", "minlot": "минимальный лот, по кнопке",
               "confirm": "по кнопке", "auto": "автомат"}
@@ -121,19 +125,24 @@ async def _margin_modes(s, usable):
 
 
 def stage_warnings():
-    """Режим confirm/auto, а потолки позиции или дневного убытка выше этапа владельца (STAGE) — .env их не понизил
-    (TRADING_MAX_POSITION_USDT, TRADING_DAILY_LOSS_USDT): предупреждение. Другие режимы — потолки minlot, пусто."""
+    """Режим confirm/auto, а потолки позиции, всего открытого или дневного убытка выше этапа владельца (STAGE) — .env их
+    не понизил (TRADING_MAX_POSITION_USDT, TRADING_MAX_TOTAL_USDT, TRADING_DAILY_LOSS_USDT): предупреждение. В пределах
+    этапа (например 120 / 250 / 5) — молчим. Другие режимы — потолки minlot, пусто."""
     mode = switch.mode()
     if mode not in ("confirm", "auto"):
         return []
     pos = max(risk.limits(st, mode)["position_usdt"] for st in risk.STRATEGIES)
-    loss = risk.limits("hedge", mode)["daily_loss_usdt"]
-    if pos <= STAGE["position_usdt"] and loss <= STAGE["daily_loss_usdt"]:
+    lim = risk.limits("hedge", mode)
+    total, loss = lim["total_usdt"], lim["daily_loss_usdt"]
+    if pos <= STAGE["position_usdt"] and total <= STAGE["total_usdt"] and loss <= STAGE["daily_loss_usdt"]:
         return []
-    return [f"режим {mode}: действуют потолки кода — позиция до {venues.fmt(pos)} USDT, дневной убыток до "
-            f"{venues.fmt(loss)} USDT; решение владельца — лот 20–50 USDT и 5 USDT в день: задайте в .env на ПК "
-            f"TRADING_MAX_POSITION_USDT={venues.fmt(STAGE['position_usdt'])} и "
-            f"TRADING_DAILY_LOSS_USDT={venues.fmt(STAGE['daily_loss_usdt'])} (см. .env.example)"]
+    return [f"режим {mode}: потолки выше этапа владельца — позиция до {venues.fmt(pos)} USDT, всего открыто до "
+            f"{venues.fmt(total)} USDT, дневной убыток до {venues.fmt(loss)} USDT; этап — хедж кругов: позиция и всего "
+            f"до {venues.fmt(STAGE['position_usdt'])} USDT, 5 USDT в день: задайте в .env на ПК "
+            f"TRADING_MAX_POSITION_USDT={venues.fmt(STAGE['position_usdt'])}, "
+            f"TRADING_MAX_TOTAL_USDT={venues.fmt(STAGE['total_usdt'])} и "
+            f"TRADING_DAILY_LOSS_USDT={venues.fmt(STAGE['daily_loss_usdt'])} (см. .env.example; позиция 120 — хедж "
+            f"только кругов до ~10 000 ₽)"]
 
 
 async def startup(bot):
@@ -349,6 +358,7 @@ async def tick(bot, now=None):
             raise
         except Exception as e:   # noqa: BLE001
             failed = failed or e
+    await hedge.tick(bot, now)   # хедж кругов — после сверки (журнал свежий); сам не бросает
     for step in (check_day_stop, write_state):
         try:
             step()
@@ -461,6 +471,11 @@ async def command(bot, arg=""):
     await bot.send(text, markup=kb)
 
 
+async def hedge_command(bot, arg=""):
+    """/hedge — хеджи кругов (trading/hedge.py): только владелец (bot.dispatch, как /trading)."""
+    await hedge.hedge_command(bot, arg)
+
+
 # --- подтверждение ордера ---
 
 def order_text(order, strategy, group=""):
@@ -546,10 +561,13 @@ def stop(bot, save_env):
 
 
 async def callback(bot, cq, data, save_env):
-    """Кнопки trd_* — bot.py вызывает только для владельца в его личном чате (после _owner_gate)."""
+    """Кнопки trd_* — bot.py вызывает только для владельца в его личном чате (после _owner_gate). trd_hedge_* (хедж
+    кругов) — сюда же, под тот же вход, что trd_ok."""
     msg = cq.get("message") or {}
     toast = ""
-    if data.startswith("trd_ok:"):
+    if data.startswith("trd_hedge_"):
+        toast = await hedge.callback(bot, cq, data)
+    elif data.startswith("trd_ok:"):
         link = link_of(bot)
         ok, _ = reread_switch(link)   # TRADING=0 в .env (launcher, владелец) — кнопки погашены, ничего не уходит
         rec, why = take_token(link, data[7:], msg.get("message_id"))

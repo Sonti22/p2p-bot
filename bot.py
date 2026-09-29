@@ -118,6 +118,7 @@ COMMANDS = [{"command": "best", "description": "Лучшая связка сей
             {"command": "banks", "description": "Банки: спред за 7 дней; /banks USDT — объём сейчас"},
             {"command": "balance", "description": "Баланс по подключённым биржам"},
             {"command": "payout", "description": "Выплата Cryptomus на адрес из белого списка, /payout history"},
+            {"command": "hedge", "description": "Хедж кругов шортом перпа: открытые, закрыть, стоп"},
             {"command": "fees", "description": "Комиссии вывода по сетям и возраст данных"},
             {"command": "settings", "description": "Порог, сумма, пауза"},
             {"command": "pause", "description": "Пауза сигналов: /pause 30m|1h|3h|до утра"},
@@ -198,7 +199,8 @@ HELP_SECTIONS = {
                 "/mybanks — свои банки и бесплатные лимиты СБП\n/fav — избранные маршруты\n"
                 "/alert USDT sell 92 7d, /alerts — алерты на курс\n"
                 "/blacklist, /blacklist note &lt;id&gt; &lt;текст&gt; — скрытые мерчанты\n"
-                "/balance — баланс подключённых бирж, итог в ₽\n/traps — последние отсеянные ловушки"),
+                "/balance — баланс подключённых бирж, итог в ₽\n/traps — последние отсеянные ловушки\n"
+                "/hedge — хедж круга шортом перпа: открытые, закрыть"),
     "paper": ("🧪 Сухой прогон", "<b>Сухой прогон и бумажные симуляции (без денег)</b>\n"
               "/paper — открытый круг, итоги, план против факта, виртуальный баланс\n"
               "/paper on / off — включить / выключить\n/paper amount 20000 — сумма круга\n"
@@ -1828,6 +1830,12 @@ class Bot:
                                risk=cfg.risk_buffer.get(d[1].asset, 0.0))
         except Exception as e:
             logger.error("hedge_plans: %s: %s", type(e).__name__, e)
+        try:   # реальный хедж (trading/hedge.py): карточка с кнопкой, только если торговля, ключ и пороги позволяют
+            await trading.hedge.offer(self, "trade", trade_id, d[1].asset, hedge_plans.coin_qty(d, cfg.amount),
+                                      cfg.amount, getattr(snap, "ref", 0.0) or 0.0,
+                                      cfg.risk_buffer.get(d[1].asset, 0.0))
+        except Exception as e:
+            logger.error("hedge offer: %s: %s", type(e).__name__, e)
         await self.call("answerCallbackQuery", callback_query_id=cq["id"], text="Записано в журнал ✅")
         await self.send(f"Расчёт был {d[0]:+.2f}%. Какой вышел факт?", markup=fact_markup(trade_id), topic="journal")
         await self.call("editMessageReplyMarkup", chat_id=self.chat_id, message_id=cq["message"]["message_id"],
@@ -4172,6 +4180,8 @@ class Bot:
             await self.cmd_resume()
         elif cmd == "/trading" and REPLY_CHAT.get() is None:   # только владелец (гость сюда и не доходит: GUEST_CMDS)
             await trading.wiring.command(self, arg)
+        elif cmd == "/hedge" and REPLY_CHAT.get() is None:   # хедж кругов — тоже только владелец
+            await trading.wiring.hedge_command(self, arg)
         elif REPLY_CHAT.get() is not None:   # гостю — справка одним сообщением (кнопки разделов — у владельца)
             await self.send(GUIDE, markup=LINKS)
         else:   # /help и незнакомая команда — оглавление справки с кнопками разделов

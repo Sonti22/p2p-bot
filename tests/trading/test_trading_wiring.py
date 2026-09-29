@@ -634,12 +634,14 @@ def _parse_env_example():
 
 
 def test_env_example_sets_owner_stage_limits_for_confirm(monkeypatch):
-    """Решение владельца: confirm, лот 20–50 USDT, убыток дня 5 USDT — в .env.example, а не потолки кода 1000/50."""
+    """Решение владельца (29.09, хедж кругов в confirm): позиция и всего открыто до 250 USDT, убыток дня 5 USDT, плечо
+    2 — в .env.example (этап wiring.STAGE), а не потолки кода 1000/2000/50."""
     env = _parse_env_example()
     for st in risk.STRATEGIES:
         lim = risk.limits(st, "confirm", environ=env)
-        assert lim["position_usdt"] <= 50 and lim["daily_loss_usdt"] <= 5 and lim["leverage"] <= 2
-        assert lim["total_usdt"] <= 100
+        assert lim["position_usdt"] <= wiring.STAGE["position_usdt"] == 250
+        assert lim["daily_loss_usdt"] <= wiring.STAGE["daily_loss_usdt"] == 5 and lim["leverage"] <= 2
+        assert lim["total_usdt"] <= wiring.STAGE["total_usdt"] == 250
     for k, v in env.items():
         monkeypatch.setenv(k, v)
     monkeypatch.setenv("TRADING_MODE", "confirm")
@@ -650,11 +652,18 @@ def test_confirm_with_code_caps_warns_owner_at_start_and_in_view(core, monkeypat
     _keys_ok_at_start(monkeypatch)
     bot = Stub()
     text = arun(wiring.startup(bot))
-    assert "TRADING_MAX_POSITION_USDT=50" in text and "1000" in text and "TRADING_DAILY_LOSS_USDT=5" in text
-    assert "TRADING_MAX_POSITION_USDT=50" in wiring.view(bot)[0]
-    monkeypatch.setenv("TRADING_MAX_POSITION_USDT", "50")
+    assert "TRADING_MAX_POSITION_USDT=250" in text and "1000" in text and "TRADING_DAILY_LOSS_USDT=5" in text
+    assert "TRADING_MAX_TOTAL_USDT=250" in text and "2000" in text
+    assert "TRADING_MAX_POSITION_USDT=250" in wiring.view(bot)[0]
+    monkeypatch.setenv("TRADING_MAX_POSITION_USDT", "120")                  # 120 — хедж только кругов до ~10 000 ₽
+    monkeypatch.setenv("TRADING_MAX_TOTAL_USDT", "250")
     monkeypatch.setenv("TRADING_DAILY_LOSS_USDT", "5")
     assert "TRADING_MAX_POSITION_USDT" not in wiring.view(bot)[0] and "−5 USDT" in wiring.view(bot)[0]
+    monkeypatch.setenv("TRADING_MAX_POSITION_USDT", "251")                  # выше этапа — снова предупреждение
+    assert "TRADING_MAX_POSITION_USDT=250" in wiring.view(bot)[0]
+    monkeypatch.setenv("TRADING_MAX_POSITION_USDT", "250")
+    monkeypatch.delenv("TRADING_MAX_TOTAL_USDT")                            # всего — потолок кода 2000
+    assert "TRADING_MAX_TOTAL_USDT=250" in wiring.view(bot)[0]
     monkeypatch.delenv("TRADING_DAILY_LOSS_USDT")
     monkeypatch.setenv("TRADING_MODE", "minlot")                            # minlot: потолки 50/5 и так
     assert wiring.stage_warnings() == []

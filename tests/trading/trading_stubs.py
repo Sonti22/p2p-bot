@@ -14,7 +14,7 @@ from decimal import Decimal
 from yarl import URL
 
 import accounts
-from trading import journal, keys
+from trading import hedge, journal, keys
 
 KEY, SECRET = "FAKEKEY0000", "FAKESECRET0000000000"
 CREDS = (KEY, SECRET)
@@ -62,8 +62,11 @@ REAL_FEED_PROBLEM = journal._feed_problem
 def fresh_journal(monkeypatch, tmp_path, gates=False, feed=False):
     """Журнал в tmp, свежие замки и соединения с базой, без идущих отправок, торговые ключи CREDS проверены (итог — в
     tmp). По умолчанию пороги gates не ограничивают режим (gates=True — настоящие: бэктест из файла владельца), а
-    свежесть сверки позиций (watch) не требуется (feed=True — требуется)."""
+    свежесть сверки позиций (watch) не требуется (feed=True — требуется). База хеджей кругов (trading/hedge.py) — тоже
+    в tmp: wiring.tick зовёт hedge.tick."""
     monkeypatch.setattr(journal, "DB_PATH", str(tmp_path / "trading.db"))
+    monkeypatch.setattr(hedge, "DB_PATH", str(tmp_path / "hedge_circles.db"))
+    monkeypatch.setattr(hedge, "_busy", {})
     monkeypatch.setattr(journal, "_CONNS", {})
     monkeypatch.setattr(journal, "RETRY_DELAY", 0)
     monkeypatch.setattr(journal, "FLAT_GRACE", 0)     # «биржа» заглушки отвечает о позиции без задержки

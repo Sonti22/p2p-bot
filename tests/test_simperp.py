@@ -66,6 +66,17 @@ def test_choose_without_quotes_explains_why():
     assert simperp.choose("USDT", 100, 10000, RUB, 90, now=NOW) == (None, "")   # стейблкоин не хеджируем
 
 
+def test_choose_can_be_limited_to_venues():
+    """venues — только эти площадки (реальный хедж: HEDGE_VENUES=bybit); None — все, как раньше."""
+    install(quote("Bybit", "ETHUSDT", mid=2700, spread=0.01, rate=0.0, lot=0.01, min_qty=0.01, fee=0.055, ts=NOW),
+            quote("BingX", "ETHUSDT", mid=2700, spread=0.01, rate=0.0, lot=0.01, min_qty=0.01, fee=0.05, ts=NOW))
+    assert simperp.choose("ETH", 0.5, 120000, RUB, 2700 * RUB, now=NOW)[0]["venue"] == "BingX"   # дешевле
+    plan, _ = simperp.choose("ETH", 0.5, 120000, RUB, 2700 * RUB, now=NOW, venues=["bybit"])
+    assert plan["venue"] == "Bybit" and plan["alt"] == {}
+    assert simperp.choose("ETH", 0.5, 120000, RUB, 2700 * RUB, now=NOW, venues=["Bybit", "BingX"])[0]["venue"] == "BingX"
+    assert simperp.choose("ETH", 0.5, 120000, RUB, 2700 * RUB, now=NOW, venues=[]) == (None, "")
+
+
 def test_hedged_plan_and_card_line():
     _btc_quotes()
     plan, note = simperp.choose("BTC", 0.0013, 10000, RUB, 84000 * RUB, risk=0.3, now=NOW)

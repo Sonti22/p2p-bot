@@ -28,17 +28,24 @@ def _connect(path):
     return con
 
 
+def coin_qty(deal, amount):
+    """Монета круга (hedge_ref_qty): сумма круга ₽ / цена покупки. Одна формула для плана здесь и реального хеджа
+    (trading/hedge.py через bot.mark_done)."""
+    _, b, _, _ = deal
+    return amount / b.price if b.price > 0 else 0.0
+
+
 def record(trade_id, deal, amount, ref=0.0, risk=0.0, path=trades.DB_PATH, now=None):
     """Посчитать и записать план хеджа сделки trade_id: deal — (прибыль %, покупка Ad, продажа Ad, маршрут), amount —
     сумма круга ₽, ref — ₽ за USDT (snap.ref), risk — запас на курс монеты, %. Монета не хеджируется или хедж
     выключен (PAPER_HEDGE=0, PERPS=0) — ничего не пишем, None; иначе id записи."""
     _, b, _, _ = deal
-    coin_qty = amount / b.price if b.price > 0 else 0.0
-    plan, note = simperp.choose(b.asset, coin_qty, amount, ref, b.price, risk=risk, now=now)
+    qty = coin_qty(deal, amount)
+    plan, note = simperp.choose(b.asset, qty, amount, ref, b.price, risk=risk, now=now)
     if plan is None and not note:
         return None
     now = time.time() if now is None else now
-    row = {"trade_id": trade_id, "ts": now, "asset": (b.asset or "").upper(), "coin_qty": coin_qty, "amount": amount,
+    row = {"trade_id": trade_id, "ts": now, "asset": (b.asset or "").upper(), "coin_qty": qty, "amount": amount,
            "note": note if plan is None else ""}
     if plan:
         row.update(venue=plan["venue"], symbol=plan["symbol"], qty=plan["qty"], ratio=plan["ratio"],
