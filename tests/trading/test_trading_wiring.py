@@ -356,7 +356,7 @@ def test_mode_can_only_be_lowered_from_telegram(core, tmp_path):
     assert "нельзя" in toast and switch.mode() == "confirm"
     toast = arun(wiring.callback(bot, press(OWNER, "x")["callback_query"], "trd_mode:minlot", saver(path)))
     assert switch.mode() == "minlot" and "TRADING_MODE=minlot" in path.read_text(encoding="utf-8")
-    kb = [b["callback_data"] for row in bot.out[-2][1]["reply_markup"]["inline_keyboard"] for b in row]
+    kb = [b["callback_data"] for row in bot.out[-1][1]["reply_markup"]["inline_keyboard"] for b in row]
     assert "trd_mode:paper" in kb and "trd_mode:confirm" not in kb and "trd_mode:auto" not in kb
 
 
@@ -370,3 +370,92 @@ def test_no_submit_call_outside_confirm_path():
     assert callers == ["_submit"]
     src = open(B.__file__, encoding="utf-8").read()
     assert "journal.submit" not in src and "request_order" not in src     # в боте стратегий и ордеров нет
+
+
+# --- ревью: устаревшая проверка ключей, позиции без ключа, лимит 0, сбой /trading ---
+
+def _stale(now):
+    for v in venues.VENUES:
+        keys.save_check(v, CREDS, keys.KeyCheck(True, "ok", "", True), now=now - keys.CHECK_TTL - 1)
+
+
+def test_stale_key_check_is_rechecked_and_reconcile_continues(core, monkeypatch):
+    import time
+    now = time.time()
+    _stale(now)
+    asked, rec = [], []
+
+    async def check(s, v, creds=None, path=None):
+        asked.append(v)
+        res = keys.KeyCheck(True, "ok", "", True)
+        keys.save_check(v, CREDS, res)
+        return res
+
+    async def reconcile(s, creds_for, now=None, positions=True):
+        rec.append(creds_for("bybit"))
+        return []
+
+    monkeypatch.setattr(keys, "check", check)
+    monkeypatch.setattr(journal, "reconcile", reconcile)
+    assert not wiring.has_keys()
+    arun(wiring.tick(Stub(), now))
+    assert asked == ["bybit", "bingx"] and rec == [CREDS] and switch.enabled()
+    arun(wiring.tick(Stub(), now + 60))
+    assert asked == ["bybit", "bingx"]                                     # свежая — снова не спрашиваем
+
+
+def test_recheck_finds_withdraw_rights_turns_trading_off(core, monkeypatch):
+    import time
+    now = time.time()
+    _stale(now)
+
+    async def check(s, v, creds=None, path=None):
+        res = keys.KeyCheck(False, "unsafe", "у ключа лишние права: Wallet:Withdraw", True)
+        keys.save_check(v, CREDS, res)
+        return res
+
+    monkeypatch.setattr(keys, "check", check)
+    bot = Stub()
+    arun(wiring.tick(bot, now))
+    assert not switch.enabled()
+    assert any("сверх торговли" in t and "Withdraw" in t for t in sent(bot))
+
+
+def test_failed_recheck_with_positions_alarms_and_waits_before_retry(core, monkeypatch):
+    import time
+    now = time.time()
+    _stale(now)
+    asked = []
+
+    async def check(s, v, creds=None, path=None):
+        asked.append(v)
+        res = keys.KeyCheck(False, "unknown", "права не проверить: timeout", None)
+        keys.save_check(v, CREDS, res)
+        return res
+
+    monkeypatch.setattr(keys, "check", check)
+    monkeypatch.setattr(journal, "_exposure_symbols", lambda path=None: [("bybit", "linear", "BTCUSDT")])
+    bot = Stub()
+    arun(wiring.tick(bot, now))
+    texts = sent(bot)
+    assert any("без сопровождения" in t or "не работают" in t for t in texts)          # тревога unmanaged
+    assert any("перепроверка прав" in t for t in texts) and not switch.enabled()
+    arun(wiring.tick(bot, now + 60))
+    assert asked == ["bybit", "bingx"]                                     # повтор не раньше RECHECK_RETRY
+    arun(wiring.tick(bot, now + wiring.RECHECK_RETRY))
+    assert asked == ["bybit", "bingx"] * 2
+
+
+def test_zero_daily_limit_does_not_spam_day_stop(core, monkeypatch):
+    monkeypatch.setenv("TRADING_DAILY_LOSS_USDT", "0")
+    assert not wiring.check_day_stop() and journal.pending_events() == []
+
+
+def test_trading_view_failure_still_answers_button(core, monkeypatch):
+    monkeypatch.setattr(wiring, "view", lambda bot: (_ for _ in ()).throw(RuntimeError("database is locked")))
+    bot = Stub()
+    arun(wiring.callback(bot, press(OWNER, "x")["callback_query"], "trd_view", None))
+    assert [m for m, _ in bot.out] == ["answerCallbackQuery", "sendMessage"]
+    assert "не прочитать" in sent(bot)[-1] and "trd_stop" in str(bot.out[-1][1]["reply_markup"])
+    arun(wiring.command(bot))
+    assert "не прочитать" in sent(bot)[-1]

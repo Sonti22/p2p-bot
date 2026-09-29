@@ -34,6 +34,8 @@ logger = logging.getLogger(__name__)
 INTERVAL = 30          # сек между сверками (journal.reconcile)
 FAIL_PAUSE = 300       # сек паузы после сбоя ядра
 TOKEN_TTL = 120        # сек жизни кнопки подтверждения ордера
+RECHECK_AFTER = keys.CHECK_TTL // 2   # сек: проверка прав ключа старше — перепроверить у биржи (живёт CHECK_TTL)
+RECHECK_RETRY = 600    # сек: перепроверка не удалась — следующая попытка не раньше
 VENUE_NAMES = {venues.BYBIT: "Bybit", venues.BINGX: "BingX"}
 MODE_NAMES = {"paper": "бумага (реальных ордеров нет)", "minlot": "минимальный лот, по кнопке",
               "confirm": "по кнопке", "auto": "автомат"}
@@ -55,6 +57,10 @@ EVENTS = {
     "reconcile_error": ("⚠️", "сверка ордера с биржей не удалась"),
     "watch_error": ("⚠️", "сверка позиций бота с биржей не удалась"),
     "day_stop": ("⛔", "дневной лимит убытка достигнут — новых открытий до конца дня (МСК) не будет"),
+    "key_unsafe": ("⛔", "у торгового ключа появились права сверх торговли (вывод, переводы…) — торговля выключена"),
+    "key_failed": ("⚠️", "перепроверка прав торгового ключа не прошла — ключом бот не пользуется"),
+    "unmanaged": ("🚨", "у бота есть позиции или ордера, а проверенного ключа нет — сверка, стопы и закрытие не "
+                  "работают; проверьте ключ на ПК: python scripts/trading_keys.py check"),
 }
 
 
@@ -67,6 +73,7 @@ class Link:
         self.tokens = {}          # токен -> {"order", "strategy", "group", "expires", "message_id"}
         self.alarmed = False      # тревога о сбое ядра уже ушла (до первой удачной сверки)
         self.tasks = set()        # фоновые отправки подтверждённых ордеров
+        self.rechecked = {}       # биржа -> когда последний раз перепроверяли права ключа (refresh_keys)
 
 
 def link_of(bot):
@@ -185,7 +192,7 @@ def day_limit():
 def check_day_stop(now=None):
     """Убыток дня дошёл до лимита — событие владельцу (один раз за день МСК)."""
     pnl, lim = journal.pnl_today(now), day_limit()
-    if pnl <= -lim:
+    if lim > 0 and pnl <= -lim:   # лимит 0 (TRADING_DAILY_LOSS_USDT=0) — открытий и так нет, «стоп» каждый день не шлём
         journal.emit("day_stop", f"результат дня {pnl:.2f} USDT при лимите −{lim} USDT",
                      dedup=f"day_stop|{int(journal.day_start(now))}")
         return True
@@ -209,14 +216,52 @@ def sweep_tokens(link, now=None):
         link.tokens.pop(t, None)
 
 
-async def tick(bot):
-    """Один шаг цикла: сверка (если есть проверенные ключи), дневной стоп, состояние для launcher, доставка событий."""
+async def refresh_keys(bot, now=None):
+    """Перепроверить у биржи права ключей, проверка которых старше RECHECK_AFTER, не прошла или ключ заменён (keys —
+    fail closed: через CHECK_TTL без перепроверки ключом не пользуется никто, и сверка позиций бота встала бы).
+    Лишние права — торговля выключена; TRADING=1, а годных ключей не осталось, — тоже; владельцу — событием."""
+    now = time.time() if now is None else now
     link = link_of(bot)
-    sweep_tokens(link)
-    if not has_keys() and not os.path.exists(journal.DB_PATH):
+    for v in venues.VENUES:
+        creds = keys.raw_credentials(v)
+        if not creds:
+            continue
+        why, rec = keys.check_status(v, creds, now)
+        ts = rec.get("ts") if isinstance(rec, dict) else None
+        if not why and isinstance(ts, (int, float)) and now - ts < RECHECK_AFTER:
+            continue
+        if now - link.rechecked.get(v, 0) < RECHECK_RETRY:
+            continue
+        link.rechecked[v] = now
+        kc = await keys.check(bot.s, v, creds)
+        link.checks[v] = kc
+        fp = keys.fingerprint(creds)
+        if kc.state == "unsafe":
+            switch.disable()
+            journal.emit("key_unsafe", f"{VENUE_NAMES[v]}: {kc.detail}", dedup=f"key_unsafe|{v}|{fp}")
+        elif not kc.ok:
+            journal.emit("key_failed", f"{VENUE_NAMES[v]}: {kc.detail}", dedup=f"key_failed|{v}|{fp}|{int(now // 3600)}")
+    if switch.enabled() and not has_keys():
+        switch.disable()
+        journal.emit("key_failed", "проверенного торгового ключа не осталось — торговля выключена",
+                     dedup=f"no_keys|{int(now // 3600)}")
+
+
+async def tick(bot, now=None):
+    """Один шаг цикла: перепроверка устаревших ключей, сверка (если есть проверенные ключи; позиции есть, а ключей нет —
+    тревога), дневной стоп, состояние для launcher, доставка событий."""
+    now = time.time() if now is None else now
+    link = link_of(bot)
+    sweep_tokens(link, now)
+    raw = any(keys.raw_credentials(v) for v in venues.VENUES)
+    if not raw and not os.path.exists(journal.DB_PATH):
         return   # торговлей не пользовались: базу журнала не создаём
+    if raw:
+        await refresh_keys(bot, now)
     if has_keys():
         await journal.reconcile(bot.s, creds_for)
+    elif journal.active() or journal._exposure_symbols():
+        journal.emit("unmanaged", "", dedup=f"unmanaged|{int(now // 3600)}")
     check_day_stop()
     write_state()
     await deliver(bot)
@@ -307,8 +352,19 @@ def view(bot):
     return "\n".join(lines), {"inline_keyboard": kb}
 
 
+def safe_view(bot):
+    """view, но сбой базы (занята скриптом владельца и т. п.) — короткий текст, а не исключение в цикл команд."""
+    try:
+        return view(bot)
+    except Exception as e:   # noqa: BLE001
+        logger.warning("trading view: %s", type(e).__name__)
+        return (f"🤖 <b>Торговля</b>: {status_line()}\nПодробности сейчас не прочитать ({_esc(type(e).__name__)}) — "
+                "повторите позже.", {"inline_keyboard": [[{"text": "⛔ Стоп торговли", "callback_data": "trd_stop"},
+                                                          {"text": "🔄 Обновить", "callback_data": "trd_view"}]]})
+
+
 async def command(bot, arg=""):
-    text, kb = view(bot)
+    text, kb = safe_view(bot)
     await bot.send(text, markup=kb)
 
 
@@ -421,8 +477,8 @@ async def callback(bot, cq, data, save_env):
         lowered, err = switch.lower_and_persist(data[9:], save_env)
         toast = (f"режим понижен до {switch.mode()}" + (f" (только до перезапуска: {err})" if err else "")
                  if lowered else "повысить режим из Telegram нельзя — только в .env на ПК")
-    if data in ("trd_view", "trd_stop") or data.startswith("trd_mode:"):
-        text, kb = view(bot)
-        await bot.send(text, markup=kb)
     await bot.call("answerCallbackQuery", callback_query_id=cq.get("id"), text=toast[:190])
+    if data in ("trd_view", "trd_stop") or data.startswith("trd_mode:"):
+        text, kb = safe_view(bot)
+        await bot.send(text, markup=kb)
     return toast
