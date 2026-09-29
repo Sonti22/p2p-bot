@@ -54,6 +54,10 @@ def _connect(path):
     con.execute("CREATE TABLE IF NOT EXISTS bank_spreads ("
                 "id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, side TEXT, bank TEXT, profit REAL)")
     con.execute("CREATE INDEX IF NOT EXISTS idx_bank_spreads_ts ON bank_spreads (ts)")
+    con.execute("CREATE TABLE IF NOT EXISTS venue_outages ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, venue TEXT, start REAL, end REAL, scans INTEGER, "
+                "alerted INTEGER, reason TEXT)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_venue_outages_end ON venue_outages (end)")
     return con
 
 
@@ -277,6 +281,7 @@ def cleanup(path=DB_PATH, now=None):
         con.execute("DELETE FROM history_routes WHERE ts < ?", (now - RETENTION,))
         con.execute("DELETE FROM signals WHERE last_seen < ?", (now - RETENTION,))
         con.execute("DELETE FROM bank_spreads WHERE ts < ?", (now - RETENTION,))
+        con.execute("DELETE FROM venue_outages WHERE end < ?", (now - RETENTION,))
     con.close()
     return cur.rowcount
 
@@ -389,4 +394,37 @@ def bank_spread_stats(days=7, path=DB_PATH, now=None):
         out.setdefault(side, []).append((bank, n, avg, best, pos / n if n else 0.0))
     for side in out:
         out[side].sort(key=lambda r: (-r[2], r[0]))
+    return out
+
+
+def record_outage(venue, start, end, scans, alerted=False, reason="", path=DB_PATH):
+    """Эпизод недоступности площадки целиком — пишет бот в момент восстановления (Bot.check_venues): начало, конец,
+    сканов с ошибкой подряд, был ли алерт владельцу, последняя ошибка (коротко)."""
+    con = _connect(path)
+    with con:
+        con.execute("INSERT INTO venue_outages (venue, start, end, scans, alerted, reason) VALUES (?, ?, ?, ?, ?, ?)",
+                    (venue, start, end, int(scans), int(bool(alerted)), str(reason or "")[:120]))
+    con.close()
+
+
+def outage_stats(days=7, path=DB_PATH, now=None, min_seconds=0):
+    """Недоступность площадок за `days` дней (эпизоды, закончившиеся в окне; часть до окна не считается):
+    {площадка: {"count", "total", "longest", "alerted"}} — секунды. min_seconds — короче не считать (разовый сбой
+    одного скана). Базы нет — {}."""
+    now = time.time() if now is None else now
+    if not os.path.exists(path):
+        return {}
+    since = now - days * 86400
+    con = _connect(path)
+    rows = con.execute("SELECT venue, start, end, alerted FROM venue_outages WHERE end >= ? AND end - start >= ?",
+                       (since, min_seconds)).fetchall()
+    con.close()
+    out = {}
+    for venue, start, end, alerted in rows:
+        dur = end - max(start, since)
+        rec = out.setdefault(venue, {"count": 0, "total": 0.0, "longest": 0.0, "alerted": 0})
+        rec["count"] += 1
+        rec["total"] += dur
+        rec["longest"] = max(rec["longest"], dur)
+        rec["alerted"] += 1 if alerted else 0
     return out
