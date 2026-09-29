@@ -21,17 +21,24 @@ data/gates_paper.json (и, для minlot, data/gates_backtest.json): trading/gat
 
 Бумага -> data/gates_paper.json (simperp.gate_stats по копии paper.db; в копии оставлены только подходящие круги)
 Считается ОТДЕЛЬНО по каждой монете, чтобы плохая монета (например, ETH) не пряталась в среднем по BTC/ETH/TON:
-  монета с числом закрытых хеджей меньше 5 — «мало данных»: в файл и в count не идёт, в отчёте перечислена;
+  монета с числом закрытых хеджей меньше 5 — «мало данных»: в count не идёт, а главное — БЛОКИРУЕТ пороги (см. ниже);
   count           сумма закрытых хеджей с итогом по монетам с данными (0 — честный ноль)
   days            МИНИМУМ по монетам: дней с первого подходящего хеджа
   ratio_ok_share  МИНИМУМ по монетам: доля хеджей с коэффициентом 1 ± 0.1
   cost_to_buffer  МАКСИМУМ по монетам: средняя стоимость хеджа / запас на курс (RISK_BUFFER монеты)
   sigma_ratio     МАКСИМУМ по монетам: σ(факт − план) с хеджем / без хеджа (нужно ≥ 2 исполненных круга на монету)
   Нет данных хотя бы у одной монеты с данными — ключа нет (кроме count и days). Цифры не округляются в лучшую сторону
-  и не выдумываются. Рядом с ratio_ok_share печатается доля кругов без хеджа (статус none: плана нет) — они в долю не
-  входят (эффект выжившего), это справка, порогом не проверяется.
+  и не выдумываются. Число вне допустимого диапазона (ratio_ok_share не в 0–1, cost_to_buffer или sigma_ratio меньше 0)
+  считается битым: ключа нет. Рядом с ratio_ok_share печатается доля кругов без хеджа (статус none: плана нет) — они в
+  долю не входят (эффект выжившего), это справка, порогом не проверяется.
   gates.load_paper не проверяет возраст файла: перезапускайте скрипт перед включением confirm и раз в неделю.
-  Монета без достаточных данных бумагой НЕ подтверждена, хотя пороги её не видят: не нужна — уберите из HEDGE_ASSETS.
+  БЛОКИРОВКА. Если ХОТЬ ОДНА монета, которую бот реально хеджирует (HEDGE_ASSETS и минимальный круг — из
+  trading.hedge.settings(), а не из этого скрипта), в «мало данных», то ratio_ok_share, cost_to_buffer и sigma_ratio в
+  gates_paper.json НЕ пишутся: порог не пройден (ядро лишних полей не читает, поэтому блокирует именно отсутствие
+  настоящих ключей). Иначе бумага прошла бы по одной BTC, а ETH/TON бот хеджировал бы всерьёз без единого закрытого
+  хеджа. Скрипт печатает, какая монета блокирует; выход — подождать данных или убрать монету из HEDGE_ASSETS.
+  Стоимость хеджа неизвестна (нет курса или суммы круга, нет запаса монеты в RISK_BUFFER) у более чем 10% закрытых хеджей
+  монеты — cost_to_buffer не пишется (simperp.gate_stats усредняет только известные стоимости, а count считает все).
 
 Бэктест -> data/gates_backtest.json (research.hedge_bt по публичной истории Bybit/BingX за 12 месяцев; сам бэктест
 запускается отдельным процессом `python -m research.report` — скриптам research импортировать нельзя; процесс
@@ -47,8 +54,15 @@ data/gates_paper.json (и, для minlot, data/gates_backtest.json): trading/gat
 Честная оговорка: count и days бэктеста — глубина истории, не независимые хеджи (окна перекрываются); пороги по
 стоимости, σ и лоту — настоящие проверки. Значение "nan", строка или пустота -> ключа нет.
 Запас на курс: бэктест считает по запасам research (BTC 0.3, ETH 0.5, TON 0.7), а бот — по RISK_BUFFER из .env. Если
-в .env запас хоть по одной монете НИЖЕ запаса бэктеста (или RISK_BUFFER не разобрать) — файл не пишется, а старый
-gates_backtest.json заменяется пустым (fail closed); выше — только предупреждение.
+в .env запас хоть по одной монете НИЖЕ запаса бэктеста (сверка по умолчаниям research — ДО запуска research.report, и
+ещё раз по запасу самого расчёта), не число (inf, nan), не больше 0, выше 5 запасов research (для монеты без запаса
+research — выше 5%) или RISK_BUFFER не разобрать — файл не пишется (fail closed); выше запаса бэктеста, но в пределах
+5 запасов — только предупреждение. Значения вне диапазона (стоимость или σ меньше 0, доля вне 0–1) — как «нет числа».
+Старый файл. ЛЮБОЙ запуск с --backtest (кроме --dry-run) заменяет gates_backtest.json пустым (без порогов) СРАЗУ,
+ДО расчёта, — даже если процесс убьют посреди research.report, старый проходящий файл не останется. Свежий файл пишется
+только после успешного расчёта, сверки запаса и проверки ботом (gates.load_backtest его принял); любой сбой (код ≠ 0,
+таймаут, исключение, битый отчёт, смена sha research/, RISK_BUFFER) оставляет пустой файл. Запуск без --backtest
+gates_backtest.json не трогает.
 
 ВАЖНО: файл gates_backtest.json сам по себе (без дня бумажной истории) открывает РЕАЛЬНЫЕ ордера minlot (до 50 USDT) при
 TRADING=1 и TRADING_MODE=minlot. Скрипт печатает об этом громкое предупреждение, когда пишет проходящий бэктест.
@@ -84,9 +98,18 @@ VENUE_CHOICES = ("bybit", "bingx")
 DEFAULT_START = "2023-01-01"   # как у research/report.py: кеш публичных данных общий
 MINLOT_POSITION_USDT = 50      # trading/risk.py MINLOT: в режиме minlot позиция не больше 50 USDT
 PAPER_KEYS = ("ratio_ok_share", "cost_to_buffer", "sigma_ratio")   # кроме count и days: без данных ключа нет
-MIN_COIN_HEDGES = 5            # монета с меньшим числом закрытых хеджей — «мало данных»: не в count и не в худший случай
+KEY_RANGES = {"ratio_ok_share": (0.0, 1.0), "cost_to_buffer": (0.0, None), "sigma_ratio": (0.0, None)}   # вне — битое число
+MIN_COIN_HEDGES = 5            # монета с меньшим числом закрытых хеджей — «мало данных»: не в count и блокирует пороги бумаги
+COST_UNKNOWN_MAX = 0.10        # доля закрытых хеджей монеты с неизвестной стоимостью, выше которой cost_to_buffer не пишем
+RISK_BUFFER_MAX_FACTOR = 5.0   # RISK_BUFFER монеты выше 5 запасов research — бессмыслица: порог «стоимость / запас» пустеет
+RISK_BUFFER_MAX_ABS = 5.0      # %: то же для монеты, у которой запаса research нет
 REPORT_TIMEOUT = 900           # сек: research.report дольше не ждём (таймаут — ничего не пишем)
 CHILD_ENV_KEYS = ("PATH", "SYSTEMROOT", "TEMP", "TMP", "USERPROFILE")   # всё окружение бэктесту не нужно (ключи, токены)
+NET_ENV_KEYS = ("HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY", "SSL_CERT_FILE", "REQUESTS_CA_BUNDLE")
+# ^ прокси и сертификаты (и в нижнем регистре): research/data.py берёт прокси из getproxies_environment() — без них бэктест
+#   за прокси историю не скачает. Ключей и токенов среди них нет.
+BUFFER_ADVICE = ("поставьте RISK_BUFFER не ниже запаса бэктеста (BTC 0.3, ETH 0.5, TON 0.7 — значения по умолчанию) и не выше "
+                 "5 таких запасов или уберите переменную и повторите.")
 BACKTEST_UNLOCK = (f"бэктест разрешает реальные ордера minlot (до {MINLOT_POSITION_USDT} USDT) при TRADING=1 и "
                    "TRADING_MODE=minlot")
 
@@ -106,6 +129,16 @@ def _finite(v):
     if isinstance(v, bool) or not isinstance(v, (int, float)):
         return None
     return float(v) if math.isfinite(v) else None
+
+
+def _ranged(key, v):
+    """_finite и допустимый диапазон ключа порога (KEY_RANGES): вне диапазона — как «нет числа» (None). Ядро принимает
+    отрицательную стоимость и долю больше 1 как прошедшие порог, поэтому проверяем здесь."""
+    v = _finite(v)
+    if v is None or key not in KEY_RANGES:
+        return v
+    lo, hi = KEY_RANGES[key]
+    return None if (lo is not None and v < lo) or (hi is not None and v > hi) else v
 
 
 def _eligible(asset, amount, assets, mins):
@@ -136,30 +169,52 @@ def _copy_db(src, dst):
 
 def _blank_coin():
     return {"count": 0, "days": 0.0, "ratio_ok_share": None, "cost_to_buffer": None, "sigma_ratio": None,
-            "pairs": 0, "hedged": 0, "none": 0}
+            "pairs": 0, "hedged": 0, "none": 0, "cost_unknown": 0}
+
+
+def _hedge_state(state):
+    try:
+        st = json.loads(state or "{}")
+    except (TypeError, ValueError):
+        return {}
+    return st if isinstance(st, dict) else {}
 
 
 def _hedge_status(state):
-    try:
-        st = json.loads(state or "{}")
-    except ValueError:
-        return None
-    return st.get("status") if isinstance(st, dict) else None
+    return _hedge_state(state).get("status")
 
 
-def paper_stats(db, assets, mins, now=None):
-    """({монета: simperp.gate_stats по подходящим кругам монеты + "hedged" (открытые и закрытые) и "none" (круги без хеджа)},
-    {"db": есть ли файл, "kept": хеджей в счёт, "dropped": не в счёт}). Каждая монета — отдельно (плохая монета не прячется
-    в среднем по всем). Считает по КОПИИ базы: paper._connect дописывает колонки, а чужую базу трогать нельзя."""
+def _cost_unknown(rows, coin, buffers):
+    """Сколько закрытых хеджей с итогом (их simperp.gate_stats считает в count) не попало в cost_to_buffer: нет курса или
+    суммы круга (simperp.fact_cost_pct → None) или у монеты нет запаса в RISK_BUFFER. rows — (id, монета, сумма, hedge_state,
+    hedge_fees, hedge_funding)."""
+    buf, n = buffers.get(coin, 0.0), 0
+    for r in rows:
+        st = _hedge_state(r[3])
+        if st.get("status") != "closed" or st.get("pnl_pct") is None:
+            continue
+        fact = simperp.fact_cost_pct({"amount": r[2], "hedge_fees": r[4], "hedge_funding": r[5]}, st)
+        if fact is None or not buf > 0:
+            n += 1
+    return n
+
+
+def paper_stats(db, assets, mins, now=None, buffers=None):
+    """({монета: simperp.gate_stats по подходящим кругам монеты + "hedged" (открытые и закрытые), "none" (круги без хеджа) и
+    "cost_unknown" (закрытых хеджей без известной стоимости)}, {"db": есть ли файл, "kept": хеджей в счёт, "dropped": не в
+    счёт}). Каждая монета — отдельно (плохая монета не прячется в среднем по всем). Считает по КОПИИ базы: paper._connect
+    дописывает колонки, а чужую базу трогать нельзя. buffers — RISK_BUFFER (по умолчанию из окружения)."""
     per = {coin: _blank_coin() for coin in assets}
     if not os.path.exists(db):   # gate_stats по несуществующему пути базы не создаёт: нули и None
         return per, {"db": False, "kept": 0, "dropped": 0}
+    buffers = simperp.risk_buffers() if buffers is None else buffers
     with tempfile.TemporaryDirectory() as tmp:
         base = os.path.join(tmp, "paper.db")
         _copy_db(db, base)
         con = paper._connect(base)
         try:
-            rows = con.execute("SELECT id, buy_asset, amount, hedge_state FROM cycles WHERE hedge_state != ''").fetchall()
+            rows = con.execute("SELECT id, buy_asset, amount, hedge_state, hedge_fees, hedge_funding FROM cycles "
+                               "WHERE hedge_state != ''").fetchall()
         finally:
             con.close()
         kept = 0
@@ -175,23 +230,44 @@ def paper_stats(db, assets, mins, now=None):
                 out.commit()
             finally:
                 out.close()
-            stats = simperp.gate_stats(copy, now=now)
+            stats = simperp.gate_stats(copy, now=now, buffers=buffers)
             statuses = [_hedge_status(r[3]) for r in mine]
             per[coin] = {**_blank_coin(), **stats,
-                         "hedged": sum(s in ("open", "closed") for s in statuses), "none": statuses.count("none")}
+                         "hedged": sum(s in ("open", "closed") for s in statuses), "none": statuses.count("none"),
+                         "cost_unknown": _cost_unknown(mine, coin, buffers)}
     return per, {"db": True, "kept": kept, "dropped": len(rows) - kept}
+
+
+def cost_gaps(per, min_count=MIN_COIN_HEDGES):
+    """{монета: доля} — монеты с данными, у которых стоимость хеджа неизвестна больше чем у COST_UNKNOWN_MAX закрытых хеджей.
+    simperp.gate_stats усредняет cost_to_buffer только по известным стоимостям, а count считает все: при большой доле
+    неизвестных среднее описывает лишь малую часть хеджей."""
+    out = {}
+    for coin, s in per.items():
+        count = _finite(s.get("count")) or 0
+        if count < min_count:
+            continue
+        share = (_finite(s.get("cost_unknown")) or 0) / count
+        if share > COST_UNKNOWN_MAX + 1e-9:
+            out[coin] = share
+    return out
 
 
 def aggregate_paper(per, min_count=MIN_COIN_HEDGES):
     """(статистика для gates_paper.json, [монеты «мало данных»]). В счёт — только монеты с числом закрытых хеджей не
     меньше min_count: count = сумма, days и ratio_ok_share — минимум, cost_to_buffer и sigma_ratio — максимум (худшая
-    монета, как в бэктесте). Нет числа хотя бы у одной монеты в счёте — этого ключа нет (порог не пройден)."""
+    монета, как в бэктесте). Нет числа (или оно вне диапазона) хотя бы у одной монеты в счёте — этого ключа нет (порог
+    не пройден). БЛОКИРОВКА: есть монета «мало данных» (бот её хеджирует, а данных нет) — ключей порогов нет вовсе;
+    стоимость неизвестна у большой доли хеджей монеты (cost_gaps) — нет cost_to_buffer."""
     used = {c: s for c, s in per.items() if (_finite(s.get("count")) or 0) >= min_count}
     few = [c for c in per if c not in used]
+    gaps = cost_gaps(per, min_count)
     out = {"count": int(sum(s["count"] for s in used.values())),
            "days": min((_finite(s.get("days")) or 0.0 for s in used.values()), default=0.0)}
     for key, pick in (("ratio_ok_share", min), ("cost_to_buffer", max), ("sigma_ratio", max)):
-        vals = [_finite(s.get(key)) for s in used.values()]
+        if few or (key == "cost_to_buffer" and gaps):
+            continue
+        vals = [_ranged(key, s.get(key)) for s in used.values()]
         if vals and all(v is not None for v in vals):
             out[key] = pick(vals)
     return out, few
@@ -212,22 +288,44 @@ def _none_share_text(s):
 
 
 def paper_lines(per, few):
-    """Русский отчёт по монетам: цифры каждой, кто «мало данных» (в файл и в count не идёт)."""
+    """Русский отчёт по монетам: цифры каждой; «мало данных» и неизвестная стоимость — громко, с причиной и выходом."""
+    gaps = cost_gaps(per)
     lines = ["Бумага по монетам (каждая отдельно; в файл идёт худшая, а не среднее):"]
     for coin, s in per.items():
         if coin in few:
             lines.append(f"  {coin}: мало данных — закрытых хеджей {s['count']} (нужно ≥ {MIN_COIN_HEDGES}); "
-                         "в count и в худший случай не входит")
+                         "в count и в худший случай не входит, но БЛОКИРУЕТ пороги бумаги")
             continue
         lines.append(f"  {coin}: закрытых {s['count']}, дней {s['days']:.1f}, коэффициент в полосе "
-                     f"{_fmt('ratio_ok_share', _finite(s['ratio_ok_share']))} ({_none_share_text(s)}), "
-                     f"стоимость/запас {_fmt('cost_to_buffer', _finite(s['cost_to_buffer']))}, "
-                     f"σ {_fmt('sigma_ratio', _finite(s['sigma_ratio']))} (кругов {s['pairs']})")
+                     f"{_fmt('ratio_ok_share', _ranged('ratio_ok_share', s['ratio_ok_share']))} ({_none_share_text(s)}), "
+                     f"стоимость/запас {_fmt('cost_to_buffer', _ranged('cost_to_buffer', s['cost_to_buffer']))} "
+                     f"(стоимость неизвестна у {s.get('cost_unknown', 0)} из {s['count']}), "
+                     f"σ {_fmt('sigma_ratio', _ranged('sigma_ratio', s['sigma_ratio']))} (кругов {s['pairs']})")
     if few:
-        lines.append(f"⚠ Мало данных: {', '.join(few)} — реальный хедж по этим монетам бумагой НЕ подтверждён, хотя пороги их не "
-                     "видят. Если хедж по ним не нужен — уберите их из HEDGE_ASSETS в .env.")
+        lines.append(f"⛔⛔ ПОРОГИ БУМАГИ НЕ ПРОЙДУТ: по {', '.join(few)} мало данных (закрытых хеджей меньше "
+                     f"{MIN_COIN_HEDGES}), а бот эти монеты хеджирует всерьёз (HEDGE_ASSETS и минимальный круг). "
+                     "ratio_ok_share, cost_to_buffer и sigma_ratio в gates_paper.json НЕ пишутся. Подождите, пока по каждой "
+                     f"из них наберётся ≥ {MIN_COIN_HEDGES} закрытых хеджей, или уберите её из HEDGE_ASSETS в .env и "
+                     "пересчитайте.")
+    for coin, share in gaps.items():
+        lines.append(f"⛔ {coin}: стоимость хеджа неизвестна у {share * 100:.0f}% закрытых хеджей (нет курса или суммы круга, "
+                     f"или монеты нет в RISK_BUFFER) — больше {COST_UNKNOWN_MAX * 100:.0f}%: cost_to_buffer НЕ пишется, "
+                     "порог стоимости не пройден.")
     lines.append(f"  Справка: {none_note(per)}; чем их больше, тем хуже ratio_ok_share описывает все круги.")
     return lines
+
+
+def paper_notes(per, few):
+    """Пояснения к строкам вердикта {ключ: текст}: доля кругов без хеджа у ratio_ok_share и причины блокировки."""
+    notes = {"ratio_ok_share": " · " + none_note(per)}
+    if few:
+        for key in PAPER_KEYS:
+            notes[key] = notes.get(key, "") + f" — не пишется: по {', '.join(few)} мало данных"
+    gaps = cost_gaps(per)
+    if gaps:
+        notes["cost_to_buffer"] = notes.get("cost_to_buffer", "") + (
+            f" — не пишется: стоимость неизвестна у более чем {COST_UNKNOWN_MAX * 100:.0f}% хеджей ({', '.join(gaps)})")
+    return notes
 
 
 def build_paper(stats, now=None):
@@ -239,7 +337,7 @@ def build_paper(stats, now=None):
     out = {"count": int(count) if count is not None and count > 0 else 0,
            "days": round(days, 4) if days is not None and days > 0 else 0.0}
     for key in PAPER_KEYS:
-        v = _finite(stats.get(key))
+        v = _ranged(key, stats.get(key))
         if v is not None:
             out[key] = v
     return {"version": gates.STATS_VERSION, "generated_at": now, "strategies": {HEDGE: out}}
@@ -259,7 +357,7 @@ def _lot_share(coin_res, venue, amount):
     cell = row.get(str(amount))
     if cell is None and isinstance(amount, float) and amount.is_integer():
         cell = row.get(str(int(amount)))
-    return _finite(cell.get("in_band_share")) if isinstance(cell, dict) else None
+    return _ranged("ratio_ok_share", cell.get("in_band_share")) if isinstance(cell, dict) else None
 
 
 def _aggregate(name, samples, pick, notes, omitted, fmt=lambda x: f"{x:g}"):
@@ -271,7 +369,8 @@ def _aggregate(name, samples, pick, notes, omitted, fmt=lambda x: f"{x:g}"):
     missing = [label for label, v in samples if v is None]
     if missing:
         omitted[name] = "нет числа: " + ", ".join(missing)
-        notes.append(f"  {name}: нет числа по {', '.join(missing)} — ключ не записан (порог не пройден)")
+        notes.append(f"  {name}: нет числа по {', '.join(missing)} (пусто, nan, inf или вне допустимого диапазона) — ключ не "
+                     "записан (порог не пройден)")
         return None
     label, value = pick(samples, key=lambda x: x[1])
     notes.append(f"  {name} = {fmt(value)} — худшее среди {len(samples)}: {label}")
@@ -323,7 +422,7 @@ def build_backtest(result, assets, mins, venues=("bybit",), sha="", now=None):
         notes.append("  count и days — глубина истории, не независимые хеджи: 60-минутные окна перекрываются, "
                      f"{stats['count']} окон — это не {stats['count']} хеджей.")
     for key in ("cost_to_buffer", "sigma_ratio"):
-        v = _aggregate(key, [(f"{coin} на {venue}", _finite((wins[(coin, venue)] or {}).get(key)))
+        v = _aggregate(key, [(f"{coin} на {venue}", _ranged(key, (wins[(coin, venue)] or {}).get(key)))
                              for coin, venue in per], max, notes, omitted, fmt=lambda x: f"{x:.3f}")
         if v is not None:
             stats[key] = v
@@ -347,10 +446,12 @@ _ProcessTimeout = subprocess.TimeoutExpired
 
 
 def _child_env(environ=None):
-    """Окружение для research.report: только PATH, SYSTEMROOT, TEMP/TMP, USERPROFILE и PYTHONIOENCODING. Остальное
-    (ключи, токены, любые чужие переменные из .env) бэктесту не нужно и в дочерний процесс не идёт."""
+    """Окружение для research.report: PATH, SYSTEMROOT, TEMP/TMP, USERPROFILE, прокси и сертификаты (NET_ENV_KEYS в верхнем и
+    нижнем регистре — research/data.py берёт прокси из окружения) и PYTHONIOENCODING. Остальное (ключи, токены, любые
+    чужие переменные из .env) бэктесту не нужно и в дочерний процесс не идёт."""
     src = os.environ if environ is None else environ
-    env = {k: src[k] for k in CHILD_ENV_KEYS if k in src}
+    allowed = set(CHILD_ENV_KEYS) | set(NET_ENV_KEYS) | {k.lower() for k in NET_ENV_KEYS}
+    env = {k: v for k, v in src.items() if k in allowed}
     env["PYTHONIOENCODING"] = "utf-8"
     return env
 
@@ -364,21 +465,56 @@ def _run_report(cmd, cwd):
         raise ValueError(f"research.report не уложился в {REPORT_TIMEOUT} с и остановлен — ничего не записано")
 
 
+def _buffer_problem(coin, raw, default):
+    """Текст, если запас монеты в RISK_BUFFER — бессмыслица, иначе None: не конечное число (inf, nan), не больше 0 или выше
+    RISK_BUFFER_MAX_FACTOR запасов research (у монеты без запаса research — выше RISK_BUFFER_MAX_ABS %). Огромный запас
+    обнуляет «стоимость / запас» (inf даёт 0) и открывает порог стоимости без настоящей экономии."""
+    v = _finite(raw)
+    if v is None:
+        return f"{coin}: RISK_BUFFER = {raw} — не конечное число"
+    if v <= 0:
+        return f"{coin}: RISK_BUFFER = {v:g}% — запас на курс должен быть больше 0"
+    cap = default[coin] * RISK_BUFFER_MAX_FACTOR if coin in default else RISK_BUFFER_MAX_ABS
+    if v > cap + 1e-9:
+        return (f"{coin}: RISK_BUFFER = {v:g}% — выше разумного предела {cap:g}%: такой запас обесценивает порог "
+                "«стоимость / запас»")
+    return None
+
+
+def buffer_nonsense(env_buffers, assets):
+    """[строки] по монетам из assets с бессмысленным запасом в RISK_BUFFER (см. _buffer_problem). Монеты в RISK_BUFFER нет —
+    не бессмыслица (бот возьмёт запас самого круга): это только предупреждение в buffer_check."""
+    default = p2p._fees(p2p.DEFAULT_RISK)
+    out = []
+    for coin in assets:
+        if coin in env_buffers:
+            problem = _buffer_problem(coin, env_buffers[coin], default)
+            if problem:
+                out.append(problem)
+    return out
+
+
 def buffer_check(result, assets, env_buffers):
-    """([отказы], [предупреждения]) по запасу на курс. Бэктест считает по запасу монеты из research (buffer_pct в его итоге),
-    бот — по RISK_BUFFER. Запас в .env НИЖЕ бэктестового по какой-то монете — отказ (бэктест был бы слишком оптимистичен
-    относительно того, что проверит бот); выше, или монеты в RISK_BUFFER нет — только предупреждение."""
+    """([отказы], [предупреждения]) по запасу на курс. Бэктест считает по запасу монеты из research (buffer_pct в его итоге;
+    result пуст — по умолчаниям research), бот — по RISK_BUFFER. Отказ: запас в .env бессмыслен (не конечное число, ≤ 0,
+    слишком большой) или НИЖЕ бэктестового по какой-то монете (бэктест был бы слишком оптимистичен относительно того, что
+    проверит бот). Выше бэктестового (в пределах разумного) или монеты в RISK_BUFFER нет — только предупреждение."""
     default = p2p._fees(p2p.DEFAULT_RISK)
     coins = result.get("coins") or {}
     refuse, warn = [], []
     for coin in assets:
+        if coin in env_buffers:
+            problem = _buffer_problem(coin, env_buffers[coin], default)
+            if problem:
+                refuse.append(problem)
+                continue
         info = coins.get(coin) if isinstance(coins.get(coin), dict) else {}
         used = _finite(info.get("buffer_pct"))
         used = default.get(coin) if used is None else used
         if used is None or used <= 0:
             continue
         env = _finite(env_buffers.get(coin))
-        if env is None or env <= 0:
+        if env is None:
             warn.append(f"{coin}: в RISK_BUFFER запаса нет — бот возьмёт запас самого круга; бэктест считал по {used:g}%")
         elif env < used - 1e-9:
             refuse.append(f"{coin}: RISK_BUFFER = {env:g}% ниже запаса бэктеста ({used:g}%) — стоимость / запас в боте выйдет "
@@ -389,9 +525,17 @@ def buffer_check(result, assets, env_buffers):
     return refuse, warn
 
 
+def _sha_or_empty(bot_dir):
+    try:
+        return gates.research_sha(bot_dir)
+    except (OSError, ValueError):
+        return ""
+
+
 def _invalidate_backtest(path, sha, now):
-    """Отказ по запасу: старый gates_backtest.json (мог быть посчитан при другом RISK_BUFFER) заменяем пустым — он не
-    должен продолжать открывать minlot. Нет файла — ничего не пишем. Возвращает True, если файл был заменён."""
+    """Запуск с --backtest, который не кончится свежей проверенной записью: старый gates_backtest.json (проходящий, посчитанный
+    при другом RISK_BUFFER или другим кодом) заменяем пустым без порогов атомарно — он не должен продолжать открывать minlot.
+    Нет файла — ничего не пишем. Возвращает True, если файл был заменён."""
     if not os.path.exists(path):
         return False
     jsonstore.write_dict(path, {"version": gates.BACKTEST_VERSION, "generated_at": now, "research_sha": sha,
@@ -577,6 +721,16 @@ def main(argv=None, runner=None, env_loader=_load_env, now=None):
     env_loader(os.path.join(bot_dir, ".env"))
     gates.flags_from_file(os.path.join(bot_dir, ".env"))
     now = time.time() if now is None else now
+    if a.backtest and not a.dry_run:
+        # Любой запуск с --backtest, который не кончится свежей проверенной записью, не должен оставить старый (возможно
+        # проходящий) gates_backtest.json: обезвреживаем ДО расчёта — даже если процесс убьют посреди research.report.
+        try:
+            cleared = _invalidate_backtest(bt_path, _sha_or_empty(bot_dir), now)
+        except OSError as e:
+            return _fail(f"старый gates_backtest.json не удалось обезвредить: {type(e).__name__}: {e} — бэктест не запускаю")
+        print("Старый gates_backtest.json заменён пустым (без порогов) ДО расчёта: по нему minlot больше не откроется. Новый "
+              "файл появится только после успешного бэктеста, принятого ботом." if cleared else
+              "Старого gates_backtest.json нет — заменять нечего.")
     cfg_assets, mins = hedge_config()
     off = [c for c in cfg_assets if mins.get(c) == math.inf]
     assets = [c for c in cfg_assets if c not in off]
@@ -588,11 +742,18 @@ def main(argv=None, runner=None, env_loader=_load_env, now=None):
               "МОНЕТА:сумма,…); в статистику и бэктест она не идёт.")
 
     try:
-        per, info = paper_stats(paper_db, assets, mins, now=now)
+        env_buf = simperp.risk_buffers()
+    except ValueError as e:   # p2p._fees: RISK_BUFFER не разобрать
+        return _fail(f"RISK_BUFFER не разобрать: {e}")
+    bad_buf = buffer_nonsense(env_buf, assets)
+    if bad_buf:
+        for r in bad_buf:
+            print(f"⛔ {r}")
+        return _fail("RISK_BUFFER непригоден — ничего не записано (порог «стоимость / запас» стал бы пустым): " + BUFFER_ADVICE)
+    try:
+        per, info = paper_stats(paper_db, assets, mins, now=now, buffers=env_buf)
     except (sqlite3.Error, OSError) as e:
         return _fail(f"paper.db не прочитана: {type(e).__name__}: {e}")
-    except ValueError as e:   # simperp.risk_buffers: RISK_BUFFER не разобрать
-        return _fail(f"RISK_BUFFER не разобрать: {e}")
     stats, few = aggregate_paper(per)
     doc_paper = build_paper(stats, now)
     got = doc_paper["strategies"][HEDGE]
@@ -605,45 +766,47 @@ def main(argv=None, runner=None, env_loader=_load_env, now=None):
         print(f"  В файл: count {got['count']} (сумма по монетам с данными), дней {got['days']:.1f} (минимум).")
         if got["count"] == 0:
             print("  Закрытых хеджей с итогом нет — цифр по стоимости и σ нет, порогов не пройти. Ничего не выдумываем.")
+        else:
+            skipped = [k for k in PAPER_KEYS if k not in got]
+            if skipped:
+                print(f"  Не записаны ключи: {', '.join(skipped)} — нет данных, число вне допустимого диапазона или "
+                      "блокировка (см. выше); порог по ним не пройден.")
     print("  Бумажный хедж выбирает более дешёвую из Bybit/BingX (обычно BingX), боевой — только Bybit: стоимость на "
           "бумаге чуть оптимистичнее.")
 
     doc_bt, notes, sha = None, [], ""
     if a.backtest:
+        pre_refuse, _ = buffer_check({}, assets, env_buf)   # по запасам research по умолчанию — ещё до запуска процесса
+        if pre_refuse:
+            for r in pre_refuse:
+                print(f"⛔ {r}")
+            print("⛔ research.report не запускался, gates_backtest.json не записан: " + BUFFER_ADVICE)
+            print("--dry-run: старый gates_backtest.json не тронут." if a.dry_run else
+                  "gates_backtest.json остаётся пустым (без порогов): по нему minlot не откроется.")
+            return 2
         print("Бэктест: запускаю research.report (публичные данные бирж, может занять много минут)...")
         try:
             with tempfile.TemporaryDirectory() as tmp:
                 result, sha = run_research(bot_dir, tmp, paper_db, history_db, a.cache, a.offline, a.start, runner)
-        except (ValueError, OSError) as e:
-            return _fail(f"бэктест не получился: {e}")
+        except Exception as e:   # любой сбой расчёта: старый файл уже обезврежен выше, свежий не пишем
+            return _fail("бэктест не получился: " + (str(e) if isinstance(e, ValueError) else f"{type(e).__name__}: {e}"))
         doc_bt, notes = build_backtest(result, assets, mins, tuple(venues), sha, now)
         print("\n".join(notes))
-        try:
-            refuse, warn = buffer_check(result, assets, simperp.risk_buffers())
-        except ValueError as e:
-            refuse, warn = [f"RISK_BUFFER не разобрать ({e}) — сравнить запас бота с запасом бэктеста нельзя"], []
+        refuse, warn = buffer_check(result, assets, env_buf)
         for w in warn:
             print(f"⚠ {w}")
         if refuse:
             for r in refuse:
                 print(f"⛔ {r}")
-            print("⛔ gates_backtest.json не записан: поставьте RISK_BUFFER не ниже запаса бэктеста "
-                  "(BTC 0.3, ETH 0.5, TON 0.7 — значения по умолчанию) или уберите переменную и повторите.")
-            if a.dry_run:
-                print("--dry-run: старый gates_backtest.json не тронут.")
-            else:
-                try:
-                    cleared = _invalidate_backtest(bt_path, sha, now)
-                except OSError as e:
-                    return _fail(f"старый gates_backtest.json не удалось обезвредить: {type(e).__name__}: {e}")
-                print("Старый gates_backtest.json заменён пустым (без порогов): по нему minlot больше не откроется."
-                      if cleared else "Старого gates_backtest.json нет.")
+            print("⛔ gates_backtest.json не записан: " + BUFFER_ADVICE)
+            print("--dry-run: старый gates_backtest.json не тронут." if a.dry_run else
+                  "gates_backtest.json остаётся пустым (без порогов): по нему minlot не откроется.")
             return 2
 
     if a.dry_run:
         print("\n--dry-run: файлы не записаны.")
         bt_stats = doc_bt["strategies"][HEDGE] if doc_bt else None
-        v = verdict(got, bt_stats, gates.short_paper_enabled(), {"ratio_ok_share": " · " + none_note(per)})
+        v = verdict(got, bt_stats, gates.short_paper_enabled(), paper_notes(per, few))
         if v["strong"]:
             print(f"⚠⚠ --dry-run, файл не записан: при записи {BACKTEST_UNLOCK.replace('разрешает', 'разрешил бы')}.")
         print("\n".join(verdict_lines(v, source="расчёт по цифрам выше; бот файлов не читал")))
@@ -671,8 +834,14 @@ def main(argv=None, runner=None, env_loader=_load_env, now=None):
     print(f"Бот принял gates_paper.json: {'да' if p_obj else 'НЕТ — ' + why_p}")
     print(f"Бот принял gates_backtest.json: {'да' if b_obj else 'нет — ' + why_b}"
           + (" (файл от прошлого запуска, он продолжает действовать)" if b_obj and doc_bt is None else ""))
-    v = verdict(got, b_obj.stats if b_obj else None, gates.short_paper_enabled(),
-                {"ratio_ok_share": " · " + none_note(per)})
+    if doc_bt is not None and not b_obj:   # свежий файл, который бот не принял, — не «проверенная запись»: обезвреживаем
+        print(f"⛔ Бот не принял только что записанный gates_backtest.json ({why_b}) — заменяю его пустым.")
+        try:
+            _invalidate_backtest(bt_path, sha, now)
+        except OSError as e:
+            return _fail(f"gates_backtest.json не удалось обезвредить: {type(e).__name__}: {e}")
+        return 2
+    v = verdict(got, b_obj.stats if b_obj else None, gates.short_paper_enabled(), paper_notes(per, few))
     if doc_bt is None and v["strong"]:
         print(f"⚠⚠⚠ ВНИМАНИЕ: старый gates_backtest.json действует: {BACKTEST_UNLOCK}.")
     bot_mode = gates.max_mode(HEDGE, paper=p_obj.stats if p_obj else None, backtest=b_obj)
