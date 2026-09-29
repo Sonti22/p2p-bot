@@ -41,6 +41,23 @@ def test_run_copies_listed_files_only(tmp_path, monkeypatch):
     assert sorted(os.listdir(dest)) == ["presets.json", "trades.db"]            # без ключей и снимков
 
 
+def test_run_copies_hedge_circles_db(tmp_path, monkeypatch):
+    """Хеджи кругов (data/hedge_circles.db, trading/hedge.py) — в копии, согласованным снимком SQLite."""
+    _fresh(monkeypatch)
+    monkeypatch.delenv("BACKUP_KEEP", raising=False)
+    data = _data(tmp_path)
+    con = sqlite3.connect(os.path.join(data, "hedge_circles.db"))
+    con.execute("CREATE TABLE hedges (id INTEGER PRIMARY KEY, grp TEXT, status TEXT)")
+    con.execute("INSERT INTO hedges (grp, status) VALUES ('cycle:trade:1', 'open')")
+    con.commit()
+    con.close()
+    dest, files = backup.run(NOW, data)
+    assert "hedge_circles.db" in files
+    con = sqlite3.connect(os.path.join(dest, "hedge_circles.db"))
+    assert con.execute("SELECT grp, status FROM hedges").fetchall() == [("cycle:trade:1", "open")]
+    con.close()
+
+
 def test_rotation_keeps_last_n_and_ignores_foreign_dirs(tmp_path, monkeypatch):
     monkeypatch.setenv("BACKUP_KEEP", "2")
     data = _data(tmp_path)

@@ -197,10 +197,14 @@ TRADING_LINES_APPROVED = {   # подключение ядра к боту (ве
     ],
     'bot.py': [
         'import trading.wiring',
-        # хедж кругов (этап 5, решение владельца 29.09): карточка после «✅ Сделал» и /hedge
-        'await trading.hedge.offer(self, "trade", trade_id, d[1].asset, hedge_plans.coin_qty(d, cfg.amount),',
+        # хедж кругов (этап 5, решение владельца 29.09): карточка после «✅ Сделал» — вызов целиком одной строкой (сумма,
+        # монета круга, курс, запас — всё в пине), и /hedge — условие «только владелец» и вызов
+        'trading.hedge.offer_soon(self, "trade", trade_id, d[1].asset, hedge_plans.coin_qty(d, cfg.amount), '
+        'cfg.amount, getattr(snap, "ref", 0.0) or 0.0, cfg.risk_buffer.get(d[1].asset, 0.0))  # noqa: E501 — одной '
+        'строкой: вся строка в пине TRADING_LINES_APPROVED',
         'await trading.wiring.callback(self, cq, data, save_env)',
         'await trading.wiring.command(self, arg)',
+        'elif cmd == "/hedge" and REPLY_CHAT.get() is None:   # только владелец → trading.wiring.hedge_command (пин)',
         'await trading.wiring.hedge_command(self, arg)',
         'trading.switch.switch_from_file(ENV_PATH)   # торговля: TRADING и TRADING_MODE — только из .env, извне не поднять',
         'trading.gates.flags_from_file(ENV_PATH)     # флаг владельца TRADING_SHORT_PAPER — тоже только из файла .env',

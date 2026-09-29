@@ -22,10 +22,15 @@ USDT за это время может уйти. Шорт бессрочного
 - закрытие — «✅ Продал — закрыть хедж», «🆘 Покупка не состоялась» (тот же путь, срочно), «Закрыть» в /hedge и само
   через HEDGE_MAX_HOURS (страховка: после него курсовой риск круга снова на владельце — так и пишем). Ордер —
   reduceOnly рыночная покупка ровно позиции группы по журналу (journal.bot_book), не числа из карточки. Работает и при
-  выключенной торговле; повторное нажатие второго ордера не шлёт.
-- tick — каждый цикл wiring (INTERVAL): устаревшие карточки, судьба «неясных» ордеров (10 мин — «реши на ПК»), вход по
-  журналу, отложенное закрытие, авто-закрытие, позиция, закрытая не ботом (closed_by_venue: сверка ядра обнулила ключ
-  группы; само событие ядра владельцу доставляет wiring.deliver — здесь его не читаем и не помечаем). Не бросает.
+  выключенной торговле; повторное нажатие второго ордера не шлёт. Закрытие исполнилось частично (PartiallyFilledCanceled)
+  — хедж снова «открыт», остаток по журналу закрывается следующим ордером; закрытие с неясным исходом не повторяется.
+  Срок HEDGE_MAX_HOURS для реального шорта — только 0 < ч ≤ 48, иначе 6 ч (без срока шорт не остаётся).
+- tick — каждый цикл wiring (INTERVAL): устаревшие карточки, судьба «неясных» ордеров (10 мин — «реши на ПК»; ордера
+  группы нет в журнале час — решаем по позиции группы: есть шорт — ведём как открытый, нет — failed), вход по
+  журналу, отложенное закрытие, авто-закрытие (повтор после неудачи — не чаще AUTO_RETRY), позиция, закрытая не ботом
+  (closed_by_venue: сверка ядра обнулила ключ группы; само событие ядра владельцу доставляет wiring.deliver — здесь его
+  не читаем и не помечаем). Не бросает.
+- offer_soon — так зовёт bot.mark_done: offer фоновой задачей, ответ кнопке «✅ Сделал» её не ждёт.
 - hedge_command — /hedge: живые хеджи (вход, P&L, до ликвидации), режим и почему, кнопки «Закрыть» и «⛔ Стоп торговли».
 
 Позиция и лимиты (решение 2): потолок позиции — TRADING_MAX_POSITION_USDT в .env. Круг 10 000 ₽ ≈ 110 USDT (BTC/TON), а
@@ -40,6 +45,7 @@ import html
 import json
 import logging
 import os
+import re
 import secrets
 import sqlite3
 import time
@@ -59,6 +65,9 @@ OFFER_TTL = 60                      # сек жизни кнопки «✅ От�
 UNKNOWN_LONG = journal.UNKNOWN_LONG  # 600 с: ордер «неясен» дольше — «реши на ПК»
 STALE_SENDING = 300                 # сек: «открывается/закрывается» дольше без ордера — перезапуск посреди отправки
 AUTO_RETRY = 600                    # сек между попытками авто-закрытия, если закрыть не вышло
+ORPHAN_AFTER = 3600                 # сек: «неясно», а ордера группы в журнале нет — дольше решаем по позиции группы
+MAX_HOURS_DEFAULT = 6.0             # HEDGE_MAX_HOURS для реального шорта: вне 0 < ч ≤ MAX_HOURS_CAP — это значение
+MAX_HOURS_CAP = 48.0
 LEVERAGE = 2                        # решение 4: изолированная маржа, плечо 2×, без стопа на бирже
 MAX_RATIO = risk.HARD["hedge_qty_ratio"]   # шорт ≤ монета круга × 1.05 — journal.submit это не проверяет
 COST_SHARE = 0.6                    # открываем, только если стоимость ≤ 0.6 × запаса на курс монеты
@@ -83,6 +92,8 @@ STATUS_TEXT = {"offered": "предложен", "expired": "кнопка уст�
                "failed": "не открыт"}
 _silent = deque(maxlen=5)   # (время, группа, причина) — почему последние круги прошли без предложения (для /hedge)
 _busy = {}                  # id хеджа → "open" | "close": сейчас его открывает или закрывает этот процесс (tick мимо)
+_offers = set()             # фоновые offer_soon (ссылки держим, пока задача не кончилась)
+_warned = set()             # предупреждения о настройках, уже записанные в лог
 _COLUMNS = {
     "source": "TEXT DEFAULT ''", "circle_id": "TEXT DEFAULT ''", "asset": "TEXT DEFAULT ''",
     "hedge_ref_qty": "TEXT DEFAULT ''", "amount_rub": "REAL DEFAULT 0", "ref": "REAL DEFAULT 0",
@@ -248,6 +259,13 @@ def _claim(hid, nonce, now, fresh, path=None):
 
 # --- настройки ---
 
+def _warn_once(text):
+    """Предупреждение о настройке — один раз за процесс (settings() зовётся каждый цикл)."""
+    if text not in _warned:
+        _warned.add(text)
+        logger.warning(text)
+
+
 def _parse_venues(raw):
     out = []
     for part in str(raw or "").split(","):
@@ -257,40 +275,64 @@ def _parse_venues(raw):
         if v in SUPPORTED and v not in out:
             out.append(v)
         else:
-            logger.warning("HEDGE_VENUES: %r не поддерживается (пока только bybit) — пропускаю", v)
+            _warn_once(f"HEDGE_VENUES: {v!r} не поддерживается (пока только bybit) — пропускаю")
     return out
 
 
 def _parse_min_amount(raw):
-    """«ETH:20000,BTC:5000» → {монета: ₽}. Число не разобрать — монету не хеджируем вовсе (inf): при сомнении не
-    открываем."""
+    """«ETH:20000,BTC:5000» → {монета: ₽}. Запись с монетой, но без «:» или с не числом («ETH», «ETH=20000»,
+    «ETH:abc») — эту монету не хеджируем вовсе (inf): при сомнении не открываем. Запись без монеты — пропуск."""
     out = {}
     for part in str(raw or "").split(","):
-        if not part.strip():
+        part = part.strip()
+        if not part:
             continue
-        coin, sep, val = part.partition(":")
-        coin = coin.strip().upper()
-        if not sep or not coin:
-            logger.warning("HEDGE_MIN_AMOUNT_RUB: %r — нужен вид МОНЕТА:сумма", part.strip())
+        head, sep, val = part.partition(":")
+        m = re.match(r"[A-Za-z0-9]+", head.strip())
+        if m is None:
+            _warn_once(f"HEDGE_MIN_AMOUNT_RUB: {part!r} — нет монеты (нужно МОНЕТА:сумма), пропускаю")
             continue
+        coin = m.group(0).upper()
         try:
+            if not sep or m.group(0) != head.strip():
+                raise ValueError(part)
             v = float(val.strip().replace(" ", ""))
             if v != v or v < 0:
                 raise ValueError(val)
         except ValueError:
-            logger.warning("HEDGE_MIN_AMOUNT_RUB: %s — не число, %s не хеджируем", part.strip(), coin)
+            _warn_once(f"HEDGE_MIN_AMOUNT_RUB: {part!r} — не МОНЕТА:сумма, {coin} не хеджируем")
             v = float("inf")
-        out[coin] = v
+        out[coin] = max(v, out.get(coin, 0.0))
     return out
 
 
+def _max_hours(raw):
+    """Срок реального шорта, ч: только 0 < h ≤ MAX_HOURS_CAP; 0, минус, NaN, мусор, больше — MAX_HOURS_DEFAULT с
+    предупреждением (реальный шорт без срока — ставка против курса без присмотра)."""
+    raw = str(raw if raw is not None else "").strip().replace(",", ".")
+    if not raw:
+        return MAX_HOURS_DEFAULT
+    try:
+        h = float(raw)
+    except ValueError:
+        h = float("nan")
+    if h == h and 0 < h <= MAX_HOURS_CAP:
+        return h
+    _warn_once(f"HEDGE_MAX_HOURS={os.getenv('HEDGE_MAX_HOURS')!r} для реального хеджа не годится (нужно 0 < ч ≤ "
+               f"{MAX_HOURS_CAP:g}) — беру {MAX_HOURS_DEFAULT:g} ч")
+    return MAX_HOURS_DEFAULT
+
+
 def settings():
-    """HEDGE_VENUES (bybit), HEDGE_MIN_AMOUNT_RUB (ETH:20000), коэффициент min(HEDGE_RATIO, 1.05), полоса, срок
-    HEDGE_MAX_HOURS, монеты HEDGE_ASSETS — из simperp.settings (одни настройки для бумаги и реального хеджа)."""
+    """HEDGE_VENUES (bybit), HEDGE_MIN_AMOUNT_RUB (ETH:20000), коэффициент min(HEDGE_RATIO, 1.05) (мусор, NaN, минус —
+    уже в simperp: по умолчанию / 0 → хеджа нет), полоса, срок HEDGE_MAX_HOURS (для реального — только 0 < ч ≤ 48,
+    иначе 6), монеты HEDGE_ASSETS — из simperp.settings (одни настройки для бумаги и реального хеджа)."""
     st = simperp.settings()
+    ratio = st["ratio"] if st["ratio"] == st["ratio"] else 0.0
     return {"venues": _parse_venues(os.getenv("HEDGE_VENUES", "bybit")),
             "min_amount": _parse_min_amount(os.getenv("HEDGE_MIN_AMOUNT_RUB", "ETH:20000")),
-            "ratio": min(st["ratio"], float(MAX_RATIO)), "band": st["band"], "max_hours": st["max_hours"],
+            "ratio": max(0.0, min(ratio, float(MAX_RATIO))), "band": st["band"],
+            "max_hours": _max_hours(os.getenv("HEDGE_MAX_HOURS", str(MAX_HOURS_DEFAULT))),
             "hold_min": st["hold_min"], "residual": st["residual"], "assets": st["assets"],
             "cost_share": COST_SHARE, "leverage": LEVERAGE, "offer_ttl": OFFER_TTL}
 
@@ -478,6 +520,21 @@ async def offer(bot, source, circle_id, asset, coin_qty, amount_rub, ref, risk_p
     except Exception as e:   # noqa: BLE001 — круг и журнал сделок идут дальше без хеджа
         logger.error("hedge offer: %s: %s", type(e).__name__, e)
         return None
+
+
+def offer_soon(bot, source, circle_id, asset, coin_qty, amount_rub, ref, risk_pct):
+    """offer фоновой задачей (так зовёт bot.mark_done): ответ кнопке «✅ Сделал» и журнал сделок не ждут чтения ключей
+    и Telegram. Ссылка на задачу держится в _offers до её конца; сбой — только в лог. → задача."""
+    task = asyncio.ensure_future(offer(bot, source, circle_id, asset, coin_qty, amount_rub, ref, risk_pct))
+    _offers.add(task)
+    task.add_done_callback(_offer_done)
+    return task
+
+
+def _offer_done(task):
+    _offers.discard(task)
+    if not task.cancelled() and task.exception() is not None:
+        logger.error("hedge offer task: %s: %s", type(task.exception()).__name__, task.exception())
 
 
 async def _offer(bot, source, circle_id, asset, coin_qty, amount_rub, ref, risk_pct, now):
@@ -698,7 +755,9 @@ async def _after_open(bot, hid, res, thread):
         filled = res.get("filled") or 0
         _set(hid, status="open", open_cid=cid, filled_ts=now, entry_price=venues.fmt(entry) if entry else "",
              filled_qty=venues.fmt(filled) if filled else "")
-        await _say(bot, _open_text(get(hid), row["qty"], entry, cid), close_kb(hid), thread=thread)
+        # исполнено частично — в сообщении исполненное, а не заказанное
+        await _say(bot, _open_text(get(hid), filled if filled else row["qty"], entry, cid), close_kb(hid),
+                   thread=thread)
     else:   # закрыт биржей без исполнения
         _set(hid, status="failed", open_cid=cid, refusal_where="venue", refusal=f"ордер {state} без исполнения")
         await _say(bot, f"✖️ Шорт хеджа круга {name} не исполнился ({_esc(state)}) — круг без хеджа.", thread=thread)
@@ -716,7 +775,7 @@ def request_close(bot, hid, reason):
         return "закрытие уже идёт"
     if row["status"] in CLOSED:
         return "хедж уже закрыт"
-    if row["status"] == "closing":
+    if row["status"] == "closing" and _close_left(row) is None:   # ордер закрытия ещё в пути или под вопросом
         return "закрытие уже отправлено — жду подтверждения"
     if row["status"] in NO_POSITION:
         if row["status"] in ("offered", "expired"):
@@ -767,7 +826,14 @@ async def _close(bot, hid, reason, thread=None):
     if st in CLOSED:
         return "хедж уже закрыт"
     if st == "closing":
-        return "закрытие уже отправлено"
+        left = _close_left(row)
+        if left is None:   # ордер закрытия в пути или исход неясен — второй не шлём
+            return "закрытие уже отправлено"
+        await _reopen(bot, row, *left, thread=thread)   # прошлое закрытие исполнилось не целиком — закрываем остаток
+        row = get(hid)
+        st = row["status"]
+        if st != "open":
+            return "уже решено"
     if st in NO_POSITION:
         if st in ("offered", "expired"):
             _set(hid, expect=("offered", "expired"), status="skipped", nonce="", close_reason=reason)
@@ -815,7 +881,7 @@ async def _gone(bot, hid, why, thread=None):
     """Позиции по кругу больше нет, и её закрыл не этот путь: исполнено было — closed_by_venue, не было — failed."""
     row = get(hid)
     oj = journal.get(row["open_cid"]) if row["open_cid"] else None
-    was = oj is not None and (_dec(oj.get("filled")) or 0) > 0
+    was = (oj is not None and (_dec(oj.get("filled")) or 0) > 0) or bool(_dec(row["filled_qty"]))
     new = "closed_by_venue" if was else "failed"
     if not _set(hid, expect=("open", "unknown", "closing"), status=new, closed_ts=time.time(), notes=why[:500]):
         return "уже решено"
@@ -854,7 +920,49 @@ async def _after_close(bot, hid, res, reason, thread=None):
         await _say(bot, f"❓ Закрытие хеджа круга {name} не подтверждено биржей — проверяю, повторно не отправляю.{warn}",
                    thread=thread)
         return "unknown"
-    return await _settle_close(bot, hid, thread) or state
+    done = await _settle_close(bot, hid, thread)
+    if done:
+        return done
+    row = get(hid)
+    left = _close_left(row)
+    if left is not None:   # исполнено не целиком (PartiallyFilledCanceled): снова «открыт», остаток закроем
+        await _reopen(bot, row, *left, thread=thread)
+        return "partial"
+    return state
+
+
+def _close_left(row):
+    """«Закрывается», а ордер закрытия в журнале уже завершён (исполнен целиком или частично, снят, отклонён) и
+    позиция группы по журналу не ноль — закрытие не довело дело до конца (Bybit PartiallyFilledCanceled). → (сальдо
+    группы, исполнено ордером закрытия) или None: ордер ещё в пути или его исход неясен — такой не трогаем и не
+    повторяем."""
+    if row is None or row["status"] != "closing" or not row["close_cid"]:
+        return None
+    cj = journal.get(row["close_cid"])
+    if cj is None or cj["state"] in journal.UNSETTLED:
+        return None
+    k = _key(row["venue"], row["symbol"], row["grp"])
+    if not k or k["net"] == 0 or k["pending_reduce"]["buy"] > 0:
+        return None
+    return k["net"], _dec(cj.get("filled")) or Decimal(0)
+
+
+async def _reopen(bot, row, net, filled, thread=None):
+    """Закрытие завершилось, а шорт группы остался: снова «открыт» (CAS с closing), ордер закрытия забыт. Исполнено
+    частично — остаток закроем сами (close_req → tick; после неудачной попытки — не чаще AUTO_RETRY), объём — по
+    сальдо журнала; не исполнилось вовсе — решает владелец кнопкой. Сообщение — одно (CAS). → переведён ли."""
+    hid, name = row["id"], _name(row)
+    reason = row["close_reason"] or "sold"
+    if not _set(hid, expect=("closing",), status="open", close_cid="", close_req=reason if filled > 0 else "",
+                notes=f"закрытие {row['close_cid']} исполнено на {venues.fmt(filled)}, осталось {venues.fmt(-net)}"):
+        return False
+    if filled > 0:
+        text = (f"⚠️ Закрытие хеджа круга {name} исполнилось частично: выкуплено {_fmt(filled)}, остаток шорта "
+                f"{_fmt(-net)} {_esc(row['asset'])} — закрываю остаток (или «Закрыть»).")
+    else:
+        text = f"✖️ Закрытие хеджа круга {name} не исполнилось — шорт {_fmt(-net)} {_esc(row['asset'])} открыт."
+    await _say(bot, text, close_kb(hid), thread=thread)
+    return True
 
 
 def _row_fee(r):
@@ -871,10 +979,18 @@ async def _settle_close(bot, hid, thread=None):
         return None
     oj = journal.get(row["open_cid"]) if row["open_cid"] else None
     cj = journal.get(row["close_cid"]) if row["close_cid"] else None
+    # все исполненные закрытия группы (частичное + остаток), не только последнее
+    fills = [r for r in journal.history(1000) if r.get("grp") == row["grp"] and r.get("strategy") == STRATEGY
+             and r.get("purpose") == "close" and (_dec(r.get("filled")) or 0) > 0]
+    if cj is not None and cj["client_id"] not in {r["client_id"] for r in fills} and (_dec(cj.get("filled")) or 0) > 0:
+        fills.append(cj)
     entry = _dec((oj or {}).get("avg_price")) or _dec(row["entry_price"])
-    exitp = _dec((cj or {}).get("avg_price"))
-    qty = _dec((cj or {}).get("filled")) or _dec(row["filled_qty"]) or _dec(row["qty"]) or Decimal(0)
-    fees = [f for f in (_row_fee(oj), _row_fee(cj)) if f is not None]
+    qty = sum((_dec(r["filled"]) for r in fills), Decimal(0))
+    exitp = None
+    if fills and all(_dec(r.get("avg_price")) for r in fills):
+        exitp = round(sum((_dec(r["filled"]) * _dec(r["avg_price"]) for r in fills), Decimal(0)) / qty, 8)
+    qty = qty or _dec(row["filled_qty"]) or _dec(row["qty"]) or Decimal(0)
+    fees = [f for f in [_row_fee(oj)] + [_row_fee(r) for r in fills] if f is not None]
     fee = sum(fees, Decimal(0))
     pnl = (entry - exitp) * qty - fee if entry and exitp else None
     pct = float(pnl) * row["ref"] / row["amount_rub"] * 100 if pnl is not None and row["ref"] and row["amount_rub"] \
@@ -978,14 +1094,19 @@ async def _tick_one(bot, row, now):
 
 async def _tick_unknown(bot, row, now):
     hid, name = row["id"], _name(row)
-    jr = journal.get(row["open_cid"]) if row["open_cid"] else _journal_row(row["grp"], "open")
+    jr = journal.get(row["open_cid"]) if row["open_cid"] else None
+    if jr is None:   # id не записан (сбой посреди отправки) или строки нет — ищем ордер группы
+        jr = _journal_row(row["grp"], "open")
+    if jr is None:
+        await _tick_orphan(bot, row, now)
+        return
     done = _journal_done(jr)
     if done == "filled":
         entry = _dec(jr.get("avg_price"))
         if _set(hid, expect=("unknown",), status="open", open_cid=jr["client_id"], filled_ts=row["filled_ts"] or now,
                 entry_price=venues.fmt(entry) if entry else "", filled_qty=jr.get("filled") or "", asked_pc=0):
-            await _say(bot, "✅ Ордер хеджа нашёлся.\n" + _open_text(get(hid), row["qty"], entry, jr["client_id"]),
-                       close_kb(hid))
+            await _say(bot, "✅ Ордер хеджа нашёлся.\n" + _open_text(get(hid), jr.get("filled") or row["qty"], entry,
+                                                                      jr["client_id"]), close_kb(hid))
             if row["close_req"]:   # закрыть просили, пока ордер был под вопросом, — закрываем сразу
                 await close(bot, hid, row["close_req"])
         return
@@ -1002,6 +1123,38 @@ async def _tick_unknown(bot, row, now):
                         f"не повторяет, новые открытия ядро запрещает до разбора.")
 
 
+async def _tick_orphan(bot, row, now):
+    """«Неясно», а ордера группы в журнале ядра нет (id не записан, строки нет). Ничего не отправляем. Через
+    ORPHAN_AFTER решаем по позиции группы в журнале: шорт есть — ведём как открытый хедж («Закрыть» и авто-закрытие
+    работают); позиции и ожидающих ордеров нет — failed. До того — как обычный «неясный» (10 мин — «реши на ПК»)."""
+    hid, name = row["id"], _name(row)
+    since = row["unknown_ts"] or row["sent_ts"] or row["pressed_ts"] or now
+    k = _key(row["venue"], row["symbol"], row["grp"]) if row["venue"] and row["symbol"] else None
+    if now - since >= ORPHAN_AFTER:
+        if k and k["net"] < 0:
+            if _set(hid, expect=("unknown",), status="open", filled_ts=row["sent_ts"] or since,
+                    filled_qty=venues.fmt(-k["net"]), asked_pc=0,
+                    notes="ордер группы не найден в журнале, позиция группы по журналу есть"):
+                await _say(bot, f"⚠️ Ордер хеджа круга {name} в журнале ядра не найден, но шорт по кругу у бота есть "
+                                f"({_fmt(-k['net'])} {_esc(row['asset'])}) — веду его как открытый хедж: «Закрыть» и "
+                                f"авто-закрытие работают.", close_kb(hid))
+                if row["close_req"]:
+                    await close(bot, hid, row["close_req"])
+            return
+        if not k or (k["net"] == 0 and k["pending_open"] == 0 and k["pending_reduce"]["buy"] == 0):
+            if _set(hid, expect=("unknown",), status="failed", refusal_where="orphan",
+                    refusal=f"ордер не найден в журнале за {ORPHAN_AFTER // 60} мин, позиции по кругу нет"):
+                await _say(bot, f"✖️ Хедж круга {name}: ордер за {ORPHAN_AFTER // 60} мин так и не нашёлся в журнале "
+                                f"ядра, позиции по кругу у бота нет — считаю, что шорта нет, круг без хеджа. Проверь "
+                                f"кабинет Bybit.")
+            return
+    if not row["asked_pc"] and now - since >= UNKNOWN_LONG:
+        _set(hid, asked_pc=1)
+        await _say(bot, f"❓ Ордер хеджа круга {name} не подтверждён 10 мин и в журнале ядра не найден — реши на ПК: "
+                        f"проверь кабинет Bybit. Бот ничего не повторяет; через {ORPHAN_AFTER // 60} мин решу по "
+                        f"позиции группы в журнале.")
+
+
 async def _tick_open(bot, row, now):
     hid = row["id"]
     oj = journal.get(row["open_cid"]) if row["open_cid"] else None
@@ -1012,7 +1165,9 @@ async def _tick_open(bot, row, now):
     if done == "filled" and oj.get("avg_price") and not row["entry_price"]:
         _set(hid, entry_price=venues.fmt(_dec(oj["avg_price"])), filled_qty=oj.get("filled") or "")
     k = _key(row["venue"], row["symbol"], row["grp"])
-    if done == "filled" and (not k or (k["net"] == 0 and k["pending_open"] == 0 and k["pending_reduce"]["buy"] == 0)):
+    # исполнение подтверждено журналом (или шорт принят по позиции группы, когда ордера в журнале нет)
+    confirmed = done == "filled" or (oj is None and bool(_dec(row["filled_qty"])))
+    if confirmed and (not k or (k["net"] == 0 and k["pending_open"] == 0 and k["pending_reduce"]["buy"] == 0)):
         # исполненный шорт группы сверка обнулила (sync_flat: на бирже пусто) — закрыла биржа или владелец
         await _gone(bot, hid, "сверка ядра не нашла позицию на бирже")
         return
@@ -1043,12 +1198,14 @@ async def _tick_closing(bot, row, now):
     cj = journal.get(row["close_cid"])
     if await _settle_close(bot, hid):
         return
-    done = _journal_done(cj)
-    if done == "none":
-        if _set(hid, expect=("closing",), status="open", refusal_where="close",
-                refusal=f"закрытие {cj['state']} без исполнения"):
-            await _say(bot, f"✖️ Закрытие хеджа круга {name} не исполнилось ({_esc(cj['state'])}) — шорт открыт.",
-                       close_kb(hid))
+    left = _close_left(row)
+    if left is not None:   # ордер закрытия завершён, а шорт остался (частично / не исполнен) — снова «открыт»
+        await _reopen(bot, row, *left)
+        return
+    if cj is None and now - (row["closing_ts"] or now) >= ORPHAN_AFTER:   # ордера закрытия в журнале нет
+        if _set(hid, expect=("closing",), status="open", close_cid="", notes="ордер закрытия не найден в журнале"):
+            await _say(bot, f"⚠️ Закрытие хеджа круга {name}: ордер {_esc(row['close_cid'])} не найден в журнале ядра — "
+                            f"шорт считаю открытым; «Закрыть» и авто-закрытие работают.", close_kb(hid))
         return
     if cj is not None and cj["state"] in ("unknown", "prepared", "sending") and not row["asked_pc"] \
             and now - (row["unknown_ts"] or row["closing_ts"] or now) >= UNKNOWN_LONG:
@@ -1061,7 +1218,18 @@ async def _tick_closing(bot, row, now):
 
 async def callback(bot, cq, data):
     """Кнопки trd_hedge_* — их вызывает wiring.callback, то есть только владелец в личном чате (bot._owner_gate).
-    → текст ответа кнопке."""
+    → текст ответа кнопке. Сбой (база хеджей занята, «database is locked» и т. п.) не уходит наверх: wiring всё равно
+    ответит кнопке, владелец увидит «повтори»."""
+    try:
+        return await _callback(bot, cq, data)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:   # noqa: BLE001
+        logger.error("hedge button %s: %s: %s", str(data)[:40], type(e).__name__, e)
+        return f"хедж: сбой ({type(e).__name__}) — повтори через минуту"
+
+
+async def _callback(bot, cq, data):
     parts = str(data).split(":")
     action = parts[0]
     if action == "trd_hedge_view":

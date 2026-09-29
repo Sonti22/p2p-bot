@@ -274,7 +274,8 @@ def test_eth_hedged_only_from_20000_rub():
 def test_min_amount_setting_parsing_fails_closed(monkeypatch):
     monkeypatch.setenv("HEDGE_MIN_AMOUNT_RUB", "ETH:25000, BTC:abc,TON:5 000,junk")
     got = hedge.settings()["min_amount"]
-    assert got["ETH"] == 25000 and got["BTC"] == float("inf") and got["TON"] == 5000 and "JUNK" not in got
+    assert got["ETH"] == 25000 and got["BTC"] == float("inf") and got["TON"] == 5000
+    assert got["JUNK"] == float("inf")                                    # монета без «:» — не хеджируем
     quotes()
     bot = Stub(exchange()[1])
     assert arun(offer_btc(bot)) is None and texts(bot) == []               # мусор — монету не хеджируем
@@ -678,7 +679,14 @@ def test_mark_done_offers_real_hedge_with_the_hedge_plans_coin_qty(tmp_path, mon
     bot = Stub()
     d = (2.0, make_ad("Bybit", "buy", 84000 * REF, asset="BTC"), make_ad("Bybit", "sell", REF), "спот BTC→USDT")
     deal_id = bot.remember_deal(d, snap=p2p.Snapshot(REF, "test", {}, {}, [d], {}, {}, {}))
-    arun(bot.mark_done({"id": "1", "message": {"message_id": 9}}, deal_id))
+
+    async def go():
+        await bot.mark_done({"id": "1", "message": {"message_id": 9}}, deal_id)
+        assert seen == [] and hedge._offers                               # фоном: ответ кнопке его не ждёт
+        assert [m for m, _ in bot.out][0] == "answerCallbackQuery"
+        await asyncio.gather(*list(hedge._offers))
+
+    arun(go())
     (src, cid, asset, coin, amount, ref, risk), = seen
     import hedge_plans
     assert (src, asset, amount, ref, risk) == ("trade", "BTC", bot.cfg.amount, REF, 0.3) and cid
@@ -694,8 +702,19 @@ def test_mark_done_survives_hedge_failure(tmp_path, monkeypatch):
     bot = Stub()
     d = (2.0, make_ad("Bybit", "buy", 84000 * REF, asset="BTC"), make_ad("Bybit", "sell", REF), "r")
     deal_id = bot.remember_deal(d)
-    arun(bot.mark_done({"id": "1", "message": {"message_id": 9}}, deal_id))
+
+    async def go():
+        await bot.mark_done({"id": "1", "message": {"message_id": 9}}, deal_id)
+        await asyncio.gather(*list(hedge._offers), return_exceptions=True)
+        await asyncio.sleep(0)
+
+    arun(go())
     assert any(m == "answerCallbackQuery" for m, _ in bot.out) and bot.out[-1][0] == "editMessageReplyMarkup"
+    assert not hedge._offers                                              # задача кончилась, ссылка отпущена
+    monkeypatch.setattr(hedge, "offer_soon", lambda *a, **k: 1 / 0)      # и синхронный сбой круг не ломает
+    deal_id = bot.remember_deal(d)
+    arun(bot.mark_done({"id": "2", "message": {"message_id": 9}}, deal_id))
+    assert bot.out[-1][0] == "editMessageReplyMarkup"
 
 
 # --- база и кнопки ---
@@ -736,3 +755,343 @@ def test_bad_callbacks_are_answered_not_raised():
         toast = arun(wiring.callback(bot, press(data)["callback_query"], data, None))
         assert toast
     assert all(m == "answerCallbackQuery" for m, _ in bot.out)
+
+
+# --- ревью 1: частичное закрытие, «неясно» без журнала, срок, коэффициент ≤ 1.05, формула монеты, восстановление ---
+
+def _journal_short(group, qty="0.001", px="65000"):
+    """Позиция бота группы в журнале ядра (исполненный шорт на открытие) — как её оставила бы сверка."""
+    order = venues.Order("bybit", "linear", "BTCUSDT", "sell", "market", Decimal(qty))
+    row = journal._insert_intent(order, "open", "hedge", "confirm", None, group=group)
+    journal._update(row["client_id"], state="sending")
+    journal._update(row["client_id"], state="filled", filled=qty, avg_price=px)
+    return row["client_id"]
+
+
+def _partial_exchange(*rest):
+    """«Биржа»: открытие исполнено целиком, закрытие — 0.0004 из 0.001 (PartiallyFilledCanceled), дальше rest."""
+    book = Book()
+    seq = [book.bybit_create(status="Filled"), book.bybit_create(status="PartiallyFilledCanceled", filled="0.0004")]
+    seq += list(rest) or [book.bybit_create(status="Filled")]
+    s = Session(book.routes("bybit", **{"POST /v5/order/create": seq, "POST /v5/position/set-leverage": bybit_ok({})}))
+    return book, s
+
+
+def test_partial_close_reopens_and_closes_only_the_remainder():
+    quotes()
+    book, s = _partial_exchange()
+    bot = Stub(s)
+
+    async def go():
+        hid = await opened(bot)
+        await bot.on_update(press(f"trd_hedge_close:{hid}"))
+        await settle(bot)
+        row = hedge.get(hid)
+        assert row["status"] == "open" and row["close_cid"] == "" and row["close_req"] == "sold"   # не «закрывается»
+        assert book.position["BTCUSDT"] == Decimal("-0.0006")
+        await hedge.tick(bot)                                              # остаток — следующим reduceOnly
+        await hedge.tick(bot)
+        return hid
+
+    hid = arun(go())
+    row = hedge.get(hid)
+    bodies = [body(c) for c in creates(s)]
+    assert len(bodies) == 3 and [b["side"] for b in bodies] == ["Sell", "Buy", "Buy"]
+    assert bodies[1]["qty"] == "0.001" and bodies[2]["qty"] == "0.0006" and bodies[2]["reduceOnly"] is True
+    assert book.position["BTCUSDT"] == 0                                    # не перезакрыли: лонга нет
+    assert row["status"] == "closed" and len([t for t in texts(bot) if "исполнилось частично" in t]) == 1
+    assert any("выкуп 0.001 BTC" in t for t in texts(bot))                # итог — по обоим закрытиям
+
+
+def test_close_press_on_stuck_closing_closes_the_remainder_at_once():
+    quotes()
+    book, s = _partial_exchange()
+    bot = Stub(s)
+
+    async def go():
+        hid = await opened(bot)
+        await bot.on_update(press(f"trd_hedge_close:{hid}"))
+        await settle(bot)
+        db_set(hid, status="closing", close_cid=body(creates(s)[1])["orderLinkId"])   # как до исправления: «застрял»
+        await bot.on_update(press(f"trd_hedge_close:{hid}"))
+        await settle(bot)
+        return hid
+
+    hid = arun(go())
+    assert hedge.get(hid)["status"] == "closed" and len(creates(s)) == 3 and book.position["BTCUSDT"] == 0
+
+
+def test_unknown_close_is_never_resent_even_when_pressed_again():
+    quotes()
+    book = Book()
+    seq = [book.bybit_create(status="Filled"), Resp(exc=asyncio.TimeoutError())]
+    s = Session(book.routes("bybit", **{"POST /v5/order/create": seq, "POST /v5/position/set-leverage": bybit_ok({})}))
+    bot = Stub(s)
+
+    async def go():
+        hid = await opened(bot)
+        await bot.on_update(press(f"trd_hedge_close:{hid}"))
+        await settle(bot)
+        n = len(link_ids(s))
+        for _ in range(2):
+            await hedge.tick(bot)
+            await bot.on_update(press(f"trd_hedge_close:{hid}"))
+            await settle(bot)
+        return hid, n
+
+    hid, n = arun(go())
+    assert hedge.get(hid)["status"] == "closing" and len(link_ids(s)) == n == 2   # открытие + одно закрытие
+
+
+def test_unknown_without_journal_row_fails_after_an_hour_if_no_position():
+    quotes()
+    bot = Stub(exchange()[1])
+
+    async def go():
+        hid = await offer_btc(bot)
+        old = time.time() - 30 * 60
+        db_set(hid, status="unknown", nonce="", open_cid="", sent_ts=old, unknown_ts=old)
+        await hedge.tick(bot)
+        assert hedge.get(hid)["status"] == "unknown" and any("реши на ПК" in t for t in texts(bot))
+        db_set(hid, unknown_ts=time.time() - hedge.ORPHAN_AFTER - 1)
+        await hedge.tick(bot)
+        await hedge.tick(bot)
+        return hid
+
+    hid = arun(go())
+    row = hedge.get(hid)
+    assert row["status"] == "failed" and row["refusal_where"] == "orphan"
+    assert len([t for t in texts(bot) if "так и не нашёлся" in t]) == 1
+
+
+def test_unknown_without_journal_row_but_with_position_is_managed_as_open(monkeypatch):
+    quotes()
+    book, s = exchange()
+    bot = Stub(s)
+    monkeypatch.setattr(hedge, "_journal_row", lambda *a, **k: None)     # строка ушла за окно истории журнала
+
+    async def go():
+        hid = await offer_btc(bot)
+        _journal_short("cycle:trade:12")
+        book.position["BTCUSDT"] = Decimal("-0.001")
+        old = time.time() - hedge.ORPHAN_AFTER - 1
+        db_set(hid, status="unknown", nonce="", open_cid="tmissing000000000000", sent_ts=old, unknown_ts=old)
+        await hedge.tick(bot)
+        assert hedge.get(hid)["status"] == "open" and "веду его как открытый хедж" in texts(bot)[-1]
+        await hedge.tick(bot)                                              # не «закрыт биржей»: позиция есть
+        assert hedge.get(hid)["status"] == "open" and creates(s) == []     # открытие не повторяли
+        await bot.on_update(press(f"trd_hedge_close:{hid}"))
+        await settle(bot)
+        return hid
+
+    hid = arun(go())
+    assert hedge.get(hid)["status"] == "closed" and len(creates(s)) == 1 and body(creates(s)[0])["reduceOnly"] is True
+    assert book.position["BTCUSDT"] == 0
+
+
+@pytest.mark.parametrize("raw", ["0", "-3", "nan", "abc", "100", "inf"])
+def test_bad_max_hours_falls_back_to_6_for_real_hedge(monkeypatch, raw):
+    monkeypatch.setenv("HEDGE_MAX_HOURS", raw)
+    assert hedge.settings()["max_hours"] == 6
+    quotes()
+    bot = Stub(exchange()[1])
+    assert arun(offer_btc(bot)) and "само через 6 ч" in texts(bot)[-1]
+
+
+def test_max_hours_zero_still_auto_closes_after_6_hours(monkeypatch):
+    monkeypatch.setenv("HEDGE_MAX_HOURS", "0")
+    assert hedge.settings()["max_hours"] == 6 and hedge._max_hours("1,5") == 1.5
+    quotes()
+    _, s = exchange()
+    bot = Stub(s)
+
+    async def go():
+        hid = await opened(bot)
+        db_set(hid, filled_ts=time.time() - 6 * 3600 - 1)
+        await hedge.tick(bot)
+        return hid
+
+    hid = arun(go())
+    assert hedge.get(hid)["status"] == "closed" and hedge.get(hid)["close_reason"] == "auto_timeout"
+
+
+def test_hedge_ratio_is_capped_at_1_05(monkeypatch):
+    monkeypatch.setenv("HEDGE_RATIO", "3")
+    monkeypatch.setenv("HEDGE_RATIO_BAND", "10")                          # полоса не мешает — важен только потолок
+    quotes()
+    assert hedge.settings()["ratio"] == 1.05
+    coin = 0.00306                                                         # × 3 = 0.009 — втрое больше монеты
+    plan, why = hedge.build_plan("BTC", coin, coin * 65000 * REF, REF, 0.3, "confirm")
+    assert plan, why
+    assert Decimal(plan["qty"]) == Decimal("0.003") <= Decimal(str(coin)) * Decimal("1.05")
+
+
+@pytest.mark.parametrize("raw", ["abc", "nan", "inf", "-1", "1e9", ""])
+def test_hedge_ratio_garbage_fails_closed_or_capped(monkeypatch, raw):
+    monkeypatch.setenv("HEDGE_RATIO", raw)
+    quotes()
+    st = hedge.settings()
+    assert 0 <= st["ratio"] <= 1.05
+    plan, _ = hedge.build_plan("BTC", COIN, AMOUNT, REF, 0.3, "confirm")
+    assert plan is None or Decimal(plan["qty"]) <= Decimal(str(COIN)) * Decimal("1.05")
+
+
+def test_open_refuses_when_stored_ref_qty_is_smaller_than_the_short(monkeypatch):
+    quotes()
+    _, s = exchange()
+    bot = Stub(s)
+    real = hedge.build_plan
+
+    async def go(circle, patch):
+        hid = await offer_btc(bot, circle=circle)
+        plan = json.loads(hedge.get(hid)["plan"])
+        db_set(hid, hedge_ref_qty=str(COIN / 2))                           # монета круга «уменьшилась» вдвое
+        monkeypatch.setattr(hedge, "build_plan", (lambda *a, **k: (dict(plan), "")) if patch else real)
+        await bot.on_update(press(buttons(bot)[0]))                        # (сборщик плана её не заметил — patch)
+        await settle(bot)
+        return hedge.get(hid)
+
+    row = arun(go(21, False))
+    assert row["status"] == "refused" and row["refusal_where"] == "plan"
+    row = arun(go(22, True))
+    assert row["status"] == "refused" and row["refusal_where"] == "ratio"
+    assert creates(s) == [] and s.sent(*LEVER) == []
+
+
+def test_hedge_ref_qty_formula_is_pinned():
+    """hedge_plans.coin_qty (незащищённый файл) задаёт монету круга и потолок шорта × 1.05: формула и её исходник
+    запинены здесь — правка без владельца краснит защищённый тест."""
+    import hashlib
+    import inspect
+
+    import hedge_plans
+    for price, asset, amount, sell in ((84000 * REF, "BTC", 10000, REF), (3000 * REF, "ETH", 20000, 91.5),
+                                       (1.59 * REF, "TON", 10000, 1.7 * REF), (80000 * 95.0, "BTC", 70000, 95.0)):
+        d = (1.0, make_ad("Bybit", "buy", price, asset=asset), make_ad("MEXC", "sell", sell, asset=asset), "r")
+        assert hedge_plans.coin_qty(d, amount) == amount / price           # по цене ПОКУПКИ, не продажи
+    d = (1.0, make_ad("Bybit", "buy", 0.0, asset="BTC"), make_ad("MEXC", "sell", REF), "r")
+    assert hedge_plans.coin_qty(d, 10000) == 0.0
+    src = inspect.getsource(hedge_plans.coin_qty).replace("\r\n", "\n")
+    assert hashlib.sha256(src.encode("utf-8")).hexdigest() == \
+        "33402374aabae3fcdd45fb3fce134e481dc659d426c1d2c4149a3fc663c533e5", "hedge_plans.coin_qty изменён"
+
+
+@pytest.mark.parametrize("spec", ["ETH", "ETH=20000", "eth:", "ETH:20 000 руб", "BTC:5000,ETH"])
+def test_malformed_min_amount_for_named_asset_means_no_hedge(monkeypatch, spec):
+    monkeypatch.setenv("HEDGE_MIN_AMOUNT_RUB", spec)
+    assert hedge.settings()["min_amount"]["ETH"] == float("inf")
+    quotes(eth=True)
+    bot = Stub(exchange()[1])
+    assert arun(hedge.offer(bot, "trade", 1, "ETH", ETH_COIN, ETH_AMOUNT, REF, 0.5)) is None and texts(bot) == []
+
+
+def test_min_amount_entry_without_coin_is_skipped(monkeypatch):
+    monkeypatch.setenv("HEDGE_MIN_AMOUNT_RUB", ":5000,ETH:20000")
+    assert hedge.settings()["min_amount"] == {"ETH": 20000.0}
+
+
+def test_stuck_opening_recovered_after_stale_sending():
+    quotes()
+    bot = Stub(exchange()[1])
+
+    async def go():
+        a = await offer_btc(bot, circle=31)
+        b = await offer_btc(bot, circle=32)
+        old = time.time() - hedge.STALE_SENDING - 1
+        for hid in (a, b):
+            db_set(hid, status="opening", nonce="", pressed_ts=old, sent_ts=old)
+        cid = _journal_short("cycle:trade:32")                            # у второго ордер ушёл, id не записан
+        await hedge.tick(bot)
+        assert hedge.get(b)["status"] == "unknown" and hedge.get(b)["open_cid"] == cid
+        await hedge.tick(bot)
+        return a, b
+
+    a, b = arun(go())
+    assert hedge.get(a)["status"] == "failed" and any("прервалась до ордера" in t for t in texts(bot))
+    assert hedge.get(b)["status"] == "open"
+
+
+def test_stuck_closing_recovered_after_stale_sending():
+    quotes()
+    _, s = exchange()
+    bot = Stub(s)
+
+    async def go():
+        hid = await opened(bot)
+        db_set(hid, status="closing", close_cid="", closing_ts=time.time() - 30)
+        await hedge.tick(bot)
+        assert hedge.get(hid)["status"] == "closing"                      # рано
+        db_set(hid, closing_ts=time.time() - hedge.STALE_SENDING - 1)
+        await hedge.tick(bot)
+        return hid
+
+    hid = arun(go())
+    assert hedge.get(hid)["status"] == "open" and len(creates(s)) == 1
+
+
+def test_auto_close_retry_is_throttled(monkeypatch):
+    quotes()
+    _, s = exchange()
+    bot = Stub(s)
+
+    async def go():
+        hid = await opened(bot)
+        await journal.reconcile(s, lambda v: CREDS, positions=False)
+        monkeypatch.setattr(keys, "raw_credentials", lambda v: None)      # ключ не проверен — закрыть нельзя
+        db_set(hid, filled_ts=time.time() - 7 * 3600)
+        for _ in range(3):                                                 # цикл каждые 30 с
+            await hedge.tick(bot)
+        first = len([t for t in texts(bot) if "не могу" in t])
+        db_set(hid, auto_ts=time.time() - hedge.AUTO_RETRY - 1)
+        await hedge.tick(bot)
+        return first
+
+    first = arun(go())
+    assert first == 1 and len([t for t in texts(bot) if "не могу" in t]) == 2
+    assert all("снова на тебе" in t for t in texts(bot) if "не могу" in t) and len(creates(s)) == 1
+
+
+@pytest.mark.parametrize("exit_px,pnl", [("60000", "4.9800"), ("70000", "-5.0200")])
+def test_pnl_sign_of_short(exit_px, pnl):
+    quotes()
+    book, s = exchange()
+    bot = Stub(s)
+
+    async def go():
+        hid = await opened(bot)                                            # вход 65 000
+        book.marks["BTCUSDT"] = exit_px
+        await bot.on_update(press(f"trd_hedge_close:{hid}"))
+        await settle(bot)
+        return hid
+
+    row = hedge.get(arun(go()))
+    assert row["status"] == "closed" and row["pnl_usdt"] == pnl              # шорт: цена вниз — плюс
+    assert any(f"{Decimal(pnl):+.2f} USDT" in t for t in texts(bot))
+
+
+def test_db_locked_in_hedge_button_is_answered_not_raised(monkeypatch):
+    def locked(*a, **k):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(hedge, "get", locked)
+    monkeypatch.setattr(hedge, "_set", locked)
+    bot = Stub()
+    for data in ("trd_hedge_close:1", "trd_hedge_open:1:abcdef12", "trd_hedge_skip:1"):
+        toast = arun(wiring.callback(bot, press(data)["callback_query"], data, None))
+        assert "повтори" in toast
+    assert [m for m, _ in bot.out] == ["answerCallbackQuery"] * 3
+
+
+def test_opened_message_shows_filled_not_planned_qty():
+    quotes()
+    bot = Stub(exchange()[1])
+
+    async def go():
+        hid = await offer_btc(bot)
+        db_set(hid, status="opening", nonce="", qty="0.001")
+        await hedge._after_open(bot, hid, {"state": "open", "reason": "", "event": None, "filled": Decimal("0.0006"),
+                                           "row": {"client_id": "t2609290000001234abcd", "avg_price": "65000"}}, None)
+        return hid
+
+    hid = arun(go())
+    assert "шорт 0.0006 BTC" in texts(bot)[-1] and hedge.get(hid)["filled_qty"] == "0.0006"
