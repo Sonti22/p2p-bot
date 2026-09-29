@@ -5,6 +5,7 @@ One-off snapshot:  python p2p.py
 """
 import asyncio
 import dataclasses
+import functools
 import html
 import io
 import json
@@ -812,6 +813,31 @@ def terms_flags(text):
     return blocked, notes
 
 
+def terms_hits(text):
+    """Стоп-фразы в условиях объявления: [(причина, сработавший фрагмент)] — по тем же TERMS_BLOCK и с тем же вырезанием
+    отрицаний, что terms_flags; для журнала отсева (TERMS_LOG, /traps, /status)."""
+    return list(_terms_hits_cached(text or ""))
+
+
+TERMS_HITS_CACHE = 4096   # разных текстов условий в кэше terms_hits: мерчант повторяет свой текст из скана в скан
+
+
+@functools.lru_cache(maxsize=TERMS_HITS_CACHE)
+def _terms_hits_cached(text):
+    """terms_hits по тексту, кэш с вытеснением давних: assemble идёт в цикле событий бота на каждом скане по всем
+    объявлениям — регулярки по одним и тем же условиям каждый раз заново держали бы цикл. Кортеж — кэш не изменить."""
+    t = _TERMS_NEG_THIRD.sub(" ", text.lower())
+    out = []
+    for pat, label in TERMS_BLOCK:
+        m = re.search(pat, t, re.I)
+        if m:
+            end = m.end()
+            while end < len(t) and t[end].isalnum():   # фрагмент до конца слова: «третьи лиц» → «третьи лица»
+                end += 1
+            out.append((label, t[m.start():end].strip()))
+    return tuple(out)
+
+
 def merchant_offline(a, cfg):
     """Мерчант объявления офлайн: площадка так и отдаёт (Ad.online is False — сейчас только LBank) или последний раз
     был на площадке раньше MERCHANT_OFFLINE_MIN минут до получения объявления (Ad.last_seen — если площадка отдаёт
@@ -1546,6 +1572,7 @@ class Snapshot:
     ads: list = field(default_factory=list)         # все объявления скана до фильтров — для снимков (snapshots.py)
     blocked: frozenset = field(default_factory=frozenset)   # блэклист (ex, nick), с которым собран снимок
     traps: list = field(default_factory=list)       # ловушки, отсеянные в этом скане (_trap_entry)
+    terms_hits: list = field(default_factory=list)  # срабатывания стоп-фраз условий в этом скане (_terms_entries)
     perps: dict = field(default_factory=dict)       # (площадка, символ) -> perp.PerpQuote: последние котировки перпов
     # EV_RANK=1: (ex покупки, монета, ex продажи, монета) -> (EV п.п., p исполнения) — calibration.rank_snapshot;
     # пусто — EV в карточке не показываем
@@ -1556,6 +1583,9 @@ class Snapshot:
     # None — снимок собран не ботом (replay, тесты)
     cfg: Config = None
     since: float = 0.0   # конец сбора прошлого скана: данные, полученные позже, — новые и для этого скана (deal_fresh)
+    # резервы обменников по стаканам снимка (_bc_reserves): считаются один раз на снимок, не на каждую связку;
+    # (groups, карта) — пересчёт, если снимку подставили другие стаканы. Не в __init__: replace() даёт новому снимку пустой
+    bc_reserves: tuple = field(default=None, init=False, repr=False, compare=False)
 
 
 # key — (монеты, площадки, сумма круга), под которые собран кэш; jobs — замеры запросов, которыми он собран
@@ -1615,6 +1645,53 @@ def traps_log():
     return list(reversed(TRAPS_LOG))
 
 
+# Журнал отсева по стоп-фразам условий (terms_hits): объявление с «третьими лицами», уводом в мессенджер и т. п. скан
+# отсеивает молча — здесь видно, кого и какой фразой, чтобы владелец мог сверить список TERMS_BLOCK (не режет ли он
+# нормальных мерчантов). Запись — на (площадка, ник, причина): одно объявление на каждом скане счёт не раздувает.
+TERMS_LOG_SIZE = 200
+TERMS_LOG = {}   # (ex, nick, причина) -> {"first", "last", "scans", "phrase", "asset", "side"}
+
+
+def _terms_entries(ads, ts=0.0):
+    """Срабатывания стоп-фраз в объявлениях скана (до всех фильтров): [{ts, ex, nick, side, asset, label, phrase}]."""
+    out = []
+    for a in ads:
+        if not a.terms:
+            continue
+        for label, phrase in terms_hits(a.terms):
+            out.append({"ts": ts or time.time(), "ex": a.ex, "nick": a.nick, "side": a.side, "asset": a.asset,
+                        "label": label, "phrase": phrase[:60]})
+    return out
+
+
+def record_terms_hits(entries):
+    """Добавить срабатывания скана (snap.terms_hits) в TERMS_LOG; сверх TERMS_LOG_SIZE — забыть самые давние."""
+    seen = set()
+    for e in entries:
+        key = (e["ex"], e["nick"], e["label"])
+        rec = TERMS_LOG.get(key)
+        if rec is None:
+            rec = TERMS_LOG[key] = {"first": e["ts"], "last": e["ts"], "scans": 0}
+        if key not in seen:   # два объявления мерчанта в одном скане — один скан
+            rec["scans"] += 1
+            seen.add(key)
+        rec.update(last=max(rec["last"], e["ts"]), phrase=e["phrase"], asset=e["asset"], side=e["side"])
+    while len(TERMS_LOG) > TERMS_LOG_SIZE:
+        del TERMS_LOG[min(TERMS_LOG, key=lambda k: TERMS_LOG[k]["last"])]
+
+
+def terms_log():
+    """Журнал отсева по стоп-фразам, свежие первыми: [{ex, nick, label, phrase, asset, side, first, last, scans}]."""
+    rows = [dict(v, ex=k[0], nick=k[1], label=k[2]) for k, v in TERMS_LOG.items()]
+    return sorted(rows, key=lambda r: -r["last"])
+
+
+def terms_summary():
+    """{причина: сколько мерчантов (площадка+ник)} по журналу — для /status."""
+    out = {}
+    for _ex, _nick, label in TERMS_LOG:
+        out[label] = out.get(label, 0) + 1
+    return out
 REQUEST_MAX = 15.0   # сек: предел запроса скана, как общий таймаут HTTP-сессии бота; дольше — ошибка площадки
 
 
@@ -2230,7 +2307,7 @@ def assemble(cfg, ads, ref=None, ref_src="-", spot=None, errors=None, blocked=fr
                 deals.append(d)
     snap = Snapshot(ref or 0, ref_src, refs, best, [], networks, dropped, errors, groups, spot, over_banks, book,
                     ts=ts, jobs=list(jobs), ads=ads, blocked=frozenset(blocked), traps=traps, extra=dict(extra or {}),
-                    since=since)
+                    since=since, terms_hits=_terms_entries(ads, ts))
     # сортировка «прибыль × надёжность» — score(): каждая единица веса риска снимает risk_penalty п.п. с профита
     deals.sort(key=lambda d: score(d, cfg, snap), reverse=True)
     # обменники разных сетей дают по связке на одну и ту же пару площадок; бот сигналит по паре
@@ -2254,6 +2331,7 @@ async def scan(s, cfg, force_alt=False):
                     over_banks=trades.banks_over_limit(trades.own_banks()[0]),   # свои банки, у которых лимит СБП исчерпан
                     **raw)
     TRAPS_LOG.extend(snap.traps)
+    record_terms_hits(snap.terms_hits)
     # котировки перпов опрашивает perp_loop бота со своим интервалом; скан сеть перпов не ждёт. Здесь, а не в
     # assemble: сборка остаётся чистой — replay старых снимков живые котировки не читает
     snap.perps = perp.quotes()
@@ -2364,11 +2442,77 @@ def spot_url(route):
 RELIABLE, RISKY, TRAP = "✅ надёжно", "⚠️ риск", "🪤 ловушка"
 
 
+# BestChange-факторы метки надёжности (ROADMAP «Метка надёжности сигнала, часть 3»): резерв обменников связки меньше
+# стольких объёмов круга — может кончиться, пока идут оплата и перевод; выгрузка (info.zip) старше стольких минут —
+# курс и резерв в ней могли уйти (обычно она обновляется раз в BC_REFRESH, старая — выгрузка не скачивается)
+BC_RESERVE_MARGIN = 1.5
+BC_STALE_MIN = 10.0
+
+
+def _bc_reserves(snap):
+    """Резервы обменников в стаканах снимка: {(сторона, монета, сеть): {ник: {банк: резерв в монете}}} — один раз на
+    снимок (Snapshot.bc_reserves), а не на каждую связку. В выгрузке у обменника строка на каждый банк с одним и тем же
+    резервом, поэтому по банку — наибольший из строк, а не сумма (сумма завысила бы резерв во столько раз, сколько
+    банков). У объявления стакана avail — резерв обменника (у стека связки — только взятый объём)."""
+    cached = snap.bc_reserves
+    if cached is not None and cached[0] is snap.groups:
+        return cached[1]
+    out = {}
+    for (ex, side, asset), grp in snap.groups.items():
+        if ex != "BestChange":
+            continue
+        for a in grp:
+            banks = out.setdefault((side, asset, a.net), {}).setdefault(a.nick, {})
+            for p in a.pays or ("",):
+                banks[p] = max(banks.get(p, 0.0), a.avail)
+    snap.bc_reserves = (snap.groups, out)
+    return out
+
+
+def _bc_reserve(ad, snap):
+    """Резерв обменников стороны ad в монете (None — их нет в стакане снимка): по каждому обменнику (нику) — резерв
+    в банке связки (ad.pays), банка нет среди его строк — наибольший по его строкам; по обменникам стека — сумма."""
+    per = _bc_reserves(snap).get((ad.side, ad.asset, ad.net), {})
+    pays = set(ad.pays or ())
+    rows = [per[n] for n in dict.fromkeys(ad.nicks or (ad.nick,)) if n in per]
+    if not rows:
+        return None
+    return sum(max([v for p, v in r.items() if p in pays] or r.values()) for r in rows)
+
+
+def _bc_stale(b, s, snap):
+    """Старая выгрузка BestChange — одна причина на связку (обе стороны-обменника из одной выгрузки: по причине на
+    сторону «обменник → обменник» сразу набирал бы 3 причины, ловушку, на каждой задержке выгрузки). [] или
+    [(1, причина)] с возрастом самой старой стороны-обменника; время неизвестно (0) — не считаем старой."""
+    if not snap.ts:
+        return []
+    old = [(snap.ts - ad.fetched_ts, side) for ad, side in ((b, "покупка"), (s, "продажа"))
+           if ad.ex == "BestChange" and ad.fetched_ts and snap.ts - ad.fetched_ts > BC_STALE_MIN * 60]
+    if not old:
+        return []
+    return [(1, f"{' и '.join(side for _, side in old)}: выгрузка BestChange {int(max(old)[0] // 60)} мин назад — "
+                f"курс и резерв могли уйти")]
+
+
+def _bc_risks(ad, side, cfg, snap):
+    """Риск стороны-обменника (ex == BestChange): [(вес, причина)] — резерв впритык: резерв обменников стороны
+    (_bc_reserve) меньше BC_RESERVE_MARGIN объёмов круга cfg.amount / цена. Старая выгрузка — на связку (_bc_stale)."""
+    if ad.ex != "BestChange":
+        return []
+    need = cfg.amount / ad.price if ad.price > 0 else 0.0
+    reserve = _bc_reserve(ad, snap)
+    if reserve is not None and need > 0 and reserve < need * BC_RESERVE_MARGIN:
+        return [(1, f"{side}: резерв обменника впритык ({reserve / need:.1f}× объёма круга) — может кончиться "
+                    f"до перевода")]
+    return []
+
+
 def _risks(deal, cfg, snap):
     """Риски связки: [(вес, причина)] — отклонение цены от ориентира (ближе к отсеву — тяжелее), мерчант у
     порога фильтра по сделкам/отзывам, рискованные условия, мерчант офлайн (merchant_offline), число
     переводов/конвертаций, волатильная монета, спред ≥5% и «обменник → обменник» (оба конца на BestChange: курсы
-    с условиями, AML-проверки и заморозки)."""
+    с условиями, AML-проверки и заморозки); у обменника — резерв впритык (_bc_risks), на связку — старая выгрузка
+    BestChange (_bc_stale)."""
     profit, b, s, route = deal
     risks = []
     for ad, side in ((b, "покупка"), (s, "продажа")):
@@ -2390,6 +2534,8 @@ def _risks(deal, cfg, snap):
         risky = [n for n in terms_flags(ad.terms)[1] if n in TERMS_RISKY]
         if risky:
             risks.append((2, f"{side}: условия — {', '.join(risky)}"))
+        risks += _bc_risks(ad, side, cfg, snap)
+    risks += _bc_stale(b, s, snap)
     steps = route.split(" → ") if route else []
     transfers = sum(1 for st in steps if "перевод" in st or "спот" in st or "через" in st)
     if transfers >= 2:
