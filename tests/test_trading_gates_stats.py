@@ -1241,3 +1241,122 @@ def test_script_imports_no_network_and_no_research():
     for bad in ("import socket", "import requests", "import urllib", "import aiohttp", "import http", "import research",
                 "from research", "import_module"):
         assert bad not in src, bad
+
+
+# --- раунд 4: --venues без Bybit, сбой обезвреживания, код выхода, границы неизвестной стоимости --------------------------
+
+def _mixed_runner(calls, bybit_cost=2.0, bingx_cost=0.2):
+    """research.report-заглушка: на Bybit стоимость хеджа плохая, на BingX хорошая — бэктест по одной BingX выглядел бы
+    сильным. Каждый вызов пишется в calls."""
+    def runner(cmd, cwd):
+        calls.append(cmd)
+        c = coin(cost=bingx_cost)
+        c["windows"]["bybit"][1]["cost_to_buffer"] = bybit_cost
+        res = result(BTC=c)
+        res["coins"]["BTC"]["buffer_pct"] = 1.0                                  # как RISK_BUFFER из _env: запас не ругается
+        with open(os.path.join(cmd[cmd.index("--out") + 1], "backtest_report.json"), "w", encoding="utf-8") as f:
+            json.dump({"hedge": res}, f)
+        return 0
+    return runner
+
+
+@pytest.mark.parametrize("raw", ["bingx", "BingX", "bingx,bingx"])
+def test_backtest_without_bybit_is_refused_before_the_process(tmp_path, capsys, monkeypatch, raw):
+    root = _strong_file_root(tmp_path, monkeypatch)                              # старый сильный файл: minlot
+    assert _mode(root) == "minlot"
+    capsys.readouterr()
+    calls = []
+    assert run_main(root, "--backtest", "--venues", raw, runner=_mixed_runner(calls)) == 2
+    out = capsys.readouterr().out
+    assert calls == []                                                           # research.report не запускался
+    assert f"⛔ --venues {raw}: для записи gates_backtest.json в бэктесте обязательно bybit" in out
+    assert "research.report не запускался" in out and "с --dry-run" in out
+    assert _bt_doc(root) == {} and _mode(root) == "paper"                        # бэктест по BingX minlot не открыл
+
+
+def test_backtest_without_bybit_and_without_old_file_writes_nothing(tmp_path, capsys, monkeypatch):
+    monkeypatch.setenv("HEDGE_ASSETS", "BTC")
+    root = bot_root(tmp_path)
+    calls = []
+    assert run_main(root, "--backtest", "--venues", "bingx", runner=_mixed_runner(calls)) == 2
+    out = capsys.readouterr().out
+    assert calls == [] and "Старого gates_backtest.json нет" in out and "обязательно bybit" in out
+    assert os.listdir(os.path.join(root, "data")) == []                          # ни бумаги, ни бэктеста
+    assert gates.load_backtest(HEDGE, root=root)[0] is None and _mode(root) == "paper"
+
+
+def test_backtest_with_both_venues_still_works_and_takes_the_worst(tmp_path, capsys, monkeypatch):
+    monkeypatch.setenv("HEDGE_ASSETS", "BTC")
+    root = bot_root(tmp_path)
+    calls = []
+    assert run_main(root, "--backtest", "--venues", "bybit,bingx", runner=_mixed_runner(calls)) == 0
+    assert len(calls) == 1 and "обязательно" not in capsys.readouterr().out
+    assert _bt_doc(root)["cost_to_buffer"] == 2.0 and _mode(root) == "paper"      # худшая площадка, а не «по BingX»
+    assert run_main(root, "--backtest", "--venues", " BingX , bybit", runner=_runner) == 0   # порядок и регистр не важны
+    assert _bt_doc(root)["count"] > 900 and _mode(root) == "minlot"
+
+
+def test_dry_run_with_bingx_only_prints_the_verdict_but_writes_nothing(tmp_path, capsys, monkeypatch):
+    root = _strong_file_root(tmp_path, monkeypatch)
+    data = os.path.join(root, "data")
+    path = os.path.join(data, "gates_backtest.json")
+    before, names = open(path, "rb").read(), sorted(os.listdir(data))
+    capsys.readouterr()
+    calls = []
+    assert run_main(root, "--backtest", "--dry-run", "--venues", "bingx", runner=_mixed_runner(calls)) == 0
+    out = capsys.readouterr().out
+    assert len(calls) == 1 and "--dry-run: файлы не записаны" in out and "обязательно" not in out
+    assert "разрешил бы реальные ордера minlot" in out                          # по одной BingX цифры красивые — потому и без записи
+    assert open(path, "rb").read() == before and sorted(os.listdir(data)) == names
+    assert _mode(root) == "minlot"                                               # старое не тронуто и не заменено
+    root2 = bot_root(tmp_path / "two")
+    assert run_main(root2, "--backtest", "--dry-run", "--venues", "bingx", runner=_mixed_runner([])) == 0
+    assert os.listdir(os.path.join(root2, "data")) == []
+
+
+def test_failed_invalidation_refuses_before_the_process_and_keeps_old_bytes(tmp_path, capsys, monkeypatch):
+    root = _strong_file_root(tmp_path, monkeypatch)
+    path = os.path.join(root, "data", "gates_backtest.json")
+    before = open(path, "rb").read()
+    real = tgs.jsonstore.write_dict
+
+    def deny(p, doc):
+        if os.path.basename(p) == gates.BACKTEST_FILE:
+            raise PermissionError("access denied")
+        return real(p, doc)
+    monkeypatch.setattr(tgs.jsonstore, "write_dict", deny)
+    capsys.readouterr()
+    calls = []
+    assert run_main(root, "--backtest", runner=_mixed_runner(calls)) == 2
+    out = capsys.readouterr().out
+    assert calls == []                                                           # без обезвреживания расчёт не начинается
+    assert "⛔ старый gates_backtest.json не удалось обезвредить: PermissionError: access denied" in out
+    assert "бэктест не запускаю" in out
+    assert open(path, "rb").read() == before                                     # старые байты на месте, файл не тронут
+
+
+def test_strong_report_with_nonzero_exit_code_is_refused(tmp_path, capsys, monkeypatch):
+    root = _strong_file_root(tmp_path, monkeypatch)
+
+    def runner(cmd, cwd):
+        _runner(cmd, cwd)                                                        # валидный сильный отчёт лежит на месте...
+        return 1                                                                 # ...но процесс закончился с ошибкой
+    capsys.readouterr()
+    assert run_main(root, "--backtest", runner=runner) == 2
+    out = capsys.readouterr().out
+    assert "⛔ бэктест не получился: research.report завершился с кодом 1" in out
+    assert _bt_doc(root) == {} and _mode(root) == "paper"
+
+
+def test_cost_gap_and_unknown_cost_boundaries():
+    assert tgs.cost_gaps({"BTC": {"count": 5, "cost_unknown": 2}}) == {"BTC": 0.4}      # ровно MIN_COIN_HEDGES: уже считаем
+    assert tgs.cost_gaps({"BTC": {"count": 4, "cost_unknown": 2}}) == {}                # мало данных — другая блокировка
+    closed_no_pnl = [(1, "BTC", 10000, json.dumps({"status": "closed"}), 0.1, 0.0)]
+    assert tgs._cost_unknown(closed_no_pnl, "BTC", {"BTC": 1.0}) == 0                   # закрыт без итога: gate_stats его не считает
+    no_rate = [(1, "BTC", 10000, json.dumps({"status": "closed", "pnl_pct": 0.1}), 0.1, 0.0)]
+    assert tgs._cost_unknown(no_rate, "BTC", {"BTC": 1.0}) == 1                         # итог есть, курса нет — стоимость неизвестна
+    with_rate = [(1, "BTC", 10000, json.dumps({"status": "closed", "pnl_pct": 0.1, "ref_close": 90.0}), 0.1, 0.0)]
+    assert tgs._cost_unknown(with_rate, "BTC", {"BTC": 1.0}) == 0
+    assert tgs._cost_unknown(with_rate, "BTC", {}) == 1                                 # у монеты нет запаса — в среднее не идёт
+    still_open = [(1, "BTC", 10000, json.dumps({"status": "open", "pnl_pct": 0.1}), 0.1, 0.0)]
+    assert tgs._cost_unknown(still_open, "BTC", {"BTC": 1.0}) == 0

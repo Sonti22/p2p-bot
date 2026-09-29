@@ -731,6 +731,14 @@ def main(argv=None, runner=None, env_loader=_load_env, now=None):
         print("Старый gates_backtest.json заменён пустым (без порогов) ДО расчёта: по нему minlot больше не откроется. Новый "
               "файл появится только после успешного бэктеста, принятого ботом." if cleared else
               "Старого gates_backtest.json нет — заменять нечего.")
+        # Файл открывает minlot целиком (gates.load_backtest его не различает по площадкам), а боевой хедж ходит на Bybit:
+        # бэктест без Bybit (например, только BingX) не имеет права его выпускать. Список площадок — из hedge.SUPPORTED.
+        missing = [v for v in hedge.SUPPORTED if v not in venues]
+        if missing:
+            return _fail(f"--venues {a.venues}: для записи gates_backtest.json в бэктесте обязательно {', '.join(missing)} "
+                         "(боевой хедж ходит только туда; цифры другой площадки его не подтверждают) — research.report не "
+                         "запускался, gates_backtest.json остаётся пустым (без порогов). Только посмотреть цифры без записи — "
+                         "с --dry-run.")
     cfg_assets, mins = hedge_config()
     off = [c for c in cfg_assets if mins.get(c) == math.inf]
     assets = [c for c in cfg_assets if c not in off]
