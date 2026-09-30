@@ -170,6 +170,80 @@ def _env_parsed(name, parse, default):
     return value
 
 
+def _parse_num(text):
+    """Число из .env-строки: пробелы вычищены, один завершающий '%' отброшен; принимает только целую или дробную
+    часть (запятая или точка) со знаком — так отсекаются nan/inf/infinity/экспонента/подчёркивания («1_0»), как в
+    parse_amount/parse_min_profit. None — не разобрано."""
+    t = re.sub(r"\s+", "", text or "")
+    if t.endswith("%"):
+        t = t[:-1]
+    if not re.fullmatch(r"[+-]?\d+(?:[.,]\d+)?", t):
+        return None
+    return float(t.replace(",", "."))
+
+
+def _env_num(name, default, lo=None, hi=None, cast=float):
+    """Числовая настройка .env толерантно: пусто/не задано — default без warning; мусор, не-целое для cast=int
+    или вне [lo, hi] — default с warning (одна строка, значение обрезано до 40 символов — ключей/токенов тут
+    не бывает, но береженого лог бережёт)."""
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    value = _parse_num(raw)
+    if value is not None and cast is int and value != int(value):
+        value = None
+    if value is not None and lo is not None and value < lo:
+        value = None
+    if value is not None and hi is not None and value > hi:
+        value = None
+    if value is None:
+        logger.warning("%s=%s в .env не подходит, использую %s", name, raw[:40], default)
+        return default
+    return cast(value)
+
+
+def _env_fees(name, default_spec, upper=True, hi=None):
+    """Комиссии/буферы (МОНЕТА:число,...) из .env толерантно: не задано — дефолт из default_spec; пусто —
+    {} (семантика не меняется); иначе разбор по частям с ':'. Десятичная запятая ломает наивный split(','):
+    «BTC:0,0002» после split даёт «BTC:0» и «0002» — вторую часть приклеиваем к первой, если та была целым числом
+    без точки. Часть без ':' — warning и пропуск. Отрицательное/nan/inf/нечисловое значение — warning и откат к
+    дефолту ЭТОГО ключа (не к 0: p2p.py берёт cfg.transfer_fees.get(asset, 0), поэтому отброшенный ключ должен
+    остаться на дефолте, а не исчезнуть — иначе «монета не указана» и «указана мусором» неотличимы)."""
+    raw = os.getenv(name)
+    if raw is None:
+        return _fees(default_spec, upper)
+    if not raw.strip():
+        return _fees(raw, upper)
+    defaults = _fees(default_spec, upper)
+    out = {}   # монета, не упомянутая пользователем в TRANSFER_FEES, по-прежнему отсутствует в результате (-> 0)
+    parts = raw.split(",")
+    i, n = 0, len(parts)
+    while i < n:
+        part = parts[i]
+        if ":" not in part:
+            logger.warning("%s: часть «%s» без «:» пропущена (формат МОНЕТА:число)", name, part.strip()[:40])
+            i += 1
+            continue
+        k, v = part.split(":", 1)
+        key = k.strip().upper() if upper else k.strip()
+        text = v.strip()
+        if i + 1 < n and re.fullmatch(r"[+-]?\d+", text) and re.fullmatch(r"\d+", parts[i + 1].strip()):
+            text = f"{text},{parts[i + 1].strip()}"
+            i += 1
+        i += 1
+        value = _parse_num(text)
+        ok = value is not None and value >= 0 and (hi is None or value <= hi)
+        if not ok:
+            logger.warning("%s: %s=%s в .env не подходит, использую %s", name, key, text[:40], defaults.get(key))
+            if key in defaults:
+                out[key] = defaults[key]
+            else:
+                out.pop(key, None)
+        else:
+            out[key] = value
+    return out
+
+
 # Пороги мерчантов по площадкам: MERCHANT_MIN="Bybit:100/97,HTX:300/96" — «площадка:сделок/%» (имя как в Ad.ex,
 # регистр не важен; «Bybit:100» или «Bybit:/97» — вторая часть общая). Не задана площадка — общие MIN_ORDERS/MIN_RATE;
 # пусто (по умолчанию) — как раньше. Счётчики разные: Bybit — недавние (recentOrderNum), HTX/MEXC — за месяц,
@@ -292,23 +366,25 @@ class Config:
 
     @classmethod
     def from_env(cls):
-        fees = _fees(os.getenv("TRANSFER_FEES", DEFAULT_FEES))
-        if "TRANSFER_FEES" not in os.environ and os.getenv("TRANSFER_FEE"):
-            fees["USDT"] = float(os.getenv("TRANSFER_FEE"))
+        fees = _env_fees("TRANSFER_FEES", DEFAULT_FEES)
+        if "TRANSFER_FEES" not in os.environ:
+            v = _env_num("TRANSFER_FEE", None, 0.0, 1000.0)
+            if v is not None:
+                fees["USDT"] = v
         return cls(
             fiat=os.getenv("FIAT", "RUB").upper(),
             amount=_env_parsed("AMOUNT", parse_amount, 50000),
             min_profit=_env_parsed("MIN_PROFIT", parse_min_profit, 1.0),
-            min_orders=int(os.getenv("MIN_ORDERS", 100)),
-            min_rate=float(os.getenv("MIN_RATE", 95)),
-            max_dev=float(os.getenv("MAX_DEV", 4)),
-            interval=int(os.getenv("INTERVAL", 20)),
-            alt_interval=int(os.getenv("ALT_INTERVAL", 60)),
-            bc_refresh=int(os.getenv("BC_REFRESH", 120)),
-            pay_fee=float(os.getenv("PAY_FEE", 0)),
-            risk_penalty=float(os.getenv("RISK_PENALTY", 1.5)),
-            spot_fees=_fees(os.getenv("SPOT_FEES", DEFAULT_SPOT_FEES), upper=False),
-            risk_buffer=_fees(os.getenv("RISK_BUFFER", DEFAULT_RISK)),
+            min_orders=_env_num("MIN_ORDERS", 100, 0, MERCHANT_ORDERS_MAX, int),
+            min_rate=_env_num("MIN_RATE", 95.0, 0.0, 100.0),
+            max_dev=_env_num("MAX_DEV", 4.0, 0.1, 50.0),
+            interval=_env_num("INTERVAL", 20, 5, 3600, int),
+            alt_interval=_env_num("ALT_INTERVAL", 60, 5, 3600, int),
+            bc_refresh=_env_num("BC_REFRESH", 120, 10, 3600, int),
+            pay_fee=_env_num("PAY_FEE", 0.0, 0.0, 20.0),
+            risk_penalty=_env_num("RISK_PENALTY", 1.5, 0.0, 50.0),
+            spot_fees=_env_fees("SPOT_FEES", DEFAULT_SPOT_FEES, upper=False, hi=100.0),
+            risk_buffer=_env_fees("RISK_BUFFER", DEFAULT_RISK, hi=100.0),
             assets=[a.upper() for a in _list("ASSETS", DEFAULT_ASSETS)],
             transfer_fees=fees,
             exchanges=_list("EXCHANGES", ALL_EXCHANGES),
