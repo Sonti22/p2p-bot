@@ -900,6 +900,15 @@ _(облачный Claude добавляет сюда предложения, к
 - Площадки под санкциями или с сомнительным статусом (Garantex, Grinex, A7A5, ABCeX).
 
 ## Журнал
+- 2026-09-30 — command-contract-test: `tests/test_command_contract.py` — контракт команд: меню (`COMMANDS`) =
+  `dispatch` = `/help` (`HELP_SECTIONS`) = `README.md` = `docs/owner-guide.md`, плюс гостевая поверхность
+  (`GUEST_CMDS`) сверена с пометками «(гость)» в owner-guide и блоком «Рыночные…» в README; денежная команда
+  исключена только по префиксу `/pay`, без имени целиком. Закрыты найденные тестом пробелы: `/nets` — в
+  `HELP_SECTIONS['market']`; `/filters` — в `HELP_SECTIONS['settings']`; в README — `/safety` (блок гостей),
+  `/nets`/`/export`/`/mybanks`/`/fav`/`/hedge`/`/filters`/`/signals` (блок владельца); в owner-guide — `/nets`,
+  `/signals` (таблица «Рынок»), `/filters` (таблица «Настройки и служебное»). Ждёт владельца: `/backtest` есть в
+  `GUEST_CMDS`, но не назван в `GUEST_DENIED` и `GUEST_WELCOME` — эти константы закреплены хэш-пином в защищённом
+  `tests/test_payout_pins.py` (владелец правит их вручную вместе с пином, облачная рутина не трогает).
 - 2026-09-30 — paper-cycles-csv: `/paper cycles [дней]` — построчная выгрузка кругов сухого прогона в CSV
   (`data/paper_cycles.csv`, BOM utf-8-sig, «;», десятичная запятая — как /export): старт по МСК, час, связка,
   монеты, сумма, банк, метка, план с запасом/без запаса, факт и разница факт−план (от `COALESCE(planned_raw,
