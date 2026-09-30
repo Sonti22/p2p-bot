@@ -51,6 +51,7 @@ def _connect(path):
                 "apr_open REAL, reason_open TEXT DEFAULT '', reason_close TEXT DEFAULT '', state TEXT DEFAULT '{}')")
     con.execute("CREATE TABLE IF NOT EXISTS fundings (id INTEGER PRIMARY KEY AUTOINCREMENT, pos_id INTEGER, ts REAL, "
                 "venue TEXT, leg TEXT, rate REAL, mark REAL, amount REAL, approx INTEGER DEFAULT 0)")
+    con.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value REAL)")
     con.commit()
     return con
 
@@ -172,6 +173,9 @@ def tick(now=None, path=DB_PATH):
     now = time.time() if now is None else now
     con = _connect(path)
     with con:
+        # без позиций файл иначе не менялся бы: первый и последний тик — чтобы «данных N дн.» и «жив ли» были честными
+        con.execute("INSERT OR IGNORE INTO meta (key, value) VALUES ('first_tick_ts', ?)", (now,))
+        con.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('last_tick_ts', ?)", (now,))
         for p in _dicts(con.execute("SELECT * FROM positions WHERE ts_close IS NULL")):
             st = json.loads(p["state"] or "{}")
             spot = p["scheme"] == "spot_perp"
@@ -230,14 +234,15 @@ def stats(path=DB_PATH, now=None):
     худший MTM, число расчётов (оценочных — отдельно)."""
     now = time.time() if now is None else now
     empty = {"open": [], "closed": 0, "wins": 0, "pnl": 0.0, "funding": 0.0, "fees": 0.0, "apr": None,
-             "worst_mtm": 0.0, "settlements": 0, "approx": 0, "days": 0.0}
+             "worst_mtm": 0.0, "settlements": 0, "approx": 0, "days": 0.0, "last_tick": None}
     if not os.path.exists(path):
         return empty
     con = _connect(path)
     rows = _dicts(con.execute("SELECT * FROM positions ORDER BY id"))
     settled, approx = con.execute("SELECT COUNT(*), COALESCE(SUM(approx), 0) FROM fundings").fetchone()
+    meta = dict(con.execute("SELECT key, value FROM meta").fetchall())
     con.close()
-    out = dict(empty, settlements=settled, approx=approx)
+    out = dict(empty, settlements=settled, approx=approx, last_tick=meta.get("last_tick_ts"))
     usd_days = 0.0
     for p in rows:
         notional = p["qty"] * (p["long_open"] + p["short_open"]) / 2
@@ -251,8 +256,9 @@ def stats(path=DB_PATH, now=None):
         out["funding"] += p["funding"] or 0.0
         out["fees"] += p["fees"] or 0.0
         usd_days += notional * max(p["ts_close"] - p["ts_open"], 1.0) / 86400
-    if rows:
-        out["days"] = (now - rows[0]["ts_open"]) / 86400
+    starts = [t for t in (meta.get("first_tick_ts"), rows[0]["ts_open"] if rows else None) if t is not None]
+    if starts:   # первая позиция могла открыться до meta (база до обновления) — берём более раннее из двух
+        out["days"] = max((now - min(starts)) / 86400, 0.0)
     if usd_days:
         out["apr"] = out["pnl"] / usd_days * 365 * 100
     return out
@@ -283,15 +289,19 @@ def view(path=DB_PATH, now=None):
             line += f", {s['apr']:+.1f}% годовых на позицию"
         lines.append(line + f"; при комиссиях ×2, как в бэктесте, — {s['pnl'] - s['fees']:+.2f} USDT")
     lines.append(f"Расчётов фандинга: {s['settlements']}" + (f" (оценочных {s['approx']})" if s["approx"] else "")
-                 + f" · худший MTM {s['worst_mtm']:+.2f} USDT · данных {s['days']:.1f} дн.")
+                 + f" · худший MTM {s['worst_mtm']:+.2f} USDT · данных {s['days']:.1f} дн."
+                 + ("" if s["last_tick"] is None else f" · последний тик {max(now - s['last_tick'], 0) // 60:.0f} мин назад"))
     market = candidates(now, cfg)
     if market:
         lines += ["", "<b>Сейчас</b> (годовых по текущей ставке):"]
         for c in sorted(market, key=lambda c: -c["apr"]):
             mark = "✅" if c["ok"] else "·"
             legs = f"лонг {c['long'].venue}{' спот' if c['long'].kind == 'spot' else ''} / шорт {c['short'].venue}"
+            # планка окупаемости: годовых, при которых вход+выход (cost_pct) окупятся за FUND_PAYBACK_HOURS
+            need = (f" (нужно ≥ {c['cost_pct'] * 8760 / cfg['payback_h']:.1f}% для окупаемости ≤ {cfg['payback_h']:g} ч)"
+                    if "cost_pct" in c and cfg["payback_h"] > 0 else "")
             lines.append(f"{mark} {c['symbol']} {SCHEMES[c['scheme']]} ({legs}): {c['apr']:+.1f}%"
-                         + (f" — {html.escape(c['why'])}" if c["why"] else ""))
+                         + (f" — {html.escape(c['why'])}" if c["why"] else "") + need)
     st = perp.status(now)
     if st["errors"] or st["paused"]:
         problems = [*st["errors"], *(f"{v} на паузе" for v in st["paused"])]
