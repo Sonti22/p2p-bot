@@ -1711,3 +1711,7 @@ _(облачный Claude добавляет сюда предложения, к
   момент проверки (масштабирует план на отношение факт/план цены); `Bot.process_paper_cycles` в bot.py
   теперь ведёт круг через все три стадии и присылает владельцу итог (план vs факт) или причину срыва
   (`failed_transfer`/`failed_sell`). Следующий пункт очереди — команда `/paper`.
+- 2026-09-30 — signal-reason-codes-contract: tests/test_signal_reason_codes.py (AST bot.py) сверяет литералы
+  `Bot.signal_reasons` с `history.SIGNAL_REASONS`, проверяет `NOT_MISSED` ⊆ `SIGNAL_REASONS` и классификацию
+  причины в `signal_stats`. Убрана мёртвая `p2p.sell_depth_ok` (не вызывалась — `paper.py` использует
+  `sell_fill_price`); коды причин не менялись.

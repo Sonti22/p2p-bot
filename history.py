@@ -132,6 +132,8 @@ def record(snap, amount=None, path=DB_PATH):
     return True
 
 
+# набор кодов сверяется тестом tests/test_signal_reason_codes.py с Bot.signal_reasons; при добавлении причины
+# обновить и NOT_MISSED, если она не считается пропуском
 SIGNAL_REASONS = ("unconfirmed", "max_signals", "cooldown", "quiet", "trap", "paused", "unsent", "stale")
 
 

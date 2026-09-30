@@ -1166,12 +1166,6 @@ def _stack_qty(ads, qty):
     return _combined(used, fiat / qty, fiat, qty, legs)
 
 
-def sell_depth_ok(ads, qty):
-    """Хватает ли глубины стакана продажи (ads, лучшая цена первой) на qty монеты — та же проверка,
-    что и в _match при сборке связки; для стадии sell сухого прогона (paper.py)."""
-    return _stack_qty(ads, qty) is not None
-
-
 def sell_fill_price(ads, qty):
     """Средняя цена продажи qty монеты по лучшим объявлениям стакана (тот же стек, что в _match), None —
     если глубины не хватает; для факта стадии sell сухого прогона (paper.py)."""
