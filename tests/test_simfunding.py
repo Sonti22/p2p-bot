@@ -187,3 +187,106 @@ def test_leg_below_min_notional_after_lot_rounding_is_rejected(tmp_path):
     assert pp["qty"] == pytest.approx(0.011)
     assert not pp["ok"] and "шорт BingX" in pp["why"] and "минимума ордера 950" in pp["why"]
     assert SF.tick(now=NOW, path=str(tmp_path / "f.db"))["opened"] == []   # спот–перп тоже нет: ставка Bybit 0
+
+
+def _meta(db):
+    con = SF._connect(db)
+    try:
+        return dict(con.execute("SELECT key, value FROM meta").fetchall())
+    finally:
+        con.close()
+
+
+def test_idle_tick_writes_meta_and_days_count_from_first_tick(tmp_path):
+    """Позиций нет (ставка ниже планки), но симулятор опрашивает: «данных N дн.» считается от первого тика."""
+    db = str(tmp_path / "f.db")
+    _market(0.0, 0.0001)
+    assert SF.tick(now=NOW, path=db) == {"opened": [], "closed": []}
+    assert SF.tick(now=NOW + 3 * 86400 + 600, path=db) == {"opened": [], "closed": []}   # котировки уже старые
+    assert _meta(db) == {"first_tick_ts": NOW, "last_tick_ts": NOW + 3 * 86400 + 600}   # first не перезаписывается
+    s = SF.stats(db, now=NOW + 3.5 * 86400)
+    assert not s["open"] and s["closed"] == 0
+    assert s["days"] == pytest.approx(3.5) and s["last_tick"] == NOW + 3 * 86400 + 600
+    assert "данных 3.5 дн." in SF.view(db, now=NOW + 3.5 * 86400)
+
+
+def test_switched_off_tick_leaves_no_meta(tmp_path, monkeypatch):
+    monkeypatch.setenv("SIM_FUNDING", "0")
+    db = str(tmp_path / "f.db")
+    SF.tick(now=NOW, path=db)
+    assert not (tmp_path / "f.db").exists()
+    assert SF.stats(db, now=NOW) == dict(SF.stats(db, now=NOW), days=0.0, last_tick=None)
+
+
+def test_legacy_db_without_meta_keeps_old_days_rule(tmp_path):
+    """База, созданная до meta: таблица досоздаётся при открытии, дни — от первой позиции, тика ещё не было."""
+    db = str(tmp_path / "f.db")
+    con = SF._connect(db)
+    con.execute("DROP TABLE meta")
+    con.execute("INSERT INTO positions (scheme, symbol, long_venue, short_venue, qty, ts_open, long_open, short_open, "
+                "apr_open) VALUES ('perp_perp', 'BTC', 'Bybit', 'BingX', 0.011, ?, 84000, 84000, 30.0)", (NOW,))
+    con.commit()
+    con.close()
+    s = SF.stats(db, now=NOW + 2 * 86400)
+    assert s["days"] == pytest.approx(2.0) and s["last_tick"] is None and len(s["open"]) == 1
+    _market(0.0, 0.0001)
+    text = SF.view(db, now=NOW + 2 * 86400)
+    assert "данных 2.0 дн." in text and "последний тик" not in text
+    old_empty = str(tmp_path / "e.db")
+    con = SF._connect(old_empty)
+    con.execute("DROP TABLE meta")
+    con.close()
+    SF.tick(now=NOW, path=old_empty)   # первый тик после обновления досоздаёт meta
+    assert _meta(old_empty) == {"first_tick_ts": NOW, "last_tick_ts": NOW}
+    # файла нет
+    s = SF.stats(str(tmp_path / "none.db"), now=NOW)
+    assert s["days"] == 0.0 and s["last_tick"] is None and s["open"] == []
+
+
+def test_view_shows_real_payback_bar_for_candidates(tmp_path, monkeypatch):
+    """Ставка 32.85% годовых выше FUND_ENTRY_APR (20), но ниже планки окупаемости — /funding говорит, какая нужна."""
+    _market(0.0, 0.0003)
+    market = {c["scheme"]: c for c in SF.candidates(NOW)}
+    pp, sp = market["perp_perp"], market["spot_perp"]
+    assert pp["apr"] >= 20 and not pp["ok"] and pp["why"] == "окупаемость 56 ч > 48 ч"
+    text = SF.view(str(tmp_path / "f.db"), now=NOW + 60)
+    for c in (pp, sp):
+        assert f"(нужно ≥ {c['cost_pct'] * 8760 / 48:.1f}% для окупаемости ≤ 48 ч)" in text
+    assert f"нужно ≥ {pp['cost_pct'] * 8760 / 48:.1f}%" in text and pp["cost_pct"] * 8760 / 48 > pp["apr"]
+    assert text.count("нужно ≥") == 2
+    monkeypatch.setenv("FUND_PAYBACK_HOURS", "24")
+    assert f"(нужно ≥ {pp['cost_pct'] * 8760 / 24:.1f}% для окупаемости ≤ 24 ч)" in SF.view(str(tmp_path / "f.db"), now=NOW)
+    monkeypatch.setenv("FUND_PAYBACK_HOURS", "0")   # деления на ноль во /funding нет
+    assert "нужно ≥" not in SF.view(str(tmp_path / "f.db"), now=NOW)
+
+
+def test_view_without_cost_has_no_bar(tmp_path, monkeypatch):
+    monkeypatch.setenv("FUND_NOTIONAL", "1")   # меньше лота — стоимости входа нет, подсказки тоже
+    _market(0.0, 0.0003)
+    text = SF.view(str(tmp_path / "f.db"), now=NOW)
+    assert "лот больше позиции" in text and "нужно ≥" not in text
+
+
+def test_view_shows_last_tick_age(tmp_path):
+    db = str(tmp_path / "f.db")
+    _market(0.0, 0.0001)
+    assert "последний тик" not in SF.view(db, now=NOW)   # тиков ещё не было
+    SF.tick(now=NOW, path=db)
+    assert "последний тик 0 мин назад" in SF.view(db, now=NOW + 20)
+    text = SF.view(db, now=NOW + 7 * 60 + 30)
+    assert "данных 0.0 дн. · последний тик 7 мин назад" in text
+    assert "последний тик 0 мин назад" in SF.view(db, now=NOW - 5)   # часы сбились назад — не отрицательное число
+
+
+def test_candidate_ok_flags_unchanged_by_view_changes():
+    """Правила входа те же: APR ≥ 20% не значит вход — отсекает окупаемость; ok = все три фильтра сразу."""
+    expected = {0.0001: (False, "доходность 11.0% < 20%"), 0.0003: (False, "окупаемость 56 ч > 48 ч"), 0.0005: (True, "")}
+    for rate, (ok, why) in expected.items():
+        perp.reset()
+        _market(0.0, rate)
+        c = next(c for c in SF.candidates(NOW) if c["scheme"] == "perp_perp")
+        assert (c["ok"], c["why"]) == (ok, why)
+        assert c["ok"] == (c["apr"] >= 20 and c["payback_h"] <= 48 and abs(c["basis"]) <= 0.3)
+    perp.reset()
+    _market(0.0, 0.0003)
+    assert [(c["scheme"], c["ok"]) for c in SF.candidates(NOW)] == [("perp_perp", False), ("spot_perp", False)]
