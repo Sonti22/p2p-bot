@@ -89,7 +89,7 @@ def test_flt_b_forged_button_name_is_rejected(tmp_path, monkeypatch):
     env = env_file(tmp_path, monkeypatch)
     bot = Stub(p2p.Config(include_pay=["sberbank"]))
 
-    toast = bot.apply("flt_b:Evil\nPAYOUTS=1")
+    toast = bot.apply("flt_b:Evil\nSECRET=1")
     assert toast == "Нет такой кнопки"
     assert bot.cfg.include_pay == ["sberbank"]
     assert env.read_text(encoding="utf-8") == ""
