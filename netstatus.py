@@ -62,6 +62,14 @@ def _f(v):
         return None
 
 
+def _merge_net(out, net, rec):
+    """Дубль записи одной сети в справочнике площадки (после normalize() несколько строк схлопываются в одну
+    сеть): если новая запись открыта на вывод, а прежней либо нет, либо она закрыта — побеждает новая (dep/fee/min
+    берутся из неё целиком, без частичных слияний); при равном статусе вывода остаётся первая запись."""
+    if net not in out or (rec["wd"] and not out[net]["wd"]):
+        out[net] = rec
+
+
 def _parse_htx(j, asset=None):
     """Справочник валют HTX по одной монете. У HTX для BTC/ETH вместе с настоящей сетью в списке
     приходят обёрнутые токены на чужих блокчейнах (chain trc20btc/trc20wbtc/wbtc и т.п. с displayName
@@ -75,9 +83,9 @@ def _parse_htx(j, asset=None):
         for ch in c.get("chains") or []:
             if asset in HTX_NATIVE_ONLY and (ch.get("chain") or "").lower() != asset.lower():
                 continue
-            out[normalize(ch.get("displayName") or ch.get("chain"))] = {
+            _merge_net(out, normalize(ch.get("displayName") or ch.get("chain")), {
                 "dep": ch.get("depositStatus") == "allowed", "wd": ch.get("withdrawStatus") == "allowed",
-                "fee": _f(ch.get("transactFeeWithdraw")), "min": _f(ch.get("minWithdrawAmt"))}
+                "fee": _f(ch.get("transactFeeWithdraw")), "min": _f(ch.get("minWithdrawAmt"))})
     return out
 
 
@@ -89,9 +97,7 @@ def _parse_kucoin(j):
         net = normalize(ch.get("chainName"))
         rec = {"dep": bool(ch.get("isDepositEnabled")), "wd": bool(ch.get("isWithdrawEnabled")),
                "fee": _f(ch.get("withdrawalMinFee")), "min": _f(ch.get("withdrawalMinSize"))}
-        cur = out.get(net)
-        if cur is None or (rec["wd"] and not cur["wd"]):   # у KuCoin бывает две записи TON — берём открытую
-            out[net] = rec
+        _merge_net(out, net, rec)   # у KuCoin бывает две записи TON — берём открытую
     return out
 
 
@@ -101,9 +107,9 @@ def _parse_bybit(j):
     out = {}
     for row in (j.get("result") or {}).get("rows") or []:
         for ch in row.get("chains") or []:
-            out[normalize(ch.get("chainType") or ch.get("chain"))] = {
+            _merge_net(out, normalize(ch.get("chainType") or ch.get("chain")), {
                 "dep": str(ch.get("chainDeposit")) == "1", "wd": str(ch.get("chainWithdraw")) == "1",
-                "fee": _f(ch.get("withdrawFee")), "min": _f(ch.get("withdrawMin"))}
+                "fee": _f(ch.get("withdrawFee")), "min": _f(ch.get("withdrawMin"))})
     return out
 
 
@@ -115,9 +121,9 @@ def _parse_mexc(j, asset):
         if c.get("coin") != asset:
             continue
         for ch in c.get("networkList") or []:
-            out[normalize(ch.get("network") or ch.get("netWork"))] = {
+            _merge_net(out, normalize(ch.get("network") or ch.get("netWork")), {
                 "dep": bool(ch.get("depositEnable")), "wd": bool(ch.get("withdrawEnable")),
-                "fee": _f(ch.get("withdrawFee")), "min": _f(ch.get("withdrawMin"))}
+                "fee": _f(ch.get("withdrawFee")), "min": _f(ch.get("withdrawMin"))})
     return out
 
 
