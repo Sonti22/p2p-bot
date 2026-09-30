@@ -746,6 +746,7 @@ BLACKLIST_NOTE_HELP = ("Причина к записи: <code>/blacklist note &l
 
 
 BLACKLIST_NOTE_SHOW, BLACKLIST_TEXT_MAX, BLACKLIST_BUTTONS_MAX = 60, 3800, 90   # лимиты Telegram: 4096 символов, 100 кнопок
+BL_UNDO_MAX = 20   # сколько последних отмен блэклиста держим в памяти (self.bl_undo)
 
 
 def blacklist_view(now=None):
@@ -1562,6 +1563,8 @@ class Bot:
         self.live_scans = int(os.getenv("LIVE_SCANS", 2))        # сигнал, только если связка держится ≥ N сканов
         self.venue = {}   # ex -> {"streak": сканов подряд с ошибкой, "down_since": ts, "alerted_at": ts}
         self.deals_by_id = {}   # id -> (d, снимок cfg, snap на момент сигнала) для кнопок «✅ Сделал»/«📝 Инструкция»; не переживает рестарт
+        self.bl_undo = {}   # токен -> (вид "unbl"/"hide", данные) для отмены снятия/скрытия в блэклисте; не переживает рестарт
+        self._bl_undo_seq = 0
         self.acc_seen = {}   # ex -> set известных ключей истории; None пока не было первого опроса
         self.start_ts = time.time()     # для аптайма в /status
         self.scan_error = ""            # текст последней ошибки скана — для watchdog
@@ -1909,6 +1912,15 @@ class Bot:
             return
         await self.save_fact(None, trade_id, row, fact, trades.FACT_MANUAL)
 
+    def bl_undo_add(self, kind, payload) -> int:
+        """Запомнить отмену снятия («unbl») или скрытия («hide») блэклиста; вытесняет самую старую сверх BL_UNDO_MAX."""
+        self._bl_undo_seq += 1
+        token = self._bl_undo_seq
+        self.bl_undo[token] = (kind, payload)
+        while len(self.bl_undo) > BL_UNDO_MAX:
+            self.bl_undo.pop(next(iter(self.bl_undo)))
+        return token
+
     async def hide_deal(self, cq, deal_id):
         """Кнопка «🚫 Скрыть мерчанта»: занести обе стороны связки в блэклист (у стакана — всех его мерчантов),
         скан их больше не покажет."""
@@ -1918,13 +1930,63 @@ class Bot:
             return
         d, cfg, snap = entry
         _, b, s, _ = d
+        before = blacklist.blocked()
         # сторона из нескольких объявлений стакана («2 объявл.») — в список каждый настоящий мерчант из Ad.nicks
         added = [(a.ex, nick, blacklist.add(a.ex, nick)) for a in (b, s) for nick in dict.fromkeys(a.nicks or (a.nick,))]
         await self.call("answerCallbackQuery", callback_query_id=cq["id"], text="Скрыто, больше не покажу")
         hidden = ", ".join(f"{EXCHANGE_NAMES.get(ex, ex)}: {html.escape(nick)} (id {i})" for ex, nick, i in added)
-        await self.send(f"🚫 В блэклисте: {hidden}.\n{BLACKLIST_NOTE_HELP}")
+        text = f"🚫 В блэклисте: {hidden}.\n{BLACKLIST_NOTE_HELP}"
+        new = list({(ex, nick): (ex, nick, i) for ex, nick, i in added if (ex, nick) not in before}.values())
+        if new:
+            token = self.bl_undo_add("hide", new)
+            await self.send(text, markup={"inline_keyboard": [[{"text": "↩️ Отменить", "callback_data": f"hideundo:{token}"}]]})
+        else:
+            await self.send(text)
         await self.call("editMessageReplyMarkup", chat_id=self.chat_id, message_id=cq["message"]["message_id"],
                         reply_markup=self.markup(deal_markup(d, cfg=cfg, snap=snap, nav=False)))
+
+    async def blacklist_undo(self, cq, data):
+        """Кнопки «↩️ Вернуть»/«↩️ Отменить»: обрабатываются РАНЬШЕ общего answerCallbackQuery в on_callback,
+        поэтому здесь ровно один ответ на нажатие."""
+        kind_prefix, _, token_s = data.partition(":")
+        kind = "unbl" if kind_prefix == "blundo" else "hide"
+        try:
+            token = int(token_s)
+        except ValueError:
+            token = None
+        entry = self.bl_undo.pop(token, None) if token is not None else None
+        if entry is not None and entry[0] != kind:
+            self.bl_undo[token] = entry   # чужой вид токена — устарел для этой кнопки, вернуть на место
+            entry = None
+        if kind == "unbl":
+            if entry is None:
+                await self.call("answerCallbackQuery", callback_query_id=cq["id"],
+                                text="Уже поздно: после перезапуска бота отмена недоступна — "
+                                     "добавь заново кнопкой 🚫 под сигналом")
+            else:
+                ex, nick, added_ts, note = entry[1]
+                if (ex, nick) in blacklist.blocked():
+                    await self.call("answerCallbackQuery", callback_query_id=cq["id"], text="Уже в блэклисте")
+                else:
+                    new_id = blacklist.add(ex, nick, ts=added_ts)
+                    if note:
+                        blacklist.set_note(new_id, note)
+                    await self.call("answerCallbackQuery", callback_query_id=cq["id"], text="↩️ Возвращён в блэклист")
+            text, kb = blacklist_view()
+            await self.call("editMessageText", chat_id=self.chat_id, message_id=cq["message"]["message_id"],
+                            text=text, parse_mode="HTML", reply_markup=kb)
+            return
+        if entry is None:
+            await self.call("answerCallbackQuery", callback_query_id=cq["id"], text="Уже отменено или устарело")
+            await self.call("editMessageReplyMarkup", chat_id=self.chat_id, message_id=cq["message"]["message_id"],
+                            reply_markup={"inline_keyboard": []})
+            return
+        for ex, nick, entry_id in entry[1]:
+            blacklist.remove(entry_id)
+        await self.call("answerCallbackQuery", callback_query_id=cq["id"], text="Скрытие отменено")
+        names = ", ".join(f"{EXCHANGE_NAMES.get(ex, ex)}: {html.escape(nick)}" for ex, nick, _ in entry[1])
+        await self.call("editMessageText", chat_id=self.chat_id, message_id=cq["message"]["message_id"],
+                        text=f"↩️ Отменено: {names} — снова могут попасть в сигналы.", parse_mode="HTML")
 
     async def blacklist_note(self, arg):
         """«/blacklist note <id> <текст>» (только владелец): записать причину, почему мерчант в блэклисте."""
@@ -4055,6 +4117,9 @@ class Bot:
         if data.startswith("pay_"):
             await self.payout_callback(cq, data)
             return
+        if data.startswith(("blundo:", "hideundo:")):
+            await self.blacklist_undo(cq, data)
+            return
         toast = self.apply(data)
         await self.call("answerCallbackQuery", callback_query_id=cq["id"], text=toast)
         if data.startswith(("flt_a:", "flt_e:", "flt_b:", "flt_sv", "preset_apply:")):
@@ -4129,9 +4194,16 @@ class Bot:
         elif data.startswith("bl:"):
             await self.hide_deal(cq, int(data[3:]))
         elif data.startswith("unbl:"):
-            blacklist.remove(int(data[5:]))
+            entry_id = int(data[5:])
+            row = next((r for r in blacklist.list_all() if r[0] == entry_id), None)
+            blacklist.remove(entry_id)
             await self.call("answerCallbackQuery", callback_query_id=cq["id"], text="Удалено из блэклиста")
             text, kb = blacklist_view()
+            if row is not None:
+                _, ex, nick, added_ts, note, *_ = row
+                token = self.bl_undo_add("unbl", (ex, nick, added_ts, note))
+                kb["inline_keyboard"].append([{"text": f"↩️ Вернуть: {EXCHANGE_NAMES.get(ex, ex)}: {nick}"[:64],
+                                               "callback_data": f"blundo:{token}"}])
             await self.call("editMessageText", chat_id=self.chat_id, message_id=cq["message"]["message_id"],
                             text=text, parse_mode="HTML", reply_markup=kb)
         elif data.startswith("delalert:"):
