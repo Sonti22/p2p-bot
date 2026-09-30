@@ -107,7 +107,8 @@ COMMANDS = [{"command": "best", "description": "Лучшая связка сей
             {"command": "history", "description": "История спредов: время суток, дни недели, BestChange"},
             {"command": "backtest", "description": "Бэктест маршрута по истории спредов (7/30 дней)"},
             {"command": "calc", "description": "Разовый расчёт под сумму, напр. /calc 20000"},
-            {"command": "stats", "description": "Журнал сделок: день/неделя/месяц, расчёт vs факт"},
+            {"command": "stats", "description": "Журнал сделок: день/неделя/месяц, расчёт vs факт; "
+                                                 "hours/dow/banks/coins — разбивка по часу, дню, банку, монете"},
             {"command": "export", "description": "Журнал сделок в CSV для банка и 3-НДФЛ: /export month|year"},
             {"command": "paper", "description": "Сухой прогон: круги, статистика, /paper on|off|amount|report|reset"},
             {"command": "funding", "description": "Арбитраж фандинга на бумаге: позиции, итог, ставки сейчас"},
@@ -203,6 +204,7 @@ HELP_SECTIONS = {
                "/backtest — сколько раз связки были выше порога по истории\n/safety — 115-ФЗ, блокировки, правила"),
     "journal": ("🧾 Сделки", "<b>Сделки и журнал</b>\n"
                 "/stats — журнал за день, неделю, месяц: сделки, сумма, расчёт против факта\n"
+                "/stats hours, dow, banks, coins — сделки по часу (МСК), дню недели, банку, монете\n"
                 "/export (month / year / prev) — журнал в CSV для банка и 3-НДФЛ\n"
                 "/mybanks — свои банки и бесплатные лимиты СБП\n/fav — избранные маршруты\n"
                 "/alert USDT sell 92 7d, /alerts — алерты на курс\n"
@@ -1504,6 +1506,47 @@ def direction_lines(rows, limit=STATS_DIRECTIONS):
     return lines
 
 
+BREAKDOWN_DAYS = 90        # /stats hours|dow|banks|coins: окно в днях
+BREAKDOWN_MIN_FACTS = 3    # меньше реальных фактов в группе — «мало данных»
+BREAKDOWN_LINES = 24       # строк групп, остальные — «…ещё N»
+BREAKDOWN_ALIASES = {"hours": "hour", "hour": "hour", "часы": "hour", "dow": "dow", "days": "dow", "дни": "dow",
+                     "banks": "bank", "bank": "bank", "банки": "bank", "coins": "coin", "coin": "coin",
+                     "монеты": "coin"}
+DOW_NAMES = ("Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс")
+BREAKDOWN_TITLES = {"hour": "Сделки по часам (МСК)", "dow": "Сделки по дням недели (МСК)",
+                    "bank": "Сделки по банку оплаты", "coin": "Сделки по монете"}
+
+
+def breakdown_lines(kind, rows, limit=BREAKDOWN_LINES):
+    """Строки /stats hours|dow|banks|coins из trades.breakdown: разбивка реальных сделок по часу (МСК), дню
+    недели, банку оплаты или монете — расчёт и факт (где факт есть), в стиле direction_lines. [] — rows пуст
+    даёт одну строку «Сделок за N дн. нет»."""
+    if not rows:
+        return [f"Сделок за {BREAKDOWN_DAYS} дн. нет"]
+    lines = [f"<b>{BREAKDOWN_TITLES[kind]}</b> за {BREAKDOWN_DAYS} дн.:"]
+    for d in rows[:limit]:
+        if kind == "hour":
+            label = f"{d['key']:02d}:00"
+        elif kind == "dow":
+            label = DOW_NAMES[d["key"]]
+        else:
+            label = html.escape(str(d["key"]))
+        line = (f"• {label}: {d['count']} сд., {_money(d['amount'])} ₽, расчёт {d['avg_plan']:+.2f}%"
+               if d["avg_plan"] is not None else f"• {label}: {d['count']} сд., {_money(d['amount'])} ₽")
+        if d["real_n"]:
+            rub = f"{d['rub']:+,.0f}".replace(",", " ")
+            line += (f", факт {d['avg_fact']:+.2f}% (у {d['real_n']}) ≈ {rub} ₽, "
+                    f"к расчёту {d['avg_diff']:+.2f} п.п.")
+        else:
+            line += ", факта нет"
+        if d["real_n"] < BREAKDOWN_MIN_FACTS:
+            line += " · мало данных"
+        lines.append(line)
+    if len(rows) > limit:
+        lines.append(f"• …ещё {len(rows) - limit}")
+    return lines
+
+
 def spread_lines(data):
     """Строки /stats «План → факт за месяц» из trades.plan_fact_spread: медиана и худший дециль расхождения
     расчёт→факт прячут хвост (среднее в trades.stats его не видит), доля сделок хуже допуска и несколько
@@ -2202,7 +2245,12 @@ class Bot:
             if delivery_final(r):
                 alerts.mark_fired(alert_id)
 
-    def stats_view(self):
+    def stats_view(self, arg=""):
+        if arg:
+            kind = BREAKDOWN_ALIASES.get(arg.split()[0].lower())
+            if kind:
+                return "\n".join(breakdown_lines(kind, trades.breakdown(kind, since=time.time() - BREAKDOWN_DAYS * 86400)))
+            return f"Не знаю «{html.escape(arg)}». Доступно: /stats hours|dow|banks|coins"
         st = trades.stats()
         labels = (("day", "За сегодня"), ("week", "За неделю"), ("month", "За месяц"))
         lines = ["📒 <b>Журнал сделок</b>", ""]
@@ -4423,7 +4471,7 @@ class Bot:
             else:
                 await self.send("Нужна сумма: /calc 20000")
         elif cmd == "/stats":
-            await self.send(self.stats_view())
+            await self.send(self.stats_view(arg))
         elif cmd == "/signals":
             await self.send(self.signals_view(arg))
         elif cmd == "/paper":
