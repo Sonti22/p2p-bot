@@ -2463,6 +2463,21 @@ class Bot:
                 "callback_data": "resume" if pause_active else "pause"}]]
         return text, {"inline_keyboard": kb}
 
+    def mute_line(self, now=None):
+        """Одна строка для /status: сигналы сейчас не отправляются (пауза или тихие часы) — и до какого времени
+        (МСК) или как это снять. Та же логика, что status в settings_view. None — сигналы идут как обычно."""
+        now = time.time() if now is None else now
+        if self.paused:
+            return "⏸ Сигналы на паузе (бессрочно) — /resume"
+        if self.pause_until and now < self.pause_until:
+            return f"⏸ Сигналы на паузе до {_hhmm_msk(self.pause_until)} МСК — /resume"
+        if self.is_quiet_now():
+            end = quiet_hours_end_ts(self.quiet_hours)
+            if end is None:
+                return "🌙 Тихие часы — сигналы копятся для дайджеста"
+            return f"🌙 Тихие часы до {_hhmm_msk(end)} МСК — сигналы копятся для дайджеста"
+        return None
+
     async def set_custom_amount(self, text):
         """Ввод суммы текстом после «✏️ Своя сумма»: сохранить AMOUNT и сразу пересканировать (как /calc)."""
         amount = parse_amount(text)
@@ -2834,6 +2849,9 @@ class Bot:
             lines.append(line)
         else:
             lines.append("⏳ Скана ещё не было")
+        mute = self.mute_line()
+        if mute:
+            lines.append(mute)
         snap = self.last
         if snap is not None:
             if snap.errors:
@@ -2843,7 +2861,10 @@ class Bot:
             else:
                 lines.append("✅ Ошибок нет — все площадки отвечают")
             above = sum(1 for d in snap.deals if d[0] >= self.cfg.min_profit)
-            lines.append(f"🔔 Связок выше порога {self.cfg.min_profit:g}%: {above}")
+            line = f"🔔 Связок выше порога {self.cfg.min_profit:g}%: {above}"
+            if mute:
+                line += " (не отправляются)"
+            lines.append(line)
         kb = {"inline_keyboard": [[{"text": "📋 Подробно", "callback_data": "status_full"},
                                    {"text": "🔄 Обновить", "callback_data": "status"}]]}
         return "\n".join(lines), kb
@@ -2861,12 +2882,18 @@ class Bot:
             lines.append(f"Последний скан: {when} ({self.last_scan_duration:.1f} с)")
         else:
             lines.append("Последний скан: ещё не было")
+        mute = self.mute_line()
+        if mute:
+            lines.append(mute)
         snap = self.last
         if snap is None:
             lines.append("Скан ещё не выполнялся.")
             return "\n".join(lines)
         above = sum(1 for d in snap.deals if d[0] >= self.cfg.min_profit)
-        lines.append(f"Связок выше порога {self.cfg.min_profit:g}%: {above}")
+        line = f"Связок выше порога {self.cfg.min_profit:g}%: {above}"
+        if mute:
+            line += " (не отправляются)"
+        lines.append(line)
         terms = terms_summary()
         if terms:
             top = ", ".join(f"{label} {n}" for label, n in sorted(terms.items(), key=lambda kv: -kv[1]))
