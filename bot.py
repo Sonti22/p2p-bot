@@ -1503,6 +1503,22 @@ def direction_lines(rows, limit=STATS_DIRECTIONS):
     return lines
 
 
+def spread_lines(data):
+    """Строки /stats «План → факт за месяц» из trades.plan_fact_spread: медиана и худший дециль расхождения
+    расчёт→факт прячут хвост (среднее в trades.stats его не видит), доля сделок хуже допуска и несколько
+    худших — для ручного разбора. None — сделок с фактом меньше 3."""
+    if data is None:
+        return ["", "План → факт: мало сделок с фактом (меньше 3)"]
+    lines = ["", f"<b>План → факт за месяц</b> ({data['n']} сд. с фактом): медиана {data['median']:+.2f} п.п., "
+                f"худшие 10% — {data['p10']:+.2f} и ниже, хуже {trades.BAD_DIFF_PP:+g} п.п.: "
+                f"{data['share_bad']:.0%} ({data['bad_n']} из {data['n']})"]
+    bad = [w for w in data["worst"] if w["diff"] < 0]
+    if bad:
+        parts = [f"#{w['id']} {html.escape(w['buy_ex'])} → {html.escape(w['sell_ex'])} {w['diff']:+.2f}" for w in bad]
+        lines.append("Худшие: " + "; ".join(parts))
+    return lines
+
+
 OUTAGE_DAYS = 7            # /status «Подробно»: недоступность площадок за столько дней
 OUTAGE_MIN_SECONDS = 60    # короче — разовый сбой скана, в сводку не идёт
 
@@ -2200,6 +2216,7 @@ class Bot:
                 lines.append(line)
             else:
                 lines.append(f"{label}: сделок нет")
+        lines += spread_lines(trades.plan_fact_spread(trades.period_start("month")))
         lines += direction_lines(trades.by_direction(trades.period_start("month")))
         banks = trades.month_banks()
         if banks:   # только информация: сколько разных мерчантов было по каждой своей карте

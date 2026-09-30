@@ -8,6 +8,7 @@ import datetime
 import os
 import re
 import sqlite3
+import statistics
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -76,6 +77,7 @@ COUNTERPARTY_WARN = 0.8
 FACT_PLAN, FACT_PLAN_SHIFT, FACT_MANUAL, FACT_AUTO = "plan", "plan±", "manual", "auto"
 PLAN_SOURCES = (FACT_PLAN, FACT_PLAN_SHIFT)
 _REAL_FACT = "fact IS NOT NULL AND (fact_source IS NULL OR fact_source NOT IN ('plan', 'plan±'))"
+BAD_DIFF_PP = -0.5   # п.п.: сделка «плохая» для plan_fact_spread, если факт хуже расчёта строго сильнее этого
 
 
 def _connect(path):
@@ -463,6 +465,32 @@ def facts_by_pair(since=0.0, path=DB_PATH):
                        (since,)).fetchall()
     con.close()
     return {tuple(r[:4]): {"count": r[4], "avg_fact": r[5]} for r in rows}
+
+
+def plan_fact_spread(since=0.0, path=DB_PATH, worst=3):
+    """Расхождение расчёт→факт по реальным сделкам (не «как расчёт»/«±0.5 п.п.») не старше `since`: медиана,
+    худший дециль, доля хуже BAD_DIFF_PP и несколько худших сделок для ручного разбора — среднее (trades.stats)
+    прячет хвост. None — сделок с фактом меньше 3 (медиана/дециль по трём-двум точкам не показательны) или базы нет."""
+    if not os.path.exists(path):
+        return None
+    con = _connect(path)
+    rows = con.execute(f"SELECT id, ts, buy_ex, sell_ex, fact - profit FROM trades "
+                       f"WHERE {_REAL_FACT} AND profit IS NOT NULL AND ts >= ?", (since,)).fetchall()
+    con.close()
+    rows.sort(key=lambda r: (r[4], r[0]))
+    n = len(rows)
+    if n < 3:
+        return None
+    diffs = [r[4] for r in rows]
+    bad_n = sum(1 for d in diffs if d < BAD_DIFF_PP)
+    return {
+        "n": n,
+        "median": statistics.median(diffs),
+        "p10": diffs[(n - 1) // 10],
+        "bad_n": bad_n,
+        "share_bad": bad_n / n,
+        "worst": [{"id": r[0], "ts": r[1], "buy_ex": r[2], "sell_ex": r[3], "diff": r[4]} for r in rows[:worst]],
+    }
 
 
 def period_start(period, now=None):
