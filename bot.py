@@ -124,6 +124,7 @@ COMMANDS = [{"command": "best", "description": "Лучшая связка сей
             {"command": "hedge", "description": "Хедж кругов шортом перпа: открытые, закрыть, стоп"},
             {"command": "fees", "description": "Комиссии вывода по сетям и возраст данных"},
             {"command": "settings", "description": "Порог, сумма, пауза"},
+            {"command": "filters", "description": "Монеты, площадки, банки и «только одна площадка»"},
             {"command": "pause", "description": "Пауза сигналов: /pause 30m|1h|3h|до утра"},
             {"command": "resume", "description": "Снять паузу сигналов"},
             {"command": "dev", "description": "Как развивается бот: версия, изменения, план"},
@@ -693,15 +694,27 @@ def onboarding_min_view():
 
 
 def filters_view(cfg):
-    """Текст и кнопки «🎛 Фильтры»: переключатели монет/площадок (✅/⬜) + пресеты. Нельзя выключить
-    последнюю монету или площадку. Изменения пишутся в .env и применяются со следующего скана."""
+    """Текст и кнопки «🎛 Фильтры»: переключатели монет/площадок/банков оплаты (✅/⬜) + «только внутри одной
+    площадки» + пресеты. Нельзя выключить последнюю монету или площадку. Изменения пишутся в .env и применяются
+    со следующего скана."""
     mark = lambda on, t: ("✅ " if on else "⬜ ") + t
     asset_row = [{"text": mark(a in cfg.assets, a), "callback_data": f"flt_a:{a}"} for a in ASSET_LIST]
     ex_rows = [[{"text": mark(ex in cfg.exchanges, VENUE_NAMES.get(ex, ex)), "callback_data": f"flt_e:{ex}"}]
                for ex in EXCHANGE_LIST]
-    text = (f"🎛 <b>Фильтры</b>\n\nМонеты: {', '.join(cfg.assets)}\nПлощадки: {', '.join(cfg.exchanges)}\n\n"
-            f"Изменения применятся со следующего скана. Нельзя выключить все монеты или все площадки.")
-    kb = [asset_row] + ex_rows + [
+    bank_buttons = [{"text": mark(name.lower() in cfg.include_pay, name), "callback_data": f"flt_b:{name}"}
+                     for name in ONBOARD_BANKS]
+    bank_rows = [bank_buttons[i:i + 3] for i in range(0, len(bank_buttons), 3)]
+    banks_line = f"Банки: {', '.join(cfg.include_pay)}" if cfg.include_pay else "Банки: любые"
+    venue_line = "Только внутри одной площадки: " + ("включено" if cfg.same_venue_only else "выключено")
+    text = (f"🎛 <b>Фильтры</b>\n\nМонеты: {', '.join(cfg.assets)}\nПлощадки: {', '.join(cfg.exchanges)}\n"
+            f"{banks_line}\n{venue_line}\n\n"
+            f"Изменения применятся со следующего скана. Нельзя выключить все монеты или все площадки.\n"
+            f"«🏦 Мои банки» — другой список (для аккаунта, не для фильтра сигналов).")
+    kb = [asset_row] + ex_rows + bank_rows
+    if cfg.include_pay:
+        kb.append([{"text": "♻️ Сбросить банки", "callback_data": "flt_b:*"}])
+    kb.append([{"text": mark(cfg.same_venue_only, "Только одна площадка"), "callback_data": "flt_sv"}])
+    kb += [
         [{"text": "💾 Сохранить как пресет", "callback_data": "preset_save"}],
         [{"text": "📋 Пресеты", "callback_data": "presets"}],
         [{"text": "⬅️ Настройки", "callback_data": "settings"}]]
@@ -2458,6 +2471,10 @@ class Bot:
                 f"Сумма круга: <b>{_money(c.amount)} ₽</b> (2-я строка)\nСтатус: {status}\n"
                 f"Тихие часы: {'✅ вкл' if self.quiet_on else '➖ выкл'} ({self.quiet_hours} МСК)\n\n"
                 f"Монеты: {', '.join(c.assets)}\nПлощадки: {', '.join(c.exchanges)}")
+        if c.include_pay:
+            text += f"\nБанки: {', '.join(c.include_pay)}"
+        if c.same_venue_only:
+            text += "\nТолько внутри одной площадки: включено"
         mark = lambda on, t: ("✅ " if on else "") + t
         kb = [[{"text": mark(c.min_profit == v, f"{v}%"), "callback_data": f"min:{v}"} for v in MIN_PRESETS],
               [{"text": mark(c.amount == v, f"{v // 1000}к"), "callback_data": f"amt:{v}"} for v in AMOUNT_PRESETS],
@@ -2513,6 +2530,27 @@ class Bot:
         values.append(item)
         save_env(env_key, ",".join(values))
         return f"Включено: {item}"
+
+    def _toggle_bank(self, name):
+        """Вкл/выкл банк фильтра сигналов (INCLUDE_PAY) или '*' — сбросить список целиком. Только имена с кнопок
+        (ONBOARD_BANKS): данные колбэка может подделать клиент. Ручные значения из .env (не из ONBOARD_BANKS)
+        не трогает."""
+        if name == "*":
+            if not self.cfg.include_pay:
+                return "Банки: любые"
+            self.cfg.include_pay = []
+            save_env("INCLUDE_PAY", "")
+            return "Банки: любые"
+        if name not in ONBOARD_BANKS:
+            return "Нет такой кнопки"
+        key = name.lower()
+        if key in self.cfg.include_pay:
+            self.cfg.include_pay = [b for b in self.cfg.include_pay if b != key]
+            save_env("INCLUDE_PAY", ",".join(self.cfg.include_pay))
+            return f"Банк выключен: {name}"
+        self.cfg.include_pay = self.cfg.include_pay + [key]
+        save_env("INCLUDE_PAY", ",".join(self.cfg.include_pay))
+        return f"Банк включён: {name}"
 
     def apply_preset(self, pid):
         """Применить пресет фильтров (встроенный или сохранённый «💾 Сохранить как пресет») — сразу все поля.
@@ -2612,6 +2650,12 @@ class Bot:
             return self._toggle(self.cfg.assets, data[6:], "ASSETS", "монету", ASSET_LIST)
         if data.startswith("flt_e:"):
             return self._toggle(self.cfg.exchanges, data[6:], "EXCHANGES", "площадку", EXCHANGE_LIST)
+        if data.startswith("flt_b:"):
+            return self._toggle_bank(data[6:])
+        if data == "flt_sv":
+            self.cfg.same_venue_only = not self.cfg.same_venue_only
+            save_env("SAME_VENUE_ONLY", "1" if self.cfg.same_venue_only else "0")
+            return "Только одна площадка: " + ("включено" if self.cfg.same_venue_only else "выключено")
         if data.startswith("preset_apply:"):
             return self.apply_preset(data[len("preset_apply:"):])
         return ""
@@ -3946,7 +3990,8 @@ class Bot:
             save_env("MIN_PROFIT", f"{self.cfg.min_profit:g}")
             self.onboarding = None
             await self.call("editMessageText", chat_id=self.chat_id, message_id=mid, parse_mode="HTML",
-                            text="✅ Готово! Сумму, банки и порог сигнала можно поменять в «⚙️ Настройки».")
+                            text="✅ Готово! Сумму и порог сигнала можно поменять в «⚙️ Настройки», "
+                                 "банки — в «🎛 Фильтры».")
             await self.welcome()
 
     async def on_callback(self, cq):
@@ -3976,7 +4021,7 @@ class Bot:
             return
         toast = self.apply(data)
         await self.call("answerCallbackQuery", callback_query_id=cq["id"], text=toast)
-        if data.startswith(("flt_a:", "flt_e:", "preset_apply:")):
+        if data.startswith(("flt_a:", "flt_e:", "flt_b:", "flt_sv", "preset_apply:")):
             text, kb = filters_view(self.cfg)
             await self.call("editMessageText", chat_id=self.chat_id, message_id=cq["message"]["message_id"],
                             text=text, parse_mode="HTML", reply_markup=kb)
@@ -4239,6 +4284,9 @@ class Bot:
             await self.send(fees.view(live=netstatus.live_fee))
         elif cmd == "/settings":
             text, kb = self.settings_view()
+            await self.send(text, markup=kb)
+        elif cmd == "/filters":
+            text, kb = filters_view(self.cfg)
             await self.send(text, markup=kb)
         elif cmd == "/dev":
             text, kb = dev_view()
