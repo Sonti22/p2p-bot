@@ -22,6 +22,7 @@ import alerts
 import backup
 import blacklist
 import fees
+import health
 import history
 import jsonstore
 import logsafe
@@ -1627,6 +1628,8 @@ class Bot:
         self.step_fail = {}
         self.watchdog_prev_tick = 0.0   # время прошлого тика watchdog — заметить сон ПК между тиками
         self.watchdog_wake_ts = 0.0     # когда watchdog заметил пробуждение ПК: простой скана считается от него
+        self.disk_alerted = False       # владельцу уже сообщили о нехватке места — ждём восстановления
+        self.disk_checked_ts = time.time()   # не 0 — монкипатченное время в тестах watchdog не включит проверку
         # id сигналов от времени старта в мс: после рестарта старая кнопка did:N не попадёт на новую связку
         self.next_deal_id = int(self.start_ts * 1000)
         self.last_scan_ts = 0.0         # unix-время окончания последнего скана
@@ -2963,6 +2966,26 @@ class Bot:
         if (r or {}).get("ok"):
             self.stall_alerted = alert
 
+    async def disk_check(self, now=None):
+        """Не чаще раза в health.DISK_CHECK_EVERY: свободного места на диске меньше health.LOW_FREE — один алерт
+        владельцу (топик «Разработка»), место выше 1.5×порога — сообщение о восстановлении. Только чтение."""
+        now = now if now is not None else time.time()
+        if now < self.disk_checked_ts or now - self.disk_checked_ts < health.DISK_CHECK_EVERY:
+            return
+        self.disk_checked_ts = now
+        free = health.snapshot()["free_bytes"]
+        if free is None:
+            return
+        if health.low(free) and not self.disk_alerted:
+            r = await self.send(f"⚠️ На диске осталось {health.fmt_size(free)} (порог 1 ГБ): базы и снимки могут "
+                                f"перестать писаться. Проверьте data/ и logs/", topic="dev")
+            if (r or {}).get("ok"):
+                self.disk_alerted = True
+        if self.disk_alerted and free > 1.5 * health.LOW_FREE:
+            r = await self.send("✅ Место на диске восстановилось", topic="dev")
+            if (r or {}).get("ok"):
+                self.disk_alerted = False
+
     async def watchdog_loop(self):
         """Раз в WATCHDOG_TICK: скан целиком стоит дольше SCAN_STALL_MINUTES — один алерт владельцу (топик «Разработка»),
         пошёл снова — сообщение о восстановлении. Своя задача, а не шаг scan_loop: зависший скан её не остановит."""
@@ -2973,6 +2996,10 @@ class Bot:
                 continue   # владельца ещё нет — не «тратим» алерт впустую, проверим, когда он появится
             try:
                 await self.watchdog_check()
+                try:
+                    await self.disk_check()
+                except Exception as e:
+                    logger.warning("disk_check: %s", e)
             except Exception as e:
                 logger.error("watchdog: %s", e)
 
@@ -3120,6 +3147,10 @@ class Bot:
         lines = ["📟 <b>Статус бота</b>", "",
                  f"Версия: <code>{html.escape(st.get('version', '?'))}</code>",
                  f"Аптайм: {_uptime_str(time.time() - self.start_ts)}"]
+        try:
+            lines += health.lines(health.snapshot(), time.time())
+        except Exception as e:
+            logger.warning("data health: %s", e)
         if self.last_scan_ts:
             when = datetime.fromtimestamp(self.last_scan_ts).strftime("%d.%m %H:%M:%S")
             lines.append(f"Последний скан: {when} ({self.last_scan_duration:.1f} с)")
