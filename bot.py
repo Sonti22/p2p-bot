@@ -1008,6 +1008,42 @@ ALERT_HELP = ("Формат: /alert USDT sell 92 7d — сообщу, когда
               "Алерт на связку: /alert route Bybit MEXC USDT 3% 7d — сообщу, когда покупка на Bybit → продажа на "
               "MEXC по USDT даст ≥3% чистыми (как сигнал, но со своим порогом и сроком). Можно «reliable» и "
               "«repeat 1h».")
+ALERT_FAR_PCT = 10   # порог «опечатка в курсе» при создании /alert, % от текущей рыночной цены
+
+
+def alert_market_hint(snap, asset, side, rate, extra=False):
+    """Подсказка к ответу на /alert: текущая лучшая цена рынка этой монеты/стороны (из snap.best — без новых
+    запросов) и предупреждение, если заданный курс похож на опечатку. "" — нет снимка или свежих объявлений
+    этой монеты/стороны (тот же отбор площадок, что alerts.due: не ad.stale)."""
+    if snap is None:
+        return ""
+    best_ad = None
+    for (ex, ad_side, ad_asset), ad in snap.best.items():
+        if ad_side != side or ad_asset != asset or ad.stale:
+            continue
+        if best_ad is None or (ad.price > best_ad.price if side == "sell" else ad.price < best_ad.price):
+            best_ad = ad
+    if best_ad is None or best_ad.price <= 0:
+        return ""
+    price = best_ad.price
+    label = "продать" if side == "sell" else "купить"
+    lines = [f"Сейчас лучшая цена {label}: {_price(price)} ₽ ({best_ad.ex})"]
+    dev = (rate / price - 1) * 100
+    done = price >= rate if side == "sell" else price <= rate
+    if done:
+        if extra:
+            lines.append("⚡ По цене условие уже выполнено — сработает на ближайшем скане, когда пройдут и "
+                         "остальные условия (vol/reliable).")
+        else:
+            lines.append("⚡ Условие уже выполнено — алерт сработает на ближайшем скане.")
+    far = dev > ALERT_FAR_PCT if side == "sell" else dev < -ALERT_FAR_PCT
+    if far:
+        lines.append(f"⚠️ Курс на {abs(dev):.0f} % дальше рынка — проверь, нет ли опечатки (сработает вряд ли).")
+    light = dev < -ALERT_FAR_PCT if side == "sell" else dev > ALERT_FAR_PCT
+    if light:
+        direction = "ниже" if side == "sell" else "выше"
+        lines.append(f"⚠️ Курс на {abs(dev):.0f} % {direction} рынка — не опечатка ли? Сработает сразу.")
+    return "\n".join(lines)
 
 
 def alerts_view(chat_id):
@@ -2055,8 +2091,12 @@ class Bot:
         notes = "".join([f", повтор не чаще раза в {cooldown_s}" if cooldown_s else "",
                          f", объём ≥{_money(min_volume)} ₽" if min_volume else "",
                          ", надёжность не хуже риска" if require_reliable else ""])
-        await self.send(f"🔔 Алерт создан: {asset} {label} {cmp}{rate:g} ₽, срок {dur_s}{notes}. "
-                        f"Список — /alerts.")
+        text = f"🔔 Алерт создан: {asset} {label} {cmp}{rate:g} ₽, срок {dur_s}{notes}. Список — /alerts."
+        if self.last is not None:
+            hint = alert_market_hint(self.last, asset, side, rate, extra=bool(min_volume or require_reliable))
+            if hint:
+                text += "\n\n" + hint
+        await self.send(text)
 
     async def add_route_alert(self, arg):
         """«/alert route <площадка покупки> <площадка продажи> <монета> <порог>% <срок> [reliable] [repeat 1h]»."""
