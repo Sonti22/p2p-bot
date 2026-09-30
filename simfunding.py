@@ -256,10 +256,9 @@ def stats(path=DB_PATH, now=None):
         out["funding"] += p["funding"] or 0.0
         out["fees"] += p["fees"] or 0.0
         usd_days += notional * max(p["ts_close"] - p["ts_open"], 1.0) / 86400
-    if meta.get("first_tick_ts") is not None:
-        out["days"] = (now - meta["first_tick_ts"]) / 86400
-    elif rows:   # база до появления meta
-        out["days"] = (now - rows[0]["ts_open"]) / 86400
+    starts = [t for t in (meta.get("first_tick_ts"), rows[0]["ts_open"] if rows else None) if t is not None]
+    if starts:   # первая позиция могла открыться до meta (база до обновления) — берём более раннее из двух
+        out["days"] = max((now - min(starts)) / 86400, 0.0)
     if usd_days:
         out["apr"] = out["pnl"] / usd_days * 365 * 100
     return out

@@ -243,6 +243,33 @@ def test_legacy_db_without_meta_keeps_old_days_rule(tmp_path):
     assert s["days"] == 0.0 and s["last_tick"] is None and s["open"] == []
 
 
+def test_days_stay_from_first_tick_once_a_position_opens(tmp_path):
+    """Обычное состояние вживую: meta есть и позиция тоже — дни от первого тика, а не от первой позиции."""
+    db = str(tmp_path / "f.db")
+    _market(0.0, 0.0001)
+    SF.tick(now=NOW, path=db)   # холостой тик, позиций нет
+    perp.reset()
+    _market(0.0, 0.0006, ts=NOW + 2 * 86400, next_funding=NOW + 2 * 86400 + 600)
+    assert SF.tick(now=NOW + 2 * 86400, path=db)["opened"]
+    s = SF.stats(db, now=NOW + 3 * 86400)
+    assert len(s["open"]) == 1 and s["days"] == pytest.approx(3.0)
+    assert SF.stats(db, now=NOW - 3600)["days"] == 0.0   # часы сбились назад — не отрицательное число
+
+
+def test_first_tick_after_upgrade_keeps_days_of_existing_position(tmp_path):
+    """База с позицией, созданная до meta: первый тик после обновления не обнуляет «данных N дн.»."""
+    db = str(tmp_path / "f.db")
+    _market(0.0, 0.0006)
+    assert SF.tick(now=NOW, path=db)["opened"]
+    con = SF._connect(db)
+    con.execute("DROP TABLE meta")
+    con.commit()
+    con.close()
+    SF.tick(now=NOW + 86400, path=db)   # первый тик после обновления: first_tick_ts = NOW + 1 сутки
+    assert _meta(db)["first_tick_ts"] == NOW + 86400
+    assert SF.stats(db, now=NOW + 5 * 86400)["days"] == pytest.approx(5.0)
+
+
 def test_view_shows_real_payback_bar_for_candidates(tmp_path, monkeypatch):
     """Ставка 32.85% годовых выше FUND_ENTRY_APR (20), но ниже планки окупаемости — /funding говорит, какая нужна."""
     _market(0.0, 0.0003)
@@ -278,7 +305,7 @@ def test_view_shows_last_tick_age(tmp_path):
     assert "последний тик 0 мин назад" in SF.view(db, now=NOW - 5)   # часы сбились назад — не отрицательное число
 
 
-def test_candidate_ok_flags_unchanged_by_view_changes():
+def test_candidate_ok_flags_unchanged_by_view_changes(tmp_path):
     """Правила входа те же: APR ≥ 20% не значит вход — отсекает окупаемость; ok = все три фильтра сразу."""
     expected = {0.0001: (False, "доходность 11.0% < 20%"), 0.0003: (False, "окупаемость 56 ч > 48 ч"), 0.0005: (True, "")}
     for rate, (ok, why) in expected.items():
@@ -287,6 +314,9 @@ def test_candidate_ok_flags_unchanged_by_view_changes():
         c = next(c for c in SF.candidates(NOW) if c["scheme"] == "perp_perp")
         assert (c["ok"], c["why"]) == (ok, why)
         assert c["ok"] == (c["apr"] >= 20 and c["payback_h"] <= 48 and abs(c["basis"]) <= 0.3)
+        if ok:   # планка показана и у подходящих строк
+            rows = SF.view(str(tmp_path / "v.db"), now=NOW + 1).splitlines()
+            assert any(r.startswith("✅") and "нужно ≥" in r for r in rows)
     perp.reset()
     _market(0.0, 0.0003)
     assert [(c["scheme"], c["ok"]) for c in SF.candidates(NOW)] == [("perp_perp", False), ("spot_perp", False)]
