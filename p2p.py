@@ -21,7 +21,6 @@ import urllib.parse
 import zipfile
 from collections import deque
 from dataclasses import dataclass, field
-from logging.handlers import RotatingFileHandler
 
 import aiohttp
 
@@ -33,6 +32,7 @@ import reputation
 
 import blacklist
 import trades
+from logthrottle import ThrottledFileHandler, ThrottledStreamHandler
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0 Safari/537.36",
@@ -79,7 +79,8 @@ _log_handlers = []   # хендлеры, поставленные setup_logging 
 
 
 def setup_logging(path=LOG_PATH):
-    """Логи в файл с ротацией (5 x 1 МБ, 5 бэкапов) + консоль, вместо print. Можно звать повторно
+    """Логи в файл с ротацией (5 x 1 МБ, 5 бэкапов) + консоль, вместо print. Одинаковые WARNING и выше не чаще раза
+    в 5 минут (logthrottle) — обрыв сети не заливает файл и консоль тысячами одинаковых строк. Можно звать повторно
     (например, из тестов с другим path) — старые хендлеры этой функции снимаются и закрываются."""
     root = logging.getLogger()
     for h in _log_handlers:
@@ -88,9 +89,9 @@ def setup_logging(path=LOG_PATH):
     _log_handlers.clear()
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     fmt = logsafe.RedactingFormatter("%(asctime)s %(levelname)s %(name)s: %(message)s", "%d.%m %H:%M:%S")
-    file_h = RotatingFileHandler(path, maxBytes=1_000_000, backupCount=5, encoding="utf-8")
+    file_h = ThrottledFileHandler(path, maxBytes=1_000_000, backupCount=5, encoding="utf-8")
     file_h.setFormatter(fmt)
-    console_h = logging.StreamHandler(sys.stdout)
+    console_h = ThrottledStreamHandler(sys.stdout)
     console_h.setFormatter(fmt)
     root.setLevel(logging.INFO)
     root.addHandler(file_h)
