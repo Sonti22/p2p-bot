@@ -411,6 +411,41 @@ async def _json(s, method, url, body=None):
         return await r.json(content_type=None)
 
 
+# площадка/сторона/монета -> сколько объявлений последнего ответа не разобрались (битое поле — не роняем всю
+# площадку из-за одной строки); перезаписывается на каждый ответ, не накапливается между сканами
+ADS_SKIPPED: dict = {}
+_BAD_AD_ERRORS = (KeyError, TypeError, ValueError, AttributeError, IndexError, OverflowError)
+
+
+def _parse_ads(venue, side, asset, items, make):
+    """items -> [Ad] через make(item), пропуская битые объявления (одно кривое поле не должно ронять всю площадку
+    из-за backoff в collect). make, вернувший None, — намеренный фильтр (например is_suspicious у bitpapa), это не
+    битое объявление. Цена обязана быть конечной и > 0 — иначе nan/inf/0/отрицательная цена молча проходит в
+    snap.deals или ломает отсев MAX_DEV. Если не разобралось НИ ОДНО объявление — это смена схемы API, а не мусорная
+    строка: площадка по-прежнему должна упасть (venue_failed/backoff в collect)."""
+    out = []
+    bad = 0
+    first_error = None
+    for it in items:
+        try:
+            ad = make(it)
+            if ad is not None and not (math.isfinite(ad.price) and ad.price > 0):
+                raise ValueError(f"bad price {ad.price!r}")
+        except _BAD_AD_ERRORS as ex:
+            bad += 1
+            if first_error is None:
+                first_error = f"{type(ex).__name__}: {ex}"
+            continue
+        if ad is not None:
+            out.append(ad)
+    ADS_SKIPPED[(venue, side, asset)] = bad
+    if bad:
+        logger.debug("%s %s %s: пропущено %d кривых объявлений, первая ошибка %s", venue, side, asset, bad, first_error)
+    if items and bad == len(items):
+        raise ValueError(f"{venue}: не разобрано ни одно из {len(items)} объявлений: {first_error}")
+    return out
+
+
 _bybit_pay = {}
 
 
@@ -423,10 +458,12 @@ async def bybit(s, cfg, side, asset, page=1):
     j = await _json(s, "POST", "https://api2.bybit.com/fiat/otc/item/online", body)
     items = j["result"]["items"] or []
     _note_page("bybit", side, asset, page, cfg.amount, len(items))
-    return [Ad("Bybit", side, float(i["price"]), float(i["minAmount"]), float(i["maxAmount"]), float(i["lastQuantity"]),
-               [_bybit_pay.get(p, p) for p in i["payments"]], i["nickName"], int(i["recentOrderNum"]),
-               float(i["recentExecuteRate"]), asset=asset, terms=i.get("remark") or "")
-            for i in items]
+
+    def make(i):
+        return Ad("Bybit", side, float(i["price"]), float(i["minAmount"]), float(i["maxAmount"]), float(i["lastQuantity"]),
+                   [_bybit_pay.get(p, p) for p in i["payments"]], i["nickName"], int(i["recentOrderNum"]),
+                   float(i["recentExecuteRate"]), asset=asset, terms=i.get("remark") or "")
+    return _parse_ads("bybit", side, asset, items, make)
 
 
 async def htx(s, cfg, side, asset, page=1):
@@ -439,10 +476,12 @@ async def htx(s, cfg, side, asset, page=1):
     j = await _json(s, "GET", url)
     items = j.get("data") or []
     _note_page("htx", side, asset, page, cfg.amount, len(items))
-    return [Ad("HTX", side, float(i["price"]), float(i["minTradeLimit"]), float(i["maxTradeLimit"]), float(i["tradeCount"]),
-               [p["name"] for p in i["payMethods"]], i["userName"], int(i["tradeMonthTimes"]),
-               float(i["orderCompleteRate"] or 0), asset=asset)
-            for i in items]
+
+    def make(i):
+        return Ad("HTX", side, float(i["price"]), float(i["minTradeLimit"]), float(i["maxTradeLimit"]), float(i["tradeCount"]),
+                   [p["name"] for p in i["payMethods"]], i["userName"], int(i["tradeMonthTimes"]),
+                   float(i["orderCompleteRate"] or 0), asset=asset)
+    return _parse_ads("htx", side, asset, items, make)
 
 
 def _kucoin_pay(p):
@@ -457,11 +496,13 @@ async def kucoin(s, cfg, side, asset, page=1):
     j = await _json(s, "GET", url)
     items = j.get("items") or []
     _note_page("kucoin", side, asset, page, cfg.amount, len(items))
-    return [Ad("KuCoin", side, float(i["floatPrice"]), float(i["limitMinQuote"]), float(i["limitMaxQuote"]),
-               float(i["currencyBalanceQuantity"]), [_kucoin_pay(p) for p in i["adPayTypes"]], i["nickName"],
-               int(i.get("dealOrderNum") or 0), float((i.get("dealOrderRate") or "0").rstrip("%")), asset=asset,
-               terms=i.get("remarks") or "")
-            for i in items]
+
+    def make(i):
+        return Ad("KuCoin", side, float(i["floatPrice"]), float(i["limitMinQuote"]), float(i["limitMaxQuote"]),
+                   float(i["currencyBalanceQuantity"]), [_kucoin_pay(p) for p in i["adPayTypes"]], i["nickName"],
+                   int(i.get("dealOrderNum") or 0), float((i.get("dealOrderRate") or "0").rstrip("%")), asset=asset,
+                   terms=i.get("remarks") or "")
+    return _parse_ads("kucoin", side, asset, items, make)
 
 
 _mexc_pay = {}
@@ -484,14 +525,14 @@ async def mexc(s, cfg, side, asset, page=1):
     j = await _json(s, "GET", url)
     items = j.get("data") or []
     _note_page("mexc", side, asset, page, cfg.amount, len(items))
-    out = []
-    for i in items:
+
+    def make(i):
         st = i.get("merchantStatistics") or {}
-        out.append(Ad("MEXC", side, float(i["price"]), float(i["minTradeLimit"]), float(i["maxTradeLimit"]),
-                      float(i["availableQuantity"]), [_mexc_pay.get(p, f"pm{p}") for p in str(i["payMethod"]).split(",")],
-                      (i.get("merchant") or {}).get("nickName", "?"), int(st.get("doneLastMonthCount") or 0),
-                      float(st.get("completeRate") or 0) * 100, asset=asset, terms=i.get("tradeTerms") or ""))
-    return out
+        return Ad("MEXC", side, float(i["price"]), float(i["minTradeLimit"]), float(i["maxTradeLimit"]),
+                  float(i["availableQuantity"]), [_mexc_pay.get(p, f"pm{p}") for p in str(i["payMethod"]).split(",")],
+                  (i.get("merchant") or {}).get("nickName", "?"), int(st.get("doneLastMonthCount") or 0),
+                  float(st.get("completeRate") or 0) * 100, asset=asset, terms=i.get("tradeTerms") or "")
+    return _parse_ads("mexc", side, asset, items, make)
 
 
 async def bitpapa(s, cfg, side, asset, page=1):
@@ -500,19 +541,19 @@ async def bitpapa(s, cfg, side, asset, page=1):
     j = await _json(s, "GET", url)
     items = j.get("ads") or []
     _note_page("bitpapa", side, asset, page, cfg.amount, len(items))
-    out = []
-    for a in items:
+
+    def make(a):
         u = a.get("user") or {}
         if u.get("is_suspicious"):
-            continue
+            return None   # намеренный фильтр, не битое объявление
         trade_count, done = u.get("trades_count") or 0, u.get("completed_trades_count") or 0
         terms = a.get("conditions") or ""
         if a.get("for_identified_people"):
             terms += " [только верифицированные]"
-        out.append(Ad("BitPapa", side, float(a["price"]), float(a["limit_min"] or 0), float(a["limit_max"] or 0),
-                      float(a["limit_max_crypto"] or 0), [a["payment_method"]["name"]], u.get("user_name", "?"),
-                      done, done / trade_count * 100 if trade_count else 0, asset=asset, terms=terms.strip()))
-    return out
+        return Ad("BitPapa", side, float(a["price"]), float(a["limit_min"] or 0), float(a["limit_max"] or 0),
+                  float(a["limit_max_crypto"] or 0), [a["payment_method"]["name"]], u.get("user_name", "?"),
+                  done, done / trade_count * 100 if trade_count else 0, asset=asset, terms=terms.strip())
+    return _parse_ads("bitpapa", side, asset, items, make)
 
 
 LBANK_ASSETS = ("USDT", "USDC")   # монеты P2P LBank (справочник config/assetAndCurrency); остальных там нет
