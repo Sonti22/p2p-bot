@@ -467,6 +467,63 @@ def facts_by_pair(since=0.0, path=DB_PATH):
     return {tuple(r[:4]): {"count": r[4], "avg_fact": r[5]} for r in rows}
 
 
+BREAKDOWN_KINDS = ("hour", "dow", "bank", "coin")
+
+
+def breakdown(kind, since=0.0, path=DB_PATH):
+    """Сделки журнала не старше `since`, сгруппированные по часу суток (МСК, 0..23), дню недели (0=Пн), банку
+    оплаты или монете — для /stats: [{"key", "count", "amount", "avg_plan", "real_n", "avg_fact", "avg_diff",
+    "rub"}]. avg_plan — среднее profit по всем сделкам группы; avg_fact/avg_diff/rub — только по сделкам с
+    настоящим фактом (не «как расчёт»/«±0.5 п.п.», см. is_estimate), иначе None. hour/dow — по key по
+    возрастанию; bank/coin — по count по убыванию, затем по key. Неизвестный kind — ValueError."""
+    if kind not in BREAKDOWN_KINDS:
+        raise ValueError(f"unknown breakdown kind: {kind!r}")
+    groups = {}
+    for row in export_rows(since, path=path):
+        ts = row.get("ts")
+        if ts is None:
+            continue
+        if kind == "hour":
+            key = datetime.datetime.fromtimestamp(ts, MSK).hour
+        elif kind == "dow":
+            key = datetime.datetime.fromtimestamp(ts, MSK).weekday()
+        elif kind == "bank":
+            bank = row.get("bank")
+            key = BANK_NAMES.get(bank, bank) if bank else "не указан"
+        else:
+            buy_asset, sell_asset = row.get("buy_asset"), row.get("sell_asset")
+            key = buy_asset if buy_asset == sell_asset else f"{buy_asset or '?'}→{sell_asset or '?'}"
+        g = groups.setdefault(key, {"key": key, "count": 0, "amount": 0.0, "profits": [], "real_n": 0,
+                                    "facts": [], "diffs": [], "rub": 0.0})
+        g["count"] += 1
+        g["amount"] += row.get("amount") or 0
+        if row.get("profit") is not None:
+            g["profits"].append(row["profit"])
+        if row.get("fact") is not None and not is_estimate(row):
+            g["real_n"] += 1
+            g["facts"].append(row["fact"])
+            if row.get("profit") is not None:
+                g["diffs"].append(row["fact"] - row["profit"])
+            rub = fact_rub(row)
+            if rub is not None:
+                g["rub"] += rub
+    out = [{
+        "key": g["key"],
+        "count": g["count"],
+        "amount": g["amount"],
+        "avg_plan": statistics.mean(g["profits"]) if g["profits"] else None,
+        "real_n": g["real_n"],
+        "avg_fact": statistics.mean(g["facts"]) if g["real_n"] else None,
+        "avg_diff": statistics.mean(g["diffs"]) if g["diffs"] else None,
+        "rub": g["rub"] if g["real_n"] else None,
+    } for g in groups.values()]
+    if kind in ("hour", "dow"):
+        out.sort(key=lambda d: d["key"])
+    else:
+        out.sort(key=lambda d: (-d["count"], d["key"]))
+    return out
+
+
 def plan_fact_spread(since=0.0, path=DB_PATH, worst=3):
     """Расхождение расчёт→факт по реальным сделкам (не «как расчёт»/«±0.5 п.п.») не старше `since`: медиана,
     худший дециль, доля хуже BAD_DIFF_PP и несколько худших сделок для ручного разбора — среднее (trades.stats)
