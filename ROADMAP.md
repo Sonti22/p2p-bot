@@ -870,6 +870,15 @@ _(облачный Claude добавляет сюда предложения, к
 - Площадки под санкциями или с сомнительным статусом (Garantex, Grinex, A7A5, ABCeX).
 
 ## Журнал
+- 2026-09-29 — config-env-numeric-sanity: `Config.from_env` толерантен к мусору в числовых настройках —
+  `_parse_num`/`_env_num`/`_env_fees` отсекают nan/inf/минус/вне диапазона/децимальную запятую (`MAX_DEV=nan` больше
+  не выключает отсев аномалий молча, `MAX_DEV=0`/`4%`/пустое значение не роняют бота); MIN_ORDERS/MIN_RATE/MAX_DEV/
+  INTERVAL/ALT_INTERVAL/BC_REFRESH/PAY_FEE/RISK_PENALTY и комиссии SPOT_FEES/RISK_BUFFER/TRANSFER_FEES/легаси
+  TRANSFER_FEE — мусорное значение отдельного поля/ключа откатывается к дефолту с warning, не роняя остальные;
+  семантика «монета не в TRANSFER_FEES -> 0» и пустого словаря (`{}`) не изменилась. Общий строгий `_fees` НЕ
+  трогали (fail-closed на нём стоит скрипт порогов хеджа: `_fees('BTC:abc')` по-прежнему поднимает `ValueError`,
+  отрицательные/nan/inf по-прежнему возвращаются как есть) — толерантность только внутри `Config.from_env`;
+  tests/test_config_env_sanity.py; волна 2, задача config-env-numeric-sanity.
 - 2026-09-29 — adapters-per-ad-tolerance: `p2p._parse_ads` разбирает объявления bybit/htx/kucoin/mexc/bitpapa
   по одному — битое (price=None, пропущенный ключ, inf в числовом поле) пропускается и считается в
   `ADS_SKIPPED`, остальные объявления площадки не теряются; price nan/inf/0/отрицательная отбрасывается молча;
