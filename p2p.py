@@ -769,6 +769,77 @@ def _mid(spot, asset):
     return None
 
 
+SPOT_MAX_SPREAD_PCT = 2.0   # спред шире — площадка отбрасывается для этой монеты (reason 'spread')
+SPOT_MAX_DEV_PCT = 5.0      # отклонение mid от медианы остальных площадок (при >= 3) — reason 'outlier'
+SPOT_REJECTED = {}   # {(площадка, монета): причина} последнего скана — пишет filter_spot
+
+
+def _finite_pair(pair):
+    """(bid, ask) как пара конечных чисел — или None (не пара, не числа, nan/inf)."""
+    try:
+        bid, ask = pair
+    except (TypeError, ValueError):
+        return None
+    if not (isinstance(bid, (int, float)) and isinstance(ask, (int, float))):
+        return None
+    if not (math.isfinite(bid) and math.isfinite(ask)):
+        return None
+    return float(bid), float(ask)
+
+
+def sane_spot(spot, max_spread_pct=SPOT_MAX_SPREAD_PCT, max_dev_pct=SPOT_MAX_DEV_PCT):
+    """Отбросить подозрительные котировки спота: не число/nan/inf, bid<=0 или ask<=0, перевёрнутый стакан (bid>ask,
+    bid==ask — норма), спред шире max_spread_pct, и — там, где у монеты после этих проверок осталось >= 3 площадок —
+    выброс площадки дальше max_dev_pct от медианы mid остальных (все решения по одной медиане за один проход).
+    Не мутирует spot. -> (clean, dropped): clean содержит каждую площадку входа (даже пустую), dropped —
+    [(venue, asset, reason)], reason из 'nonfinite'/'nonpositive'/'crossed'/'spread'/'outlier'."""
+    clean = {venue: {} for venue in spot}
+    dropped = []
+    by_asset = {}
+    for venue, coins in spot.items():
+        for asset, pair in coins.items():
+            finite = _finite_pair(pair)
+            if finite is None:
+                dropped.append((venue, asset, "nonfinite"))
+                continue
+            bid, ask = finite
+            if bid <= 0 or ask <= 0:
+                dropped.append((venue, asset, "nonpositive"))
+            elif bid > ask:
+                dropped.append((venue, asset, "crossed"))
+            elif ask > bid * (1 + max_spread_pct / 100):
+                dropped.append((venue, asset, "spread"))
+            else:
+                by_asset.setdefault(asset, {})[venue] = (bid, ask)
+    for asset, venues in by_asset.items():
+        if len(venues) < 3:
+            for venue, pair in venues.items():
+                clean[venue][asset] = pair
+            continue
+        mids = {venue: (b + a) / 2 for venue, (b, a) in venues.items()}
+        median = statistics.median(mids.values())
+        for venue, pair in venues.items():
+            if abs(mids[venue] / median - 1) * 100 > max_dev_pct:
+                dropped.append((venue, asset, "outlier"))
+            else:
+                clean[venue][asset] = pair
+    return clean, dropped
+
+
+def filter_spot(spot):
+    """sane_spot(spot) + запомнить отброшенное последнего скана в SPOT_REJECTED, предупредить в лог только когда
+    набор отброшенного изменился (не на каждом скане); пустой набор после непустого — без предупреждения."""
+    clean, dropped = sane_spot(spot)
+    rejected = {(venue, asset): reason for venue, asset, reason in dropped}
+    if rejected != SPOT_REJECTED:
+        if rejected:
+            logger.warning("спот: подозрительные котировки отброшены: %s",
+                           ", ".join(f"{venue}/{asset}: {reason}" for venue, asset, reason in sorted(dropped)))
+        SPOT_REJECTED.clear()
+        SPOT_REJECTED.update(rejected)
+    return clean
+
+
 def _pays(a, cfg):
     """Отфильтровать способы оплаты объявления по exclude_pay/include_pay. Объявление из кэша `_alt`
     переживает несколько сканов и фильтруется каждый раз заново (настройки могли поменяться) — поэтому
@@ -2182,6 +2253,7 @@ async def collect(s, cfg, force_alt=False, blocked=frozenset()):
             pass
     try:
         spot = await spot_task
+        spot = filter_spot(spot)
         spot_err = None
     except Exception as e:
         spot = {"Bybit": {"USDT": (1.0, 1.0)}}
