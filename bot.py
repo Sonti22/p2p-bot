@@ -4,6 +4,7 @@ import contextvars
 import copy
 import dataclasses
 import html
+import inspect
 import json
 import logging
 import os
@@ -272,6 +273,9 @@ VENUE_FAIL_STREAK = 3       # или столько сканов подряд с
 VENUE_ALERT_COOLDOWN = 3600  # не чаще раза в час на площадку
 SCAN_STALL_MINUTES_DEFAULT = 5   # мин без успешного скана — алерт «скан стоит» (SCAN_STALL_MINUTES)
 WATCHDOG_TICK = 60                # сек между проверками watchdog
+SCAN_STEP_ALERT_AFTER = 3         # шаг скана падает подряд столько раз — один алерт владельцу (topic dev)
+SCAN_STEP_ALERT_RETRY_SEC = 300   # не чаще одного повторного алерта по шагу за этот интервал
+SCAN_STEP_NET_ERRORS = (aiohttp.ClientError, asyncio.TimeoutError, ConnectionError)  # сеть подождёт, не алертим
 LADDER_ALERT_COOLDOWN = 86400  # предложение лестницы суммы сухого прогона — не чаще раза в сутки
 EXCHANGE_NAMES = {"bybit": "Bybit", "mexc": "MEXC", "htx": "HTX", "kucoin": "KuCoin", "bitpapa": "BitPapa",
                   "lbank": "LBank"}
@@ -1548,6 +1552,9 @@ class Bot:
         self.scan_error = ""            # текст последней ошибки скана — для watchdog
         self.scan_errors = 0            # ошибок скана подряд
         self.stall_alerted = False      # watchdog уже сообщил «скан стоит» (Telegram принял) — ждём восстановления
+        # имя шага scan_loop -> {'n': подряд сбоев, 'last': текст ошибки, 'alerted': бот уже сообщил, 'net': сетевая
+        # ошибка (без алерта), 'try_ts': unix-время последней попытки алерта} — для /status и алерта в topic dev
+        self.step_fail = {}
         self.watchdog_prev_tick = 0.0   # время прошлого тика watchdog — заметить сон ПК между тиками
         self.watchdog_wake_ts = 0.0     # когда watchdog заметил пробуждение ПК: простой скана считается от него
         # id сигналов от времени старта в мс: после рестарта старая кнопка did:N не попадёт на новую связку
@@ -2650,6 +2657,43 @@ class Bot:
         except Exception as e:
             logger.warning("reputation: %s", e)
 
+    async def scan_step(self, name, fn, *args):
+        """Один шаг scan_loop изолированно: исключение шага не глушит остальные (только Exception — CancelledError и
+        KeyboardInterrupt проходят наружу). Подряд идущие сбои считает step_fail; на SCAN_STEP_ALERT_AFTER подряд —
+        один алерт владельцу в topic dev (сетевые ошибки не алертим, sqlite/диск и прочее — алертим); успех после
+        алерта шлёт «снова работает» и чистит запись."""
+        try:
+            res = fn(*args)
+            if inspect.isawaitable(res):
+                await res
+        except Exception as e:
+            logger.error("scan step %s: %s", name, e)
+            rec = self.step_fail.setdefault(name, {"n": 0, "last": "", "alerted": False, "net": False, "try_ts": 0.0})
+            rec["n"] += 1
+            rec["last"] = f"{type(e).__name__}: {e}"[:200]
+            rec["net"] = isinstance(e, SCAN_STEP_NET_ERRORS)
+            if (rec["n"] >= SCAN_STEP_ALERT_AFTER and not rec["alerted"] and not rec["net"] and self.chat_id
+                    and time.time() - rec["try_ts"] >= SCAN_STEP_ALERT_RETRY_SEC):
+                rec["try_ts"] = time.time()
+                try:
+                    r = await self.send(f"⚠️ Шаг скана «{name}» падает {rec['n']} раз подряд: "
+                                         f"{html.escape(rec['last'])}", topic="dev")
+                    if (r or {}).get("ok"):
+                        rec["alerted"] = True
+                except Exception as send_err:
+                    logger.error("scan step %s alert: %s", name, send_err)
+        else:
+            rec = self.step_fail.pop(name, None)
+            if rec and rec["alerted"] and self.chat_id:
+                try:
+                    await self.send(f"✅ Шаг скана «{name}» снова работает", topic="dev")
+                except Exception as send_err:
+                    logger.error("scan step %s recovery: %s", name, send_err)
+
+    def _history_step(self, snap):
+        if history.record(snap, self.snap_cfg(snap).amount):   # не чаще раза в 5 минут, независимо от чата
+            history.cleanup()
+
     async def scan_loop(self):
         while True:
             snap = None
@@ -2659,10 +2703,9 @@ class Bot:
                 self.last_scan_ts, self.last_scan_duration = time.time(), time.time() - t0
                 self.scan_errors = 0
                 self.speed.add(self.last, self.last_scan_duration)
-                self.track_liveness(self.last)
-                if history.record(snap, self.snap_cfg(snap).amount):   # не чаще раза в 5 минут, независимо от чата
-                    history.cleanup()
-                self.schedule_reputation()
+                await self.scan_step("track_liveness", self.track_liveness, self.last)
+                await self.scan_step("history", self._history_step, snap)
+                await self.scan_step("reputation", self.schedule_reputation)
 
                 if simmaker.enabled():   # бумажный мейкер (SIM_MAKER=1): только расчёт по снимку, объявлений нет
                     try:
@@ -2671,14 +2714,14 @@ class Bot:
                         logger.error("simmaker: %s", e)
 
                 if self.chat_id:
-                    await self.check_venues(self.last)
-                    await self.check_alerts(self.last)
-                    await self.check_networks()
-                    await self.process_paper_cycles(self.last)
-                    self.paper_hedge_tick(self.last)
-                    await self.check_paper_ladder()
-                    await self.quiet_and_pause_tick(self.last)
-                    await self.update_market_status(self.last)
+                    await self.scan_step("venues", self.check_venues, self.last)
+                    await self.scan_step("alerts", self.check_alerts, self.last)
+                    await self.scan_step("networks", self.check_networks)
+                    await self.scan_step("paper_cycles", self.process_paper_cycles, self.last)
+                    await self.scan_step("paper_hedge", self.paper_hedge_tick, self.last)
+                    await self.scan_step("paper_ladder", self.check_paper_ladder)
+                    await self.scan_step("quiet_pause", self.quiet_and_pause_tick, self.last)
+                    await self.scan_step("market_status", self.update_market_status, self.last)
             except Exception as e:
                 logger.error("scan error: %s", e)
                 if snap is None:   # сам скан не прошёл (а не шаг после него) — для watchdog
@@ -2886,6 +2929,10 @@ class Bot:
         mute = self.mute_line()
         if mute:
             lines.append(mute)
+        if self.step_fail:
+            lines += ["", "⚠️ Сбои шагов скана:"]
+            lines += [f"• {html.escape(name)}: {rec['n']} подряд, последняя ошибка {html.escape(rec['last'])}"
+                      for name, rec in self.step_fail.items()]
         snap = self.last
         if snap is None:
             lines.append("Скан ещё не выполнялся.")

@@ -3331,7 +3331,7 @@ def test_scan_loop_records_last_scan_timestamp_and_duration(monkeypatch):
         return p2p.Snapshot(88.0, "test", {}, {}, [], {}, {}, {})
 
     monkeypatch.setattr(B, "scan", fake_scan)
-    monkeypatch.setattr(B.history, "record", lambda snap: False)   # не пишем в реальный data/history.db
+    monkeypatch.setattr(B.history, "record", lambda *a, **k: False)   # не пишем в реальный data/history.db
 
     async def no_sleep(_):
         raise asyncio.CancelledError
