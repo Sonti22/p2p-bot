@@ -21,10 +21,11 @@ def sbp_deal(profit=2.0):
 
 def test_log_and_stats_within_periods(tmp_path):
     db = str(tmp_path / "trades.db")
-    trades.log_trade(deal(2.0), 50000, path=db, ts=time.time())
-    trades.log_trade(deal(4.0), 100000, path=db, ts=time.time() - 3 * 86400)     # неделя, не день
-    trades.log_trade(deal(6.0), 200000, path=db, ts=time.time() - 40 * 86400)    # старее месяца
-    st = trades.stats(path=db)
+    now = datetime.datetime(2026, 9, 15, 12, 0).timestamp()    # середина месяца: «3 дня назад» не падает на 1–3 число в прошлый месяц
+    trades.log_trade(deal(2.0), 50000, path=db, ts=now)
+    trades.log_trade(deal(4.0), 100000, path=db, ts=now - 3 * 86400)     # неделя, не день
+    trades.log_trade(deal(6.0), 200000, path=db, ts=now - 40 * 86400)    # старее месяца
+    st = trades.stats(path=db, now=now)
     assert st["day"]["count"] == 1 and st["day"]["amount"] == 50000
     assert st["week"]["count"] == 2 and st["week"]["amount"] == 150000
     assert st["week"]["avg_profit"] == 3.0
