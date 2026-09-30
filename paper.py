@@ -37,6 +37,7 @@ import trades
 HERE = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(HERE, "data", "paper.db")
 REPORT_CSV_PATH = os.path.join(HERE, "data", "paper_report.csv")
+CYCLES_CSV_PATH = os.path.join(HERE, "data", "paper_cycles.csv")
 REPORT_COLUMNS = ("buy_ex", "buy_asset", "sell_ex", "sell_asset", "total", "done", "failed",
                    "depth_shortfall", "avg_planned_pct", "avg_realized_pct", "avg_duration_min",
                    "avg_buy_min", "avg_transfer_min", "avg_sell_min", "avg_index_start", "avg_streak_start",
@@ -1128,6 +1129,90 @@ def write_report_csv(rows, path=REPORT_CSV_PATH):
                 cells[REPORT_COLUMNS.index("fail_reasons")] = ";".join(
                     f"{REASON_LABELS.get(k, k)}:{v}" for k, v in r["fail_reasons"].items())
             w.writerow(cells + [reasons])
+    return path
+
+
+CYCLES_COLUMNS = ("Старт (МСК)", "Час (МСК)", "Связка", "Покупка (монета)", "Продажа (монета)", "Сумма", "Банк",
+                  "Метка", "План с запасом, %", "План без запаса, %", "Факт, %", "Факт-план, п.п.", "Итог",
+                  "Причина срыва", "Покупка, мин", "Перевод факт, мин", "Продажа, мин", "Перевод план, мин",
+                  "Проскальзывание покупки, %", "Примечание", "Маршрут")
+# какие колонки CYCLES_COLUMNS числовые (write_cycles_csv форматирует их через trades._num — запятая, 2 знака)
+# или текстовые (через trades._csv_text — экранирование формул Excel); остальные («Старт», «Час», «Итог») — как есть
+_CYCLES_NUM_COLUMNS = frozenset({"Сумма", "План с запасом, %", "План без запаса, %", "Факт, %", "Факт-план, п.п.",
+                                 "Покупка, мин", "Перевод факт, мин", "Продажа, мин", "Перевод план, мин",
+                                 "Проскальзывание покупки, %"})
+_CYCLES_TEXT_COLUMNS = frozenset({"Связка", "Покупка (монета)", "Продажа (монета)", "Банк", "Метка",
+                                  "Причина срыва", "Примечание", "Маршрут"})
+
+
+def export_cycles(since=0.0, path=DB_PATH):
+    """Круги прогона с ts_start >= `since`, по возрастанию ts_start, для построчной выгрузки /paper cycles:
+    [{...}] с ключами = CYCLES_COLUMNS. Столбцы читаются только по имени (_dicts) — порядок в БД зависит от
+    миграций, не от _COLUMNS. Открытые круги (result ещё NULL) — с итогом «открыт» и пустыми недостающими
+    полями; срывы — «Факт»/«Факт-план» пустые, а не 0 (realized_pct срыва в расчёт не идёт). «Факт-план» —
+    от COALESCE(planned_raw, planned_pct), как _PLAN_CMP в report_rows/stats. Файла базы нет — [], без записи."""
+    if not os.path.exists(path):
+        return []
+    con = _connect(path)
+    rows = _dicts(con.execute("SELECT * FROM cycles WHERE ts_start >= ? ORDER BY ts_start, id", (since,)))
+    con.close()
+
+    def minutes(a, b):
+        return (b - a) / 60 if a is not None and b is not None else None
+
+    out = []
+    for r in rows:
+        start = datetime.datetime.fromtimestamp(r["ts_start"], MSK)
+        result = r.get("result")
+        done = result == "done"
+        failed = result in FAIL_LABELS
+        planned = r.get("planned_raw") if r.get("planned_raw") is not None else r.get("planned_pct")
+        bank = r.get("bank") or ""
+        out.append({
+            "Старт (МСК)": start.strftime("%d.%m.%Y %H:%M"),
+            "Час (МСК)": start.hour,
+            "Связка": r.get("route") or "",
+            "Покупка (монета)": r.get("buy_asset") or "",
+            "Продажа (монета)": r.get("sell_asset") or "",
+            "Сумма": r.get("amount"),
+            "Банк": trades.BANK_NAMES.get(bank, bank) if bank else "",
+            "Метка": r.get("label") or "",
+            "План с запасом, %": r.get("planned_pct"),
+            "План без запаса, %": r.get("planned_raw"),
+            "Факт, %": r.get("realized_pct") if done else None,
+            "Факт-план, п.п.": (r["realized_pct"] - planned) if done and planned is not None else None,
+            "Итог": "исполнен" if done else (f"срыв: {FAIL_LABELS[result]}" if failed else "открыт"),
+            "Причина срыва": REASON_LABELS.get(fail_reason(r.get("note")), "") if failed else "",
+            "Покупка, мин": minutes(r.get("ts_start"), r.get("ts_buy_done")),
+            "Перевод факт, мин": minutes(r.get("ts_buy_done"), r.get("ts_transfer_done")),
+            "Продажа, мин": minutes(r.get("ts_transfer_done"), r.get("ts_sell_done")),
+            "Перевод план, мин": r.get("transfer_min"),
+            "Проскальзывание покупки, %": r.get("buy_slip_pct"),
+            "Примечание": r.get("note") or "",
+            "Маршрут": r.get("route_hops") or "",
+        })
+    return out
+
+
+def write_cycles_csv(rows, path=CYCLES_CSV_PATH):
+    """Построчная выгрузка кругов прогона (export_cycles) в CSV для /paper cycles: BOM utf-8-sig, «;», десятичная
+    запятая — как trades.write_export_csv, открывается в русском Excel по колонкам. Текстовые поля — через
+    trades._csv_text (формулы Excel = + - @ не исполняются)."""
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.writer(f, delimiter=";")
+        w.writerow(CYCLES_COLUMNS)
+        for r in rows:
+            cells = []
+            for col in CYCLES_COLUMNS:
+                v = r.get(col)
+                if col in _CYCLES_NUM_COLUMNS:
+                    cells.append("" if v is None else trades._num(v))
+                elif col in _CYCLES_TEXT_COLUMNS:
+                    cells.append(trades._csv_text(v))
+                else:
+                    cells.append("" if v is None else str(v))
+            w.writerow(cells)
     return path
 
 

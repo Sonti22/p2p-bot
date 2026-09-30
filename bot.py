@@ -110,7 +110,8 @@ COMMANDS = [{"command": "best", "description": "Лучшая связка сей
             {"command": "stats", "description": "Журнал сделок: день/неделя/месяц, расчёт vs факт; "
                                                  "hours/dow/banks/coins — разбивка по часу, дню, банку, монете"},
             {"command": "export", "description": "Журнал сделок в CSV для банка и 3-НДФЛ: /export month|year"},
-            {"command": "paper", "description": "Сухой прогон: круги, статистика, /paper on|off|amount|report|reset"},
+            {"command": "paper", "description": "Сухой прогон: круги, статистика, "
+                                                 "/paper on|off|amount|report|cycles|reset"},
             {"command": "funding", "description": "Арбитраж фандинга на бумаге: позиции, итог, ставки сейчас"},
             {"command": "futures", "description": "Направленная стратегия на бумаге: сделки, PF, просадка, vs случайные"},
             {"command": "mybanks", "description": "Мои банки и бесплатные лимиты СБП"},
@@ -214,7 +215,8 @@ HELP_SECTIONS = {
     "paper": ("🧪 Сухой прогон", "<b>Сухой прогон и бумажные симуляции (без денег)</b>\n"
               "/paper — открытый круг, итоги, план против факта, виртуальный баланс\n"
               "/paper on / off — включить / выключить\n/paper amount 20000 — сумма круга\n"
-              "/paper report — отчёт по площадкам и парам + CSV\n/paper reset — обнулить (с подтверждением)\n"
+              "/paper report — отчёт по площадкам и парам + CSV\n/paper cycles [дней] — круги в CSV\n"
+              "/paper reset — обнулить (с подтверждением)\n"
               "/funding — бумажный арбитраж фандинга\n/futures — бумажная стратегия EMA 20/100\n"
               "/maker paper — бумажный мейкер\n/calibration — поправка факт − план (CALIBRATION=1)"),
     "settings": ("⚙️ Настройки", "<b>Настройки и служебное</b>\n"
@@ -2445,7 +2447,8 @@ class Bot:
     async def cmd_paper(self, arg):
         """/paper — сводка сухого прогона; /paper on|off — включить/выключить; /paper amount 20000 —
         сумма виртуального круга (баланс не сбрасывает, действует для новых кругов); /paper report —
-        отчёт по площадкам и парам + CSV-файл (data/paper_report.csv); /paper reset — спросить кнопками и
+        отчёт по площадкам и парам + CSV-файл (data/paper_report.csv); /paper cycles [дней] — построчная
+        выгрузка кругов в CSV (по умолчанию 30 дн., 1..365); /paper reset — спросить кнопками и
         обнулить (paper_reset:yes → paper.reset, база в архив)."""
         sub, _, rest = arg.strip().partition(" ")
         sub = sub.lower()
@@ -2469,6 +2472,15 @@ class Bot:
             if rows:
                 path = paper.write_report_csv(rows)
                 await self.send_document(path, "Отчёт сухого прогона (CSV)")
+        elif sub == "cycles":
+            days = int(rest) if rest.strip().isdigit() else 30
+            days = min(365, max(1, days))
+            rows = paper.export_cycles(time.time() - days * 86400)
+            if not rows:
+                await self.send("за период кругов нет")
+            else:
+                path = paper.write_cycles_csv(rows)
+                await self.send_document(path, f"Круги бумаги: {len(rows)} шт. за {days} дн.")
         elif sub == "reset":
             r = await self.send("🧪 Обнулить сухой прогон? Все круги (и открытые) уйдут в архив "
                             "data/paper-archive-…db — он не удаляется; статистика, баланс и лестница начнутся с нуля. "
