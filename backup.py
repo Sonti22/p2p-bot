@@ -6,7 +6,12 @@ SQLite копируется через sqlite3 backup API — согласова
 обычной копией. В копию не идут: ключи бирж (keys.json — секреты не размножаем, их заново вводят в боте), снимки
 сканов (snapshots.db — гигабайты, восстанавливаются сами) и всё, чего нет в FILES.
 Восстановление — вручную: остановить бота, скопировать файлы из нужной папки data/backup/… в data/.
+
+Каждая копия перед попаданием в data/backup проверяется на целостность (PRAGMA quick_check для баз, json.load для
+JSON): испорченный файл в новую копию не попадает и не вытесняет ротацией последнюю исправную копию — см. bad()
+и last_good().
 """
+import json
 import os
 import re
 import shutil
@@ -52,6 +57,56 @@ def _ts(name):
     return datetime.strptime(name, "%Y%m%d-%H%M").replace(tzinfo=MSK).timestamp()
 
 
+def _check_db(path):
+    """Проверка целостности копии базы (PRAGMA quick_check): None — исправна, иначе текст первой найденной проблемы
+    (обрезано до 200 символов). Странично испорченная база бросает DatabaseError вместо возврата строк, поэтому его
+    тоже ловим; сбой самой проверки (диск, I/O) — это OperationalError, подкласс DatabaseError, его перехватываем и
+    пробрасываем ПЕРВЫМ, иначе сбой копии выглядел бы как испорченная база."""
+    con = sqlite3.connect(path)
+    try:
+        rows = con.execute("PRAGMA quick_check").fetchall()
+    except sqlite3.OperationalError:
+        raise
+    except sqlite3.DatabaseError as e:
+        return str(e)[:200]
+    finally:
+        con.close()
+        for suffix in ("-wal", "-shm", "-journal"):   # копия WAL-базы создаёт их рядом на время проверки
+            try:
+                os.remove(path + suffix)
+            except OSError:
+                pass
+    if rows == [("ok",)]:
+        return None
+    return "; ".join(str(r[0]) for r in rows)[:200]
+
+
+def _check_json(path):
+    """None — исправный словарь JSON (favorites/presets — словари, см. jsonstore.read_dict), иначе текст проблемы."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except ValueError:   # сюда входят json.JSONDecodeError и UnicodeDecodeError
+        return "битый JSON"
+    if not isinstance(data, dict):
+        return "не словарь"
+    return None
+
+
+def bad():
+    """Файлы последней копии, не прошедшие проверку целостности и не попавшие в неё: [(имя файла, текст проблемы)]."""
+    return list(_state.get("bad", []))
+
+
+def last_good(fname, data_dir=DATA_DIR):
+    """Самая новая папка копии, где есть fname (плохие файлы в копию не попадают, значит присутствие = исправность
+    на момент той копии), или None, если ни в одной копии файла нет."""
+    for name in reversed(copies(data_dir)):
+        if os.path.isfile(os.path.join(_dir(data_dir), name, fname)):
+            return name
+    return None
+
+
 def due(now=None, data_dir=DATA_DIR):
     """Пора ли делать копию: включено и последней копии нет или она старше EVERY (по имени папки — переживает
     перезапуск бота)."""
@@ -65,7 +120,8 @@ def due(now=None, data_dir=DATA_DIR):
 
 
 def run(now=None, data_dir=DATA_DIR):
-    """Сделать копию FILES (что есть) и удалить старые сверх keep(). Возвращает (папка копии или None, [файлы])."""
+    """Сделать копию FILES (что есть), пропустив испорченные (см. _check_db/_check_json — bad()), и удалить старые
+    сверх keep(), сохраняя последнюю копию каждого испорченного файла. Возвращает (папка копии или None, [файлы])."""
     n = keep()
     if n <= 0:
         return None, []
@@ -77,27 +133,45 @@ def run(now=None, data_dir=DATA_DIR):
     shutil.rmtree(tmp, ignore_errors=True)
     os.makedirs(tmp)
     done = []
+    bad_files = []
     try:
         for fname in FILES:
             src = os.path.join(data_dir, fname)
             if not os.path.isfile(src):
                 continue
             out = os.path.join(tmp, fname)
+            why = None
             if fname.endswith(".db"):
                 s, d = sqlite3.connect(src), sqlite3.connect(out)
                 try:
                     s.backup(d)
+                except sqlite3.OperationalError:
+                    raise
+                except sqlite3.DatabaseError as e:
+                    why = str(e)[:200]
                 finally:
                     d.close()
                     s.close()
+                if why is None:
+                    why = _check_db(out)
             else:
                 shutil.copy2(src, out)
+                why = _check_json(out)
+            if why:
+                if os.path.exists(out):
+                    os.remove(out)
+                bad_files.append((fname, why))
+                continue
             done.append(fname)
         shutil.rmtree(dest, ignore_errors=True)   # та же минута (перезапуск) — заменяем
         os.replace(tmp, dest)
     except BaseException:
         shutil.rmtree(tmp, ignore_errors=True)
         raise
+    _state["bad"] = bad_files
+    keepset = {g for g in (last_good(f, data_dir) for f, _ in bad_files) if g}
     for old in copies(data_dir)[:-n]:   # ротация: только наши папки по шаблону имени внутри data/backup
+        if old in keepset:              # последняя исправная копия испорченного файла переживает ротацию
+            continue
         shutil.rmtree(os.path.join(_dir(data_dir), old), ignore_errors=True)
     return dest, done

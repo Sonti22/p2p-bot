@@ -1556,6 +1556,7 @@ class Bot:
         self.live_msg = {}   # (ex,asset,ex,asset) -> последнее сообщение сигнала для «живой карточки» (editMessage)
         self.chip_tasks = set()   # фоновые уточнения фишек сумм у отправленных карточек (ссылки держим до конца)
         self.backup_task = None   # фоновая суточная копия баз (schedule_backup)
+        self.backup_bad_alerted = set()   # файлы, о порче которых владельцу уже написали
         self.live = {}                                            # (ex,asset,ex,asset) -> {"first": ts, "streak": n}
         self.live_scans = int(os.getenv("LIVE_SCANS", 2))        # сигнал, только если связка держится ≥ N сканов
         self.venue = {}   # ex -> {"streak": сканов подряд с ошибкой, "down_since": ts, "alerted_at": ts}
@@ -2864,12 +2865,42 @@ class Bot:
         self.backup_task = asyncio.ensure_future(self.run_backup())
 
     async def run_backup(self):
+        dest = None
         try:
             dest, files = await asyncio.to_thread(backup.run)
             if dest:
                 logger.info("резервная копия баз: %s (%d файлов)", dest, len(files))
         except Exception as e:
             logger.warning("backup: %s", e)
+        if dest:
+            try:
+                await self.backup_alert()
+            except Exception as e:
+                logger.warning("backup alert: %s", e)
+
+    async def backup_alert(self):
+        """После run_backup: предупреждение владельцу о файлах последней копии, не прошедших проверку целостности
+        (backup.bad()), и одно сообщение, когда файл снова в порядке; флаг меняется, только если Telegram принял
+        сообщение — как watchdog_check."""
+        bad = dict(backup.bad())
+        for fname, why in bad.items():
+            logger.warning("backup: %s не прошёл проверку целостности: %s", fname, why)
+        if not self.chat_id:
+            return
+        new = sorted(set(bad) - self.backup_bad_alerted)
+        fixed = sorted(self.backup_bad_alerted - set(bad))
+        if new:
+            lines = [f"⚠️ Резервная копия: {html.escape(fname)} не прошёл проверку целостности "
+                     f"({html.escape(bad[fname])}) и в новую копию не попал. Последняя копия этого файла: "
+                     f"{html.escape(backup.last_good(fname) or 'нет')}. Прошлые копии сохранены." for fname in new]
+            r = await self.send("\n".join(lines), topic="dev")
+            if (r or {}).get("ok"):
+                self.backup_bad_alerted |= set(new)
+        if fixed:
+            lines = [f"✅ {html.escape(fname)} снова проходит проверку целостности и попал в копию." for fname in fixed]
+            r = await self.send("\n".join(lines), topic="dev")
+            if (r or {}).get("ok"):
+                self.backup_bad_alerted -= set(fixed)
 
     async def save_snapshot(self, snap):
         """Снимок скана в data/snapshots.db (snapshots.py): каждый SNAPSHOT_EVERY-й скан (первый после запуска —
