@@ -675,6 +675,7 @@ async def lbank(s, cfg, side, asset, page=1):
 
 # local — локальный адрес, с которого выгрузка дошла в обход VPN; task — идущее скачивание (bestchange)
 _bc = {"t": 0.0, "ads": [], "local": None}
+_bc_stats = {"skipped": 0}   # строк ПОСЛЕДНЕЙ выгрузки, пропущенных как битые (справочники + bm_rates.dat)
 BC_URL = "http://api.bestchange.ru/info.zip"
 # без ответа за 10 с — путь закрыт (VPN-выход бывает в бане у BestChange: пакет уходит, ответа нет вообще)
 BC_TIMEOUT = aiohttp.ClientTimeout(total=60, sock_connect=6, sock_read=10)
@@ -682,14 +683,25 @@ BC_MAX_TRIES = 5
 
 
 def _bc_parse(data):
+    """Разбор выгрузки info.zip. Единичная битая строка справочника или bm_rates.dat пропускается (счётчик
+    _bc_stats['skipped'], лог при изменении числа); если битых строк bm_rates.dat больше, чем разобранных
+    объявлений — это смена формата выгрузки, а не случайная строка, и разбор падает (кэш и бэкофф площадки не
+    трогаются, как при любом другом сбое выгрузки)."""
     z = zipfile.ZipFile(io.BytesIO(data))
+    skipped = 0
     cy = {}
-    for line in z.read("bm_cy.dat").decode("cp1251").splitlines():
+    for line in z.read("bm_cy.dat").decode("cp1251", errors="replace").splitlines():
         f = line.split(";")
+        if len(f) < 6:
+            skipped += 1
+            continue
         cy[f[0]] = f
     exch = {}
-    for line in z.read("bm_exch.dat").decode("cp1251").splitlines():
+    for line in z.read("bm_exch.dat").decode("cp1251", errors="replace").splitlines():
         f = line.split(";")
+        if len(f) < 2:
+            skipped += 1
+            continue
         exch[f[0]] = f[1]
     coins = {k: BC_COINS[f[2]] for k, f in cy.items() if f[2] in BC_COINS}
     banks = {k: BC_BANKS.get(f[2], f[2].removesuffix(" RUB")) for k, f in cy.items()
@@ -697,25 +709,42 @@ def _bc_parse(data):
     pairs = {f"{c};{b};".encode(): "sell" for c in coins for b in banks}   # мы продаём монету обменнику
     pairs.update({f"{b};{c};".encode(): "buy" for c in coins for b in banks})
     ads = []
+    bad_rows = 0
     with z.open("bm_rates.dat") as rows:
         for line in rows:
             side = pairs.get(line[:line.find(b";", line.find(b";") + 1) + 1])
             if not side:
                 continue
-            f = line.decode("cp1251").strip().split(";")
-            give, recv, reserve, mn, mx = float(f[3]), float(f[4]), float(f[5]), float(f[8]), float(f[9]) or 1e12
-            bad, _, good = f[6].partition(".")
-            bad, good = int(bad or 0), int(good or 0)
-            c, b = (f[0], f[1]) if side == "sell" else (f[1], f[0])
-            if side == "sell":   # лимиты в монете, резерв в рублях
-                price = recv / give
-                mn, mx, avail = mn * price, mx * price, reserve / price
-            else:                # лимиты в рублях, резерв в монете
-                price, avail = give / recv, reserve
-            asset, net = coins[c]
-            ads.append(Ad("BestChange", side, price, mn, mx, avail, [banks[b]], f"{exch.get(f[2], f[2])} [{net}]",
-                          good, good / (good + bad) * 100 if good + bad else 0,
-                          f"https://www.bestchange.ru/click.php?id={f[2]}&from={f[0]}&to={f[1]}&city=0", asset, net))
+            try:
+                f = line.decode("cp1251", errors="replace").strip().split(";")
+                give, recv, reserve, mn, mx = float(f[3]), float(f[4]), float(f[5]), float(f[8]), float(f[9]) or 1e12
+                if give <= 0 or recv <= 0 or not all(math.isfinite(x) for x in (give, recv, reserve, mn, mx)):
+                    raise ValueError("строка bm_rates.dat: битые числа")
+                bad, _, good = f[6].partition(".")
+                bad, good = int(bad or 0), int(good or 0)
+                c, b = (f[0], f[1]) if side == "sell" else (f[1], f[0])
+                if side == "sell":   # лимиты в монете, резерв в рублях
+                    price = recv / give
+                    mn, mx, avail = mn * price, mx * price, reserve / price
+                else:                # лимиты в рублях, резерв в монете
+                    price, avail = give / recv, reserve
+                if not math.isfinite(price) or price <= 0:
+                    raise ValueError("строка bm_rates.dat: битый курс")
+                asset, net = coins[c]
+                ads.append(Ad("BestChange", side, price, mn, mx, avail, [banks[b]], f"{exch.get(f[2], f[2])} [{net}]",
+                              good, good / (good + bad) * 100 if good + bad else 0,
+                              f"https://www.bestchange.ru/click.php?id={f[2]}&from={f[0]}&to={f[1]}&city=0",
+                              asset, net))
+            except (ValueError, IndexError, KeyError, ZeroDivisionError):
+                bad_rows += 1
+                skipped += 1
+                continue
+    prev = _bc_stats["skipped"]
+    _bc_stats["skipped"] = skipped
+    if skipped and skipped != prev:
+        logger.warning("BestChange: пропущено %d строк выгрузки, разобрано %d", skipped, len(ads))
+    if bad_rows > len(ads):
+        raise ValueError(f"BestChange: разобрано {len(ads)}, пропущено {bad_rows} строк — формат выгрузки изменился?")
     return ads
 
 
