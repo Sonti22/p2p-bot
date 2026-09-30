@@ -817,12 +817,44 @@ FETCHERS = {"bybit": bybit, "htx": htx, "kucoin": kucoin, "mexc": mexc, "bitpapa
 
 
 REF_MEDIAN = "медиана P2P"   # ref_src ориентира без Rapira: медиана USDT по объявлениям скана (assemble)
+REF_MAX_SPREAD_PCT = 5.0    # спред Rapira ask/bid шире — котировка битая (пустая/кривая сторона стакана)
+REF_SANITY_PCT = 10.0       # ориентир дальше от медианы P2P USDT — не верим Rapira, берём запасной ориентир
+REF_MIN_ADS = 5             # меньше объявлений первой страницы USDT — медиана для сверки не годится
+
+
+def rapira_quote_mid(bid, ask):
+    """Середина котировки Rapira USDT/RUB с проверкой: bid/ask — конечные положительные числа, bid <= ask, спред не
+    шире REF_MAX_SPREAD_PCT — иначе котировка битая (пустая сторона стакана, перевёрнутый или устаревший стакан) и
+    слепо резать все объявления MAX_DEV по такому ориентиру нельзя."""
+    try:
+        bid, ask = float(bid), float(ask)
+    except (TypeError, ValueError):
+        raise ValueError("Rapira: bad quote")
+    if not (math.isfinite(bid) and math.isfinite(ask)) or bid <= 0 or ask <= 0 or bid > ask \
+            or (ask / bid - 1) * 100 > REF_MAX_SPREAD_PCT + 1e-9:   # эпсилон: ровно 5% не должен зависеть от
+        raise ValueError("Rapira: bad quote")                      # погрешности деления float
+    return (bid + ask) / 2
+
+
+def ref_vs_median(ref, prices, limit=REF_SANITY_PCT):
+    """Доверять ли ориентиру Rapira: сравнение с медианой первой страницы P2P USDT. ref не конечное число или <= 0 —
+    не доверяем независимо от числа объявлений (явно битый ответ). Меньше REF_MIN_ADS объявлений — доказательств
+    расхождения нет, доверие сохраняется. -> (ok, причина; причина пустая, если ok)."""
+    if not (isinstance(ref, (int, float)) and math.isfinite(ref)) or ref <= 0:
+        return False, f"ориентир Rapira {ref!r} не годится"
+    if len(prices) < REF_MIN_ADS:
+        return True, ""
+    m = statistics.median(prices)
+    dev = abs(ref / m - 1) * 100
+    if dev > limit:
+        return False, f"ориентир Rapira {ref:.2f} ₽ расходится с медианой P2P {m:.2f} ₽ на {dev:.0f}%"
+    return True, ""
 
 
 async def rapira_mid(s):
     j = await _json(s, "GET", "https://api.rapira.net/open/market/rates")
     r = next(x for x in j["data"] if x["symbol"] == "USDT/RUB")
-    return (r["askPrice"] + r["bidPrice"]) / 2
+    return rapira_quote_mid(r["bidPrice"], r["askPrice"])
 
 
 def _spot_fee(cfg, venue):
@@ -2378,8 +2410,13 @@ async def collect(s, cfg, force_alt=False, blocked=frozenset()):
 
     # глубина: вторая страница там, где годных объявлений первой меньше DEPTH_PAGE2 × сумма круга (бюджет на скан)
     first = [a for rs in results.values() for a in rs]
+    usdt = [a.price for a in first if a.asset == "USDT"]
+    if ref is not None:
+        ok, why = ref_vs_median(ref, usdt, max(REF_SANITY_PCT, cfg.max_dev))
+        if not ok:   # битый/устаревший ориентир Rapira — не резать все объявления по нему; assemble сам
+            ref, ref_src = None, "-"   # поставит REF_MEDIAN и посчитает медиану по всем объявлениям
+            errors["rapira"] = why
     if ref is None:
-        usdt = [a.price for a in first if a.asset == "USDT"]
         ref_est = statistics.median(usdt) if usdt else None
     else:
         ref_est = ref
