@@ -36,6 +36,7 @@ import simdirectional
 import simfunding
 import simmaker
 import hedge_plans
+import signal_funnel
 import simperp
 import snapshots
 import trades
@@ -2108,6 +2109,10 @@ class Bot:
                         for n, lim in ((day, trades.COUNTERPARTY_DAY), (month, trades.COUNTERPARTY_MONTH))]
                 lines.append(f"• {trades.BANK_NAMES.get(bank, bank)}: сегодня {day}{warn[0]}, "
                              f"за месяц {month}{warn[1]}")
+        try:
+            lines += signal_funnel.lines(signal_funnel.funnel())
+        except Exception as e:
+            logger.warning("signal funnel: %s", e)
         lines.append("\nОтмечай связку кнопкой «✅ Сделал» под сигналом — так она попадёт в журнал, "
                      "затем укажи факт кнопкой или числом, чтобы сравнить расчёт с реальным результатом.")
         return "\n".join(lines)
