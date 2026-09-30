@@ -23,6 +23,7 @@ import blacklist
 import fees
 import history
 import jsonstore
+import logsafe
 import netstatus
 import paper
 import payouts
@@ -1265,7 +1266,7 @@ def logs_view(path=LOG_PATH, n=30):
             lines = f.readlines()
     except OSError:
         return "📄 <b>Логи</b>\n\nФайл логов пока пуст — бот ещё не писал (logs/bot.log)."
-    tail = "".join(lines[-n:]).strip()
+    tail = logsafe.redact("".join(lines[-n:]).strip())
     if not tail:
         return "📄 <b>Логи</b>\n\nФайл логов пуст."
     if len(tail) > 3500:   # запас под лимит сообщения Telegram (4096) и заголовок
@@ -3655,7 +3656,7 @@ class Bot:
             try:
                 r = await self.call("getUpdates", offset=offset, timeout=30)
             except Exception as e:
-                logger.warning("getUpdates error: %s", e)
+                logger.warning("getUpdates error: %s", accounts.api_error_text(e))   # без URL с токеном бота
                 await asyncio.sleep(5)
                 continue
             if not r.get("ok"):
@@ -4420,7 +4421,7 @@ class Bot:
                 if not r.get("ok"):
                     logger.warning("%s: %s", method, r.get("description"))
             except Exception as e:
-                logger.warning("%s: %s", method, e)
+                logger.warning("%s: %s", method, accounts.api_error_text(e))   # без URL с токеном бота
 
 
 async def main():

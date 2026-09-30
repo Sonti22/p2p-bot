@@ -26,6 +26,7 @@ from logging.handlers import RotatingFileHandler
 import aiohttp
 
 import fees
+import logsafe
 import netstatus
 import perp
 import reputation
@@ -86,7 +87,7 @@ def setup_logging(path=LOG_PATH):
         h.close()
     _log_handlers.clear()
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s", "%d.%m %H:%M:%S")
+    fmt = logsafe.RedactingFormatter("%(asctime)s %(levelname)s %(name)s: %(message)s", "%d.%m %H:%M:%S")
     file_h = RotatingFileHandler(path, maxBytes=1_000_000, backupCount=5, encoding="utf-8")
     file_h.setFormatter(fmt)
     console_h = logging.StreamHandler(sys.stdout)
