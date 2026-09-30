@@ -876,6 +876,11 @@ _(облачный Claude добавляет сюда предложения, к
 - Площадки под санкциями или с сомнительным статусом (Garantex, Grinex, A7A5, ABCeX).
 
 ## Журнал
+- 2026-09-30 — netstatus-duplicate-net-merge: правило «открытая на вывод выигрывает» (уже было у KuCoin) теперь
+  в четырёх разборщиках `netstatus.py` (`_merge_net`) — HTX/Bybit/MEXC раньше при дубле сети (после `normalize()`)
+  безусловно брали последнюю запись, и результат `wd` зависел от порядка строк в ответе биржи, что давало и ложные
+  алерты владельцу о переключении вывода при простой смене порядка; при равном статусе вывода остаётся первая
+  запись (dep/fee/min — из неё целиком); tests/test_netstatus_duplicates.py.
 - 2026-09-30 — log-repeat-throttle: `logthrottle.py` (`RepeatThrottle` — миксин к `logging.Handler`,
   `ThrottledFileHandler`/`ThrottledStreamHandler`) — одинаковые WARNING/ERROR (логгер, уровень, первые 200 символов
   текста) не чаще раза в 5 минут в bot.log и консоли, дальше — с числом подавленных; `p2p.setup_logging` ставит эти
