@@ -830,6 +830,13 @@ _(облачный Claude добавляет сюда предложения, к
 - Площадки под санкциями или с сомнительным статусом (Garantex, Grinex, A7A5, ABCeX).
 
 ## Журнал
+- 2026-09-30 — тест-гигиена: убран единственный среди 106 файлов tests/test_*.py тест без единого assert
+  (`test_sim_tick_isolates_failures` в tests/test_simfunding.py — только вызывал `Bot.sim_tick()`, ничего не
+  проверял), заменён настоящими тестами `tests/test_sim_tick.py` (сбой одной бумажной симуляции не мешает другой
+  и логируется); плюс новый AST-сторож `tests/test_hygiene.py`, который не даст будущим тестам верхнего уровня
+  обойтись без assert/raises/warns/fail/assert_* (tests/trading/ вне охвата — там свои хелперы bad()/ok()).
+  Мутация вручную: общий try/except на обе симуляции красит тест (a); убранный try/except вокруг simfunding красит
+  только тест (a) — оба подтверждены и откачены (волна 2, задача test-hygiene-assert-guard).
 - 2026-09-30 — токен Telegram-бота и подписи запросов (signature, api_key, token, Authorization/Bearer) больше не
   попадают в logs/bot.log, консоль и /logs: новый `logsafe.py` (`redact`/`RedactingFormatter`), `p2p.setup_logging`
   форматирует логи через него, `bot.logs_view` маскирует уже записанные строки, `getUpdates`/`setup()` логируют

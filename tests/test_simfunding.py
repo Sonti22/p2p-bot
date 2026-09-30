@@ -151,13 +151,6 @@ def test_funding_command_owner_only(monkeypatch, tmp_path):
     assert "Арбитраж" not in TB.texts(bot)[-1] and "только для владельца" in TB.texts(bot)[-1]
 
 
-def test_sim_tick_isolates_failures(monkeypatch):
-    def boom(*a, **k):
-        raise RuntimeError("x")
-    monkeypatch.setattr(B.simfunding, "tick", boom)
-    TB.Stub(p2p.Config()).sim_tick()   # не падает
-
-
 def test_perp_loop_refreshes_then_ticks_sims(monkeypatch):
     calls = []
 
