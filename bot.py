@@ -29,6 +29,7 @@ import payouts
 import perp
 import presets
 import reputation
+import sigreport
 import simdirectional
 import simfunding
 import simmaker
@@ -125,6 +126,7 @@ COMMANDS = [{"command": "best", "description": "Лучшая связка сей
             {"command": "resume", "description": "Снять паузу сигналов"},
             {"command": "dev", "description": "Как развивается бот: версия, изменения, план"},
             {"command": "status", "description": "Версия, аптайм, последний скан, скорость, ошибки площадок"},
+            {"command": "signals", "description": "Отчёт качества сигналов: доля пропущенных, причины, топ направлений"},
             {"command": "logs", "description": "Последние строки лога (logs/bot.log)"},
             {"command": "guests", "description": "Гости: кому ещё слать сигналы (/allow id, /deny id)"},
             {"command": "safety", "description": "Безопасность: 115-ФЗ, блокировки карт, правила сделки"},
@@ -175,7 +177,8 @@ LINKS = {"inline_keyboard": [
 # же сообщения. Гостю — прежняя справка одним сообщением (GUIDE): его кнопки обрабатывает запиненный on_guest_callback.
 _GUIDE_PARTS = GUIDE_BODY.split("\n\n<b>")
 HELP_SECTIONS = {
-    "signal": ("📨 Сигнал", _GUIDE_PARTS[0]),
+    "signal": ("📨 Сигнал", _GUIDE_PARTS[0] + "\n\n/signals — отчёт качества сигналов: доля пропущенных, причины, "
+               "задержка, топ направлений (только владелец)."),
     "safety": ("🛡 Безопасность", "<b>" + _GUIDE_PARTS[1]),
     "costs": ("🧮 Что учтено в %", "<b>" + "\n\n<b>".join(_GUIDE_PARTS[2:]).rstrip()),
     "labels": ("🏷 Метки", "<b>Метки надёжности</b>\n"
@@ -2086,6 +2089,14 @@ class Bot:
         lines.append("\nОтмечай связку кнопкой «✅ Сделал» под сигналом — так она попадёт в журнал, "
                      "затем укажи факт кнопкой или числом, чтобы сравнить расчёт с реальным результатом.")
         return "\n".join(lines)
+
+    def signals_view(self, arg):
+        """/signals (только владелец): отчёт sigreport за arg дней (по умолчанию 7, мусор — тоже 7; 1..30 — sigreport.build)."""
+        try:
+            days = int(arg) if arg else 7
+        except ValueError:
+            days = 7
+        return sigreport.render(sigreport.build(days=days))
 
     def paper_view(self):
         """Текст «/paper»: настройки, открытые виртуальные круги, статистика за день/неделю/всё время
@@ -4097,6 +4108,8 @@ class Bot:
                 await self.send("Нужна сумма: /calc 20000")
         elif cmd == "/stats":
             await self.send(self.stats_view())
+        elif cmd == "/signals":
+            await self.send(self.signals_view(arg))
         elif cmd == "/paper":
             await self.cmd_paper(arg)
         # план 2.6: отчёт калибровки — только владельцу (не в GUEST_CMDS), за флагом CALIBRATION=1 (по умолчанию выкл.);
