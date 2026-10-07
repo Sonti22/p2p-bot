@@ -59,7 +59,7 @@ def normalize(venue, asset, depth, instrument, received):
         bids, asks, stamp, sequence = book["b"], book["a"], book["ts"] / 1000, book["u"]
     elif venue == "MEXC":
         info = next(x for x in instrument["symbols"] if x["symbol"] == base)
-        active = str(info["status"]) in ("1", "TRADING", "ENABLED") and info["isSpotTradingAllowed"] is True
+        active = str(info["status"]) in ("1", "ENABLED") and info["isSpotTradingAllowed"] is True
         side = str(info.get("tradeSideType", "1"))
         rules = {"base_step": str(step(info["baseAssetPrecision"])),
                  "quote_step": str(step(info.get("quoteAssetPrecision", info["quotePrecision"]))),
