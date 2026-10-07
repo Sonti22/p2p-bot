@@ -101,7 +101,7 @@ OWNER_ONLY_PRIVATE = ("🔒 Команды владельца (настройк�
                       "Сейчас TG_CHAT_ID в .env — группа или канал: впиши туда id своего личного чата с ботом (он "
                       "равен твоему Telegram user id) и перезапусти бота.")
 OWNER_ONLY_TOAST = "Кнопки владельца — только в личном чате владельца с ботом"
-FIRST_CHAT_PRIVATE = "🔒 Владельцем бота становится только личный чат: напиши мне /start в личные сообщения."
+FIRST_CHAT_PRIVATE = "🔒 Владелец ещё не настроен: укажи свой Telegram user ID в TG_CHAT_ID в .env на ПК и перезапусти бота."
 COMMANDS = [{"command": "best", "description": "Лучшая связка сейчас"},
             {"command": "top", "description": "Топ связок графиком"},
             {"command": "history", "description": "История спредов: время суток, дни недели, BestChange"},
@@ -2330,6 +2330,14 @@ class Bot:
                 line += f", факт vs план {p['avg_diff']:+.2f} п.п."
             lines.append(line)
         balance = paper.get_balance()
+        # Итоговые суммы по периодам видны рядом со статистикой кругов.
+        for key, label in (("day", "Сегодня"), ("week", "Неделя"), ("all", "Всё время")):
+            p = st[key]
+            if p["done"]:
+                lines.append(f"{label}: теоретическая прибыль {p['profit_rub']:+.2f} ₽ "
+                             f"({p['return_pct']:+.2f}% от оборота {_money(p['turnover_rub'])} ₽)")
+        lines.append("Это виртуальный результат по котировкам; сорванные круги не считаются продажей, "
+                     "стоимость оставшейся монеты в итог прибыли не включена.")
         if balance is not None:
             change = paper.balance_change()
             change_str = f"{change:+,.0f}".replace(",", " ")
@@ -3720,7 +3728,10 @@ class Bot:
                     plan = cycle.get("planned_raw")
                     plan = cycle["planned_pct"] if plan is None else plan
                     await self.send(f"🧪 Сухой прогон: круг #{cycle['id']} завершён — план "
-                                    f"{plan:.2f}%, факт {rp:.2f}%"
+                                    f"{plan:.2f}%, теоретический результат {rp:+.2f}% "
+                                    f"({cycle['amount'] * rp / 100:+.2f} ₽), "
+                                    f"выручка {cycle['amount'] * (1 + rp / 100):.2f} ₽ "
+                                    f"при вложении {cycle['amount']:.2f} ₽"
                                     + (f" ({note})" if note else ""), topic="signals")
 
     def paper_hedge_tick(self, snap):
@@ -3961,10 +3972,9 @@ class Bot:
         и покупки, и продажи."""
         since = time.time() - 86400  # не старше суток — дальше сопоставлять по времени уже нет смысла
         for trade in trades.unmatched(since=since):
-            fact = trades.match_fact(trade, hist_by_ex)
+            fact = trades.set_auto_fact(trade, hist_by_ex)
             if fact is None:
                 continue
-            trades.set_fact(trade["id"], fact, source=trades.FACT_AUTO)
             was = " вместо «как расчёт»" if trade.get("fact_source") in trades.PLAN_SOURCES else ""
             await self.send(f"✅ автосопоставление сделки #{trade['id']}: факт {fact:+.2f}% чистыми{was} "
                             f"(расчёт был {trade['profit']:+.2f}%)", topic="journal")
@@ -4014,8 +4024,8 @@ class Bot:
         "owner" — владелец в своём личном чате: chat.type == "private" и from.id == chat.id == TG_CHAT_ID (у личного
         чата id равен id пользователя; у кнопки from — тот, кто нажал, chat — где сообщение с кнопкой): ему всё, в том
         числе настройки, ключи, выплаты и их подтверждение; "refuse" — чат TG_CHAT_ID, но не личный (группа,
-        супергруппа, канал) или пишет/нажал не владелец: команды и кнопки владельца — отказ; "bind" — TG_CHAT_ID пуст и
-        пишет человек в личном чате с ботом: этот чат станет чатом владельца (группа или канал — никогда);
+        супергруппа, канал) или пишет/нажал не владелец: команды и кнопки владельца — отказ;
+        TG_CHAT_ID задаётся на ПК: при пустом ID никто не получает права владельца или гостя;
         "guest" — гость из /allow: только GUEST_CMDS/GUEST_CALLBACKS; None — чужой.
         Защищённая функция (пин в tests/test_payout_pins.py): от неё зависит, кто может нажимать кнопки выплат."""
         u = u if isinstance(u, dict) else {}
@@ -4026,8 +4036,8 @@ class Bot:
         private = bool(cid) and chat.get("type") == "private" and str(sender.get("id", "")) == cid
         if self.chat_id and cid == self.chat_id:
             return "owner" if private else "refuse"
-        if not self.chat_id and private and m is u:
-            return "bind"
+        if not self.chat_id:
+            return None
         if cid and self.is_guest(cid):
             return "guest"
         return None
@@ -4053,18 +4063,10 @@ class Bot:
             return
         self.cur_thread = msg.get("message_thread_id")
         who = self._owner_gate(msg)
-        if who == "bind":
-            # первый, кто написал боту в личку, становится владельцем и получателем сигналов
-            self.chat_id = chat
-            save_env("TG_CHAT_ID", chat)
-            logger.info("chat_id сохранён в .env: %s", chat)
-            await self.setup_topics()
-            await self.start_onboarding()
-            return
         if not self.chat_id:
             if chat not in self.unbound_asked:   # группа, канал или чужой отправитель: владельцем не делаем, раз
                 self.unbound_asked.add(chat)
-                logger.warning("TG_CHAT_ID пуст: чат %s (%s) не личный — владельцем не назначен, жду /start в личке",
+                logger.warning("TG_CHAT_ID пуст: чат %s (%s) не назначен владельцем, настрой ID на ПК",
                                chat, msg.get("chat", {}).get("type"))
                 await self.send(FIRST_CHAT_PRIVATE, chat_id=chat)
             return
@@ -4470,7 +4472,10 @@ class Bot:
         elif cmd == "/guests":
             await self.cmd_guests()
         elif cmd == "/start":
-            await self.welcome()
+            if arg.strip().lower() == "setup" and REPLY_CHAT.get() is None:
+                await self.start_onboarding()
+            else:
+                await self.welcome()
         elif cmd == "/best":
             await self.show_best()
         elif cmd == "/top":
@@ -4786,6 +4791,9 @@ async def main():
     token = os.getenv("TG_TOKEN", "").strip()
     if not token:
         raise SystemExit("TG_TOKEN не задан: создай бота у @BotFather и пропиши токен в .env")
+    owner_id = os.getenv("TG_CHAT_ID", "").strip()
+    if not owner_id.isdigit() or int(owner_id) <= 0:
+        raise SystemExit("TG_CHAT_ID должен содержать Telegram user ID владельца, заданный в .env на ПК")
     cfg = Config.from_env()
     try:   # ключи от прошлой версии лежат открыто — шифруем (DPAPI); сбой не мешает запуску
         if accounts.encrypt_saved_keys():

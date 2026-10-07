@@ -890,24 +890,32 @@ def stats(path=DB_PATH, now=None):
     Считаем по завершённым кругам (result IS NOT NULL): total — сколько завершилось, done — исполнились
     полностью, failed/failed_by_reason — сколько и на какой стадии сорвалось, avg_diff — средняя
     (факт − план) в п.п. по исполнившимся (None — исполнившихся ещё не было; план — без запаса на курс,
-    _PLAN_CMP). «day» — календарные сутки по МСК, «week» — последние 7 суток, «all» — за всё время."""
+    _PLAN_CMP). profit_rub и turnover_rub — итог и оборот завершённых продаж (включая убытки);
+    return_pct — отношение результата к обороту, а не среднее процентов кругов.
+    «day» — календарные сутки по МСК, «week» — последние 7 суток, «all» — за всё время."""
     now = time.time() if now is None else now
     starts = {"day": _day_start(now), "week": now - STATS_WEEK, "all": 0.0}
-    empty = {"total": 0, "done": 0, "failed": 0, "failed_by_reason": {}, "avg_diff": None}
+    empty = {"total": 0, "done": 0, "failed": 0, "failed_by_reason": {}, "avg_diff": None,
+             "profit_rub": 0.0, "turnover_rub": 0.0, "return_pct": None}
     if not os.path.exists(path):
         return {p: dict(empty) for p in starts}
     con = _connect(path)
     out = {}
     for period, start in starts.items():
-        rows = con.execute(f"SELECT result, {_PLAN_CMP}, realized_pct FROM cycles "
+        rows = con.execute(f"SELECT result, {_PLAN_CMP}, realized_pct, amount FROM cycles "
                            "WHERE result IS NOT NULL AND ts_start >= ?", (start,)).fetchall()
-        done_diffs = [r - p for res, p, r in rows if res == "done"]
+        done_diffs = [r - p for res, p, r, a in rows if res == "done" and r is not None and p is not None]
+        completed = [(r or 0, a or 0) for res, p, r, a in rows if res == "done"]
+        profit = sum(r * a / 100 for r, a in completed)
+        turnover = sum(a for r, a in completed)
         failed_by_reason = {}
-        for res, _, _ in rows:
+        for res, _, _, _ in rows:
             if res != "done":
                 failed_by_reason[res] = failed_by_reason.get(res, 0) + 1
-        out[period] = {"total": len(rows), "done": len(done_diffs), "failed": len(rows) - len(done_diffs),
+        out[period] = {"total": len(rows), "done": len(completed), "failed": len(rows) - len(completed),
                        "failed_by_reason": failed_by_reason,
+                       "profit_rub": profit, "turnover_rub": turnover,
+                       "return_pct": profit / turnover * 100 if turnover else None,
                        "avg_diff": sum(done_diffs) / len(done_diffs) if done_diffs else None}
     con.close()
     return out

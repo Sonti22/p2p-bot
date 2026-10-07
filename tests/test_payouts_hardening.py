@@ -362,9 +362,8 @@ def test_stop_button_interrupts_background_resend(monkeypatch):
 
 @pytest.mark.parametrize("ctype,chat,uid", [("group", -5, 7), ("supergroup", -1001, 7), ("channel", -1002, 7),
                                             ("private", 7, 8)])
-def test_new_install_binds_owner_only_from_private_chat(monkeypatch, caplog, ctype, chat, uid):
-    """TG_CHAT_ID пуст: владельцем становится только личный чат (type private, from.id == chat.id). Группа,
-    супергруппа, канал (и чужой отправитель) — не привязываются, это пишется в лог; потом личный чат — как раньше."""
+def test_new_install_cannot_bind_owner_from_any_chat(monkeypatch, caplog, ctype, chat, uid):
+    """TG_CHAT_ID пуст: ни группа, ни личный чат не назначают владельца. Настройка ID — только на ПК."""
     saved = []
     monkeypatch.setattr(B, "save_env", lambda k, v, path=None: saved.append((k, v)))
     bot = owner()
@@ -374,8 +373,8 @@ def test_new_install_binds_owner_only_from_private_chat(monkeypatch, caplog, cty
     assert bot.chat_id == "" and saved == [] and bot.onboarding is None
     assert "TG_CHAT_ID" in caplog.text
     run(bot.on_update(_msg(7, "/start")))                           # личный чат — мастер первого запуска
-    assert bot.chat_id == "7" and saved == [("TG_CHAT_ID", "7")]
-    assert bot.onboarding == {"step": "amount", "banks": set()}
+    assert bot.chat_id == "" and saved == []
+    assert bot.onboarding is None
 
 
 @pytest.mark.parametrize("ctype", ["group", "supergroup", "channel"])

@@ -100,6 +100,8 @@ def _connect(path):
             con.execute(f"ALTER TABLE trades ADD COLUMN {col} TEXT DEFAULT ''")
     if "fact_source" not in cols:   # NULL — факт записан до колонки: откуда он, неизвестно, считаем как раньше
         con.execute("ALTER TABLE trades ADD COLUMN fact_source TEXT DEFAULT NULL")
+    con.execute("CREATE TABLE IF NOT EXISTS fact_orders (venue TEXT NOT NULL, order_id TEXT NOT NULL, "
+                "trade_id INTEGER NOT NULL, PRIMARY KEY (venue, order_id))")
     return con
 
 
@@ -372,7 +374,7 @@ def _match_leg(hist, asset, side, ts, want_fiat, window, amount_tolerance):
     return best
 
 
-def match_fact(trade, hist_by_ex, window=AUTO_MATCH_WINDOW, amount_tolerance=AUTO_MATCH_AMOUNT_TOLERANCE):
+def _fact_match(trade, hist_by_ex, window=AUTO_MATCH_WINDOW, amount_tolerance=AUTO_MATCH_AMOUNT_TOLERANCE):
     """Чистый реализованный % сделки журнала (`unmatched`) по истории подключённых бирж: в истории нашлись
     P2P-ордер покупки и P2P-ордер продажи той же монеты за рубли рядом по времени и сумме (_match_leg). Считаем от
     реальных цен и количества ордера покупки, вычитая издержки, которые заложил расчёт (route_costs): комиссию
@@ -383,8 +385,8 @@ def match_fact(trade, hist_by_ex, window=AUTO_MATCH_WINDOW, amount_tolerance=AUT
     не совпадают; у площадки в истории нет P2P-ордеров (сейчас они есть только у Bybit — у остальных депозиты,
     выводы и спот, _p2p_leg); межмонетная связка (монета покупки ≠ монете продажи — нужны курс и комиссия
     спота, которых в истории нет, валовый % был бы выдумкой) или вывод съел бы всю монету.
-    Пределы: комиссии — по расчёту, а не списанные биржей на деле; покупка/продажа из нескольких ордеров
-    (стакан) — берётся один ближайший ордер, остальные не видны; запас на курс в факт не входит (его и нет)."""
+    Пределы: комиссии — по расчёту, а не списанные биржей на деле; неполная продажа остаётся
+    неподтверждённой; запас на курс в факт не входит. Возвращает (процент, покупка, продажа) или None."""
     asset = (trade["buy_asset"] or "").upper()
     if asset != (trade["sell_asset"] or "").upper():
         return None
@@ -400,9 +402,55 @@ def match_fact(trade, hist_by_ex, window=AUTO_MATCH_WINDOW, amount_tolerance=AUT
     qty, fee = buy["amount"], fees.get(asset, 0.0)
     if qty <= fee or bank >= 100:
         return None
+    expected = qty - fee
+    sold = sell.get("amount", 0)
+    if abs(sold - expected) > max(1e-8, expected * 1e-6):
+        return None   # неполная/чужая продажа — полный реализованный факт не подтверждён
     spent = qty * buy["price"] / (1 - bank / 100)   # ушло с карты: мерчанту за монету + комиссия банка
-    got = (qty - fee) * sell["price"]                # монета после вывода — по цене ордера продажи
-    return (got / spent - 1) * 100
+    got = sold * sell["price"]
+    return (got / spent - 1) * 100, buy, sell
+
+
+def match_fact(trade, hist_by_ex, window=AUTO_MATCH_WINDOW, amount_tolerance=AUTO_MATCH_AMOUNT_TOLERANCE):
+    """Полный чистый факт: объём продажи должен совпасть с полученным после комиссии вывода."""
+    matched = _fact_match(trade, hist_by_ex, window, amount_tolerance)
+    return matched[0] if matched else None
+
+
+def _order_key(venue, it):
+    # Старые адаптеры без ID: стабильный ключ исполнения, чтобы один снимок не засчитать дважды.
+    oid = str(it.get("id") or repr((it.get("ts"), it.get("side"), it.get("asset"),
+                                  it.get("fiat"), it.get("amount"), it.get("price"))))
+    return venue.lower(), oid
+
+
+def set_auto_fact(trade, hist_by_ex, path=DB_PATH):
+    """Сопоставить полную продажу и атомарно закрепить оба исполнения за одной сделкой."""
+    con = _connect(path)
+    try:
+        with con:
+            con.execute("BEGIN IMMEDIATE")
+            reserved = set(con.execute("SELECT venue, order_id FROM fact_orders"))
+            available = {v: [it for it in items if _order_key(v, it) not in reserved]
+                         for v, items in hist_by_ex.items()}
+            matched = _fact_match(trade, available)
+            if matched is None:
+                return None
+            fact, buy, sell = matched
+            order_keys = [_order_key(trade["buy_ex"], buy), _order_key(trade["sell_ex"], sell)]
+            if order_keys[0] == order_keys[1]:
+                return None
+            cur = con.execute("UPDATE trades SET fact=?, fact_source=? WHERE id=? "
+                              "AND (fact IS NULL OR fact_source IN ('plan', 'plan±'))",
+                              (fact, FACT_AUTO, trade["id"]))
+            if cur.rowcount != 1:
+                return None
+            for venue, oid in order_keys:
+                con.execute("INSERT INTO fact_orders (venue, order_id, trade_id) VALUES (?, ?, ?)",
+                            (venue, oid, trade["id"]))
+            return fact
+    finally:
+        con.close()
 
 
 def stats(path=DB_PATH, now=None):

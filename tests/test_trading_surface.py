@@ -1399,10 +1399,12 @@ def test_aiohttp_and_urllib_are_blocked(network_attempts):
     network_attempts.clear()
 
 
-def test_foreign_loopback_port_is_blocked(network_attempts):
+def test_foreign_loopback_port_is_blocked(network_attempts, monkeypatch):
     """На 127.0.0.1 чужой порт — это, например, прокси VPN владельца: через него запрос ушёл бы наружу. Соединяться по
     loopback можно только с портами, которые открыл сам процесс тестов."""
     foreign = 10808   # не эфемерный порт: процесс тестов его сам не открывает
+    # Проверяем транспорт через заданный прокси независимо от proxy bypass Windows и его DNS-вызовов.
+    monkeypatch.setattr(urllib.request, "proxy_bypass", lambda host: False)
     with pytest.raises(ConnectionRefusedError, match="сеть в тестах заблокирована"):
         socket.create_connection((LOOPBACK, foreign), timeout=1)
     via_proxy = urllib.request.build_opener(urllib.request.ProxyHandler({"http": f"http://{LOOPBACK}:{foreign}"}))

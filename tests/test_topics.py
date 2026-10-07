@@ -101,11 +101,15 @@ def test_routing_by_topic_and_reply_thread(monkeypatch):
     assert sent(bot, "sendPhoto")[-1]["message_thread_id"] == 11
 
 
-def test_first_chat_sets_up_topics(tmp_path, monkeypatch):
+def test_locally_configured_owner_gets_topics_and_setup(tmp_path, monkeypatch):
     monkeypatch.setattr(B, "TOPICS_PATH", str(tmp_path / "topics.json"))
     monkeypatch.setattr(B, "save_env", lambda *a, **k: None)
     bot = Stub(p2p.Config())
     bot.chat_id = ""
     arun(bot.on_update({"message": {"chat": {"id": 42, "type": "private"}, "from": {"id": 42}, "text": "/start"}}))
+    assert bot.chat_id == "" and bot.topics == {}
+    bot.chat_id = "42"                          # локальная настройка, затем startup как в main()
+    arun(bot.setup_topics())
+    arun(bot.on_update({"message": {"chat": {"id": 42, "type": "private"}, "from": {"id": 42}, "text": "/start setup"}}))
     assert bot.chat_id == "42" and bot.topics["signals"] == 11
     assert sent(bot)[-1]["text"].startswith("👋") and "message_thread_id" not in sent(bot)[-1]

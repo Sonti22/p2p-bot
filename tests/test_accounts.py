@@ -98,7 +98,7 @@ class _FakeResp:
 
 
 class _FakeSession:
-    def get(self, url, headers=None):
+    def get(self, url, headers=None, **kwargs):
         return _FakeResp(url, headers)
 
 
@@ -299,7 +299,7 @@ class _JsonSession:
     def __init__(self, body):
         self.body = body
 
-    def get(self, url, headers=None):
+    def get(self, url, headers=None, **kwargs):
         return _JsonResp(self.body)
 
 
@@ -383,7 +383,7 @@ class _HttpErrorSession:
     def __init__(self, status=401, message="Unauthorized"):
         self.status, self.message, self.errors = status, message, []
 
-    def get(self, url, headers=None):
+    def get(self, url, headers=None, **kwargs):
         session = self
 
         class _Resp(_JsonResp):
@@ -417,7 +417,7 @@ def test_verify_timeout_readable(tmp_path, monkeypatch):
     accounts.save_key("bybit", "k", "s")
 
     class _Slow:
-        def get(self, url, headers=None):
+        def get(self, url, headers=None, **kwargs):
             raise asyncio.TimeoutError()
 
     ok, msg = arun(accounts.verify(_Slow(), "bybit"))
@@ -482,7 +482,7 @@ class _HtxKeySession:
         self.permission, self.urls = permission, []
         self.uid_body = uid_body or {"code": 200, "data": 123456}
 
-    def get(self, url, headers=None):
+    def get(self, url, headers=None, **kwargs):
         self.urls.append(url)
         if "/v2/user/uid?" in url:
             return _JsonResp(self.uid_body)
@@ -543,7 +543,7 @@ class _UrlJsonSession:
     def __init__(self, by_substr):
         self.by_substr = by_substr
 
-    def get(self, url, headers=None):
+    def get(self, url, headers=None, **kwargs):
         for substr, body in self.by_substr.items():
             if substr in url:
                 return _JsonResp(body)
@@ -596,7 +596,7 @@ def test_portfolio_skips_exchange_on_error(tmp_path, monkeypatch):
     accounts.save_key("mexc", "k", "s")
 
     class _Boom:
-        def get(self, url, headers=None):
+        def get(self, url, headers=None, **kwargs):
             raise RuntimeError("network down")
 
     assert arun(accounts.portfolio(_Boom())) == {}
@@ -1010,7 +1010,7 @@ def test_api_permissions_fails_open_when_api_errors(tmp_path, monkeypatch):
     accounts.save_key("bybit", "k", "s")
 
     class _Boom:
-        def get(self, url, headers=None):
+        def get(self, url, headers=None, **kwargs):
             raise RuntimeError("network down")
 
     safe, detail = arun(accounts.api_permissions(_Boom(), "bybit"))
@@ -1044,7 +1044,7 @@ def test_key_permissions_network_error_is_unknown(tmp_path, monkeypatch):
     accounts.save_key("bybit", "k", "s")
 
     class _Boom:
-        def get(self, url, headers=None):
+        def get(self, url, headers=None, **kwargs):
             raise RuntimeError("network down")
 
     assert arun(accounts.key_permissions(_Boom(), "bybit")) == (None, "")

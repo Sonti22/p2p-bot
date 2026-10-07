@@ -11,9 +11,9 @@
 
 ```bash
 pip install -r requirements.txt
-cp .env.example .env        # вписать TG_TOKEN от @BotFather
+cp .env.example .env        # вписать TG_TOKEN от @BotFather и свой Telegram user ID в TG_CHAT_ID
 python p2p.py               # разовый срез в консоль
-python bot.py               # бот (или run.bat); напиши ему /start в личку — chat_id запишется в .env сам
+python bot.py               # бот (или run.bat); TG_CHAT_ID заранее задан на ПК, затем /start в личку
                             # (владелец — только личный чат: группа или канал владельцем не станут)
 python scripts/merchant_suggest.py data/snapshots.db   # предложение MERCHANT_MIN по снимкам (только чтение базы)
 ```
@@ -53,7 +53,8 @@ python scripts/merchant_suggest.py data/snapshots.db   # предложение 
   классам связок, вероятность исполнения по корзинам, EV, запас на курс из данных против `RISK_BUFFER` и хеджа.
   `EV_RANK=1` — `/top`, `/best` и сигналы по убыванию EV, в карточке «EV x.xx% (p=…)».
 - `/paper` — сухой прогон (виртуальные круги без денег): открытый круг и стадия, итоги за день/неделю/всё время,
-  план vs факт, виртуальный баланс, лимит СБП по банкам. `/paper on|off` — вкл/выкл, `/paper amount 20000` — сумма круга,
+  план vs факт, теоретическая прибыль в ₽ и % от оборота, виртуальный баланс, лимит СБП по банкам.
+  `/paper on|off` — вкл/выкл, `/paper amount 20000` — сумма круга,
   `/paper reset` — обнулить с подтверждением (база уходит в архив). Только владельцу.
 - `/paper report` — отчёт сухого прогона по площадкам и парам: круги, исполнилось/сорвалось и почему, средний план/факт,
   время стадий, нехватка глубины; следом — CSV-файл `data/paper_report.csv`.
