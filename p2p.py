@@ -441,6 +441,14 @@ class Ad:
 # отправляет (ValueError до отправки, как accounts.bybit_post). Список запинен в tests/test_trading_surface.py
 # (защищённый файл): новая площадка или адрес — только после проверки владельцем.
 JSON_ALLOWED = frozenset({
+    ("GET", "api.bybit.com", "/v5/market/orderbook"),
+    ("GET", "api.bybit.com", "/v5/market/instruments-info"),
+    ("GET", "api.mexc.com", "/api/v3/depth"),
+    ("GET", "api.mexc.com", "/api/v3/exchangeInfo"),
+    ("GET", "api.htx.com", "/market/depth"),
+    ("GET", "api.htx.com", "/v1/common/symbols"),
+    ("GET", "api.kucoin.com", "/api/v1/market/orderbook/level2_100"),
+    ("GET", "api.kucoin.com", "/api/v2/symbols/"),
     ("POST", "api2.bybit.com", "/fiat/otc/configuration/queryAllPaymentList"),
     ("POST", "api2.bybit.com", "/fiat/otc/item/online"),
     ("GET", "www.htx.com", "/-/x/otc/v1/data/trade-market"),

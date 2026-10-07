@@ -13,6 +13,7 @@ from decimal import Decimal, ROUND_DOWN, ROUND_UP, localcontext
 
 import p2p
 import paper
+import spotbook
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "data", "paper_portfolio.db")
 EXPORT_PATH = os.path.join(os.path.dirname(__file__), "data", "paper_portfolio.csv")
@@ -111,7 +112,8 @@ def start(amount, buy, sell, hops, planned_pct, pay_fee=0, path=DB_PATH, now=Non
                "bank": bank, "pay_kind": pay_kind,
                "settings": paper.settings(),
                "measures": measures or {},
-               "note": "", "assumptions": [], "in_transit": False}
+               "note": "", "assumptions": [], "in_transit": False, "dust": []}
+        run["settings"]["spot_model"] = os.getenv("PAPER_SPOT_MODEL", "depth")
         _save(con, run)
         con.execute("UPDATE wallet SET cash=?", (str(dec(cash) - amount),))
         _event(con, run["id"], "reserve", {"rub": str(amount), "initial": initial}, now)
@@ -156,7 +158,7 @@ def _offer_key(ad):
     return json.dumps([ad.ex, ad.side, ad.asset, ad.ad_id or ad.nick, ad.net, ad.fetched_ts, ad.price])
 
 
-def tick(snap, cfg, path=DB_PATH, now=None):
+def tick(snap, cfg, path=DB_PATH, now=None, books=None):
     """Execute one durable step per scan; no fabricated fills on missing data."""
     now = time.time() if now is None else now
     notices = []
@@ -169,15 +171,16 @@ def tick(snap, cfg, path=DB_PATH, now=None):
         con.execute("BEGIN IMMEDIATE")
         for state, in con.execute("SELECT state FROM runs ORDER BY id").fetchall():
             run = json.loads(state)
-            if run["stage"] in ("done", "cancelled"):
-                continue
+            was_terminal = run["stage"] in ("done", "cancelled")
             with localcontext() as ctx:
                 ctx.prec = 40
-                _step(con, run, snap, cfg, now)
+                _sell_dust(con, run, snap, now)
+                if not was_terminal:
+                    _step(con, run, snap, cfg, now, books or {})
             _save(con, run)
             if state != json.dumps(run, ensure_ascii=False):
                 _event(con, run["id"], "state", run, now)
-            if run["stage"] in ("done", "cancelled"):
+            if not was_terminal and run["stage"] in ("done", "cancelled"):
                 label = "завершён" if run["stage"] == "done" else "покупка отменена"
                 notices.append(f"Круг #{run['id']} {label}, результат {dec(run['realized']):+.2f} ₽")
         with localcontext() as ctx:
@@ -193,7 +196,7 @@ def tick(snap, cfg, path=DB_PATH, now=None):
     return notices
 
 
-def _step(con, r, snap, cfg, now):
+def _step(con, r, snap, cfg, now, books):
     st = r["settings"]
     elapsed = now - r["stage_ts"]
     if r["stage"] == "buy":
@@ -235,6 +238,42 @@ def _step(con, r, snap, cfg, now):
         if leg["kind"] == "spot":
             venue = leg["venue"]
             alt = leg["target"] if r["asset"] == "USDT" else r["asset"]
+            if st.get("spot_model", "depth") != "ticker":
+                book = books.get((venue, alt))
+                if book is None or book.get("venue") != venue or book.get("asset") != alt \
+                        or not now - 15 <= book["ts"] <= now + 2 or not 0 <= now - book["received"] <= 15:
+                    r["note"] = "Нет свежего стакана спота и правил пары; монеты сохранены"
+                    if elapsed >= 1800:
+                        r["stage"], r["stage_ts"] = "sell", now - 1800
+                    return
+                used = {key: value for key, value in con.execute("SELECT key,qty FROM consumed WHERE key LIKE 'spot:%'")}
+                fill = spotbook.fill(book, r["asset"], r["qty"], used)
+                if fill is None:
+                    r["note"] = "Не хватает глубины спота или объём вне ограничений пары"
+                    if elapsed >= 1800:
+                        r["stage"], r["stage_ts"] = "sell", now - 1800
+                    return
+                qty, spent = dec(r["qty"]), dec(fill["spent"])
+                gross = dec(fill["gross"])
+                fee = gross * dec(leg["fee_pct"]) / 100
+                output = (gross - fee).quantize(COIN, rounding=ROUND_DOWN)
+                if output <= 0:
+                    return
+                leftover = qty - spent
+                if leftover:
+                    cost = dec(r["cost"]) * leftover / qty
+                    r.setdefault("dust", []).append({"asset": r["asset"], "venue": venue, "net": r["net"],
+                                                      "qty": str(leftover), "cost": str(cost)})
+                    r["cost"] = str(dec(r["cost"]) - cost)
+                for key, take, price in fill["takes"]:
+                    con.execute("INSERT OR REPLACE INTO consumed VALUES (?,?)", (key, str(dec(used.get(key, 0)) + dec(take))))
+                _event(con, r["id"], "spot", {"input": str(spent), "input_asset": r["asset"], "target": leg["target"],
+                                              "output": str(output), "fee": str(fee), "dust": str(leftover),
+                                              "venue": venue, "model": "orderbook_fok", "fill": fill, "book": book}, now)
+                r["qty"], r["asset"], r["venue"], r["net"] = str(output), leg["target"], venue, ""
+                r["leg"] += 1
+                r["stage_ts"], r["note"] = now, ""
+                return
             q = snap.spot.get(venue, {}).get(alt)
             if not q or paper._venue_down(snap, venue, alt) or not 0 < getattr(snap, "ts", 0) <= now <= snap.ts + 120:
                 r["note"] = "Нет котировки спота; монеты сохранены"
@@ -375,13 +414,18 @@ def report_lines(path=DB_PATH):
         lines.append(f"Исполненные продажи: сегодня {dec(s['period_profit']['day']):+.2f} ₽ · "
                      f"7 дней {dec(s['period_profit']['week']):+.2f} ₽")
     for r in s["runs"]:
+        for dust in r.get("dust", []):
+            if dec(dust["qty"]):
+                lines.append(f"Остаток округления #{r['id']}: {dust['qty']} {dust['asset']} на {html.escape(dust['venue'])}")
         if r["stage"] in ("done", "cancelled"):
             continue
         lines.append(f"#{r['id']} · {r['stage']} · {r['venue']} · {r['qty']} {r['asset']}"
                      + (" (в пути)" if r["in_transit"] else "") + f" · себестоимость {dec(r['cost']):.2f} ₽")
         if r["note"]:
             lines.append(html.escape(r["note"]))
-    lines.append("P2P: модель исполнения объявлений; спот: котировки без подтверждения глубины. Хеджи исключены.")
+    if any("Спот: котировка без глубины" in r["assumptions"] for r in s["runs"]):
+        lines.append("В истории есть обмены по тикеру без глубины; они помечены как приближённые.")
+    lines.append("P2P: модель исполнения объявлений; спот: весь допустимый объём по стакану либо ожидание. Хеджи исключены.")
     return lines
 
 
@@ -392,6 +436,9 @@ def _mark(con, snap, now):
     for state, in con.execute("SELECT state FROM runs"):
         r = json.loads(state)
         total += dec(r["reserved"])
+        for dust in r.get("dust", []):
+            key = (dust["venue"], dust["asset"], dust["net"] if dust["venue"] == "BestChange" else "")
+            positions[key] = positions.get(key, ZERO) + dec(dust["qty"])
         qty = dec(r["qty"])
         if not qty:
             continue
@@ -399,7 +446,7 @@ def _mark(con, snap, now):
             # An asset in transit is not immediately liquidatable.
             _event(con, None, "valuation_unknown", {"reason": "in_transit"}, now)
             return
-        key = (r["venue"], r["asset"], r["net"])
+        key = (r["venue"], r["asset"], r["net"] if r["venue"] == "BestChange" else "")
         positions[key] = positions.get(key, ZERO) + qty
     for (venue, asset, net), qty in positions.items():
         ads = _ads(snap, venue, "sell", asset, net, now)
@@ -434,6 +481,10 @@ def _verify(con):
             if dec(r[name]) < 0:
                 raise ValueError(f"Negative {name} in run {r['id']}")
         balance += dec(r["reserved"]) + dec(r["cost"]) - dec(r["realized"])
+        for dust in r.get("dust", []):
+            if dec(dust["qty"]) < 0 or dec(dust["cost"]) < 0:
+                raise ValueError("Negative rounding remainder")
+            balance += dec(dust["cost"])
     if abs(balance - initial) > Decimal("0.000000000001"):
         raise ValueError("Portfolio reconciliation failed")
 
@@ -490,6 +541,36 @@ def replay(path=DB_PATH):
         return {"cash": str(cash), "runs": list(states.values())}
     finally:
         con.close()
+
+
+def needed_books(path=DB_PATH):
+    pairs = set()
+    for r in runs(path, active=True):
+        if r["stage"] != "route" or r["leg"] >= len(r["route"]) or r["settings"].get("spot_model", "depth") == "ticker":
+            continue
+        leg = r["route"][r["leg"]]
+        if leg["kind"] == "spot":
+            pairs.add((leg["venue"], leg["target"] if leg["asset"] == "USDT" else leg["asset"]))
+    return pairs
+
+
+def _sell_dust(con, run, snap, now):
+    for dust in run.get("dust", []):
+        remaining = dec(dust["qty"])
+        for ad in _ads(snap, dust["venue"], "sell", dust["asset"], dust["net"], now):
+            qty = _take(con, ad, remaining)
+            if not qty:
+                continue
+            proceeds = (qty * dec(ad.price)).quantize(RUB, rounding=ROUND_DOWN)
+            cost = dec(dust["cost"]) * qty / remaining
+            dust["cost"] = str(dec(dust["cost"]) - cost)
+            remaining -= qty
+            run["proceeds"] = str(dec(run["proceeds"]) + proceeds)
+            run["realized"] = str(dec(run["realized"]) + proceeds - cost)
+            _cash(con, proceeds)
+            _event(con, run["id"], "sell", {"qty": str(qty), "rub": str(proceeds), "cost": str(cost),
+                                            "asset": dust["asset"], "venue": dust["venue"], "rounding_remainder": True}, now)
+        dust["qty"] = str(remaining)
 
 
 def export(destination, path=DB_PATH):

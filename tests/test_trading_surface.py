@@ -408,6 +408,14 @@ ALLOWED_SENDERS = {
 # p2p._json шлёт только это (метод, хост, путь; путь с «/» на конце — префикс + монета). Расширить — только владелец:
 # сначала сюда (защищённый файл), потом в p2p.JSON_ALLOWED.
 JSON_ALLOWED_PIN = frozenset({
+    ("GET", "api.bybit.com", "/v5/market/orderbook"),
+    ("GET", "api.bybit.com", "/v5/market/instruments-info"),
+    ("GET", "api.mexc.com", "/api/v3/depth"),
+    ("GET", "api.mexc.com", "/api/v3/exchangeInfo"),
+    ("GET", "api.htx.com", "/market/depth"),
+    ("GET", "api.htx.com", "/v1/common/symbols"),
+    ("GET", "api.kucoin.com", "/api/v1/market/orderbook/level2_100"),
+    ("GET", "api.kucoin.com", "/api/v2/symbols/"),
     ("POST", "api2.bybit.com", "/fiat/otc/configuration/queryAllPaymentList"),
     ("POST", "api2.bybit.com", "/fiat/otc/item/online"),
     ("GET", "www.htx.com", "/-/x/otc/v1/data/trade-market"),

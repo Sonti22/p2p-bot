@@ -24,6 +24,7 @@ def snapshot(*ads, spot=None, now=1000):
 
 @pytest.fixture
 def cfg(monkeypatch):
+    monkeypatch.setenv("PAPER_SPOT_MODEL", "ticker")
     monkeypatch.setenv("PAPER_PAY_MINUTES", "0")
     monkeypatch.setenv("PAPER_TRANSFER_MINUTES", "0")
     return p2p.Config()

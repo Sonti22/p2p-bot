@@ -41,6 +41,7 @@ import signal_funnel
 import simperp
 import sqlite3
 import portfolio
+import spotbook
 import snapshots
 import trades
 import trading.wiring
@@ -3602,7 +3603,11 @@ class Bot:
         """Один шаг виртуального маршрута по свежим данным; состояние и журнал атомарны."""
         if not self.chat_id:
             return
-        for notice in portfolio.tick(snap, self.cfg):
+        pairs = portfolio.needed_books()
+        books, errors = await spotbook.load(self.s, pairs) if pairs else ({}, {})
+        for (venue, asset), error in errors.items():
+            logger.warning("paper spot depth unavailable: %s/%s (%s)", venue, asset, error)
+        for notice in portfolio.tick(snap, self.cfg, books=books):
             await self.send("🧪 " + html.escape(notice), topic="signals")
 
     def paper_hedge_tick(self, snap):
