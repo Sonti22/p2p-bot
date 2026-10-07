@@ -1,0 +1,505 @@
+"""Durable paper portfolio. No exchange requests or real money operations.
+
+Decimal strings are the source of truth; every state transition and its audit
+event are committed together. Legacy paper.db is deliberately not imported.
+"""
+import csv
+import html
+import json
+import os
+import sqlite3
+import time
+from decimal import Decimal, ROUND_DOWN, ROUND_UP, localcontext
+
+import p2p
+import paper
+
+DB_PATH = os.path.join(os.path.dirname(__file__), "data", "paper_portfolio.db")
+EXPORT_PATH = os.path.join(os.path.dirname(__file__), "data", "paper_portfolio.csv")
+ZERO = Decimal(0)
+COIN = Decimal("0.000000000000000001")
+RUB = Decimal("0.01")
+
+
+def dec(value):
+    value = Decimal(str(value))
+    if not value.is_finite():
+        raise ValueError("Non-finite portfolio amount")
+    return value
+
+
+def connect(path=DB_PATH):
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    con = sqlite3.connect(path, timeout=30)
+    con.execute("CREATE TABLE IF NOT EXISTS wallet (id INTEGER PRIMARY KEY CHECK(id=1), initial TEXT, cash TEXT)")
+    con.execute("CREATE TABLE IF NOT EXISTS runs (id INTEGER PRIMARY KEY, state TEXT NOT NULL)")
+    con.execute("CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY, run_id INTEGER, ts REAL, kind TEXT, details TEXT)")
+    con.execute("CREATE TABLE IF NOT EXISTS consumed (key TEXT PRIMARY KEY, qty TEXT)")
+    con.execute("CREATE TABLE IF NOT EXISTS equity (ts REAL PRIMARY KEY, value TEXT)")
+    con.commit()
+    return con
+
+
+def _event(con, run, kind, details, now):
+    con.execute("INSERT INTO events(run_id,ts,kind,details) VALUES (?,?,?,?)",
+                (run, now, kind, json.dumps(details, ensure_ascii=False)))
+
+
+def _save(con, run):
+    con.execute("UPDATE runs SET state=? WHERE id=?", (json.dumps(run, ensure_ascii=False), run["id"]))
+
+
+def runs(path=DB_PATH, active=False):
+    if not os.path.exists(path):
+        return []
+    con = connect(path)
+    try:
+        values = [json.loads(r[0]) for r in con.execute("SELECT state FROM runs ORDER BY id")]
+        return [r for r in values if r["stage"] not in ("done", "cancelled")] if active else values
+    finally:
+        con.close()
+
+
+def start(amount, buy, sell, hops, planned_pct, pay_fee=0, path=DB_PATH, now=None, max_open=1,
+          bank="", pay_kind="", spot_fees=None, measures=None):
+    """Reserve principal atomically; a second process cannot spend the same cash."""
+    now = time.time() if now is None else now
+    amount = dec(amount).quantize(RUB, rounding=ROUND_DOWN)
+    fee = dec(pay_fee)
+    if amount <= 0 or not ZERO <= fee < 100 or not hops or not hops.get("hops") or max_open < 1:
+        raise ValueError("Invalid amount, fee or missing immutable route")
+    if hops["hops"][0]["asset"] != buy.asset or hops["hops"][-1]["asset"] != sell.asset:
+        raise ValueError("Route assets do not match the offers")
+    con = connect(path)
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        con.execute("INSERT OR IGNORE INTO wallet VALUES (1, '50000.00', '50000.00')")
+        initial, cash = con.execute("SELECT initial,cash FROM wallet").fetchone()
+        open_count = sum(json.loads(r[0])["stage"] not in ("done", "cancelled")
+                         for r in con.execute("SELECT state FROM runs"))
+        if dec(cash) < amount or open_count >= max_open:
+            con.rollback()
+            return None
+        route = []
+        hs = hops["hops"]
+        for index, h in enumerate(hs):
+            if h["frm"] == h["to"] == "BestChange":
+                route.extend([dict(h, kind="transfer", to="Bybit", to_net=h.get("frm_net") or "", fee=0),
+                              dict(h, kind="transfer", frm="Bybit", frm_net=h.get("frm_net") or "")])
+            else:
+                route.append(dict(h, kind="transfer"))
+            if index + 1 < len(hs) and h["asset"] != hs[index + 1]["asset"]:
+                source, target = h["asset"], hs[index + 1]["asset"]
+                if source != "USDT" and target != "USDT":
+                    route.append({"kind": "spot", "venue": h["to"], "asset": source, "target": "USDT"})
+                    source = "USDT"
+                route.append({"kind": "spot", "venue": h["to"], "asset": source, "target": target})
+        for leg in route:
+            if leg["kind"] == "spot":
+                leg["fee_pct"] = str(dec((spot_fees or {}).get(leg["venue"], p2p._spot_fee(p2p.Config(), leg["venue"]))))
+                if not 0 <= dec(leg["fee_pct"]) < 100:
+                    raise ValueError("Invalid spot fee")
+            else:
+                leg["minutes"] = paper.hops_transfer_minutes([leg], paper.net_minutes_table(), paper.settings()["transfer_minutes"])
+        cur = con.execute("INSERT INTO runs(state) VALUES ('{}')")
+        run = {"id": cur.lastrowid, "start": now, "stage_ts": now, "stage": "buy", "amount": str(amount),
+               "reserved": str(amount), "spent": "0", "proceeds": "0", "qty": "0", "cost": "0",
+               "realized": "0", "asset": buy.asset, "venue": buy.ex, "net": buy.net or "",
+               "buy_ex": buy.ex, "buy_asset": buy.asset, "buy_price": str(buy.price), "buy_nick": buy.nick,
+               "buy_pays": list(buy.pays), "sell_ex": sell.ex, "sell_asset": sell.asset, "sell_net": sell.net or "",
+               "route": route, "leg": 0, "pay_fee": str(fee), "planned_pct": planned_pct,
+               "bank": bank, "pay_kind": pay_kind,
+               "settings": paper.settings(),
+               "measures": measures or {},
+               "note": "", "assumptions": [], "in_transit": False}
+        _save(con, run)
+        con.execute("UPDATE wallet SET cash=?", (str(dec(cash) - amount),))
+        _event(con, run["id"], "reserve", {"rub": str(amount), "initial": initial}, now)
+        _event(con, run["id"], "state", run, now)
+        con.commit()
+        return run
+    finally:
+        con.close()
+
+
+def _cash(con, delta):
+    cash, = con.execute("SELECT cash FROM wallet").fetchone()
+    value = dec(cash) + delta
+    if value < 0:
+        raise ValueError("Negative free cash")
+    con.execute("UPDATE wallet SET cash=?", (str(value),))
+
+
+def _ads(snap, venue, side, asset, net, now):
+    if paper._venue_down(snap, venue, asset):
+        return []
+    return sorted((a for a in snap.groups.get((venue, side, asset), [])
+                   if a.fetched_ts > 0 and 0 <= now - a.fetched_ts <= 120
+                   and (venue != "BestChange" or not net or a.net == net) and a.price > 0 and a.avail > 0),
+                  key=lambda a: a.price, reverse=side == "sell")
+
+
+def _take(con, ad, wanted):
+    """A cached offer's quantity can be consumed only once across all runs."""
+    key = _offer_key(ad)
+    row = con.execute("SELECT qty FROM consumed WHERE key=?", (key,)).fetchone()
+    used = dec(row[0]) if row else ZERO
+    take = min(wanted, max(ZERO, dec(ad.avail) - used), dec(ad.max_amt) / dec(ad.price))
+    take = take.quantize(COIN, rounding=ROUND_DOWN)
+    if take <= 0 or take * dec(ad.price) < dec(ad.min_amt):
+        return ZERO
+    con.execute("INSERT OR REPLACE INTO consumed VALUES (?,?)", (key, str(used + take)))
+    return take
+
+
+def _offer_key(ad):
+    return json.dumps([ad.ex, ad.side, ad.asset, ad.ad_id or ad.nick, ad.net, ad.fetched_ts, ad.price])
+
+
+def tick(snap, cfg, path=DB_PATH, now=None):
+    """Execute one durable step per scan; no fabricated fills on missing data."""
+    now = time.time() if now is None else now
+    notices = []
+    if cfg.fiat != "RUB":
+        return notices  # Preserve holdings; foreign-fiat offers cannot price this RUB wallet.
+    if not os.path.exists(path):
+        return notices
+    con = connect(path)
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        for state, in con.execute("SELECT state FROM runs ORDER BY id").fetchall():
+            run = json.loads(state)
+            if run["stage"] in ("done", "cancelled"):
+                continue
+            with localcontext() as ctx:
+                ctx.prec = 40
+                _step(con, run, snap, cfg, now)
+            _save(con, run)
+            if state != json.dumps(run, ensure_ascii=False):
+                _event(con, run["id"], "state", run, now)
+            if run["stage"] in ("done", "cancelled"):
+                label = "завершён" if run["stage"] == "done" else "покупка отменена"
+                notices.append(f"Круг #{run['id']} {label}, результат {dec(run['realized']):+.2f} ₽")
+        with localcontext() as ctx:
+            ctx.prec = 40
+            _mark(con, snap, now)
+            _verify(con)
+        con.commit()
+    except Exception:
+        con.rollback()
+        raise
+    finally:
+        con.close()
+    return notices
+
+
+def _step(con, r, snap, cfg, now):
+    st = r["settings"]
+    elapsed = now - r["stage_ts"]
+    if r["stage"] == "buy":
+        if elapsed < st["pay_minutes"] * 60:
+            return
+        budget = dec(r["reserved"])
+        for ad in _ads(snap, r["venue"], "buy", r["asset"], r["net"], now):
+            if not set(ad.pays).intersection(r["buy_pays"]):
+                continue
+            if dec(ad.price) > dec(r["buy_price"]) * (1 + dec(st["buy_slip_max"]) / 100):
+                continue
+            price = dec(ad.price)
+            multiplier = 1 - dec(r["pay_fee"]) / 100
+            qty = _take(con, ad, budget * multiplier / price)
+            if not qty:
+                continue
+            paid = (qty * price / multiplier).quantize(RUB, rounding=ROUND_UP)
+            budget -= paid
+            r["qty"] = str(dec(r["qty"]) + qty)
+            r["spent"] = str(dec(r["spent"]) + paid)
+            r["cost"] = r["spent"]
+            _event(con, r["id"], "buy", {"qty": str(qty), "asset": r["asset"], "rub": str(paid),
+                                         "bank_fee_rub": str(paid - qty * price), "price": str(price),
+                                         "bank": r["bank"], "pay_kind": r["pay_kind"],
+                                         "offer": ad.ad_id or ad.nick, "quote_ts": ad.fetched_ts}, now)
+        r["reserved"] = str(budget)
+        if budget <= RUB or elapsed >= (st["pay_minutes"] + 30) * 60:
+            _cash(con, budget)
+            r["reserved"] = "0"
+            r["stage"] = "route" if dec(r["qty"]) else "cancelled"
+            r["stage_ts"] = now
+            _event(con, r["id"], "release", {"rub": str(budget)}, now)
+        return
+    if r["stage"] == "route":
+        if r["leg"] >= len(r["route"]):
+            r["stage"], r["stage_ts"] = "sell", now
+            return
+        leg = r["route"][r["leg"]]
+        if leg["kind"] == "spot":
+            venue = leg["venue"]
+            alt = leg["target"] if r["asset"] == "USDT" else r["asset"]
+            q = snap.spot.get(venue, {}).get(alt)
+            if not q or paper._venue_down(snap, venue, alt) or not 0 < getattr(snap, "ts", 0) <= now <= snap.ts + 120:
+                r["note"] = "Нет котировки спота; монеты сохранены"
+                if elapsed >= 1800:
+                    r["stage"], r["stage_ts"] = "sell", now - 1800
+                return
+            bid, ask = map(dec, q)
+            if bid <= 0 or ask < bid:
+                return
+            qty = dec(r["qty"])
+            gross = qty / ask if r["asset"] == "USDT" else qty * bid
+            fee = dec(leg["fee_pct"]) / 100
+            output = (gross * (1 - fee)).quantize(COIN, rounding=ROUND_DOWN)
+            if output <= 0:
+                return
+            _event(con, r["id"], "spot", {"input": str(qty), "asset": r["asset"], "target": leg["target"],
+                                          "output": str(output), "fee": str(gross * fee), "venue": venue,
+                                          "bid": str(bid), "ask": str(ask), "snapshot_ts": snap.ts,
+                                          "model": "ticker_without_depth"}, now)
+            r["qty"], r["asset"], r["venue"] = str(output), leg["target"], venue
+            r["net"] = ""
+            if "Спот: котировка без глубины" not in r["assumptions"]:
+                r["assumptions"].append("Спот: котировка без глубины")
+        else:
+            if not r["in_transit"]:
+                closed, unknown = paper._hop_state(leg) if leg["frm"] != leg["to"] else ([], [])
+                if closed or unknown:
+                    r["note"] = "; ".join(closed + unknown) + "; монеты сохранены"
+                    if elapsed >= 1800:
+                        r["stage"], r["stage_ts"] = "sell", now - 1800
+                    return
+                qty, fee = dec(r["qty"]), dec(leg.get("fee") or 0)
+                if leg["frm"] != leg["to"]:
+                    current_fee, _, current_net = p2p._hop_detail(
+                        cfg, leg["frm"], leg.get("frm_net") or "", leg["to"], leg.get("to_net") or "",
+                        leg["asset"], qty=float(qty), parts=leg.get("parts") or 1)
+                    if current_fee is None or (leg.get("to_net") and current_net != leg["to_net"]):
+                        r["note"] = "Перевод недоступен для фактического остатка"
+                        if elapsed >= 1800:
+                            r["stage"], r["stage_ts"] = "sell", now - 1800
+                        return
+                    fee = dec(current_fee)
+                if qty <= fee:
+                    r["note"] = "Остаток меньше комиссии перевода"
+                    return
+                r["qty"] = str(qty - fee)
+                r["in_transit"], r["stage_ts"] = True, now
+                _event(con, r["id"], "transfer_sent", {"qty": r["qty"], "fee": str(fee), "hop": leg}, now)
+                return
+            delay = leg["minutes"]
+            if elapsed < delay * 60:
+                return
+            if leg["frm"] != leg["to"]:
+                closed, unknown = paper._hop_state(leg)
+                if closed or unknown:
+                    r["note"] = "Зачисление не подтверждено: " + "; ".join(closed + unknown)
+                    return
+            r["venue"], r["net"], r["in_transit"] = leg["to"], leg.get("to_net") or "", False
+            _event(con, r["id"], "transfer_received", {"qty": r["qty"], "venue": r["venue"]}, now)
+        r["leg"] += 1
+        r["stage_ts"], r["note"] = now, ""
+        return
+    if r["stage"] == "sell":
+        remaining = dec(r["qty"])
+        for ad in _ads(snap, r["venue"], "sell", r["asset"], r["net"], now):
+            qty = _take(con, ad, remaining)
+            if not qty:
+                continue
+            price = dec(ad.price)
+            # First 30 minutes preserve the projected break-even; afterwards accept losses.
+            if elapsed < 1800 and qty * price < dec(r["cost"]) * qty / remaining:
+                # No execution: undo the provisional offer consumption.
+                key = _offer_key(ad)
+                used, = con.execute("SELECT qty FROM consumed WHERE key=?", (key,)).fetchone()
+                con.execute("UPDATE consumed SET qty=? WHERE key=?", (str(dec(used) - qty), key))
+                continue
+            proceeds = (qty * price).quantize(RUB, rounding=ROUND_DOWN)
+            cost = dec(r["cost"]) * qty / remaining
+            r["cost"] = str(dec(r["cost"]) - cost)
+            r["realized"] = str(dec(r["realized"]) + proceeds - cost)
+            r["proceeds"] = str(dec(r["proceeds"]) + proceeds)
+            remaining -= qty
+            _cash(con, proceeds)
+            _event(con, r["id"], "sell", {"qty": str(qty), "rub": str(proceeds), "cost": str(cost),
+                                          "price": str(price), "quote_ts": ad.fetched_ts}, now)
+        r["qty"] = str(remaining)
+        if remaining == 0:
+            r["stage"] = "done"
+        else:
+            r["note"] = "Остаток сохранён; ждём доступную продажу"
+
+
+def summary(path=DB_PATH):
+    if not os.path.exists(path):
+        return {"initial": "50000.00", "cash": "50000.00", "reserved": "0", "realized": "0", "runs": []}
+    con = connect(path)
+    try:
+        row = con.execute("SELECT initial,cash FROM wallet").fetchone()
+        values = [json.loads(r[0]) for r in con.execute("SELECT state FROM runs")]
+        last_mark = con.execute("SELECT ts,kind,details FROM events WHERE kind IN ('valuation','valuation_unknown') "
+                                "ORDER BY id DESC LIMIT 1").fetchone()
+        marks = (last_mark[0], json.loads(last_mark[2])["value"]) if last_mark and last_mark[1] == "valuation" else None
+        peak, max_drawdown = dec("50000"), ZERO
+        for value, in con.execute("SELECT value FROM equity ORDER BY ts"):
+            peak = max(peak, dec(value))
+            max_drawdown = max(max_drawdown, (peak - dec(value)) / peak * 100)
+        now = time.time()
+        periods = {}
+        for name, since in (("day", paper._day_start(now)), ("week", now - 7 * 86400)):
+            periods[name] = str(sum((dec(d["rub"]) - dec(d["cost"]) for raw, in
+                                    con.execute("SELECT details FROM events WHERE kind='sell' AND ts>=?", (since,))
+                                    for d in [json.loads(raw)]), ZERO))
+        return {"initial": row[0] if row else "50000.00", "cash": row[1] if row else "50000.00",
+                "reserved": str(sum((dec(r["reserved"]) for r in values), ZERO)),
+                "realized": str(sum((dec(r["realized"]) for r in values), ZERO)), "runs": values,
+                "equity": marks[1] if marks else None, "mark_ts": marks[0] if marks else None,
+                "period_profit": periods,
+                "drawdown_pct": str(max_drawdown) if marks else None}
+    finally:
+        con.close()
+
+
+def report_lines(path=DB_PATH):
+    s = summary(path)
+    lines = ["🧪 <b>Виртуальный портфель</b>", f"Начальный капитал: {dec(s['initial']):.2f} ₽",
+             f"Свободно: {dec(s['cash']):.2f} ₽ · резерв: {dec(s['reserved']):.2f} ₽",
+             f"Прибыль исполненных продаж: {dec(s['realized']):+.2f} ₽",
+             "Открытые позиции оцениваются отдельно; неизвестная цена не равна нулю."]
+    if s.get("equity") is not None:
+        pnl = dec(s["equity"]) - dec(s["initial"])
+        lines.append(f"Оценка портфеля: {dec(s['equity']):.2f} ₽ · результат {pnl:+.2f} ₽ "
+                     f"({pnl / dec(s['initial']) * 100:+.2f}%) · макс. просадка {dec(s['drawdown_pct']):.2f}%")
+        lines.append(f"Оценка на {time.strftime('%d.%m %H:%M:%S', time.localtime(s['mark_ts']))}")
+        lines.append(f"Переоценка открытых позиций: {pnl - dec(s['realized']):+.2f} ₽")
+    else:
+        lines.append("Общая оценка и доходность: нет свежей полной оценки открытых позиций.")
+    if s.get("period_profit"):
+        lines.append(f"Исполненные продажи: сегодня {dec(s['period_profit']['day']):+.2f} ₽ · "
+                     f"7 дней {dec(s['period_profit']['week']):+.2f} ₽")
+    for r in s["runs"]:
+        if r["stage"] in ("done", "cancelled"):
+            continue
+        lines.append(f"#{r['id']} · {r['stage']} · {r['venue']} · {r['qty']} {r['asset']}"
+                     + (" (в пути)" if r["in_transit"] else "") + f" · себестоимость {dec(r['cost']):.2f} ₽")
+        if r["note"]:
+            lines.append(html.escape(r["note"]))
+    lines.append("P2P: модель исполнения объявлений; спот: котировки без подтверждения глубины. Хеджи исключены.")
+    return lines
+
+
+def _mark(con, snap, now):
+    cash, = con.execute("SELECT cash FROM wallet").fetchone() or ("50000",)
+    total = dec(cash)
+    positions = {}
+    for state, in con.execute("SELECT state FROM runs"):
+        r = json.loads(state)
+        total += dec(r["reserved"])
+        qty = dec(r["qty"])
+        if not qty:
+            continue
+        if r["in_transit"]:
+            # An asset in transit is not immediately liquidatable.
+            _event(con, None, "valuation_unknown", {"reason": "in_transit"}, now)
+            return
+        key = (r["venue"], r["asset"], r["net"])
+        positions[key] = positions.get(key, ZERO) + qty
+    for (venue, asset, net), qty in positions.items():
+        ads = _ads(snap, venue, "sell", asset, net, now)
+        remaining_qty, value = qty, ZERO
+        for ad in ads:
+            used = con.execute("SELECT qty FROM consumed WHERE key=?", (_offer_key(ad),)).fetchone()
+            remaining = max(ZERO, dec(ad.avail) - (dec(used[0]) if used else ZERO))
+            take = min(remaining_qty, remaining, dec(ad.max_amt) / dec(ad.price))
+            if take <= 0 or take * dec(ad.price) < dec(ad.min_amt):
+                continue
+            value += take * dec(ad.price)
+            remaining_qty -= take
+        if remaining_qty > 0:
+            # Clear the display of an older complete valuation without inventing a zero price.
+            _event(con, None, "valuation_unknown", {"reason": "insufficient_fresh_depth"}, now)
+            return
+        total += value
+    con.execute("INSERT OR REPLACE INTO equity VALUES (?,?)", (now, str(total.quantize(RUB, rounding=ROUND_DOWN))))
+    _event(con, None, "valuation", {"value": str(total.quantize(RUB, rounding=ROUND_DOWN))}, now)
+
+
+def _verify(con):
+    """Cash + reserved + remaining historical cost - realized P&L = initial capital."""
+    row = con.execute("SELECT initial,cash FROM wallet").fetchone()
+    if not row:
+        return
+    initial, cash = map(dec, row)
+    balance = cash
+    for state, in con.execute("SELECT state FROM runs"):
+        r = json.loads(state)
+        for name in ("reserved", "qty", "cost"):
+            if dec(r[name]) < 0:
+                raise ValueError(f"Negative {name} in run {r['id']}")
+        balance += dec(r["reserved"]) + dec(r["cost"]) - dec(r["realized"])
+    if abs(balance - initial) > Decimal("0.000000000001"):
+        raise ValueError("Portfolio reconciliation failed")
+
+
+def reset(path=DB_PATH):
+    """Archive a consistent SQLite snapshot before resetting the independent wallet."""
+    if not os.path.exists(path):
+        return None
+    archive = os.path.join(os.path.dirname(path), f"paper-portfolio-archive-{time.time_ns()}.db")
+    con = connect(path)
+    source = sqlite3.connect(path)
+    target = sqlite3.connect(archive)
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        source.backup(target)
+        target.close()
+        for table in ("wallet", "runs", "events", "consumed", "equity"):
+            con.execute(f"DELETE FROM {table}")
+        con.execute("INSERT INTO wallet VALUES (1,'50000.00','50000.00')")
+        _event(con, None, "reset", {"archive": os.path.basename(archive)}, time.time())
+        con.commit()
+        return archive
+    finally:
+        source.close()
+        target.close()
+        con.close()
+
+
+def bank_month_total(bank, path=DB_PATH, now=None):
+    now = time.time() if now is None else now
+    if not os.path.exists(path):
+        return 0.0
+    con = connect(path)
+    try:
+        purchases = [json.loads(d) for d, in con.execute("SELECT details FROM events WHERE kind='buy' AND ts>=?",
+                                                       (paper._month_start(now),))]
+        return float(sum((dec(p["rub"]) for p in purchases if p.get("bank") == bank and p.get("pay_kind") == "sbp"), ZERO))
+    finally:
+        con.close()
+
+
+def replay(path=DB_PATH):
+    """Reconstruct latest run states and free RUB from the audit journal."""
+    con = connect(path)
+    try:
+        states = {}
+        for detail, in con.execute("SELECT details FROM events WHERE kind='state' ORDER BY id"):
+            state = json.loads(detail)
+            states[state["id"]] = state
+        with localcontext() as ctx:
+            ctx.prec = 40
+            cash = dec("50000") + sum((dec(r["proceeds"]) - dec(r["spent"]) - dec(r["reserved"])
+                                       for r in states.values()), ZERO)
+        return {"cash": str(cash), "runs": list(states.values())}
+    finally:
+        con.close()
+
+
+def export(destination, path=DB_PATH):
+    con = connect(path)
+    try:
+        rows = con.execute("SELECT id,run_id,ts,kind,details FROM events ORDER BY id").fetchall()
+        with open(destination, "w", encoding="utf-8-sig", newline="") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(("event_id", "run_id", "timestamp", "operation", "details"))
+            writer.writerows(rows)
+        return destination
+    finally:
+        con.close()

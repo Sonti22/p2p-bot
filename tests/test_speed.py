@@ -528,3 +528,8 @@ def test_env_settings(monkeypatch):
     monkeypatch.setenv("FRESH_WINDOW", "abc")
     cfg = p2p.Config.from_env()
     assert cfg.venue_timeout == p2p.VENUE_TIMEOUT_DEFAULT and cfg.fresh_window == p2p.FRESH_WINDOW_DEFAULT
+
+
+# Paper assertions in this module exercise the preserved historical engine.
+import pytest as _compat_pytest
+pytestmark = _compat_pytest.mark.usefixtures("legacy_paper_engine")

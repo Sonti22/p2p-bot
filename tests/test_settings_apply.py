@@ -44,3 +44,8 @@ def test_ladder_button_takes_effect_immediately(monkeypatch, tmp_path):
     bot = Stub(p2p.Config())
     arun(bot.on_callback({"id": "1", "data": "paper_ladder:20000", "message": {"message_id": 9}}))
     assert paper.settings()["amount"] == 20000
+
+
+# These regressions explicitly exercise the preserved historical engine.
+import pytest as _compat_pytest
+pytestmark = _compat_pytest.mark.usefixtures("legacy_paper_engine")

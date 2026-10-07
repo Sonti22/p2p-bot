@@ -386,3 +386,8 @@ def test_ton_hedges_with_per_venue_symbols():
     plan, _ = simperp.choose("TON", 70.0, 10000, RUB, 1.59 * RUB, now=NOW)
     assert plan["symbol"] == {"Bybit": "GRAMUSDT", "BingX": "GRAMTONUSDT"}[plan["venue"]]
     assert set(plan["alt"]) == {"Bybit", "BingX"} - {plan["venue"]}
+
+
+# These regressions explicitly exercise the preserved historical engine.
+import pytest as _compat_pytest
+pytestmark = _compat_pytest.mark.usefixtures("legacy_paper_engine")

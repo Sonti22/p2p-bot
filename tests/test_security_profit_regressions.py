@@ -129,3 +129,8 @@ def test_paper_profit_is_weighted_and_includes_losses():
     view = b.paper_view()
     assert "теоретическая прибыль +0.00 ₽" in view
     assert "стоимость оставшейся монеты" in view
+
+
+# These regressions explicitly exercise the preserved historical engine.
+import pytest as _compat_pytest
+pytestmark = _compat_pytest.mark.usefixtures("legacy_paper_engine")

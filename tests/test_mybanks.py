@@ -102,3 +102,8 @@ def test_paper_card_says_how_owner_pays(monkeypatch, tmp_path):
         arun(bot.notify(snap))
         card = [t for t in texts(bot) if "Сухой прогон" in t][-1]
         assert f"оплата: {expect}" in card, card
+
+
+# Paper assertions in this module exercise the preserved historical engine.
+import pytest as _compat_pytest
+pytestmark = _compat_pytest.mark.usefixtures("legacy_paper_engine")

@@ -374,3 +374,8 @@ def test_report_and_csv_show_new_reasons(tmp_path):
     text = Stub(_cfg()).paper_report_view(paper.report_rows())
     assert "причины срывов: цена покупки ушла дальше допуска 1, нет свежей котировки BestChange 1" in text
     assert "статус сети неизвестен 1×" in text and "у других мерчантов 1×" in text and "покупка к плану +0.34%" in text
+
+
+# These regressions explicitly exercise the preserved historical engine.
+import pytest as _compat_pytest
+pytestmark = _compat_pytest.mark.usefixtures("legacy_paper_engine")

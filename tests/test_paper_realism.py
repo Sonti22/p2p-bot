@@ -147,3 +147,8 @@ def test_ladder_button_answers_callback_once(monkeypatch):
     bot = Stub(p2p.Config())
     arun(bot.on_callback({"id": "1", "data": "paper_ladder:20000", "message": {"message_id": 9}}))
     assert [m for m, _ in bot.out].count("answerCallbackQuery") == 1
+
+
+# These regressions explicitly exercise the preserved historical engine.
+import pytest as _compat_pytest
+pytestmark = _compat_pytest.mark.usefixtures("legacy_paper_engine")

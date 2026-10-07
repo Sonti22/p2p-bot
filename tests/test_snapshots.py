@@ -545,3 +545,8 @@ def test_lean_snapshot_drops_ads_and_jobs():
                         perps={("Bybit", "BTCUSDT"): object()})
     lean = B._lean(snap)
     assert lean.ads == [] and lean.jobs == [] and lean.perps == {} and snap.ads and snap.perps
+
+
+# These regressions explicitly exercise the preserved historical engine.
+import pytest as _compat_pytest
+pytestmark = _compat_pytest.mark.usefixtures("legacy_paper_engine")

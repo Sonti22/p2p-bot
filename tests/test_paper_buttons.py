@@ -77,3 +77,8 @@ def test_guest_cannot_press_paper_buttons(monkeypatch, tmp_path):
     assert not paper.settings()["on"] and not env.exists()
     arun(bot.on_update(msg(42, "/paper on")))
     assert not paper.settings()["on"]
+
+
+# These regressions explicitly exercise the preserved historical engine.
+import pytest as _compat_pytest
+pytestmark = _compat_pytest.mark.usefixtures("legacy_paper_engine")
