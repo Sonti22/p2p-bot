@@ -357,6 +357,27 @@ def blocked(name, reason, now=None):
         con.close()
 
 
+def account_lines(name='base'):
+    maintain(name)
+    with context(name) as data:
+        con = pf.connect(path(name))
+        try:
+            lines = [f'🏦 Счета: {LABELS[name]} сценарий. Личные разрешения и неизвестные лимиты не подтверждены.']
+            for profile in data['profiles']['accounts']:
+                cash = con.execute('SELECT cash FROM bank_accounts WHERE id=?', (profile['id'],)).fetchone()[0]
+                used = _usage(con, profile, 'out', 'sbp', time.time(), 'month')
+                lines.append(html.escape(f"{profile['bank']} / {profile['tariff']}: свободно {cash} ₽; "
+                                         f"СБП контрагентам за месяц {used} ₽."))
+                terms = profile['product_terms']
+                lines.append(html.escape('Каналы: ' + ', '.join(profile['methods']) +
+                                         '; суточный предел СБП: ' + str(terms.get('per_day') or 'неизвестен') +
+                                         '; предел числа операций: неизвестен.'))
+            lines.append('/paper verified — строгий портфель и личные банковские профили.')
+            return lines
+        finally:
+            con.close()
+
+
 def reset_all():
     archives = []
     for name in VARIANTS:

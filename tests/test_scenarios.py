@@ -306,6 +306,8 @@ def test_telegram_default_comparison_export_and_signal_wiring(cfg, monkeypatch):
     assert 'Базовый сценарий' in texts(bot)[-1]
     arun(bot.cmd_paper('scenarios'))
     assert 'Стрессовый сценарий' in texts(bot)[-1]
+    arun(bot.cmd_paper('banks'))
+    assert 'Базовый сценарий' in texts(bot)[-1] and 'неизвестен' in texts(bot)[-1]
     arun(bot.cmd_paper('scenario-report stress'))
     exported = [params['path'] for method, params in bot.out if method == 'sendDocument'][-1]
     assert 'paper_scenario_stress.csv' in exported

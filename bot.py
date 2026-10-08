@@ -2461,7 +2461,8 @@ class Bot:
             except ValueError as exc:
                 await self.send("Расчёт отклонён: " + html.escape(str(exc)))
         elif sub == "banks":
-            await self.send("\n".join(portfolio.bank_report()))
+            import scenarios
+            await self.send('\n'.join(scenarios.account_lines() if scenarios.enabled() else portfolio.bank_report()))
         elif sub == "transfer":
             parts = rest.split()
             if len(parts) != 4:
