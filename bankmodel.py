@@ -437,7 +437,7 @@ def replay(con):
 
 
 def report(con, data, now):
-    lines = ['🏦 Банковская модель: строгая; неизвестные условия блокируют исполнение.']
+    lines = ['🏦 <b>Банковская модель: строгая</b>', '', 'Неизвестные условия блокируют исполнение.']
     for profile in data['accounts']:
         row = con.execute('SELECT cash FROM bank_accounts WHERE id=?', (profile['id'],)).fetchone()
         label = profile['bank'] + ' / ' + profile.get('tariff', 'неизвестный тариф')
@@ -447,7 +447,10 @@ def report(con, data, now):
         except (Blocked, ValueError, TypeError) as exc:
             status = str(exc)
         import html
-        lines.append(html.escape(f"{label}: {row[0] if row else '0'} ₽ — {status}"))
+        from display import rubles
+        lines.extend(['', '<b>' + html.escape(label) + '</b>',
+                      'Свободно: ' + rubles(row[0] if row else '0'),
+                      'Статус: ' + html.escape(status)])
         if status.startswith('профиль подтверждён'):
             for direction, name in (('out', 'исходящие'), ('in', 'входящие')):
                 try:
@@ -457,5 +460,6 @@ def report(con, data, now):
                                              f"операций {count} / {limit['count']}"))
                 except (Blocked, KeyError, ValueError):
                     lines.append('  Использованный месячный лимит не подтверждён.')
+    lines.append('')
     lines.append('Карты одного счёта не создают новые лимиты. Это не гарантия отсутствия блокировки.')
     return lines

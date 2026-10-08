@@ -34,7 +34,8 @@ def test_default_view_lists_owner_banks_and_tariffs(monkeypatch, tmp_path):
     assert not buttons["ownbank:Ozon Bank"].startswith("✅")
     assert buttons["ownbank:*"].startswith("✅")
     assert buttons["sbplim:T-Bank:100000"].startswith("✅") and buttons["sbplim:VTB:300000"].startswith("✅")
-    assert "Т-Банк — бесплатно по СБП 100 000 ₽" in text and "ВТБ — бесплатно по СБП 300 000 ₽" in text
+    assert "<b>Т-Банк</b>\nБесплатно по СБП: 100 000 ₽" in text
+    assert "\n\n<b>ВТБ</b>\nБесплатно по СБП: 300 000 ₽" in text
 
 
 def test_toggle_banks_and_star(monkeypatch, tmp_path):

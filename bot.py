@@ -1374,11 +1374,12 @@ def mybanks_view():
     остальных банках (перевод мерчанту в его банк — внутри банка) и бесплатный лимит СБП каждого по тарифу."""
     listed, star = trades.own_banks()
     lines = ["🏦 <b>Мои банки и лимиты СБП</b>", "",
-             "Есть у мерчанта твой банк — перевод внутри банка, лимит СБП не тратится. Мерчант принимает только СБП "
+             "Есть у мерчанта твой банк — перевод внутри банка, лимит СБП не тратится.\n\nМерчант принимает только СБП "
              "или чужой банк — бот считает оплату по СБП с первого твоего банка, у которого бесплатный лимит за "
              "месяц ещё не исчерпан.", ""]
     for b in listed:
-        lines.append(f"• {trades.BANK_NAMES.get(b, b)} — бесплатно по СБП {_limit_text(trades.free_limit(b))} в месяц")
+        lines.extend([f"<b>{html.escape(trades.BANK_NAMES.get(b, b))}</b>",
+                      f"Бесплатно по СБП: {_limit_text(trades.free_limit(b))} в месяц", ""])
     lines.append(f"• {'✅' if star else '➖'} карты и в любом другом банке")
     kb = [[{"text": ("✅ " if b in listed else "") + trades.BANK_NAMES.get(b, b), "callback_data": f"ownbank:{b}"}
            for b in MY_BANKS[i:i + 3]] for i in range(0, len(MY_BANKS), 3)]
@@ -2275,9 +2276,14 @@ class Bot:
                             f"{s['avg_fact']:+.2f}%, расхождение расчёт→факт {s['avg_diff']:+.2f} п.п.")
                 if s.get("plan_facts"):
                     line += f"; «как расчёт»/±0.5 у {s['plan_facts']} — не факт, в сравнение не идут"
-                lines.append(line)
+                heading = f"{label}: {s['count']} сделок"
+                lines.extend([line.replace(heading, f"<b>{heading}</b>", 1)
+                              .replace(", оборот", "\nОборот")
+                              .replace(", средний профит", "\nСредний профит")
+                              .replace("; факт", "\nфакт")
+                              .replace("; «как расчёт»", "\n«как расчёт»"), ""])
             else:
-                lines.append(f"{label}: сделок нет")
+                lines.extend([f"<b>{label}</b>", "Сделок нет", ""])
         lines += spread_lines(trades.plan_fact_spread(trades.period_start("month")))
         lines += direction_lines(trades.by_direction(trades.period_start("month")))
         banks = trades.month_banks()
@@ -2701,9 +2707,9 @@ class Bot:
         else:
             status = f"▶️ сканирую каждые {c.interval} с"
         text = (f"⚙️ <b>Настройки</b>\n\nПорог сигнала: <b>{c.min_profit:g}%</b> (1-я строка кнопок)\n"
-                f"Сумма круга: <b>{_money(c.amount)} ₽</b> (2-я строка)\nСтатус: {status}\n"
+                f"Сумма круга: <b>{_money(c.amount)} ₽</b> (2-я строка)\n\n<b>Работа бота</b>\nСтатус: {status}\n"
                 f"Тихие часы: {'✅ вкл' if self.quiet_on else '➖ выкл'} ({self.quiet_hours} МСК)\n\n"
-                f"Монеты: {', '.join(c.assets)}\nПлощадки: {', '.join(c.exchanges)}")
+                f"<b>Рынки и фильтры</b>\nМонеты: {', '.join(c.assets)}\nПлощадки: {', '.join(c.exchanges)}")
         if c.include_pay:
             text += f"\nБанки: {', '.join(c.include_pay)}"
         if c.same_venue_only:

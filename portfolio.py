@@ -555,19 +555,21 @@ def summary(path=DB_PATH):
 
 def report_lines(path=DB_PATH):
     s = summary(path)
-    lines = ["🧪 <b>Виртуальный портфель</b>", f"Начальный капитал: {dec(s['initial']):.2f} ₽",
-             f"Свободно: {dec(s['cash']):.2f} ₽ · резерв: {dec(s['reserved']):.2f} ₽",
+    lines = ["🧪 <b>Виртуальный портфель</b>", "", "<b>Деньги</b>", f"Начальный капитал: {dec(s['initial']):.2f} ₽",
+             f"Свободно: {dec(s['cash']):.2f} ₽",
+             f"Резерв: {dec(s['reserved']):.2f} ₽", "", "<b>Результат продаж</b>",
              f"Прибыль исполненных продаж: {dec(s['realized']):+.2f} ₽",
              "Открытые позиции оцениваются отдельно; неизвестная цена не равна нулю."]
     if "bank_expenses" in s:
-        lines.append(f"Расходы счетов/собственных переводов: {dec(s['bank_expenses']):.2f} ₽ · "
-                     f"результат после расходов: {dec(s['net_realized']):+.2f} ₽")
+        lines.append(f"Расходы счетов/собственных переводов: {dec(s['bank_expenses']):.2f} ₽\n"
+                     f"Результат после расходов: {dec(s['net_realized']):+.2f} ₽")
         lines.append(f"Рубли между своими счетами в пути: {dec(s['bank_in_transit']):.2f} ₽")
         lines.append(f"Прибыль новых кругов строгого этапа: {dec(s['strict_realized']):+.2f} ₽")
+    lines.extend(["", "<b>Оценка открытых позиций</b>"])
     if s.get("equity") is not None:
         pnl = dec(s["equity"]) - dec(s["initial"])
-        lines.append(f"Оценка портфеля: {dec(s['equity']):.2f} ₽ · результат {pnl:+.2f} ₽ "
-                     f"({pnl / dec(s['initial']) * 100:+.2f}%) · макс. просадка {dec(s['drawdown_pct']):.2f}%")
+        lines.append(f"Оценка портфеля: {dec(s['equity']):.2f} ₽\nРезультат {pnl:+.2f} ₽ "
+                     f"({pnl / dec(s['initial']) * 100:+.2f}%)\nМакс. просадка {dec(s['drawdown_pct']):.2f}%")
         lines.append(f"Оценка на {time.strftime('%d.%m %H:%M:%S', time.localtime(s['mark_ts']))}")
         lines.append(f"Переоценка открытых позиций: {pnl - dec(s.get('net_realized', s['realized'])):+.2f} ₽")
     else:
@@ -575,20 +577,28 @@ def report_lines(path=DB_PATH):
     if s.get("period_profit"):
         lines.append(f"Исполненные продажи: сегодня {dec(s['period_profit']['day']):+.2f} ₽ · "
                      f"7 дней {dec(s['period_profit']['week']):+.2f} ₽")
+    if s["runs"]:
+        lines.extend(["", "<b>Круги и остатки</b>"])
     for r in s["runs"]:
         for dust in r.get("dust", []):
             if dec(dust["qty"]):
                 lines.append(f"Остаток округления #{r['id']}: {dust['qty']} {dust['asset']} на {html.escape(dust['venue'])}")
         if r["stage"] in ("done", "cancelled"):
             continue
-        lines.append(f"#{r['id']} · {r['stage']} · {r['venue']} · {r['qty']} {r['asset']}"
-                     + (" (в пути)" if r["in_transit"] else "") + f" · себестоимость {dec(r['cost']):.2f} ₽")
+        stages = {'buy': 'Покупка', 'route': 'Обмен / перевод', 'sell': 'Продажа',
+                  'escrow': 'Разблокировка криптовалюты'}
+        lines.extend(['', f"<b>Круг #{r['id']}</b>",
+                      'Этап: ' + html.escape(stages.get(r['stage'], r['stage'])),
+                      'Площадка: ' + html.escape(r['venue']),
+                      html.escape(f"Актив: {r['qty']} {r['asset']}") + (" (в пути)" if r["in_transit"] else ""),
+                      f"Себестоимость: {dec(r['cost']):.2f} ₽"])
         if r["note"]:
             lines.append(html.escape(r["note"]))
     if any("Спот: котировка без глубины" in r["assumptions"] for r in s["runs"]):
         lines.append("В истории есть обмены по тикеру без глубины; они помечены как приближённые.")
     if any(r.get("origin_model") or r["settings"].get("bank_model", "legacy") != "strict" for r in s["runs"]):
         lines.append("В истории есть операции прежней модели без проверки персональных банковских условий.")
+    lines.extend(["", "<b>Модель расчёта</b>"])
     lines.append("P2P: модель исполнения объявлений; спот: весь допустимый объём по стакану либо ожидание. Хеджи исключены.")
     return lines
 

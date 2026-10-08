@@ -350,3 +350,20 @@ def test_guest_cannot_open_scenario_navigation(cfg):
         arun(b.on_update({'callback_query': {'id': '1', 'data': data,
             'message': {'chat': {'id': 42}, 'message_id': 7}}}))
         assert [method for method, _ in b.out] == ['answerCallbackQuery']
+
+
+def test_bank_screen_separates_accounts_and_translates_channels(cfg):
+    from display import rubles
+    lines = sc.account_lines('base')
+    text = '\n'.join(lines)
+    assert 'СБП между своими счетами' in text
+    assert 'По банковским реквизитам' in text
+    assert 'self_sbp' not in text and 'card_number' not in text and 'requisites' not in text
+    assert '49 901,00 ₽' in text
+    assert text.count('<b>Доступные каналы</b>') == 4
+    assert text.count('<b>Ограничения</b>') == 4
+    assert '\n\n<b>VTB' in text and 'неизвестен' in text
+    assert rubles('300000') == '300 000,00 ₽'
+    summary = '\n'.join(sc.report('base'))
+    for title in ('Деньги', 'Результат продаж', 'Оценка открытых позиций', 'Допущения сценария', 'Учтённые расходы'):
+        assert '<b>' + title + '</b>' in summary

@@ -120,16 +120,20 @@ def estimate(product_id, amount, used_month=0, *, own_account=False, used_day=0,
 def report_lines():
     import trades
     covered = {p['bank'] for p in PRODUCTS}
-    lines = [f'🏦 Каталог стандартных условий — проверка {CHECKED.isoformat()}.',
+    lines = [f'🏦 <b>Каталог стандартных условий</b>', f'Проверка: {CHECKED.isoformat()}', '',
              'Сценарий, не подтверждение разрешения банка. Капитал не увеличивается.',
              'СБП: базовый бесплатный порог 100 000 ₽/месяц; далее потолок комиссии '
              '0,5% превышения, максимум 1 500 ₽/перевод. Себе: 30 млн ₽/месяц.',
              'Порог комиссии — не лимит оборота. Карты одного банка делят использованный порог.']
     for p in PRODUCTS:
-        lines.append(html.escape(f"{p['id']}: {p['product']}; обслуживание: {p['service']}"))
+        lines.extend(['', '<b>' + html.escape(p['product']) + '</b>',
+                      'Код продукта: <code>' + html.escape(p['id']) + '</code>',
+                      'Обслуживание: ' + html.escape(p['service'])])
         lines.append(f'<a href="{p["source"]}">Условия продукта</a>')
     missing = [name for bank, name in trades.BANK_NAMES.items() if bank != 'SBP' and bank not in covered]
-    lines.append('Пока без проверенного продуктового тарифа: ' + html.escape(', '.join(missing)))
+    lines.extend(['', '<b>Пока без проверенного продуктового тарифа</b>'])
+    lines.extend('• ' + html.escape(name) for name in missing)
+    lines.append('')
     lines.append('Кредитные, зарплатные и премиальные условия не добавляют бесплатный капитал. '
                  'Неизвестные лимиты и разрешения сохраняются неизвестными.')
     return lines

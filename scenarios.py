@@ -306,23 +306,25 @@ def report(name='base'):
     maintain(name)
     with context(name):
         s = pf.summary(path(name))
-        lines = [f'🧪 {LABELS[name]} сценарий — отдельные 50 000 ₽, варианты не суммируются.']
+        lines = [f'🧪 <b>{LABELS[name]} сценарий</b>', 'Отдельные 50 000 ₽. Варианты не суммируются.', '']
         lines.extend(line.replace('Прибыль новых кругов строгого этапа', 'Прибыль сценарных кругов')
                      for line in pf.report_lines(path(name)))
         active = [r for r in s['runs'] if r['stage'] not in ('done', 'cancelled')]
         if not s['runs']:
             lines.append('Исполнимых новых сигналов пока нет; прибыль от продаж равна нулю.')
         cost = sum((pf.dec(r['cost']) + sum((pf.dec(d['cost']) for d in r.get('dust', [])), Decimal(0)) for r in s['runs']), Decimal(0))
-        lines.append(f'Себестоимость оставшихся активов: {cost:.2f} ₽; активных кругов: {len(active)}.')
+        lines.append(f'\n<b>Активы и исполнение</b>\nСебестоимость оставшихся активов: {cost:.2f} ₽\nАктивных кругов: {len(active)}')
         durations = [r['stage_ts'] - r['start'] for r in s['runs'] if r['stage'] == 'done']
         if durations:
             lines.append(f'Среднее время завершённого круга: {sum(durations) / len(durations) / 60:.1f} мин.')
-        lines.extend(html.escape(x) for x in ASSUMPTIONS)
+        lines.extend(['', '<b>Допущения сценария</b>'])
+        lines.extend('• ' + html.escape(x) for x in ASSUMPTIONS)
+        lines.extend(['', '<b>Учтённые расходы</b>'])
         con = pf.connect(path(name))
         try:
             paid_service = sum((pf.dec(v) for v, in con.execute("SELECT amount FROM bank_expenses WHERE kind='service'")), Decimal(0))
             bank_fees = sum((pf.dec(v) for v, in con.execute('SELECT fee FROM bank_payments')), Decimal(0))
-            lines.append(f'Справочно, уже учтено: обслуживание {paid_service:.2f} ₽; банковские комиссии {bank_fees:.2f} ₽.')
+            lines.append(f'Справочно, уже учтено:\nОбслуживание: {paid_service:.2f} ₽\nБанковские комиссии: {bank_fees:.2f} ₽')
             coins = {}
             for kind, raw in con.execute("SELECT kind,details FROM events WHERE kind IN ('spot','transfer_sent')"):
                 d = json.loads(raw)
@@ -338,7 +340,8 @@ def report(name='base'):
                              'Новые круги остановлены до оплаты.')
             last = con.execute("SELECT details FROM events WHERE kind IN ('bank_blocked','scenario_blocked') ORDER BY id DESC LIMIT 1").fetchone()
             if last:
-                lines.append('Последний отказ: ' + html.escape(json.loads(last[0])['reason']))
+                lines.extend(['', '<b>Последний отказ</b>'])
+                lines.append(html.escape(json.loads(last[0])['reason']))
         finally:
             con.close()
         return lines
@@ -362,17 +365,23 @@ def account_lines(name='base'):
     with context(name) as data:
         con = pf.connect(path(name))
         try:
-            lines = [f'🏦 Счета: {LABELS[name]} сценарий. Личные разрешения и неизвестные лимиты не подтверждены.']
+            from display import rubles, channel_name
+            lines = [f'🏦 <b>Счета · {LABELS[name]} сценарий</b>', '',
+                     'Личные разрешения и неизвестные лимиты не подтверждены.']
             for profile in data['profiles']['accounts']:
                 cash = con.execute('SELECT cash FROM bank_accounts WHERE id=?', (profile['id'],)).fetchone()[0]
                 used = _usage(con, profile, 'out', 'sbp', time.time(), 'month')
-                lines.append(html.escape(f"{profile['bank']} / {profile['tariff']}: свободно {cash} ₽; "
-                                         f"СБП контрагентам за месяц {used} ₽."))
                 terms = profile['product_terms']
-                lines.append(html.escape('Каналы: ' + ', '.join(profile['methods']) +
-                                         '; суточный предел СБП: ' + str(terms.get('per_day') or 'неизвестен') +
-                                         '; предел числа операций: неизвестен.'))
-            lines.append('/paper verified — строгий портфель и личные банковские профили.')
+                daily = terms.get('per_day')
+                lines.extend(['', '<b>' + html.escape(profile['bank'] + ' / ' + profile['tariff']) + '</b>',
+                              'Свободно: <b>' + rubles(cash) + '</b>',
+                              'СБП контрагентам за месяц: ' + rubles(used), '',
+                              '<b>Доступные каналы</b>'])
+                lines.extend('• ' + html.escape(channel_name(method)) for method in profile['methods'])
+                lines.extend(['', '<b>Ограничения</b>',
+                              '• Суточный предел СБП: ' + (rubles(daily) if daily is not None else 'неизвестен'),
+                              '• Число операций: неизвестно'])
+            lines.extend(['', '/paper verified — строгий портфель и личные банковские профили.'])
             return lines
         finally:
             con.close()

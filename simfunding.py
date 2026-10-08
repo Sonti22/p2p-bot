@@ -270,18 +270,20 @@ def view(path=DB_PATH, now=None):
     cfg = settings()
     s = stats(path, now)
     lines = ["💱 <b>Арбитраж фандинга — бумага</b> (ордеров нет)",
-             f"Статус: {'🟢 включён' if cfg['on'] else '⚪ выключен'} · позиция {cfg['notional']:g} USDT на ногу · "
+             f"Статус: {'🟢 включён' if cfg['on'] else '⚪ выключен'}\nпозиция {cfg['notional']:g} USDT на ногу\n"
              f"вход от {cfg['entry_apr']:g}% годовых, окупаемость ≤ {cfg['payback_h']:g} ч, выход ниже "
              f"{cfg['exit_apr']:g}%", ""]
     if s["open"]:
         lines.append("<b>Открыто:</b>")
         for p in s["open"]:
+            lines.append("")
             hours = (now - p["ts_open"]) / 3600
             lines.append(f"• #{p['id']} {SCHEMES.get(p['scheme'], p['scheme'])} {p['symbol']}: лонг {p['long_venue']}, "
-                         f"шорт {p['short_venue']}, {hours:.0f} ч, фандинг {p['funding'] or 0:+.2f}, "
-                         f"MTM {p['mtm'] or 0:+.2f} USDT (вход при {p['apr_open']:.1f}%)")
+                         f"\nШорт {p['short_venue']}, {hours:.0f} ч, фандинг {p['funding'] or 0:+.2f}, "
+                         f"\nMTM {p['mtm'] or 0:+.2f} USDT (вход при {p['apr_open']:.1f}%)")
     else:
         lines.append("Открытых позиций нет.")
+    lines.extend(["", "<b>Результаты и наблюдения</b>"])
     if s["closed"]:
         line = (f"Закрыто {s['closed']} (в плюсе {s['wins']}): итог {s['pnl']:+.2f} USDT = фандинг "
                 f"{s['funding']:+.2f} − комиссии {s['fees']:.2f} ± базис")
@@ -289,8 +291,8 @@ def view(path=DB_PATH, now=None):
             line += f", {s['apr']:+.1f}% годовых на позицию"
         lines.append(line + f"; при комиссиях ×2, как в бэктесте, — {s['pnl'] - s['fees']:+.2f} USDT")
     lines.append(f"Расчётов фандинга: {s['settlements']}" + (f" (оценочных {s['approx']})" if s["approx"] else "")
-                 + f" · худший MTM {s['worst_mtm']:+.2f} USDT · данных {s['days']:.1f} дн."
-                 + ("" if s["last_tick"] is None else f" · последний тик {max(now - s['last_tick'], 0) // 60:.0f} мин назад"))
+                 + f"\nхудший MTM {s['worst_mtm']:+.2f} USDT\nданных {s['days']:.1f} дн."
+                 + ("" if s["last_tick"] is None else f"\nпоследний тик {max(now - s['last_tick'], 0) // 60:.0f} мин назад"))
     market = candidates(now, cfg)
     if market:
         lines += ["", "<b>Сейчас</b> (годовых по текущей ставке):"]
