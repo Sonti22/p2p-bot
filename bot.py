@@ -2420,7 +2420,26 @@ class Bot:
         обнулить (paper_reset:yes → paper.reset, база в архив)."""
         sub, _, rest = arg.strip().partition(" ")
         sub = sub.lower()
-        if sub == "banks":
+        if sub == "catalog":
+            import bankcatalog
+            await self.send("\n".join(bankcatalog.report_lines()))
+        elif sub == "bankfee":
+            import bankcatalog
+            parts = rest.split()
+            if len(parts) not in (3, 4) or (len(parts) == 4 and parts[3] != "own"):
+                await self.send("/paper bankfee продукт сумма уже_переведено_за_месяц [own]. "
+                                "Продукты: /paper catalog. own — только между своими счетами.")
+                return
+            try:
+                quote = bankcatalog.estimate(parts[0], parts[1], parts[2],
+                                             own_account=len(parts) == 4)
+                await self.send("Сценарная комиссия: " + quote['fee'] + " ₽. "
+                                "Это не чистая прибыль: обслуживание, расходы биржи, "
+                                "финансирование и персональные ограничения здесь не вычтены. "
+                                "Расчёт не открывает виртуальную сделку и не подтверждает разрешение банка.")
+            except ValueError as exc:
+                await self.send("Расчёт отклонён: " + html.escape(str(exc)))
+        elif sub == "banks":
             await self.send("\n".join(portfolio.bank_report()))
         elif sub == "transfer":
             parts = rest.split()
