@@ -355,6 +355,18 @@ def _step(con, r, snap, cfg, now, books):
             return
         leg = r["route"][r["leg"]]
         if leg["kind"] == "spot":
+            if r["settings"].get("bank_model") == "strict":
+                try:
+                    data = bankmodel.load()
+                    profile = next(p for p in data["accounts"] if p["id"] == r["bank_account"])
+                    bankmodel.validate(profile, now)
+                    spec = profile.get("exchange_fees", {}).get(leg["venue"], {})
+                    if (spec.get("confirmed") is not True or spec.get("currency") != "received"
+                            or dec(spec.get("percent", "-1")) != dec(leg["fee_pct"])):
+                        raise bankmodel.Blocked("Комиссия спота не подтверждена для текущего счёта")
+                except (bankmodel.Blocked, StopIteration) as exc:
+                    r["note"] = str(exc) or "Профиль счёта отсутствует"
+                    return
             venue = leg["venue"]
             alt = leg["target"] if r["asset"] == "USDT" else r["asset"]
             if st.get("spot_model", "depth") != "ticker":
@@ -516,7 +528,10 @@ def summary(path=DB_PATH):
                                     for d in [json.loads(raw)]), ZERO))
         expenses = sum((dec(v) for v, in con.execute("SELECT amount FROM bank_expenses")), ZERO)
         transit = sum((dec(v) for v, in con.execute("SELECT amount FROM bank_transfers WHERE state='pending'")), ZERO)
+        strict_profit = sum((dec(r["realized"]) for r in values
+                             if r["settings"].get("bank_model") == "strict" and not r.get("origin_model")), ZERO)
         return {"bank_expenses": str(expenses), "bank_in_transit": str(transit),
+                "strict_realized": str(strict_profit),
                 "net_realized": str(sum((dec(r["realized"]) for r in values), ZERO) - expenses),
                 "initial": row[0] if row else "50000.00", "cash": row[1] if row else "50000.00",
                 "reserved": str(sum((dec(r["reserved"]) for r in values), ZERO)),
@@ -538,6 +553,7 @@ def report_lines(path=DB_PATH):
         lines.append(f"Расходы счетов/собственных переводов: {dec(s['bank_expenses']):.2f} ₽ · "
                      f"результат после расходов: {dec(s['net_realized']):+.2f} ₽")
         lines.append(f"Рубли между своими счетами в пути: {dec(s['bank_in_transit']):.2f} ₽")
+        lines.append(f"Прибыль новых кругов строгого этапа: {dec(s['strict_realized']):+.2f} ₽")
     if s.get("equity") is not None:
         pnl = dec(s["equity"]) - dec(s["initial"])
         lines.append(f"Оценка портфеля: {dec(s['equity']):.2f} ₽ · результат {pnl:+.2f} ₽ "
@@ -561,7 +577,7 @@ def report_lines(path=DB_PATH):
             lines.append(html.escape(r["note"]))
     if any("Спот: котировка без глубины" in r["assumptions"] for r in s["runs"]):
         lines.append("В истории есть обмены по тикеру без глубины; они помечены как приближённые.")
-    if any(r["settings"].get("bank_model", "legacy") != "strict" for r in s["runs"]):
+    if any(r.get("origin_model") or r["settings"].get("bank_model", "legacy") != "strict" for r in s["runs"]):
         lines.append("В истории есть операции прежней модели без проверки персональных банковских условий.")
     lines.append("P2P: модель исполнения объявлений; спот: весь допустимый объём по стакану либо ожидание. Хеджи исключены.")
     return lines
@@ -798,6 +814,45 @@ def own_transfer(source, target, amount, delay_seconds, path=DB_PATH, now=None):
         _verify(con)
         con.commit()
         return result
+    except Exception:
+        con.rollback()
+        raise
+    finally:
+        con.close()
+
+
+def activate_banks(path=DB_PATH, now=None):
+    """Upgrade outstanding actions; retain every historical amount and cost basis."""
+    now = time.time() if now is None else now
+    data = bankmodel.load()
+    con = connect(path)
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        bankmodel.initialize(con, data, now)
+        start_profile = next(p for p in data['accounts'] if p['id'] == data['start_account'])
+        upgraded = []
+        for state, in con.execute("SELECT state FROM runs").fetchall():
+            run = json.loads(state)
+            outstanding = run['stage'] not in ('done', 'cancelled') or any(
+                dec(d['qty']) > 0 for d in run.get('dust', []))
+            if not outstanding or run['settings'].get('bank_model') == 'strict':
+                continue
+            run['origin_model'] = 'pre_bank_policy'
+            run['settings']['bank_model'] = 'strict'
+            run['bank_account'] = start_profile['id']
+            run['bank_profile'] = start_profile
+            if dec(run['reserved']):
+                con.execute('INSERT INTO bank_reservations VALUES (?,?,?,?,?,?)',
+                            (run['id'], start_profile['id'], start_profile['scope'],
+                             run['pay_kind'], run['reserved'], now))
+            _save(con, run)
+            _event(con, run['id'], 'state', run, now)
+            upgraded.append(run['id'])
+        _event(con, None, 'bank_model_activation', {'version': 1, 'upgraded_runs': upgraded,
+                                                  'history_repriced': False}, now)
+        _verify(con)
+        con.commit()
+        return upgraded
     except Exception:
         con.rollback()
         raise

@@ -446,3 +446,37 @@ def test_fractional_baseline_operation_count_blocks(setup):
     data['accounts'][0]['methods']['sbp']['out']['baseline']['day']['count'] = 0.5
     save()
     assert start(path) is None
+
+
+def test_activation_preserves_balances_and_upgrades_unpaid_run(setup, monkeypatch):
+    path, data, save = setup
+    monkeypatch.setenv('PAPER_BANK_MODEL', 'legacy')
+    start(path)
+    before = pf.summary(path)
+    data['accounts'][0]['status'] = 'pending'
+    save()
+    monkeypatch.setenv('PAPER_BANK_MODEL', 'strict')
+    assert pf.activate_banks(path, now=1000) == [1]
+    after = pf.summary(path)
+    assert (after['cash'], after['reserved']) == (before['cash'], before['reserved'])
+    assert pf.runs(path)[0]['origin_model'] == 'pre_bank_policy'
+    pf.tick(snapshot(ad('buy')), p2p.Config(), path, now=1000)
+    assert pf.summary(path)['cash'] == '50000.00'
+    assert pf.runs(path)[0]['spent'] == '0'
+
+
+def test_activation_keeps_existing_coins_without_unverified_sale(setup, monkeypatch):
+    path, data, save = setup
+    monkeypatch.setenv('PAPER_BANK_MODEL', 'legacy')
+    start(path)
+    pf.tick(snapshot(ad('buy')), p2p.Config(), path, now=1000)
+    qty = pf.runs(path)[0]['qty']
+    data['accounts'][0]['status'] = 'pending'
+    save()
+    monkeypatch.setenv('PAPER_BANK_MODEL', 'strict')
+    pf.activate_banks(path, now=1000)
+    for t in (1001, 1002, 1003, 1004):
+        pf.tick(snapshot(ad('sell', 110, ts=t), now=t), p2p.Config(), path, now=t)
+    assert pf.runs(path)[0]['qty'] == qty
+    assert pf.runs(path)[0]['realized'] == '0'
+    assert pf.summary(path)['strict_realized'] == '0'
