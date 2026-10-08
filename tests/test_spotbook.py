@@ -209,3 +209,9 @@ def test_bot_passes_required_public_book_to_portfolio(monkeypatch):
     assert calls == [{("Bybit", "ETH")}]
     assert pf.runs()[0]["asset"] == "ETH"
     assert pf.dec(pf.runs()[0]["qty"]) == 5
+
+
+@pytest.fixture(autouse=True)
+def previous_bank_model(monkeypatch):
+    """Existing execution scenarios explicitly exercise the pre-bank model."""
+    monkeypatch.setenv("PAPER_BANK_MODEL", "legacy")

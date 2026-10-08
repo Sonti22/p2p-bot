@@ -2310,7 +2310,7 @@ class Bot:
         return "\n".join(portfolio.report_lines() + [
             f"Статус: {'включён' if s['on'] else 'выключен'} · сумма круга {s['amount']:.2f} ₽",
             "/paper report — журнал CSV; /paper reset — новый портфель с архивом",
-            "Прежняя история сохранена отдельно в paper.db."])
+            "Прежняя история сохранена отдельно в paper.db."] + portfolio.bank_report())
 
     def paper_markup(self):
         """Кнопки под сводкой «/paper»: включить/выключить, сумма круга, отчёт. Ссылка «/paper» в тексте
@@ -2420,7 +2420,23 @@ class Bot:
         обнулить (paper_reset:yes → paper.reset, база в архив)."""
         sub, _, rest = arg.strip().partition(" ")
         sub = sub.lower()
-        if sub == "on":
+        if sub == "banks":
+            await self.send("\n".join(portfolio.bank_report()))
+        elif sub == "transfer":
+            parts = rest.split()
+            if len(parts) != 4:
+                await self.send("Формат: /paper transfer счёт_откуда счёт_куда сумма секунды_зачисления. "
+                                "Только виртуальные рубли; условия обоих счетов должны быть подтверждены.")
+                return
+            try:
+                amount = parse_amount(parts[2])
+                if amount is None:
+                    raise ValueError("Некорректная сумма")
+                tid = portfolio.own_transfer(parts[0], parts[1], amount, int(parts[3]))
+                await self.send(f"Виртуальный перевод #{tid}: деньги в пути до проверки зачисления.")
+            except (ValueError, KeyError, OSError, sqlite3.Error) as exc:
+                await self.send("Виртуальный перевод отклонён: " + html.escape(str(exc)))
+        elif sub == "on":
             save_env("PAPER", "1")
             await self.send("🧪 Сухой прогон включён.")
         elif sub == "off":

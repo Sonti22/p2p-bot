@@ -14,6 +14,8 @@ from decimal import Decimal, ROUND_DOWN, ROUND_UP, localcontext
 import p2p
 import paper
 import spotbook
+import bankmodel
+import execution_review
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "data", "paper_portfolio.db")
 EXPORT_PATH = os.path.join(os.path.dirname(__file__), "data", "paper_portfolio.csv")
@@ -37,6 +39,7 @@ def connect(path=DB_PATH):
     con.execute("CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY, run_id INTEGER, ts REAL, kind TEXT, details TEXT)")
     con.execute("CREATE TABLE IF NOT EXISTS consumed (key TEXT PRIMARY KEY, qty TEXT)")
     con.execute("CREATE TABLE IF NOT EXISTS equity (ts REAL PRIMARY KEY, value TEXT)")
+    bankmodel.schema(con)
     con.commit()
     return con
 
@@ -102,6 +105,25 @@ def start(amount, buy, sell, hops, planned_pct, pay_fee=0, path=DB_PATH, now=Non
                     raise ValueError("Invalid spot fee")
             else:
                 leg["minutes"] = paper.hops_transfer_minutes([leg], paper.net_minutes_table(), paper.settings()["transfer_minutes"])
+        bank_data = None
+        bank_profile = None
+        if os.getenv("PAPER_BANK_MODEL", "strict") == "strict":
+            bank_data = bankmodel.load()
+            bankmodel.initialize(con, bank_data, now)
+            bank_profile, pay_kind, _ = bankmodel.select(con, bank_data, buy.pays, "out", amount, now, venue=buy.ex)
+            receipt_profile, _, _ = bankmodel.select(con, bank_data, sell.pays, "in", amount, now, venue=sell.ex)
+            execution_review.check(bank_profile, buy, now)
+            execution_review.check(receipt_profile, sell, now)
+            bank = bank_profile["bank"]
+            for leg in route:
+                if leg["kind"] == "spot":
+                    spec = bank_profile.get("exchange_fees", {}).get(leg["venue"], {})
+                    if spec.get("confirmed") is not True or spec.get("currency") != "received":
+                        raise bankmodel.Blocked("Не подтверждены ставка и валюта комиссии спота: " + leg["venue"])
+                    rate = dec(spec.get("percent", "-1"))
+                    if not 0 <= rate < 100:
+                        raise bankmodel.Blocked("Некорректная персональная комиссия спота")
+                    leg["fee_pct"] = str(rate)
         cur = con.execute("INSERT INTO runs(state) VALUES ('{}')")
         run = {"id": cur.lastrowid, "start": now, "stage_ts": now, "stage": "buy", "amount": str(amount),
                "reserved": str(amount), "spent": "0", "proceeds": "0", "qty": "0", "cost": "0",
@@ -113,23 +135,43 @@ def start(amount, buy, sell, hops, planned_pct, pay_fee=0, path=DB_PATH, now=Non
                "settings": paper.settings(),
                "measures": measures or {},
                "note": "", "assumptions": [], "in_transit": False, "dust": []}
+        run["settings"]["bank_model"] = "strict" if bank_profile else "legacy"
+        if bank_profile:
+            run["bank_profile"] = bank_profile
+            run["bank_account"] = bank_profile["id"]
+            bankmodel.reserve(con, run["id"], bank_profile, pay_kind, amount, now)
         run["settings"]["spot_model"] = os.getenv("PAPER_SPOT_MODEL", "depth")
         _save(con, run)
-        con.execute("UPDATE wallet SET cash=?", (str(dec(cash) - amount),))
+        if not bank_profile and con.execute("SELECT 1 FROM bank_accounts LIMIT 1").fetchone():
+            _cash(con, -amount, now=now)
+        else:
+            con.execute("UPDATE wallet SET cash=?", (str(dec(cash) - amount),))
         _event(con, run["id"], "reserve", {"rub": str(amount), "initial": initial}, now)
         _event(con, run["id"], "state", run, now)
         con.commit()
         return run
+    except bankmodel.Blocked as exc:
+        con.rollback()
+        previous = con.execute("SELECT details FROM events WHERE kind='bank_blocked' ORDER BY id DESC LIMIT 1").fetchone()
+        if not previous or json.loads(previous[0])["reason"] != str(exc):
+            _event(con, None, "bank_blocked", {"reason": str(exc)}, now)
+        con.commit()
+        return None
     finally:
         con.close()
 
 
-def _cash(con, delta):
+def _cash(con, delta, account=None, now=None):
     cash, = con.execute("SELECT cash FROM wallet").fetchone()
     value = dec(cash) + delta
     if value < 0:
         raise ValueError("Negative free cash")
     con.execute("UPDATE wallet SET cash=?", (str(value),))
+    if con.execute("SELECT 1 FROM bank_accounts LIMIT 1").fetchone():
+        if account is None:
+            row = con.execute("SELECT details FROM bank_events WHERE kind='migration' ORDER BY id LIMIT 1").fetchone()
+            account = json.loads(row[0])["start_account"]
+        bankmodel.cash(con, account, delta, time.time() if now is None else now)
 
 
 def _ads(snap, venue, side, asset, net, now):
@@ -155,8 +197,30 @@ def _take(con, ad, wanted):
 
 
 def _offer_key(ad):
+    if os.getenv("PAPER_BANK_MODEL", "strict") == "strict":
+        return json.dumps(["unreplenished", ad.ex, ad.side, ad.asset, ad.ad_id or ad.nick, ad.net])
     return json.dumps([ad.ex, ad.side, ad.asset, ad.ad_id or ad.nick, ad.net, ad.fetched_ts, ad.price])
 
+
+
+def _receivable(con, run, ad, now):
+    if run["settings"].get("bank_model") != "strict":
+        return None
+    try:
+        data = bankmodel.load()
+        available = con.execute("SELECT qty FROM consumed WHERE key=?", (_offer_key(ad),)).fetchone()
+        left = max(ZERO, dec(ad.avail) - (dec(available[0]) if available else ZERO))
+        # Limits checked again at the exact quantity after offer selection.
+        estimate = min(dec(run["qty"]), left, dec(ad.max_amt) / dec(ad.price)) * dec(ad.price)
+        profile, _, q = bankmodel.select(con, data, ad.pays, "in", estimate, now, run["id"], venue=ad.ex)
+        review = execution_review.check(profile, ad, now)
+        if now - run["stage_ts"] < review["payment_seconds"]:
+            raise bankmodel.Blocked("Ожидание моделируемого банковского зачисления")
+        q["receipt_model"] = "elapsed_time_not_real_bank_confirmation"
+        return q
+    except bankmodel.Blocked as exc:
+        run["note"] = "Продажа заблокирована: " + str(exc)
+        return False
 
 def tick(snap, cfg, path=DB_PATH, now=None, books=None):
     """Execute one durable step per scan; no fabricated fills on missing data."""
@@ -169,6 +233,14 @@ def tick(snap, cfg, path=DB_PATH, now=None, books=None):
     con = connect(path)
     try:
         con.execute("BEGIN IMMEDIATE")
+        if con.execute("SELECT 1 FROM bank_accounts LIMIT 1").fetchone():
+            try:
+                data = bankmodel.load()
+                bankmodel.initialize(con, data, now)
+                bankmodel.settle(con, data, now)
+                bankmodel.service_charges(con, data, now)
+            except bankmodel.Blocked:
+                pass
         for state, in con.execute("SELECT state FROM runs ORDER BY id").fetchall():
             run = json.loads(state)
             was_terminal = run["stage"] in ("done", "cancelled")
@@ -199,10 +271,34 @@ def tick(snap, cfg, path=DB_PATH, now=None, books=None):
 def _step(con, r, snap, cfg, now, books):
     st = r["settings"]
     elapsed = now - r["stage_ts"]
+    if r["stage"] == "release":
+        if elapsed < r.get("release_seconds", 0):
+            r["note"] = "Монеты заблокированы в моделируемом P2P-эскроу"
+            return
+        r["stage"], r["stage_ts"], r["in_transit"] = "route", now, False
+        _event(con, r["id"], "p2p_release", {"qty": r["qty"], "model": "elapsed_time"}, now)
+        return
     if r["stage"] == "buy":
         if elapsed < st["pay_minutes"] * 60:
             return
         budget = dec(r["reserved"])
+        strict_bank = r["settings"].get("bank_model") == "strict"
+        if strict_bank:
+            try:
+                current = bankmodel.load()
+                profile = next(p for p in current["accounts"] if p["id"] == r["bank_account"])
+                if profile != r["bank_profile"]:
+                    raise bankmodel.Blocked("Условия счёта изменились после резервирования")
+                bankmodel.validate(profile, now)
+            except (bankmodel.Blocked, StopIteration, ValueError, TypeError) as exc:
+                r["note"] = str(exc) or "Профиль счёта удалён"
+                _cash(con, budget, r["bank_account"], now)
+                con.execute("DELETE FROM bank_reservations WHERE run_id=?", (r["id"],))
+                r["reserved"] = "0"
+                r["stage"] = ("release" if strict_bank and r.get("release_seconds", 0) else "route") if dec(r["qty"]) else "cancelled"
+                r["stage_ts"] = now
+                r["in_transit"] = r["stage"] == "release"
+                return
         for ad in _ads(snap, r["venue"], "buy", r["asset"], r["net"], now):
             if not set(ad.pays).intersection(r["buy_pays"]):
                 continue
@@ -210,24 +306,47 @@ def _step(con, r, snap, cfg, now, books):
                 continue
             price = dec(ad.price)
             multiplier = 1 - dec(r["pay_fee"]) / 100
-            qty = _take(con, ad, budget * multiplier / price)
+            principal = budget * multiplier
+            if strict_bank:
+                if bankmodel.compatible(profile, ad.pays) != r["pay_kind"]:
+                    continue
+                try:
+                    review = execution_review.check(profile, ad, now)
+                    if elapsed < review["payment_seconds"]:
+                        r["note"] = "Ожидание моделируемой оплаты P2P"
+                        continue
+                    r["release_seconds"] = max(r.get("release_seconds", 0), review["release_seconds"])
+                except bankmodel.Blocked as exc:
+                    r["note"] = str(exc)
+                    continue
+                principal = bankmodel.affordable(con, profile, r["pay_kind"], budget, now, r["id"])
+            qty = _take(con, ad, principal / price)
             if not qty:
                 continue
             paid = (qty * price / multiplier).quantize(RUB, rounding=ROUND_UP)
+            bank_quote = None
+            if strict_bank:
+                bank_quote = bankmodel.quote(con, profile, r["pay_kind"], "out", qty * price, now, r["id"])
+                paid = dec(bank_quote["amount"]) + dec(bank_quote["fee"])
+                bankmodel.payment(con, bank_quote, now, r["id"])
             budget -= paid
+            if strict_bank:
+                con.execute("UPDATE bank_reservations SET amount=? WHERE run_id=?", (str(budget), r["id"]))
             r["qty"] = str(dec(r["qty"]) + qty)
             r["spent"] = str(dec(r["spent"]) + paid)
             r["cost"] = r["spent"]
             _event(con, r["id"], "buy", {"qty": str(qty), "asset": r["asset"], "rub": str(paid),
                                          "bank_fee_rub": str(paid - qty * price), "price": str(price),
-                                         "bank": r["bank"], "pay_kind": r["pay_kind"],
+                                         "bank": r["bank"], "pay_kind": r["pay_kind"], "bank_quote": bank_quote,
                                          "offer": ad.ad_id or ad.nick, "quote_ts": ad.fetched_ts}, now)
         r["reserved"] = str(budget)
         if budget <= RUB or elapsed >= (st["pay_minutes"] + 30) * 60:
-            _cash(con, budget)
+            _cash(con, budget, r.get("bank_account"), now)
+            con.execute("DELETE FROM bank_reservations WHERE run_id=?", (r["id"],))
             r["reserved"] = "0"
-            r["stage"] = "route" if dec(r["qty"]) else "cancelled"
+            r["stage"] = ("release" if strict_bank and r.get("release_seconds", 0) else "route") if dec(r["qty"]) else "cancelled"
             r["stage_ts"] = now
+            r["in_transit"] = r["stage"] == "release"
             _event(con, r["id"], "release", {"rub": str(budget)}, now)
         return
     if r["stage"] == "route":
@@ -247,7 +366,8 @@ def _step(con, r, snap, cfg, now, books):
                         r["stage"], r["stage_ts"] = "sell", now - 1800
                     return
                 used = {key: value for key, value in con.execute("SELECT key,qty FROM consumed WHERE key LIKE 'spot:%'")}
-                fill = spotbook.fill(book, r["asset"], r["qty"], used)
+                fill_book = dict(book, id="unreplenished") if r["settings"].get("bank_model") == "strict" else book
+                fill = spotbook.fill(fill_book, r["asset"], r["qty"], used)
                 if fill is None:
                     r["note"] = "Не хватает глубины спота или объём вне ограничений пары"
                     if elapsed >= 1800:
@@ -339,26 +459,34 @@ def _step(con, r, snap, cfg, now, books):
     if r["stage"] == "sell":
         remaining = dec(r["qty"])
         for ad in _ads(snap, r["venue"], "sell", r["asset"], r["net"], now):
+            bank_quote = _receivable(con, r, ad, now)
+            if bank_quote is False:
+                continue
             qty = _take(con, ad, remaining)
             if not qty:
                 continue
             price = dec(ad.price)
             # First 30 minutes preserve the projected break-even; afterwards accept losses.
-            if elapsed < 1800 and qty * price < dec(r["cost"]) * qty / remaining:
+            if elapsed < 1800 and qty * price - (dec(bank_quote["fee"]) if bank_quote else ZERO) < dec(r["cost"]) * qty / remaining:
                 # No execution: undo the provisional offer consumption.
                 key = _offer_key(ad)
                 used, = con.execute("SELECT qty FROM consumed WHERE key=?", (key,)).fetchone()
                 con.execute("UPDATE consumed SET qty=? WHERE key=?", (str(dec(used) - qty), key))
                 continue
             proceeds = (qty * price).quantize(RUB, rounding=ROUND_DOWN)
+            if bank_quote:
+                proceeds -= dec(bank_quote["fee"])
+                if proceeds < 0:
+                    raise bankmodel.Blocked("Комиссия получения превышает платёж")
+                bankmodel.payment(con, bank_quote, now, r["id"])
             cost = dec(r["cost"]) * qty / remaining
             r["cost"] = str(dec(r["cost"]) - cost)
             r["realized"] = str(dec(r["realized"]) + proceeds - cost)
             r["proceeds"] = str(dec(r["proceeds"]) + proceeds)
             remaining -= qty
-            _cash(con, proceeds)
+            _cash(con, proceeds, bank_quote["account"] if bank_quote else None, now)
             _event(con, r["id"], "sell", {"qty": str(qty), "rub": str(proceeds), "cost": str(cost),
-                                          "price": str(price), "quote_ts": ad.fetched_ts}, now)
+                                          "price": str(price), "quote_ts": ad.fetched_ts, "bank_quote": bank_quote}, now)
         r["qty"] = str(remaining)
         if remaining == 0:
             r["stage"] = "done"
@@ -386,7 +514,11 @@ def summary(path=DB_PATH):
             periods[name] = str(sum((dec(d["rub"]) - dec(d["cost"]) for raw, in
                                     con.execute("SELECT details FROM events WHERE kind='sell' AND ts>=?", (since,))
                                     for d in [json.loads(raw)]), ZERO))
-        return {"initial": row[0] if row else "50000.00", "cash": row[1] if row else "50000.00",
+        expenses = sum((dec(v) for v, in con.execute("SELECT amount FROM bank_expenses")), ZERO)
+        transit = sum((dec(v) for v, in con.execute("SELECT amount FROM bank_transfers WHERE state='pending'")), ZERO)
+        return {"bank_expenses": str(expenses), "bank_in_transit": str(transit),
+                "net_realized": str(sum((dec(r["realized"]) for r in values), ZERO) - expenses),
+                "initial": row[0] if row else "50000.00", "cash": row[1] if row else "50000.00",
                 "reserved": str(sum((dec(r["reserved"]) for r in values), ZERO)),
                 "realized": str(sum((dec(r["realized"]) for r in values), ZERO)), "runs": values,
                 "equity": marks[1] if marks else None, "mark_ts": marks[0] if marks else None,
@@ -402,6 +534,10 @@ def report_lines(path=DB_PATH):
              f"Свободно: {dec(s['cash']):.2f} ₽ · резерв: {dec(s['reserved']):.2f} ₽",
              f"Прибыль исполненных продаж: {dec(s['realized']):+.2f} ₽",
              "Открытые позиции оцениваются отдельно; неизвестная цена не равна нулю."]
+    if "bank_expenses" in s:
+        lines.append(f"Расходы счетов/собственных переводов: {dec(s['bank_expenses']):.2f} ₽ · "
+                     f"результат после расходов: {dec(s['net_realized']):+.2f} ₽")
+        lines.append(f"Рубли между своими счетами в пути: {dec(s['bank_in_transit']):.2f} ₽")
     if s.get("equity") is not None:
         pnl = dec(s["equity"]) - dec(s["initial"])
         lines.append(f"Оценка портфеля: {dec(s['equity']):.2f} ₽ · результат {pnl:+.2f} ₽ "
@@ -425,47 +561,70 @@ def report_lines(path=DB_PATH):
             lines.append(html.escape(r["note"]))
     if any("Спот: котировка без глубины" in r["assumptions"] for r in s["runs"]):
         lines.append("В истории есть обмены по тикеру без глубины; они помечены как приближённые.")
+    if any(r["settings"].get("bank_model", "legacy") != "strict" for r in s["runs"]):
+        lines.append("В истории есть операции прежней модели без проверки персональных банковских условий.")
     lines.append("P2P: модель исполнения объявлений; спот: весь допустимый объём по стакану либо ожидание. Хеджи исключены.")
     return lines
 
 
 def _mark(con, snap, now):
-    cash, = con.execute("SELECT cash FROM wallet").fetchone() or ("50000",)
-    total = dec(cash)
+    """Net liquidation estimate with temporary cumulative bank-limit consumption."""
+    row = con.execute("SELECT cash FROM wallet").fetchone()
+    total = dec(row[0]) if row else dec("50000")
     positions = {}
+    strict = os.getenv("PAPER_BANK_MODEL", "strict") == "strict"
+    reason = "bank_transfer_in_transit" if con.execute(
+        "SELECT 1 FROM bank_transfers WHERE state='pending' LIMIT 1").fetchone() else None
     for state, in con.execute("SELECT state FROM runs"):
         r = json.loads(state)
         total += dec(r["reserved"])
-        for dust in r.get("dust", []):
-            key = (dust["venue"], dust["asset"], dust["net"] if dust["venue"] == "BestChange" else "")
-            positions[key] = positions.get(key, ZERO) + dec(dust["qty"])
-        qty = dec(r["qty"])
-        if not qty:
-            continue
-        if r["in_transit"]:
-            # An asset in transit is not immediately liquidatable.
-            _event(con, None, "valuation_unknown", {"reason": "in_transit"}, now)
-            return
-        key = (r["venue"], r["asset"], r["net"] if r["venue"] == "BestChange" else "")
-        positions[key] = positions.get(key, ZERO) + qty
-    for (venue, asset, net), qty in positions.items():
-        ads = _ads(snap, venue, "sell", asset, net, now)
-        remaining_qty, value = qty, ZERO
-        for ad in ads:
-            used = con.execute("SELECT qty FROM consumed WHERE key=?", (_offer_key(ad),)).fetchone()
-            remaining = max(ZERO, dec(ad.avail) - (dec(used[0]) if used else ZERO))
-            take = min(remaining_qty, remaining, dec(ad.max_amt) / dec(ad.price))
-            if take <= 0 or take * dec(ad.price) < dec(ad.min_amt):
-                continue
-            value += take * dec(ad.price)
-            remaining_qty -= take
-        if remaining_qty > 0:
-            # Clear the display of an older complete valuation without inventing a zero price.
-            _event(con, None, "valuation_unknown", {"reason": "insufficient_fresh_depth"}, now)
-            return
-        total += value
-    con.execute("INSERT OR REPLACE INTO equity VALUES (?,?)", (now, str(total.quantize(RUB, rounding=ROUND_DOWN))))
-    _event(con, None, "valuation", {"value": str(total.quantize(RUB, rounding=ROUND_DOWN))}, now)
+        strict = strict or r["settings"].get("bank_model") == "strict"
+        for position in r.get("dust", []) + ([r] if dec(r["qty"]) else []):
+            if position.get("in_transit"):
+                reason = "in_transit"
+                break
+            key = (position["venue"], position["asset"],
+                   position["net"] if position["venue"] == "BestChange" else "")
+            positions[key] = positions.get(key, ZERO) + dec(position["qty"])
+    con.execute("SAVEPOINT bank_valuation")
+    try:
+        data = bankmodel.load() if strict and positions else None
+        for (venue, asset, net), qty in positions.items():
+            remaining = qty
+            for ad in _ads(snap, venue, "sell", asset, net, now):
+                used = con.execute("SELECT qty FROM consumed WHERE key=?", (_offer_key(ad),)).fetchone()
+                available = max(ZERO, dec(ad.avail) - (dec(used[0]) if used else ZERO))
+                take = min(remaining, available, dec(ad.max_amt) / dec(ad.price))
+                gross = (take * dec(ad.price)).quantize(RUB, rounding=ROUND_DOWN)
+                if take <= 0 or take * dec(ad.price) < dec(ad.min_amt):
+                    continue
+                fee = ZERO
+                if data:
+                    try:
+                        profile, _, q = bankmodel.select(con, data, ad.pays, "in", gross, now, venue=venue)
+                        execution_review.check(profile, ad, now)
+                        fee = dec(q["fee"])
+                        if fee > gross:
+                            continue
+                        bankmodel.payment(con, q, now, None)
+                    except bankmodel.Blocked:
+                        continue
+                total += gross - fee
+                remaining -= take
+            if remaining > 0:
+                reason = "insufficient_fresh_depth_or_bank_limits"
+                break
+    except bankmodel.Blocked:
+        reason = "bank_conditions_not_confirmed"
+    finally:
+        con.execute("ROLLBACK TO bank_valuation")
+        con.execute("RELEASE bank_valuation")
+    if reason:
+        _event(con, None, "valuation_unknown", {"reason": reason}, now)
+        return
+    value = str(total.quantize(RUB, rounding=ROUND_DOWN))
+    con.execute("INSERT OR REPLACE INTO equity VALUES (?,?)", (now, value))
+    _event(con, None, "valuation", {"value": value}, now)
 
 
 def _verify(con):
@@ -475,6 +634,8 @@ def _verify(con):
         return
     initial, cash = map(dec, row)
     balance = cash
+    balance += sum((dec(amount) for amount, in con.execute("SELECT amount FROM bank_transfers WHERE state='pending'")), ZERO)
+    balance += sum((dec(amount) for amount, in con.execute("SELECT amount FROM bank_expenses")), ZERO)
     for state, in con.execute("SELECT state FROM runs"):
         r = json.loads(state)
         for name in ("reserved", "qty", "cost"):
@@ -485,6 +646,7 @@ def _verify(con):
             if dec(dust["qty"]) < 0 or dec(dust["cost"]) < 0:
                 raise ValueError("Negative rounding remainder")
             balance += dec(dust["cost"])
+    bankmodel.reconcile(con)
     if abs(balance - initial) > Decimal("0.000000000001"):
         raise ValueError("Portfolio reconciliation failed")
 
@@ -501,7 +663,7 @@ def reset(path=DB_PATH):
         con.execute("BEGIN IMMEDIATE")
         source.backup(target)
         target.close()
-        for table in ("wallet", "runs", "events", "consumed", "equity"):
+        for table in ("wallet", "runs", "events", "consumed", "equity", "bank_accounts", "bank_payments", "bank_reservations", "bank_events", "bank_transfers", "bank_expenses"):
             con.execute(f"DELETE FROM {table}")
         con.execute("INSERT INTO wallet VALUES (1,'50000.00','50000.00')")
         _event(con, None, "reset", {"archive": os.path.basename(archive)}, time.time())
@@ -538,7 +700,18 @@ def replay(path=DB_PATH):
             ctx.prec = 40
             cash = dec("50000") + sum((dec(r["proceeds"]) - dec(r["spent"]) - dec(r["reserved"])
                                        for r in states.values()), ZERO)
-        return {"cash": str(cash), "runs": list(states.values())}
+        transfers, expenses = {}, ZERO
+        for kind, raw in con.execute("SELECT kind,details FROM bank_events ORDER BY id"):
+            detail = json.loads(raw)
+            if kind == "transfer_sent":
+                transfers[detail["id"]] = dec(detail["amount"])
+                expenses += dec(detail["fee"])
+            elif kind == "transfer_received":
+                transfers.pop(detail["id"], None)
+            elif kind == "service_fee":
+                expenses += dec(detail["amount"])
+        cash -= expenses + sum(transfers.values(), ZERO)
+        return {"cash": str(cash), "runs": list(states.values()), "bank_accounts": bankmodel.replay(con)}
     finally:
         con.close()
 
@@ -558,18 +731,27 @@ def _sell_dust(con, run, snap, now):
     for dust in run.get("dust", []):
         remaining = dec(dust["qty"])
         for ad in _ads(snap, dust["venue"], "sell", dust["asset"], dust["net"], now):
+            bank_quote = _receivable(con, dict(run, qty=str(remaining)), ad, now)
+            if bank_quote is False:
+                run["note"] = "Не подтверждён счёт для продажи остатка"
+                continue
             qty = _take(con, ad, remaining)
             if not qty:
                 continue
             proceeds = (qty * dec(ad.price)).quantize(RUB, rounding=ROUND_DOWN)
+            if bank_quote:
+                proceeds -= dec(bank_quote["fee"])
+                if proceeds < 0:
+                    raise bankmodel.Blocked("Комиссия получения превышает платёж")
+                bankmodel.payment(con, bank_quote, now, run["id"])
             cost = dec(dust["cost"]) * qty / remaining
             dust["cost"] = str(dec(dust["cost"]) - cost)
             remaining -= qty
             run["proceeds"] = str(dec(run["proceeds"]) + proceeds)
             run["realized"] = str(dec(run["realized"]) + proceeds - cost)
-            _cash(con, proceeds)
+            _cash(con, proceeds, bank_quote["account"] if bank_quote else None, now)
             _event(con, run["id"], "sell", {"qty": str(qty), "rub": str(proceeds), "cost": str(cost),
-                                            "asset": dust["asset"], "venue": dust["venue"], "rounding_remainder": True}, now)
+                                            "asset": dust["asset"], "venue": dust["venue"], "rounding_remainder": True, "bank_quote": bank_quote}, now)
         dust["qty"] = str(remaining)
 
 
@@ -577,10 +759,47 @@ def export(destination, path=DB_PATH):
     con = connect(path)
     try:
         rows = con.execute("SELECT id,run_id,ts,kind,details FROM events ORDER BY id").fetchall()
+        rows += [("bank:" + str(eid), None, ts, "bank:" + kind, details) for eid, ts, kind, details in
+                 con.execute("SELECT id,ts,kind,details FROM bank_events ORDER BY id")]
+        rows.sort(key=lambda item: item[2])
         with open(destination, "w", encoding="utf-8-sig", newline="") as handle:
             writer = csv.writer(handle)
             writer.writerow(("event_id", "run_id", "timestamp", "operation", "details"))
             writer.writerows(rows)
         return destination
+    finally:
+        con.close()
+
+
+def bank_report(path=DB_PATH):
+    try:
+        data = bankmodel.load()
+        con = connect(path)
+        try:
+            lines = bankmodel.report(con, data, time.time())
+            row = con.execute("SELECT details FROM events WHERE kind='bank_blocked' ORDER BY id DESC LIMIT 1").fetchone()
+            if row:
+                lines.append("Последний запрет: " + html.escape(json.loads(row[0])["reason"]))
+            return lines
+        finally:
+            con.close()
+    except bankmodel.Blocked as exc:
+        return ["🏦 " + html.escape(str(exc))]
+
+
+def own_transfer(source, target, amount, delay_seconds, path=DB_PATH, now=None):
+    now = time.time() if now is None else now
+    con = connect(path)
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        data = bankmodel.load()
+        bankmodel.initialize(con, data, now)
+        result = bankmodel.transfer(con, data, source, target, amount, now, delay_seconds)
+        _verify(con)
+        con.commit()
+        return result
+    except Exception:
+        con.rollback()
+        raise
     finally:
         con.close()

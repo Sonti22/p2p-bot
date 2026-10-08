@@ -301,3 +301,9 @@ def test_invalid_capital_does_not_create_wallet(tmp_path, cfg, amount):
     with pytest.raises(ValueError):
         start(path, cfg, amount)
     assert not __import__("os").path.exists(path)
+
+
+@pytest.fixture(autouse=True)
+def previous_bank_model(monkeypatch):
+    """Existing execution scenarios explicitly exercise the pre-bank model."""
+    monkeypatch.setenv("PAPER_BANK_MODEL", "legacy")
