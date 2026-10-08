@@ -310,6 +310,8 @@ def report(name='base'):
         lines.extend(line.replace('Прибыль новых кругов строгого этапа', 'Прибыль сценарных кругов')
                      for line in pf.report_lines(path(name)))
         active = [r for r in s['runs'] if r['stage'] not in ('done', 'cancelled')]
+        if not s['runs']:
+            lines.append('Исполнимых новых сигналов пока нет; прибыль от продаж равна нулю.')
         cost = sum((pf.dec(r['cost']) + sum((pf.dec(d['cost']) for d in r.get('dust', [])), Decimal(0)) for r in s['runs']), Decimal(0))
         lines.append(f'Себестоимость оставшихся активов: {cost:.2f} ₽; активных кругов: {len(active)}.')
         durations = [r['stage_ts'] - r['start'] for r in s['runs'] if r['stage'] == 'done']
@@ -340,6 +342,19 @@ def report(name='base'):
         finally:
             con.close()
         return lines
+
+
+def blocked(name, reason, now=None):
+    now = time.time() if now is None else now
+    con = pf.connect(path(name))
+    try:
+        con.execute('BEGIN IMMEDIATE')
+        last = con.execute("SELECT details FROM events WHERE kind='scenario_blocked' ORDER BY id DESC LIMIT 1").fetchone()
+        if not last or json.loads(last[0])['reason'] != reason:
+            pf._event(con, None, 'scenario_blocked', {'reason': reason}, now)
+        con.commit()
+    finally:
+        con.close()
 
 
 def reset_all():

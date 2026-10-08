@@ -3742,6 +3742,8 @@ class Bot:
                     if picked is None or net > picked[0]:
                         picked = net, d, estimate, cfg
                 if picked is None:
+                    scenarios.blocked(name, 'Нет подтверждённого сигнала с доступной глубиной, каналом оплаты '
+                                      'и чистой прибыльностью выше порога; неизвестные условия не подтверждены.')
                     continue
                 net, d, estimate, cfg = picked
                 _, buy, sell, route = d
