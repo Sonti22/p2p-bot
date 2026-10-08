@@ -429,3 +429,20 @@ def test_nonzero_spot_fee_currency_not_assumed(setup):
                      {'frm': 'Bybit', 'to': 'Bybit', 'asset': 'ETH', 'fee': 0}]}
     assert pf.start(10000, ad('buy'), ad('sell', asset='ETH'), hops, 10, path=path, now=1000) is None
     assert pf.summary(path)['cash'] == '50000.00'
+
+
+def test_invalid_service_date_cannot_charge_repeatedly(setup):
+    path, data, save = setup
+    data['accounts'][0]['service']['charges'] = [{'period': 'nan', 'amount': '99', 'confirmed': True}]
+    save()
+    for t in (1000, 1001):
+        pf.tick(snapshot(now=t), p2p.Config(), path, now=t)
+    assert pf.summary(path)['cash'] == '50000.00'
+    assert start(path) is None
+
+
+def test_fractional_baseline_operation_count_blocks(setup):
+    path, data, save = setup
+    data['accounts'][0]['methods']['sbp']['out']['baseline']['day']['count'] = 0.5
+    save()
+    assert start(path) is None

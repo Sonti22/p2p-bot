@@ -87,6 +87,14 @@ def validate(profile, now):
     service = profile.get('service', {})
     if service.get('confirmed') is not True:
         raise Blocked('Не подтверждены расходы обслуживания счёта')
+    try:
+        for charge in service.get('charges', []):
+            period = float(charge['period'])
+            if not math.isfinite(period) or period < 0:
+                raise ValueError('Invalid charge date')
+            money(charge['amount'])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise Blocked('Некорректные подтверждённые расходы обслуживания') from exc
 
 
 def period_start(now, period, billing_day=1):
@@ -113,7 +121,10 @@ def usage(con, profile, direction, method, now, period, exclude_run=None, reserv
     baseline = rule.get('baseline', {}).get(period)
     if not baseline or baseline.get('period_start') != since:
         raise Blocked('Не подтверждён использованный лимит: ' + period)
-    total, count = money(baseline['amount']), int(baseline['count'])
+    raw_count = baseline['count']
+    if isinstance(raw_count, bool) or not isinstance(raw_count, int):
+        raise Blocked('Некорректное число уже выполненных операций')
+    total, count = money(baseline['amount']), raw_count
     if count < 0:
         raise ValueError('Invalid baseline count')
     condition, params = ('', ()) if method == '*' else (' AND method=?', (method,))
@@ -278,7 +289,7 @@ def wallet_cash(con, delta):
 
 def transfer(con, data, source, target, amount, now, delay_seconds):
     """Explicit own-account transfer. No automatic account rotation to bypass limits."""
-    if source == target or not 0 < delay_seconds <= 7 * 86400:
+    if source == target or isinstance(delay_seconds, bool) or not 0 < delay_seconds <= 7 * 86400:
         raise Blocked('Некорректный собственный перевод или срок зачисления')
     profiles = {p['id']: p for p in data['accounts']}
     a, b = profiles[source], profiles[target]
