@@ -534,6 +534,12 @@ def _parse_ads(venue, side, asset, items, make):
 _bybit_pay = {}
 
 
+def _public_ad_id(item):
+    """Preserve the response's ad ID; never substitute a merchant or snapshot ID."""
+    value = item.get('id')
+    return str(value).strip() if isinstance(value, (str, int)) and not isinstance(value, bool) else ''
+
+
 async def bybit(s, cfg, side, asset, page=1):
     if not _bybit_pay:
         j = await _json(s, "POST", "https://api2.bybit.com/fiat/otc/configuration/queryAllPaymentList", {})
@@ -547,7 +553,7 @@ async def bybit(s, cfg, side, asset, page=1):
     def make(i):
         return Ad("Bybit", side, float(i["price"]), float(i["minAmount"]), float(i["maxAmount"]), float(i["lastQuantity"]),
                    [_bybit_pay.get(p, p) for p in i["payments"]], i["nickName"], int(i["recentOrderNum"]),
-                   float(i["recentExecuteRate"]), asset=asset, terms=i.get("remark") or "")
+                   float(i["recentExecuteRate"]), asset=asset, terms=i.get("remark") or "", ad_id=_public_ad_id(i))
     return _parse_ads("bybit", side, asset, items, make)
 
 
@@ -565,7 +571,7 @@ async def htx(s, cfg, side, asset, page=1):
     def make(i):
         return Ad("HTX", side, float(i["price"]), float(i["minTradeLimit"]), float(i["maxTradeLimit"]), float(i["tradeCount"]),
                    [p["name"] for p in i["payMethods"]], i["userName"], int(i["tradeMonthTimes"]),
-                   float(i["orderCompleteRate"] or 0), asset=asset)
+                   float(i["orderCompleteRate"] or 0), asset=asset, ad_id=_public_ad_id(i))
     return _parse_ads("htx", side, asset, items, make)
 
 
@@ -586,7 +592,7 @@ async def kucoin(s, cfg, side, asset, page=1):
         return Ad("KuCoin", side, float(i["floatPrice"]), float(i["limitMinQuote"]), float(i["limitMaxQuote"]),
                    float(i["currencyBalanceQuantity"]), [_kucoin_pay(p) for p in i["adPayTypes"]], i["nickName"],
                    int(i.get("dealOrderNum") or 0), float((i.get("dealOrderRate") or "0").rstrip("%")), asset=asset,
-                   terms=i.get("remarks") or "")
+                   terms=i.get("remarks") or "", ad_id=_public_ad_id(i))
     return _parse_ads("kucoin", side, asset, items, make)
 
 
@@ -616,7 +622,7 @@ async def mexc(s, cfg, side, asset, page=1):
         return Ad("MEXC", side, float(i["price"]), float(i["minTradeLimit"]), float(i["maxTradeLimit"]),
                   float(i["availableQuantity"]), [_mexc_pay.get(p, f"pm{p}") for p in str(i["payMethod"]).split(",")],
                   (i.get("merchant") or {}).get("nickName", "?"), int(st.get("doneLastMonthCount") or 0),
-                  float(st.get("completeRate") or 0) * 100, asset=asset, terms=i.get("tradeTerms") or "")
+                  float(st.get("completeRate") or 0) * 100, asset=asset, terms=i.get("tradeTerms") or "", ad_id=_public_ad_id(i))
     return _parse_ads("mexc", side, asset, items, make)
 
 

@@ -2303,6 +2303,11 @@ class Bot:
         return sigreport.render(sigreport.build(days=days))
 
     def paper_view(self):
+        import scenarios
+        if scenarios.enabled():
+            return '\n'.join(scenarios.report('base') + [
+                '/paper scenarios — сравнение · /paper verified — строгий портфель',
+                '/paper scenario-report [fast|base|stress] — журнал CSV'])
         if os.getenv("PAPER_ENGINE", "ledger") == "legacy":
             return self._legacy_paper_view()
         """Сводка нового виртуального портфеля; прежняя история доступна отдельно."""
@@ -2420,7 +2425,23 @@ class Bot:
         обнулить (paper_reset:yes → paper.reset, база в архив)."""
         sub, _, rest = arg.strip().partition(" ")
         sub = sub.lower()
-        if sub == "catalog":
+        if sub == "verified":
+            await self.send('\n'.join(portfolio.report_lines() + portfolio.bank_report()))
+        elif sub == "scenarios":
+            import scenarios
+            for name in scenarios.VARIANTS:
+                await self.send('\n'.join(scenarios.report(name)))
+        elif sub == "scenario-report":
+            import scenarios
+            name = rest.strip() or 'base'
+            if name not in scenarios.VARIANTS:
+                await self.send('Варианты: fast, base, stress.')
+                return
+            with scenarios.context(name):
+                output = os.path.join(scenarios.ROOT, 'paper_scenario_' + name + '.csv')
+                portfolio.export(output, path=scenarios.path(name))
+            await self.send_document(output, caption='Сценарный журнал: ' + name)
+        elif sub == "catalog":
             import bankcatalog
             await self.send("\n".join(bankcatalog.report_lines()))
         elif sub == "bankfee":
@@ -2471,9 +2492,19 @@ class Bot:
             await self.send(f"🧪 Сумма круга сухого прогона: {_money(amount)} ₽.")
         elif sub in ("report", "cycles"):
             await self.send(self.paper_view())
-            path = portfolio.export(portfolio.EXPORT_PATH)
+            import scenarios
+            if scenarios.enabled():
+                path = portfolio.export(os.path.join(scenarios.ROOT, 'paper_scenario_base.csv'), path=scenarios.path('base'))
+            else:
+                path = portfolio.export(portfolio.EXPORT_PATH)
             await self.send_document(path, "Журнал виртуального портфеля (CSV)")
         elif sub == "reset":
+            import scenarios
+            if scenarios.enabled():
+                r = await self.send('Архивировать и начать заново три стандартных сценария по 50 000 ₽? '
+                                    'Строгий портфель сохранится.', markup=PAPER_RESET_MARKUP)
+                self.paper_reset_ask = (r.get('result') or {}).get('message_id')
+                return
             r = await self.send("🧪 Обнулить сухой прогон? Все круги (и открытые) уйдут в архив "
                             "data/paper-portfolio-archive-…db — он не удаляется; капитал станет 50 000 ₽. "
                             "Вкл/выкл и сумма круга не меняются.", markup=PAPER_RESET_MARKUP)
@@ -2484,6 +2515,13 @@ class Bot:
             await self.send(self.paper_view(), markup=self.paper_markup())
 
     def paper_reset(self):
+        import scenarios
+        if scenarios.enabled():
+            try:
+                archives = scenarios.reset_all()
+                return f'Три сценария начаты заново; архивов: {len(archives)}. Строгий портфель сохранён.'
+            except (OSError, ValueError, sqlite3.Error) as exc:
+                return 'Сброс сценариев не завершён: ' + html.escape(str(exc))
         if os.getenv("PAPER_ENGINE", "ledger") == "legacy":
             return self._legacy_paper_reset()
         """Архивировать новый портфель и начать с 50 000 рублей."""
@@ -3376,6 +3414,14 @@ class Bot:
         сутки не завершилось ни одного круга."""
         if not paper.settings()["on"]:
             return []
+        import scenarios
+        if scenarios.enabled():
+            lines = ['🧪 Стандартные сценарии (альтернативы одного капитала):']
+            for name in scenarios.VARIANTS:
+                s = portfolio.summary(scenarios.path(name))
+                lines.append(f"{scenarios.LABELS[name]}: продажи {float(s['realized']):+.2f} ₽; "
+                             f"после расходов {float(s.get('net_realized', s['realized'])):+.2f} ₽.")
+            return lines
         now = time.time() if now is None else now
         try:
             p = paper.summary_since(now - 86400)
@@ -3570,6 +3616,9 @@ class Bot:
         return f"⏱ держится {minutes} мин · "
 
     async def maybe_start_paper_cycle(self, deals, snap):
+        import scenarios
+        if scenarios.enabled():
+            return await self.start_scenario_cycles(deals, snap)
         if os.getenv("PAPER_ENGINE", "ledger") == "legacy":
             return await self._legacy_maybe_start_paper_cycle(deals, snap)
         """Резервировать капитал по подтверждённому сигналу и неизменному маршруту."""
@@ -3638,12 +3687,76 @@ class Bot:
         """Один шаг виртуального маршрута по свежим данным; состояние и журнал атомарны."""
         if not self.chat_id:
             return
-        pairs = portfolio.needed_books()
+        import scenarios
+        pairs = set(portfolio.needed_books())
+        if scenarios.enabled():
+            for name in scenarios.VARIANTS:
+                scenarios.maintain(name, self.cfg)
+                pairs.update(portfolio.needed_books(path=scenarios.path(name)))
         books, errors = await spotbook.load(self.s, pairs) if pairs else ({}, {})
         for (venue, asset), error in errors.items():
             logger.warning("paper spot depth unavailable: %s/%s (%s)", venue, asset, error)
         for notice in portfolio.tick(snap, self.cfg, books=books):
             await self.send("🧪 " + html.escape(notice), topic="signals")
+        if scenarios.enabled():
+            for name in scenarios.VARIANTS:
+                with scenarios.context(name, self.cfg):
+                    for notice in portfolio.tick(snap, self.cfg, path=scenarios.path(name), books=books):
+                        await self.send('🧪 ' + scenarios.LABELS[name] + ': ' + html.escape(notice), topic='signals')
+
+    async def start_scenario_cycles(self, deals, snap):
+        import scenarios
+        settings = paper.settings()
+        if not settings['on'] or not self.chat_id or not deals or self.cfg.fiat != 'RUB':
+            return
+        # Scenario counters are independent of the user's real bank turnover.
+        for name in scenarios.VARIANTS:
+            scenarios.maintain(name, self.cfg)
+            psnap = scenarios.market_snapshot(name, snap, self.cfg)
+            with scenarios.context(name, self.cfg):
+                if len(portfolio.runs(path=scenarios.path(name), active=True)) >= settings['max_open']:
+                    continue
+                balance = portfolio.summary(scenarios.path(name))
+                budget = min(float(balance['cash']), settings['amount'])
+                if budget <= 0:
+                    continue
+                picked = None
+                for deal in deals:
+                    if not self.is_confirmed(deal) or deal_stale(deal):
+                        continue
+                    preview = deal_for_amount(deal, dataclasses.replace(self.cfg, pay_fee=0), psnap, budget)
+                    if preview is None:
+                        continue
+                    estimate = scenarios.prepare(name, preview[1], preview[2], budget, self.cfg)
+                    if estimate is None:
+                        continue
+                    principal = float(estimate['principal'])
+                    cfg = dataclasses.replace(self.cfg, amount=principal, pay_fee=0)
+                    d = deal_for_amount(deal, cfg, psnap, principal)
+                    if d is None:
+                        continue
+                    net = ((principal * (1 + d[0] / 100) - float(estimate['incoming_fee'])) / budget - 1) * 100
+                    label, reasons = reliability(d, cfg, psnap)
+                    if net < self.cfg.min_profit or (label == TRAP and not settings['traps']):
+                        continue
+                    if picked is None or net > picked[0]:
+                        picked = net, d, estimate, cfg
+                if picked is None:
+                    continue
+                net, d, estimate, cfg = picked
+                _, buy, sell, route = d
+                if scenarios.prepare(name, buy, sell, budget, self.cfg, fund=True) is None:
+                    continue
+                hops = route_hops(buy, sell, cfg, psnap.spot, frozenset())
+                if not hops:
+                    continue
+                cycle = portfolio.start(budget, buy, sell, hops, net, pay_fee=0,
+                                        path=scenarios.path(name), max_open=settings['max_open'],
+                                        measures={'scenario_quote': estimate, 'snapshot_ts': snap.ts},
+                                        spot_fees={v: p2p._spot_fee(cfg, v) for v in hops.get('venues', [])})
+                if cycle:
+                    await self.send(f"🧪 {scenarios.LABELS[name]}: круг #{cycle['id']}, резерв {budget:.2f} ₽; "
+                                    f"сценарный план {net:+.2f}%. Личный допуск сделки предполагается.", topic='signals')
 
     def paper_hedge_tick(self, snap):
         if os.getenv("PAPER_ENGINE", "ledger") == "legacy":

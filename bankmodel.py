@@ -8,12 +8,18 @@ import datetime as dt
 import json
 import math
 import os
+from contextvars import ContextVar
 from decimal import Decimal, ROUND_UP, ROUND_DOWN
 
 CENT = Decimal('0.01')
 ZERO = Decimal(0)
 MSK = dt.timezone(dt.timedelta(hours=3))
 PROFILE_PATH = os.path.join(os.path.dirname(__file__), 'data', 'paper_bank_profiles.json')
+SCENARIO = ContextVar('paper_bank_scenario', default=None)
+
+
+def mode():
+    return 'strict' if SCENARIO.get() is not None else os.getenv('PAPER_BANK_MODEL', 'strict')
 
 
 class Blocked(ValueError):
@@ -46,6 +52,8 @@ def event(con, kind, details, now):
 
 
 def load(path=None):
+    if path is None and SCENARIO.get() is not None:
+        return SCENARIO.get()['profiles']
     try:
         with open(path or os.getenv('PAPER_BANK_PROFILES') or PROFILE_PATH, encoding='utf-8-sig') as f:
             data = json.load(f)
@@ -69,6 +77,9 @@ def load(path=None):
 
 
 def validate(profile, now):
+    if SCENARIO.get() is not None:
+        from scenarios import validate_profile
+        return validate_profile(profile, now)
     names = {'tariff_confirmed': 'персональный тариф', 'limits_confirmed': 'персональные лимиты',
              'shared_limits_confirmed': 'общие лимиты клиента и счетов',
              'ownership_confirmed': 'принадлежность счёта владельцу',
@@ -143,6 +154,9 @@ def usage(con, profile, direction, method, now, period, exclude_run=None, reserv
 
 
 def quote(con, profile, method, direction, amount, now, run_id=None):
+    if SCENARIO.get() is not None:
+        from scenarios import quote
+        return quote(con, profile, method, direction, amount, now, run_id)
     validate(profile, now)
     amount = money(amount).quantize(CENT, rounding=ROUND_UP if direction == 'out' else ROUND_DOWN)
     try:
@@ -213,12 +227,27 @@ def compatible(profile, pays):
         return 'intra'
     if any(trades.is_sbp(p) for p in pays) and 'sbp' in profile.get('methods', {}):
         return 'sbp'
+    if SCENARIO.get() is not None:
+        text = ' '.join(pays).lower()
+        if any(s in text for s in ('card number', 'по номеру карты')) and 'card_number' in profile['methods']:
+            return 'card_number'
+        if any(s in text for s in ('bank requisites', 'по реквизитам')) and 'requisites' in profile['methods']:
+            return 'requisites'
     return None  # A named foreign bank is not proof that an ad accepts SBP.
 
 
 def select(con, data, pays, direction, amount, now, run_id=None, venue=None):
     reasons = []
-    for profile in data['accounts']:
+    accounts = data['accounts']
+    if SCENARIO.get() is not None and direction == 'out':
+        def cost(profile):
+            method = compatible(profile, pays)
+            try:
+                return money(quote(con, profile, method, direction, amount, now, run_id)['fee'])
+            except (Blocked, ValueError):
+                return Decimal('Infinity')
+        accounts = sorted(accounts, key=cost)
+    for profile in accounts:
         method = compatible(profile, pays)
         if not method:
             continue

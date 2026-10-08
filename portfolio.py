@@ -107,7 +107,7 @@ def start(amount, buy, sell, hops, planned_pct, pay_fee=0, path=DB_PATH, now=Non
                 leg["minutes"] = paper.hops_transfer_minutes([leg], paper.net_minutes_table(), paper.settings()["transfer_minutes"])
         bank_data = None
         bank_profile = None
-        if os.getenv("PAPER_BANK_MODEL", "strict") == "strict":
+        if bankmodel.mode() == "strict":
             bank_data = bankmodel.load()
             bankmodel.initialize(con, bank_data, now)
             bank_profile, pay_kind, _ = bankmodel.select(con, bank_data, buy.pays, "out", amount, now, venue=buy.ex)
@@ -136,11 +136,21 @@ def start(amount, buy, sell, hops, planned_pct, pay_fee=0, path=DB_PATH, now=Non
                "measures": measures or {},
                "note": "", "assumptions": [], "in_transit": False, "dust": []}
         run["settings"]["bank_model"] = "strict" if bank_profile else "legacy"
+        if bankmodel.SCENARIO.get() is not None:
+            scenario = bankmodel.SCENARIO.get()
+            run['settings']['pay_minutes'] = execution_review.check(bank_profile, buy, now)['payment_seconds'] / 60
+            run['settings']['spot_model'] = 'depth'
+            run['scenario'] = scenario['name']
+            run['assumptions'] = list(scenario['assumptions'])
+            run['catalog_revision'] = scenario['revision']
+            for leg in run['route']:
+                if leg['kind'] == 'transfer':
+                    leg['minutes'] *= scenario['network_multiplier']
         if bank_profile:
             run["bank_profile"] = bank_profile
             run["bank_account"] = bank_profile["id"]
             bankmodel.reserve(con, run["id"], bank_profile, pay_kind, amount, now)
-        run["settings"]["spot_model"] = os.getenv("PAPER_SPOT_MODEL", "depth")
+        run["settings"]["spot_model"] = 'depth' if bankmodel.SCENARIO.get() is not None else os.getenv("PAPER_SPOT_MODEL", "depth")
         _save(con, run)
         if not bank_profile and con.execute("SELECT 1 FROM bank_accounts LIMIT 1").fetchone():
             _cash(con, -amount, now=now)
@@ -197,7 +207,7 @@ def _take(con, ad, wanted):
 
 
 def _offer_key(ad):
-    if os.getenv("PAPER_BANK_MODEL", "strict") == "strict":
+    if bankmodel.mode() == "strict":
         return json.dumps(["unreplenished", ad.ex, ad.side, ad.asset, ad.ad_id or ad.nick, ad.net])
     return json.dumps([ad.ex, ad.side, ad.asset, ad.ad_id or ad.nick, ad.net, ad.fetched_ts, ad.price])
 
@@ -559,7 +569,7 @@ def report_lines(path=DB_PATH):
         lines.append(f"Оценка портфеля: {dec(s['equity']):.2f} ₽ · результат {pnl:+.2f} ₽ "
                      f"({pnl / dec(s['initial']) * 100:+.2f}%) · макс. просадка {dec(s['drawdown_pct']):.2f}%")
         lines.append(f"Оценка на {time.strftime('%d.%m %H:%M:%S', time.localtime(s['mark_ts']))}")
-        lines.append(f"Переоценка открытых позиций: {pnl - dec(s['realized']):+.2f} ₽")
+        lines.append(f"Переоценка открытых позиций: {pnl - dec(s.get('net_realized', s['realized'])):+.2f} ₽")
     else:
         lines.append("Общая оценка и доходность: нет свежей полной оценки открытых позиций.")
     if s.get("period_profit"):
@@ -588,7 +598,7 @@ def _mark(con, snap, now):
     row = con.execute("SELECT cash FROM wallet").fetchone()
     total = dec(row[0]) if row else dec("50000")
     positions = {}
-    strict = os.getenv("PAPER_BANK_MODEL", "strict") == "strict"
+    strict = bankmodel.mode() == "strict"
     reason = "bank_transfer_in_transit" if con.execute(
         "SELECT 1 FROM bank_transfers WHERE state='pending' LIMIT 1").fetchone() else None
     for state, in con.execute("SELECT state FROM runs"):

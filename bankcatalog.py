@@ -23,14 +23,45 @@ PRODUCTS = (
     {'id': 'gpb-debit', 'bank': 'Gazprombank', 'product': 'Счёт / дебетовый продукт',
      'kind': 'debit', 'free_sbp': '100000', 'service': 'зависит от конкретного продукта',
      'source': 'https://www.gazprombank.ru/personal/page/sbp/'},
-    {'id': 'mts-debit', 'bank': 'MTS-Bank', 'product': 'Дебетовый счёт',
+    {'id': 'mts-debit', 'bank': 'MTS Bank', 'product': 'Дебетовый счёт',
      'kind': 'debit', 'free_sbp': '100000', 'service': 'зависит от конкретного продукта',
      'source': 'https://www.mtsbank.ru/chastnim-licam/vse-servici/perevody-po-nomeru/'},
     {'id': 'alfa-credit', 'bank': 'Alfa-bank', 'product': 'Кредитная карта / СБП',
      'kind': 'credit', 'service': 'проценты и обслуживание зависят от договора',
      'out_rate': '0.059', 'out_min': '150', 'incoming_sbp': False,
      'source': 'https://alfabank.ru/everyday/online/sbp/'},
+    {'id': 'psb-cashback', 'bank': 'PSB', 'product': 'Твой кешбэк', 'kind': 'debit',
+     'service': '0 ₽; платное SMS-информирование в сценарии отключено', 'service_monthly': '0',
+     'free_sbp': '100000', 'source': 'https://www.psbank.ru/personal/debetcards/yourcashback'},
+    {'id': 'alfa-debit', 'bank': 'Alfa-bank', 'product': 'Альфа-Карта', 'kind': 'debit',
+     'service': '0 ₽', 'service_monthly': '0',
+     'per_day': '300000', 'limit_source': 'https://alfabank.ru/help/articles/sme/payservice/sbp-ehkvajring-kak-podklyuchit/',
+     'source': 'https://alfabank.ru/everyday/debit-cards/s-besplatnym-obsluzhivaniem/'},
 )
+
+# Public product facts are not personal permissions. Unknown fields stay null.
+for _product in PRODUCTS:
+    _product.update({'checked_at': CHECKED.isoformat(), 'valid_until': (CHECKED + dt.timedelta(days=30)).isoformat(),
+                     'eligibility': 'полная идентификация; условия выдачи и возраст требуют проверки',
+                     'enrollment_confirmed': False, 'service_waiver_confirmed': False,
+                     'operation_count_limit': None, 'monthly_amount_limit': None,
+                     'channels': {'sbp': {'free_month': _product.get('free_sbp'),
+                                          'per_operation': _product.get('per_operation'),
+                                          'per_day': _product.get('per_day'),
+                                          'fee_basis': 'published_credit_fee' if _product['kind'] == 'credit' else 'regulatory_ceiling'},
+                                  'self_sbp': {'free_month': '30000000'} if _product['kind'] != 'credit' else None,
+                                  'intra': None, 'card_number': None, 'requisites': None}})
+PRODUCTS[0]['channels']['intra'] = {'fee': '0', 'source': 'https://www.tbank.ru/finance/blog/no-more-pay/'}
+PRODUCTS[0]['channels']['requisites'] = {'fee': '0', 'source': 'https://www.tbank.ru/bank/help/payments/transfers/russia/requisites/',
+                                       'settlement': 'до рабочего дня; срочная услуга отдельно'}
+PRODUCTS[0]['service_monthly'] = '99'
+PRODUCTS[1]['service_monthly'] = '0'
+PRODUCTS[6]['channels']['intra'] = {'fee': '0', 'source': PRODUCTS[6]['source']}
+PRODUCTS[6]['channels']['card_number'] = {'percent': '1.99', 'minimum': '199',
+                                        'maximum': None, 'source': PRODUCTS[6]['source']}
+PRODUCTS[6]['channels']['requisites'] = {'percent': '0.6', 'minimum': '20',
+                                       'maximum': '1500', 'source': PRODUCTS[6]['source'],
+                                       'settlement_seconds': 86400}
 
 
 def _amount(value):
@@ -40,26 +71,33 @@ def _amount(value):
     return result
 
 
-def estimate(product_id, amount, used_month=0, *, own_account=False, used_day=0, today=None):
+def estimate(product_id, amount, used_month=0, *, own_account=False, used_day=0, today=None, terms=None):
     """Quote an outgoing RUB SBP cost; unknown limits stay explicit.
 
     A credit quote excludes financing cost and cannot become executable profit.
     Shared monthly usage must be supplied across all cards of the same bank.
     """
     today = today or dt.datetime.now(dt.timezone(dt.timedelta(hours=3))).date()
-    if not CHECKED <= today <= CHECKED + dt.timedelta(days=30):
-        raise ValueError('Каталог тарифов требует обновления')
-    product = next((p for p in PRODUCTS if p['id'] == product_id), None)
+    product = terms if terms is not None else next((p for p in PRODUCTS if p['id'] == product_id), None)
     if product is None:
         raise ValueError('Продукт отсутствует в проверенном каталоге')
+    if product['id'] != product_id:
+        raise ValueError('Несовпадение продукта и тарифа')
+    checked = dt.date.fromisoformat(product.get('checked_at', CHECKED.isoformat()))
+    expires = dt.date.fromisoformat(product.get('valid_until', (checked + dt.timedelta(days=30)).isoformat()))
+    if not checked <= today <= expires:
+        raise ValueError('Каталог тарифов требует обновления')
     amount, used, daily = map(_amount, (amount, used_month, used_day))
     if amount <= 0:
         raise ValueError('Сумма перевода должна быть положительной')
     if own_account and product['kind'] == 'credit':
         raise ValueError('Кредитные средства не моделируются как собственные')
-    if product.get('per_operation') and amount > _amount(product['per_operation']):
+    ceiling = Decimal('30000000') if own_account else Decimal('1000000')
+    if amount > ceiling:
+        raise ValueError('Превышен максимальный размер операции СБП')
+    if not own_account and product.get('per_operation') and amount > _amount(product['per_operation']):
         raise ValueError('Превышен опубликованный лимит операции')
-    if product.get('per_day') and daily + amount > _amount(product['per_day']):
+    if not own_account and product.get('per_day') and daily + amount > _amount(product['per_day']):
         raise ValueError('Превышен опубликованный суточный лимит')
     if product['kind'] == 'credit':
         fee = max(amount * _amount(product['out_rate']), _amount(product['out_min']))

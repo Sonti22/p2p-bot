@@ -14,6 +14,10 @@ def terms_hash(ad):
 
 
 def check(profile, ad, now):
+    import bankmodel
+    if bankmodel.SCENARIO.get() is not None:
+        from scenarios import review_offer
+        return review_offer(profile, ad, now)
     if not ad.ad_id:
         raise Blocked('Нет устойчивого идентификатора P2P-объявления')
     review = profile.get('offer_reviews', {}).get(key(ad))
