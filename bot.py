@@ -75,11 +75,15 @@ def save_topics(topics, path=None):
     jsonstore.write_dict(path or TOPICS_PATH, topics)
 
 
-MENU = {"keyboard": [[{"text": "🔥 Лучшая сейчас"}, {"text": "📊 Топ связок"}],
+MENU = {"keyboard": [[{"text": "🧪 Виртуальный баланс"}, {"text": "📈 Сценарии"}],
+                     [{"text": "🏦 Банки и лимиты"}, {"text": "📒 Журнал CSV"}],
+                     [{"text": "🔥 Лучшая сейчас"}, {"text": "📊 Топ связок"}],
                      [{"text": "⚙️ Настройки"}, {"text": "🛠 Разработка"}],
                      [{"text": "❓ Как работать"}, {"text": "🛡 Безопасность"}]],
         "resize_keyboard": True, "is_persistent": True}
-BUTTONS = {"🔥 Лучшая сейчас": "/best", "📊 Топ связок": "/top", "⚙️ Настройки": "/settings",
+BUTTONS = {"🧪 Виртуальный баланс": "/paper", "📈 Сценарии": "/paper scenarios",
+           "🏦 Банки и лимиты": "/paper banks", "📒 Журнал CSV": "/paper scenario-report",
+           "🔥 Лучшая сейчас": "/best", "📊 Топ связок": "/top", "⚙️ Настройки": "/settings",
            "🛠 Разработка": "/dev", "❓ Как работать": "/help", "🛡 Безопасность": "/safety"}
 
 # Гости (TG_GUESTS в .env): получают сигналы и рыночные команды; настройки, ключи, журнал, алерты — только
@@ -2325,7 +2329,19 @@ class Bot:
                   else {"text": "▶️ Включить", "callback_data": "paper_set:on"})
         amounts = [{"text": ("✓ " if s["amount"] == a else "") + f"{_money(a)} ₽", "callback_data": f"paper_amt:{a}"}
                    for a in PAPER_AMOUNTS]
-        return {"inline_keyboard": [[toggle], amounts,
+        import scenarios
+        navigation = []
+        if scenarios.enabled() and os.getenv("PAPER_ENGINE", "ledger") != "legacy":
+            navigation = [
+                [{"text": label, "callback_data": "paper_view:" + name}
+                 for name, label in (("fast", "⚡ Быстрый"), ("base", "📊 Базовый"), ("stress", "⏳ Стрессовый"))],
+                [{"text": "📈 Сравнение", "callback_data": "paper_nav:scenarios"},
+                 {"text": "🏦 Банки и лимиты", "callback_data": "paper_nav:banks"}],
+                [{"text": "📋 Тарифы", "callback_data": "paper_nav:catalog"},
+                 {"text": "🔒 Строгий портфель", "callback_data": "paper_nav:verified"}],
+                [{"text": label + " CSV", "callback_data": "paper_csv:" + name}
+                 for name, label in (("fast", "⚡"), ("base", "📊"), ("stress", "⏳"))]]
+        return {"inline_keyboard": navigation + [[toggle], amounts,
                                     [{"text": "📊 Отчёт + CSV", "callback_data": "paper_report"},
                                      {"text": "🔄 Обновить", "callback_data": "paper"}]]}
 
@@ -2426,11 +2442,11 @@ class Bot:
         sub, _, rest = arg.strip().partition(" ")
         sub = sub.lower()
         if sub == "verified":
-            await self.send('\n'.join(portfolio.report_lines() + portfolio.bank_report()))
+            await self.send('\n'.join(portfolio.report_lines() + portfolio.bank_report()), markup=self.paper_markup())
         elif sub == "scenarios":
             import scenarios
             for name in scenarios.VARIANTS:
-                await self.send('\n'.join(scenarios.report(name)))
+                await self.send('\n'.join(scenarios.report(name)), markup=self.paper_markup())
         elif sub == "scenario-report":
             import scenarios
             name = rest.strip() or 'base'
@@ -2443,7 +2459,7 @@ class Bot:
             await self.send_document(output, caption='Сценарный журнал: ' + name)
         elif sub == "catalog":
             import bankcatalog
-            await self.send("\n".join(bankcatalog.report_lines()))
+            await self.send("\n".join(bankcatalog.report_lines()), markup=self.paper_markup())
         elif sub == "bankfee":
             import bankcatalog
             parts = rest.split()
@@ -2462,7 +2478,7 @@ class Bot:
                 await self.send("Расчёт отклонён: " + html.escape(str(exc)))
         elif sub == "banks":
             import scenarios
-            await self.send('\n'.join(scenarios.account_lines() if scenarios.enabled() else portfolio.bank_report()))
+            await self.send('\n'.join(scenarios.account_lines() if scenarios.enabled() else portfolio.bank_report()), markup=self.paper_markup())
         elif sub == "transfer":
             parts = rest.split()
             if len(parts) != 4:
@@ -4327,6 +4343,14 @@ class Bot:
                 save_env("PAPER_AMOUNT", value)
             await self.call("editMessageText", chat_id=self.chat_id, message_id=cq["message"]["message_id"],
                             text=self.paper_view(), parse_mode="HTML", reply_markup=self.paper_markup())
+        elif data in {"paper_nav:" + sub for sub in ("scenarios", "banks", "catalog", "verified")}:
+            await self.cmd_paper(data.split(":", 1)[1])
+        elif data in {"paper_view:" + name for name in ("fast", "base", "stress")}:
+            import scenarios
+            if scenarios.enabled() and os.getenv("PAPER_ENGINE", "ledger") != "legacy":
+                await self.send("\n".join(scenarios.report(data.split(":", 1)[1])), markup=self.paper_markup())
+        elif data in {"paper_csv:" + name for name in ("fast", "base", "stress")}:
+            await self.cmd_paper("scenario-report " + data.split(":", 1)[1])
         elif data == "paper_report":
             await self.cmd_paper("report")
         elif data.startswith("paper_reset:"):

@@ -314,3 +314,39 @@ def test_telegram_default_comparison_export_and_signal_wiring(cfg, monkeypatch):
     with open(exported, encoding='utf-8-sig') as f:
         raw = f.read()
     assert 'scenario_started' in raw and 'service_fee' in raw and 'reserve' in raw
+
+
+def test_visible_menu_and_scenario_navigation(cfg, monkeypatch):
+    from helpers import arun
+    from test_bot import Stub, texts
+    import bot as B
+    monkeypatch.setenv('PAPER_SCENARIOS', '1')
+    monkeypatch.setenv('PAPER_ENGINE', 'ledger')
+    b = Stub(cfg)
+    labels = {item['text'] for row in B.MENU['keyboard'] for item in row}
+    for command in ('/paper', '/paper scenarios', '/paper banks', '/paper scenario-report'):
+        assert any(B.BUTTONS.get(label) == command for label in labels)
+    callbacks = {item['callback_data'] for row in b.paper_markup()['inline_keyboard'] for item in row}
+    for name in sc.VARIANTS:
+        assert 'paper_view:' + name in callbacks
+        arun(b.on_callback({'id': '1', 'data': 'paper_view:' + name, 'message': {'message_id': 7}}))
+        assert '\n'.join(sc.report(name)) == texts(b)[-1]
+    dispatched = []
+    async def capture(arg):
+        dispatched.append(arg)
+    monkeypatch.setattr(b, 'cmd_paper', capture)
+    for data in ('paper_nav:banks', 'paper_nav:verified', 'paper_nav:catalog', 'paper_csv:stress',
+                 'paper_csv:../../private', 'paper_view:unknown'):
+        arun(b.on_callback({'id': '1', 'data': data, 'message': {'message_id': 7}}))
+    assert dispatched == ['banks', 'verified', 'catalog', 'scenario-report stress']
+
+
+def test_guest_cannot_open_scenario_navigation(cfg):
+    from helpers import arun
+    from test_guests import Stub
+    b = Stub(cfg, guests=['42'])
+    for data in ('paper_nav:banks', 'paper_view:base', 'paper_csv:stress'):
+        b.out.clear()
+        arun(b.on_update({'callback_query': {'id': '1', 'data': data,
+            'message': {'chat': {'id': 42}, 'message_id': 7}}}))
+        assert [method for method, _ in b.out] == ['answerCallbackQuery']
