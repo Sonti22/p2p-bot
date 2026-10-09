@@ -25,6 +25,8 @@ FILES = ("trades.db", "blacklist.db", "alerts.db", "history.db", "paper.db", "pa
          "payouts.db",         # ID выплат, неизвестные исходы и учёт дневного лимита
          "hedge_circles.db",   # хеджи кругов (trading/hedge.py): открытые шорты и их итог
          "trading.db")         # журнал ордеров торгового ядра: позиции бота, результат дня (WAL — копия через backup API)
+FILES += ("alt_shorts.db", "paper_scenario_fast.db", "paper_scenario_base.db", "paper_scenario_stress.db")
+FILES += ("sim_maker.db", "sim_funding.db", "sim_directional.db")
 KEEP_DEFAULT = 7
 EVERY = 86400                     # сек — не чаще раза в сутки
 MSK = timezone(timedelta(hours=3))

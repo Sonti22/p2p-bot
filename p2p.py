@@ -695,6 +695,8 @@ BC_URL = "http://api.bestchange.ru/info.zip"
 # без ответа за 10 с — путь закрыт (VPN-выход бывает в бане у BestChange: пакет уходит, ответа нет вообще)
 BC_TIMEOUT = aiohttp.ClientTimeout(total=60, sock_connect=6, sock_read=10)
 BC_MAX_TRIES = 5
+BC_MAX_ARCHIVE = 32 * 1024 * 1024
+BC_MAX_UNPACKED = 256 * 1024 * 1024
 
 
 def _bc_parse(data):
@@ -702,7 +704,12 @@ def _bc_parse(data):
     _bc_stats['skipped'], лог при изменении числа); если битых строк bm_rates.dat больше, чем разобранных
     объявлений — это смена формата выгрузки, а не случайная строка, и разбор падает (кэш и бэкофф площадки не
     трогаются, как при любом другом сбое выгрузки)."""
+    if len(data) > BC_MAX_ARCHIVE:
+        raise ValueError("BestChange: archive size limit exceeded")
     z = zipfile.ZipFile(io.BytesIO(data))
+    if sum(item.file_size for item in z.infolist()) > BC_MAX_UNPACKED:
+        z.close()
+        raise ValueError("BestChange: unpacked size limit exceeded")
     skipped = 0
     cy = {}
     for line in z.read("bm_cy.dat").decode("cp1251", errors="replace").splitlines():
@@ -782,7 +789,12 @@ async def _bc_download(s, local=None):
     try:
         async with sess.get(BC_URL, headers=HEADERS, timeout=BC_TIMEOUT) as r:
             r.raise_for_status()
-            return await r.read()
+            data = bytearray()
+            async for chunk in r.content.iter_chunked(65536):
+                data.extend(chunk)
+                if len(data) > BC_MAX_ARCHIVE:
+                    raise ValueError("BestChange: archive size limit exceeded")
+            return bytes(data)
     finally:
         if own:
             await sess.close()

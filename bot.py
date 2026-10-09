@@ -43,6 +43,7 @@ import sqlite3
 import portfolio
 import spotbook
 import snapshots
+import health_http
 import shorts
 import shortmarket
 import trades
@@ -2998,6 +2999,7 @@ class Bot:
                 t0 = time.time()
                 snap = self.last = await self.fresh_scan()
                 self.last_scan_ts, self.last_scan_duration = time.time(), time.time() - t0
+                health_http.update_scan_status(self.last_scan_duration, snap.errors)
                 self.scan_errors = 0
                 self.speed.add(self.last, self.last_scan_duration)
                 await self.scan_step("track_liveness", self.track_liveness, self.last)
@@ -5207,6 +5209,7 @@ class Bot:
 async def main():
     setup_logging()
     load_env()
+    health_http.start_metrics()
     payouts.switch_from_file(ENV_PATH)   # выключатель выплат — только из .env: PAYOUTS=1 извне его не перебьёт
     trading.switch.switch_from_file(ENV_PATH)   # торговля: TRADING и TRADING_MODE — только из .env, извне не поднять
     trading.gates.flags_from_file(ENV_PATH)     # флаг владельца TRADING_SHORT_PAPER — тоже только из файла .env
@@ -5236,7 +5239,13 @@ async def main():
         bot.watchdog_task = asyncio.ensure_future(bot.watchdog_loop())   # «скан стоит» — своей задачей
         logger.info("Бот запущен: каждые %ss, порог %g%%, биржи %s", cfg.interval, cfg.min_profit,
                     ', '.join(cfg.exchanges))
-        await asyncio.gather(bot.scan_loop(), bot.command_loop(), bot.accounts_loop(), bot.payouts_loop())
+        health_port = int(os.getenv("HEALTH_CHECK_PORT", "0"))
+        health_runner = await health_http.init_app(health_port) if health_port else None
+        try:
+            await asyncio.gather(bot.scan_loop(), bot.command_loop(), bot.accounts_loop(), bot.payouts_loop())
+        finally:
+            if health_runner is not None:
+                await health_runner.cleanup()
 
 
 if __name__ == "__main__":

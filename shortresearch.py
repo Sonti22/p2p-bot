@@ -52,6 +52,8 @@ def evaluate(path=None, minimum_days=90):
         observations = [(float(r['ts']), r['symbol'], decode(r['state'])) for r in
                         con.execute('SELECT * FROM snapshots ORDER BY ts,symbol')]
         catalogs = [(float(r['ts']), decode(r['state'])) for r in con.execute('SELECT * FROM catalog ORDER BY ts')]
+    if any(raw.get('observed_at') != ts for ts, sym, raw in observations):
+        return {'ready': False, 'reason': 'история содержит снимки без подтверждённого времени наблюдения', 'coverage': c}
     # Parameters are fixed before testing; training only records the baseline, never selects test winners.
     boundary = c['start'] + (c['end']-c['start'])*.6
     result = {'ready': False, 'coverage': c, 'split': boundary, 'version': shorts.VERSION,

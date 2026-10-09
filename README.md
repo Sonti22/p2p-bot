@@ -183,3 +183,5 @@ P2P-объявления блокируют исполнение. `/paper banks`
 Проверка накопленных данных и гипотез: `/shorts research`, `/paper research [fast|base|stress]`.
 Методика и ограничения — [docs/STRATEGY_RESEARCH.md](docs/STRATEGY_RESEARCH.md).
 Автоматический подбор параметров и переключение рабочих правил пока не включены.
+
+HTTP-мониторинг и результаты проверки: [docs/AUDIT_2026-10-09.md](docs/AUDIT_2026-10-09.md).

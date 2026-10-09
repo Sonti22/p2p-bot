@@ -285,8 +285,12 @@ def tick(markets, now=None, path=None, allow_entries=True, filters=True, random_
         if int(now // 86400) != state['day']:
             state.update(day=int(now // 86400), day_start=state['equity'], day_pnl='0')
         for sym, m in markets.items():
+            previous = con.execute('SELECT ts,state FROM snapshots WHERE symbol=? ORDER BY ts DESC LIMIT 1', (sym,)).fetchone()
+            # Other symbols are processed repeatedly while collecting fresh books. Keep only changes.
+            if previous and previous['state'] == zlib.compress(dump(dict(m, observed_at=previous['ts'])).encode('utf-8')):
+                continue
             con.execute('INSERT OR IGNORE INTO snapshots VALUES(?,?,?)',
-                        (sym, m['ticker_ts'], zlib.compress(dump(m).encode('utf-8'))))
+                        (sym, now, zlib.compress(dump(dict(m, observed_at=float(now))).encode('utf-8'))))
         consumed = {}
         for p in positions(con, True):
             m = markets.get(p['symbol'])

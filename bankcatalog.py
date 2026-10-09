@@ -35,7 +35,7 @@ PRODUCTS = (
      'free_sbp': '100000', 'source': 'https://www.psbank.ru/personal/debetcards/yourcashback'},
     {'id': 'alfa-debit', 'bank': 'Alfa-bank', 'product': 'Альфа-Карта', 'kind': 'debit',
      'service': '0 ₽', 'service_monthly': '0',
-     'per_day': '300000', 'limit_source': 'https://alfabank.ru/help/articles/sme/payservice/sbp-ehkvajring-kak-podklyuchit/',
+     'per_day': None, 'limit_note': 'Лимит личной карты не подтверждён; условия СБП-эквайринга бизнеса неприменимы',
      'source': 'https://alfabank.ru/everyday/debit-cards/s-besplatnym-obsluzhivaniem/'},
 )
 

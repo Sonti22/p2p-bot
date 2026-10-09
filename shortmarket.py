@@ -304,7 +304,12 @@ class Collector:
 
     async def refresh(self, session):
         if session is not None:
-            await self.calibrate(session)
+            try:
+                await self.calibrate(session)
+            except Exception as exc:
+                shorts.record_error('Калибровка времени: ' + type(exc).__name__, self.path)
+                shorts.tick({}, self.now(), self.path, allow_entries=False)
+                return {}
         now = self.now()
         state = shorts.status(self.path)
         opened = {p['symbol']: p.get('opened', p['submitted']) for p in state['positions'] if p['stage'] != 'closed'} if state else {}

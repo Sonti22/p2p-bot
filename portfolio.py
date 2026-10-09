@@ -518,7 +518,9 @@ def _step(con, r, snap, cfg, now, books):
 
 def summary(path=DB_PATH):
     if not os.path.exists(path):
-        return {"initial": "50000.00", "cash": "50000.00", "reserved": "0", "realized": "0", "runs": []}
+        return {"initial": "50000.00", "cash": "50000.00", "reserved": "0", "realized": "0", "runs": [],
+                "bank_expenses": "0", "bank_in_transit": "0", "strict_realized": "0", "net_realized": "0",
+                "equity": None, "mark_ts": None, "period_profit": {"day": "0", "week": "0"}, "drawdown_pct": None}
     con = connect(path)
     try:
         row = con.execute("SELECT initial,cash FROM wallet").fetchone()
