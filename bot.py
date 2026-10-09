@@ -43,6 +43,8 @@ import sqlite3
 import portfolio
 import spotbook
 import snapshots
+import shorts
+import shortmarket
 import trades
 import trading.wiring
 from cards import deal_card, history_card, history_compare_card, portfolio_card, top_chart
@@ -51,7 +53,7 @@ from p2p import ALL_EXCHANGES, AMOUNT_MAX, AMOUNT_MIN, DEFAULT_ASSETS, ENV_PATH,
     deal_for_amount, deal_fresh, fmt_ad, fmt_breakeven, fmt_deal, fmt_top, load_env, maker_neighbors, maker_place, maker_quote, \
     maker_round_fee, parse_amount, parse_min_profit, profit_breakdown, reliability, reliability_index, route_hops, scan, \
     score, setup_logging, spot_url, traps_log, venue_url, ScanSpeed, deal_stale
-from p2p import depth_for_deal, depth_settings, terms_log, terms_summary
+from p2p import depth_for_deal, depth_settings, terms_log, terms_summary, rapira_mid
 
 logger = logging.getLogger(__name__)
 
@@ -76,12 +78,14 @@ def save_topics(topics, path=None):
 
 
 MENU = {"keyboard": [[{"text": "🧪 Виртуальный баланс"}, {"text": "📈 Сценарии"}],
+                     [{"text": "📉 Шорты альтов"}],
                      [{"text": "🏦 Банки и лимиты"}, {"text": "📒 Журнал CSV"}],
                      [{"text": "🔥 Лучшая сейчас"}, {"text": "📊 Топ связок"}],
                      [{"text": "⚙️ Настройки"}, {"text": "🛠 Разработка"}],
                      [{"text": "❓ Как работать"}, {"text": "🛡 Безопасность"}]],
         "resize_keyboard": True, "is_persistent": True}
 BUTTONS = {"🧪 Виртуальный баланс": "/paper", "📈 Сценарии": "/paper scenarios",
+           "📉 Шорты альтов": "/shorts",
            "🏦 Банки и лимиты": "/paper banks", "📒 Журнал CSV": "/paper scenario-report",
            "🔥 Лучшая сейчас": "/best", "📊 Топ связок": "/top", "⚙️ Настройки": "/settings",
            "🛠 Разработка": "/dev", "❓ Как работать": "/help", "🛡 Безопасность": "/safety"}
@@ -110,6 +114,7 @@ OWNER_ONLY_PRIVATE = ("🔒 Команды владельца (настройк�
 OWNER_ONLY_TOAST = "Кнопки владельца — только в личном чате владельца с ботом"
 FIRST_CHAT_PRIVATE = "🔒 Владелец ещё не настроен: укажи свой Telegram user ID в TG_CHAT_ID в .env на ПК и перезапусти бота."
 COMMANDS = [{"command": "best", "description": "Лучшая связка сейчас"},
+            {"command": "shorts", "description": "Виртуальные шорты альтов: баланс, позиции, риск и журнал"},
             {"command": "top", "description": "Топ связок графиком"},
             {"command": "history", "description": "История спредов: время суток, дни недели, BestChange"},
             {"command": "backtest", "description": "Бэктест маршрута по истории спредов (7/30 дней)"},
@@ -226,6 +231,7 @@ HELP_SECTIONS = {
               "/paper report — отчёт по площадкам и парам + CSV\n/paper cycles [дней] — круги в CSV\n"
               "/paper reset — обнулить (с подтверждением)\n"
               "/funding — бумажный арбитраж фандинга\n/futures — бумажная стратегия EMA 20/100\n"
+              "/shorts — виртуальные шорты альтов: баланс, позиции, риск и CSV\n"
               "/maker paper — бумажный мейкер\n/calibration — поправка факт − план (CALIBRATION=1)"),
     "settings": ("⚙️ Настройки", "<b>Настройки и служебное</b>\n"
                  "/settings — порог, сумма, фильтры, мои биржи и банки, тихие часы, пауза, пресеты (всё в .env)\n"
@@ -3193,6 +3199,74 @@ class Bot:
                 logger.error("perp_loop error: %s", e)
             await asyncio.sleep(PERP_LOOP_TICK)
 
+    async def shorts_loop(self):
+        collector = shortmarket.Collector()
+        last_notice = 0
+        if os.getenv('ALT_SHORTS', '0') == '1':
+            with shorts.connect() as con:
+                last_notice = con.execute('SELECT COALESCE(MAX(id),0) FROM events').fetchone()[0]
+        while True:
+            state = None
+            try:
+                if os.getenv('ALT_SHORTS', '0') == '1':
+                    state = shorts.status()
+                    if state is None and self.last is not None and 0 <= time.time()-self.last.ts <= 60:
+                        shorts.initialize(self.last.ref, self.last.ref_src)
+                    elif state is None:
+                        rate = await rapira_mid(self.s)
+                        shorts.initialize(rate, 'Rapira USDT/RUB · наблюдение при запуске')
+                    if shorts.status() is not None:
+                        await collector.refresh(self.s)
+                        with shorts.connect() as con:
+                            row = con.execute("SELECT MAX(id) FROM events").fetchone()
+                            high = row[0] or 0
+                            events = con.execute("SELECT kind FROM events WHERE id>? AND kind IN ('entry_fill','exit_fill','stress_loss','drawdown_halt')", (last_notice,)).fetchall()
+                        last_notice = high
+                        if events:
+                            await self.send(shorts.report('positions'), markup=self.shorts_markup(), topic='journal')
+            except Exception as exc:
+                logger.warning('shorts_loop: %s', type(exc).__name__)
+                shorts.record_error('Ошибка получения данных: ' + type(exc).__name__)
+            current = shorts.status() if os.getenv('ALT_SHORTS', '0') == '1' else None
+            await asyncio.sleep(1 if current and any(p['stage'] != 'closed' for p in current['positions']) else 15)
+
+    def shorts_markup(self):
+        return {'inline_keyboard': [
+            [{'text': '💰 Баланс', 'callback_data': 'shorts:balance'},
+             {'text': '🔎 Кандидаты', 'callback_data': 'shorts:candidates'}],
+            [{'text': '📉 Позиции', 'callback_data': 'shorts:positions'},
+             {'text': '📊 Результаты', 'callback_data': 'shorts:results'}],
+            [{'text': '🛡 Риск', 'callback_data': 'shorts:risk'},
+             {'text': '📒 CSV', 'callback_data': 'shorts:export'}],
+            [{'text': '⏸ Пауза входов', 'callback_data': 'shorts:pause'},
+             {'text': '▶️ Возобновить', 'callback_data': 'shorts:resume'}]]}
+
+    async def cmd_shorts(self, arg):
+        section = arg.strip().lower()
+        if section in ('pause', 'resume'):
+            shorts.control(section)
+            section = ''
+        if section == 'export':
+            destination = os.path.join(os.path.dirname(shorts.DB_PATH), 'alt_shorts.csv')
+            shorts.export(destination)
+            await self.send_document(destination, caption='Журнал виртуальных шортов альтов')
+        elif section == 'research':
+            import shortresearch
+            await self.send(shortresearch.summary(), markup=self.shorts_markup())
+        elif section in ('', 'balance', 'candidates', 'positions', 'results', 'risk'):
+            text = shorts.report('' if section == 'balance' else section)
+            # Blocks have balanced HTML tags. Split only between blocks for long watchlists.
+            chunk = ''
+            for block in text.split('\n\n'):
+                if chunk and len(chunk) + len(block) + 2 > 3800:
+                    await self.send(chunk, markup=self.shorts_markup())
+                    chunk = ''
+                chunk += ('\n\n' if chunk else '') + block
+            if chunk:
+                await self.send(chunk, markup=self.shorts_markup())
+        else:
+            await self.send('/shorts balance|candidates|positions|results|risk|export|pause|resume|research')
+
     def sim_tick(self):
         """Бумажные симуляции на свежих котировках перпов; сбой одной не мешает другой и опросу."""
         for name, run in (("simfunding", simfunding.tick), ("simdirectional", simdirectional.tick)):
@@ -4341,6 +4415,8 @@ class Bot:
             await self.open_help(cq, data[5:])
         elif data == "paper":
             await self.send(self.paper_view(), markup=self.paper_markup())
+        elif data in {'shorts:' + action for action in ('balance', 'candidates', 'positions', 'results', 'risk', 'export', 'pause', 'resume')}:
+            await self.cmd_shorts(data.split(':', 1)[1])
         elif data.startswith(("paper_set:", "paper_amt:")):
             key, value = data.split(":", 1)
             if key == "paper_set" and value in ("on", "off"):
@@ -4546,6 +4622,8 @@ class Bot:
             await self.send(simfunding.view())
         elif cmd == "/futures":   # и «/futures paper» — пока есть только бумага
             await self.send(simdirectional.view())
+        elif cmd == "/shorts":
+            await self.cmd_shorts(arg)
         elif cmd == "/fav":
             text, kb = self.favorites_view()
             await self.send(text, markup=kb)
@@ -5143,6 +5221,7 @@ async def main():
             await bot.setup_topics()
             await bot.check_key_safety()
         bot.perp_task = asyncio.ensure_future(bot.perp_loop())   # публичные данные перпов — своим циклом (perp.py)
+        bot.shorts_task = asyncio.ensure_future(bot.shorts_loop())
         # торговое ядро: старт (ключи у бирж, предупреждения — одно сообщение) и сверка — своей задачей, скан не ждёт
         bot.trading_task = asyncio.ensure_future(trading.wiring.run(bot))
         bot.watchdog_task = asyncio.ensure_future(bot.watchdog_loop())   # «скан стоит» — своей задачей
