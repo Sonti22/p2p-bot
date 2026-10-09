@@ -43,6 +43,7 @@ def connect(path=None, write=False):
       CREATE TABLE IF NOT EXISTS positions (id INTEGER PRIMARY KEY, symbol TEXT, state TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY, ts REAL, kind TEXT, details TEXT);
       CREATE TABLE IF NOT EXISTS snapshots (symbol TEXT, ts REAL, state TEXT, PRIMARY KEY(symbol,ts));
+      CREATE INDEX IF NOT EXISTS snapshots_chronology ON snapshots(ts,symbol);
       CREATE TABLE IF NOT EXISTS catalog (ts REAL PRIMARY KEY, state TEXT);
     ''')
     try:

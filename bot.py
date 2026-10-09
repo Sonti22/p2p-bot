@@ -46,6 +46,8 @@ import snapshots
 import health_http
 import shorts
 import shortmarket
+import shortlab
+import shortlogic
 import trades
 import trading.wiring
 from cards import deal_card, history_card, history_compare_card, portfolio_card, top_chart
@@ -3211,6 +3213,15 @@ class Bot:
 
     async def shorts_loop(self):
         collector = shortmarket.Collector()
+        lab = shortlab.Worker()
+        self.short_collector, self.short_lab = collector, lab
+        try:
+            await self._shorts_watch_loop(collector, lab)
+        finally:
+            await collector.close()
+            await lab.close()
+
+    async def _shorts_watch_loop(self, collector, lab):
         last_notice = 0
         if os.getenv('ALT_SHORTS', '0') == '1':
             with shorts.connect() as con:
@@ -3226,7 +3237,8 @@ class Bot:
                         rate = await rapira_mid(self.s)
                         shorts.initialize(rate, 'Rapira USDT/RUB · наблюдение при запуске')
                     if shorts.status() is not None:
-                        await collector.refresh(self.s)
+                        markets = await collector.refresh(self.s)
+                        lab.submit(markets, collector.diagnostics_snapshot(), collector.now())
                         with shorts.connect() as con:
                             row = con.execute("SELECT MAX(id) FROM events").fetchone()
                             high = row[0] or 0
@@ -3249,6 +3261,11 @@ class Bot:
             [{'text': '🛡 Риск', 'callback_data': 'shorts:risk'},
              {'text': '📒 CSV', 'callback_data': 'shorts:export'}],
             [{'text': '📚 Данные и обучение', 'callback_data': 'shorts:research'}],
+            [{'text': '🧠 Обучение', 'callback_data': 'shorts:learning'},
+             {'text': '⚡ Качество данных', 'callback_data': 'shorts:feed'}],
+            [{'text': '🔎 Решения', 'callback_data': 'shorts:decisions'},
+             {'text': '📖 Логика', 'callback_data': 'shorts:knowledge'}],
+            [{'text': '📒 Журнал решений CSV', 'callback_data': 'shorts:labexport'}],
             [{'text': '⏸ Пауза входов', 'callback_data': 'shorts:pause'},
              {'text': '▶️ Возобновить', 'callback_data': 'shorts:resume'}]]}
 
@@ -3264,6 +3281,22 @@ class Bot:
         elif section == 'research':
             import strategyreview
             await self.send(strategyreview.shorts_report(), markup=self.shorts_markup())
+        elif section == 'knowledge':
+            await self.send(shortlogic.guide(), markup=self.shorts_markup())
+        elif section in ('learning', 'decisions', 'feed'):
+            text = await asyncio.to_thread(shortlab.report, section)
+            chunk = ''
+            for block in text.split('\n\n'):
+                if chunk and len(chunk) + len(block) + 2 > 3800:
+                    await self.send(chunk, markup=self.shorts_markup())
+                    chunk = ''
+                chunk += ('\n\n' if chunk else '') + block
+            if chunk:
+                await self.send(chunk, markup=self.shorts_markup())
+        elif section == 'labexport':
+            destination = os.path.join(os.path.dirname(shortlab.DB_PATH), 'short_decisions.csv')
+            await asyncio.to_thread(shortlab.export, destination)
+            await self.send_document(destination, caption='Причины входов и отказов · виртуальные шорты')
         elif section in ('', 'balance', 'candidates', 'positions', 'results', 'risk'):
             text = shorts.report('' if section == 'balance' else section)
             # Blocks have balanced HTML tags. Split only between blocks for long watchlists.
@@ -3276,7 +3309,7 @@ class Bot:
             if chunk:
                 await self.send(chunk, markup=self.shorts_markup())
         else:
-            await self.send('/shorts balance|candidates|positions|results|risk|export|pause|resume|research')
+            await self.send('/shorts balance|candidates|positions|results|risk|export|pause|resume|research|learning|decisions|feed|knowledge|labexport')
 
     def sim_tick(self):
         """Бумажные симуляции на свежих котировках перпов; сбой одной не мешает другой и опросу."""
@@ -4426,7 +4459,7 @@ class Bot:
             await self.open_help(cq, data[5:])
         elif data == "paper":
             await self.send(self.paper_view(), markup=self.paper_markup())
-        elif data in {'shorts:' + action for action in ('balance', 'candidates', 'positions', 'results', 'risk', 'export', 'pause', 'resume', 'research')}:
+        elif data in {'shorts:' + action for action in ('balance', 'candidates', 'positions', 'results', 'risk', 'export', 'pause', 'resume', 'research', 'learning', 'feed', 'decisions', 'knowledge', 'labexport')}:
             await self.cmd_shorts(data.split(':', 1)[1])
         elif data.startswith(("paper_set:", "paper_amt:")):
             key, value = data.split(":", 1)
