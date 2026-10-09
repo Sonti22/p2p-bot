@@ -74,6 +74,7 @@ def test_clock_calibration_changes_clock_not_freshness_policy(monkeypatch,tmp_pa
     from helpers import arun
     c=M.Collector(str(tmp_path/'empty.db'))
     monkeypatch.setattr(M.time,'time',lambda:NOW+1.2)
+    monkeypatch.setattr(M.time,'monotonic',lambda:0)
     async def server(session,endpoint):
         assert endpoint=='time'
         return {},NOW
