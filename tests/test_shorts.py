@@ -326,7 +326,7 @@ def test_snapshot_research_is_dated_and_not_optimistic(db,tmp_path):
     later=market(NOW+120)
     S.tick({'ALTUSDT':later},NOW+120,db)
     result=R.evaluate(db,minimum_days=0)
-    assert not result['ready'] and set(result['variants'])=={'strategy','random','flat','no_filters','fees_x2','worse_execution'}
+    assert not result['ready'] and set(result['variants'])=={'strategy','random','flat','no_filters','fees_x2','worse_execution','breakdown','wick_reversal'}
     assert Decimal(result['variants']['flat']['realized'])==0
 
 

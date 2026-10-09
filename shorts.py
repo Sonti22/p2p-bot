@@ -173,7 +173,7 @@ def protection(m, now):
     return None
 
 
-def signal(m, now):
+def signal(m, now, kind='ema_retest'):
     hours = contiguous(m.get('hours', []), 3600, now, 21)
     bars = contiguous(m.get('bars', []), 900, now, 35)
     if not hours or not bars:
@@ -184,6 +184,8 @@ def signal(m, now):
         return None, 'часовой объём меньше 3× медианы'
     if now - (bars[-1][0] + 900) > 60:
         return None, 'окно входа 60с истекло'
+    if kind not in ('ema_retest', 'breakdown', 'wick_reversal'):
+        raise ValueError('неизвестная исследовательская стратегия')
     closes = [b[4] for b in bars]
     means = ema(closes)
     j = len(bars) - 1
@@ -191,6 +193,19 @@ def signal(m, now):
                   for i in range(max(1, j - 4), j))
     b = bars[-1]
     a = atr(bars)
+    if kind != 'ema_retest':
+        body = abs(dec(b[4])-dec(b[1]))
+        wick = dec(b[2])-max(dec(b[1]),dec(b[4]))
+        if a <= 0 or dec(b[4]) >= means[-1] or dec(b[4]) >= dec(b[1]):
+            return None, 'нет медвежьего подтверждения'
+        if dec(b[2]) > max(dec(r[2]) for r in bars[-7:-1]):
+            return None, 'обновлён максимум шести свечей'
+        if kind == 'breakdown' and dec(b[4]) >= min(dec(r[3]) for r in bars[-7:-1]):
+            return None, 'нет пробоя минимума шести свечей'
+        if kind == 'wick_reversal' and (body <= 0 or wick < 2*body):
+            return None, 'нет верхней тени 2× тела'
+        return {'stop': str(max(dec(r[2]) for r in bars[-6:])+a/4),
+                'signal_ts': b[0]+900, 'reason': 'исследовательская гипотеза: '+kind}, None
     if not crossed or a <= 0 or not means[-1] - a / 4 <= dec(b[2]) <= means[-1] + a / 4:
         return None, 'нет неудачного возврата к EMA20'
     if dec(b[4]) >= means[-1] or dec(b[4]) >= dec(b[1]):
@@ -260,7 +275,7 @@ def size_order(state, opened, m, stop):
             'risk': str(qty * risk_per_qty), 'entry_est': str(px)}
 
 
-def tick(markets, now=None, path=None, allow_entries=True, filters=True, random_entry=False):
+def tick(markets, now=None, path=None, allow_entries=True, filters=True, random_entry=False, strategy='ema_retest'):
     now = time.time() if now is None else now
     with connect(path, True) as con:
         state = meta(con)
@@ -423,7 +438,7 @@ def tick(markets, now=None, path=None, allow_entries=True, filters=True, random_
                 err = protection(m, now)
                 if not filters and err in ('ускорение mark >5% за 60с', 'расхождение mark/index >1%', 'фандинг ниже −0,1%'):
                     err = None
-                sig, why = signal(m, now)
+                sig, why = signal(m, now, strategy)
                 if random_entry:
                     import hashlib
                     edge = int(now // 900) * 900

@@ -2351,6 +2351,7 @@ class Bot:
                  {"text": "🏦 Банки и лимиты", "callback_data": "paper_nav:banks"}],
                 [{"text": "📋 Тарифы", "callback_data": "paper_nav:catalog"},
                  {"text": "🔒 Строгий портфель", "callback_data": "paper_nav:verified"}],
+                [{"text": "📚 Проверка маршрутов", "callback_data": "paper_nav:research"}],
                 [{"text": label + " CSV", "callback_data": "paper_csv:" + name}
                  for name, label in (("fast", "⚡"), ("base", "📊"), ("stress", "⏳"))]]
         return {"inline_keyboard": navigation + [[toggle], amounts,
@@ -2453,7 +2454,14 @@ class Bot:
         обнулить (paper_reset:yes → paper.reset, база в архив)."""
         sub, _, rest = arg.strip().partition(" ")
         sub = sub.lower()
-        if sub == "verified":
+        if sub == "research":
+            import strategyreview
+            name = rest.strip() or 'base'
+            if name not in ('fast','base','stress'):
+                await self.send('Варианты: fast, base, stress.')
+                return
+            await self.send(strategyreview.p2p_report(name), markup=self.paper_markup())
+        elif sub == "verified":
             await self.send('\n'.join(portfolio.report_lines() + portfolio.bank_report()), markup=self.paper_markup())
         elif sub == "scenarios":
             import scenarios
@@ -3238,6 +3246,7 @@ class Bot:
              {'text': '📊 Результаты', 'callback_data': 'shorts:results'}],
             [{'text': '🛡 Риск', 'callback_data': 'shorts:risk'},
              {'text': '📒 CSV', 'callback_data': 'shorts:export'}],
+            [{'text': '📚 Данные и обучение', 'callback_data': 'shorts:research'}],
             [{'text': '⏸ Пауза входов', 'callback_data': 'shorts:pause'},
              {'text': '▶️ Возобновить', 'callback_data': 'shorts:resume'}]]}
 
@@ -3251,8 +3260,8 @@ class Bot:
             shorts.export(destination)
             await self.send_document(destination, caption='Журнал виртуальных шортов альтов')
         elif section == 'research':
-            import shortresearch
-            await self.send(shortresearch.summary(), markup=self.shorts_markup())
+            import strategyreview
+            await self.send(strategyreview.shorts_report(), markup=self.shorts_markup())
         elif section in ('', 'balance', 'candidates', 'positions', 'results', 'risk'):
             text = shorts.report('' if section == 'balance' else section)
             # Blocks have balanced HTML tags. Split only between blocks for long watchlists.
@@ -4415,7 +4424,7 @@ class Bot:
             await self.open_help(cq, data[5:])
         elif data == "paper":
             await self.send(self.paper_view(), markup=self.paper_markup())
-        elif data in {'shorts:' + action for action in ('balance', 'candidates', 'positions', 'results', 'risk', 'export', 'pause', 'resume')}:
+        elif data in {'shorts:' + action for action in ('balance', 'candidates', 'positions', 'results', 'risk', 'export', 'pause', 'resume', 'research')}:
             await self.cmd_shorts(data.split(':', 1)[1])
         elif data.startswith(("paper_set:", "paper_amt:")):
             key, value = data.split(":", 1)
@@ -4425,7 +4434,7 @@ class Bot:
                 save_env("PAPER_AMOUNT", value)
             await self.call("editMessageText", chat_id=self.chat_id, message_id=cq["message"]["message_id"],
                             text=self.paper_view(), parse_mode="HTML", reply_markup=self.paper_markup())
-        elif data in {"paper_nav:" + sub for sub in ("scenarios", "banks", "catalog", "verified")}:
+        elif data in {"paper_nav:" + sub for sub in ("scenarios", "banks", "catalog", "verified", "research")}:
             await self.cmd_paper(data.split(":", 1)[1])
         elif data in {"paper_view:" + name for name in ("fast", "base", "stress")}:
             import scenarios

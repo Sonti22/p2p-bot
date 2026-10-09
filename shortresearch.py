@@ -38,6 +38,8 @@ def summary(path=None):
             f"Снимков каталога: {c['catalogs']}\n\n"
             'Порог анализа: 90 дней наблюдений и минимум 50 исполненных сделок в проверочной части.\n'
             'Накопленные данные позволяют воспроизводимый реплей. Недостающие стаканы, снятые монеты и интервалы связи не восстанавливаются.\n'
+            'Гипотезы: возврат к EMA20, пробой минимума, разворот с верхней тенью.\n'
+            'Новые гипотезы проверяются отдельно; рабочие правила не переключаются автоматически.\n'
             'Свечной результат не подтверждает доходность реального исполнения. /shorts research')
 
 
@@ -55,7 +57,7 @@ def evaluate(path=None, minimum_days=90):
     result = {'ready': False, 'coverage': c, 'split': boundary, 'version': shorts.VERSION,
               'training': [c['start'], boundary], 'verification': [boundary, c['end']], 'variants': {}}
     with tempfile.TemporaryDirectory() as temp:
-        for variant in ('strategy', 'random', 'flat', 'no_filters', 'fees_x2', 'worse_execution'):
+        for variant in ('strategy', 'random', 'flat', 'no_filters', 'fees_x2', 'worse_execution', 'breakdown', 'wick_reversal'):
             db = os.path.join(temp, variant + '.db')
             shorts.initialize(original['rub_rate'], original['rate_source'], boundary, db)
             markets, invalid = {}, 0
@@ -76,7 +78,8 @@ def evaluate(path=None, minimum_days=90):
                     m['asks'] = [[str(shorts.dec(p)*shorts.D('1.003')), q] for p, q in m['asks']]
                 markets[sym] = m
                 shorts.tick(markets, ts, db, allow_entries=variant != 'flat',
-                            filters=variant != 'no_filters', random_entry=variant == 'random')
+                            filters=variant != 'no_filters', random_entry=variant == 'random',
+                            strategy=variant if variant in ('breakdown','wick_reversal') else 'ema_retest')
             s = shorts.status(db)
             closed = [p for p in s['positions'] if p['stage'] == 'closed' and p.get('opened')]
             pnl = [shorts.dec(p['pnl']) for p in closed]

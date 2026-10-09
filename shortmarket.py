@@ -76,6 +76,8 @@ class Collector:
         self.pending_ends = {}
         self.watched = set()
         self.sample_task = None
+        self.clock_offset = 0
+        self.clock_checked = None
         if os.path.exists(path or shorts.DB_PATH):
             with shorts.connect(path) as con:
                 row = con.execute('SELECT ts,state FROM catalog ORDER BY ts DESC LIMIT 1').fetchone()
@@ -86,6 +88,29 @@ class Collector:
                     for group in raw.get('fee_groups', {}).get('list', []):
                         for symbol in group['symbols']:
                             self.groups[symbol] = group['groupName']
+
+    def now(self):
+        return time.time()-self.clock_offset
+
+    async def calibrate(self, session):
+        if self.clock_checked is not None and time.monotonic()-self.clock_checked < 300:
+            return
+        measurements = []
+        for _ in range(3):
+            start, monotonic = time.time(), time.monotonic()
+            try:
+                _, server = await get(session, 'time')
+            except Exception:
+                continue
+            elapsed = time.monotonic()-monotonic
+            if elapsed <= 1 and abs(time.time()-start-elapsed) <= .1:
+                measurements.append((elapsed, start+elapsed/2-server))
+        if not measurements:
+            raise ValueError('нет точного измерения часов Bybit')
+        uncertainty, offset = min(measurements)
+        if abs(offset) > 5:
+            raise ValueError('сдвиг часов больше 5с: нужна проверка компьютера')
+        self.clock_offset, self.clock_checked = offset, time.monotonic()
 
     def add_samples(self, tickers, ts, now):
         """Only observed prices; any outage/reordering invalidates the warm-up window."""
@@ -98,6 +123,8 @@ class Collector:
                 self.samples.pop(sym, None)
                 continue
             samples = self.samples.setdefault(sym, [])
+            if samples and ts == samples[-1][0] and ticker['markPrice'] == samples[-1][1]:
+                continue  # The same cached snapshot is not a new observation or a data gap.
             if samples and (ts <= samples[-1][0] or ts-samples[-1][0] > 3):
                 samples.clear()
             samples.append([ts, ticker['markPrice']])
@@ -109,7 +136,7 @@ class Collector:
             try:
                 # One public request for all contracts, not one per watched coin.
                 result, ts = await get(session, 'tickers', category='linear')
-                self.add_samples({t['symbol']: t for t in result['list']}, ts, time.time())
+                self.add_samples({t['symbol']: t for t in result['list']}, ts, self.now())
             except Exception:
                 self.samples.clear()
             await asyncio.sleep(max(.1, 1-(time.monotonic()-started)))
@@ -173,7 +200,7 @@ class Collector:
 
     async def market(self, session, sym, candidate, opened):
         async with self.semaphore:
-            now = time.time()
+            now = self.now()
             inst = self.instruments.get(sym)
             if inst is None:
                 raise ValueError('символ отсутствует в полном каталоге: итог делистинга неизвестен')
@@ -228,10 +255,10 @@ class Collector:
             ticker_result, ticker_ts = await get(session, 'tickers', category='linear', symbol=sym)
             ticker = ticker_result['list'][0]
             book, server_ts = await get(session, 'orderbook', category='linear', symbol=sym, limit=200)
-            if abs(time.time()-server_ts) > 2:
+            if abs(self.now()-server_ts) > 2:
                 raise ValueError('часы сервера/локальные отличаются больше 2с')
             samples = self.samples.get(sym, [])
-            if not samples or time.time()-samples[-1][0] > 3:
+            if not samples or self.now()-samples[-1][0] > 3:
                 samples = []
             if opened and not samples:
                 errors.append('Разрыв секундных наблюдений mark: защита за 60с не проверена')
@@ -268,14 +295,17 @@ class Collector:
                  'data_errors': errors,
                  'terms': {'instrument': inst, 'tiers': tiers, 'fee': fee, 'fee_source': FEE_SOURCE,
                            'fee_group': group, 'catalog_ts': self.catalog_ts, 'version': shorts.VERSION,
-                           'ticker': ticker}}
+                           'ticker': ticker, 'clock_offset': self.clock_offset,
+                           'clock_source': 'Bybit public time; minimum RTT of 3; RTT <=1s'}}
             for key in ('mark', 'index', 'step', 'tick', 'min_qty', 'min_notional', 'max_qty', 'funding_interval'):
                 if shorts.dec(m[key]) <= 0:
                     raise ValueError('неверный параметр ' + key)
             return sym, m
 
     async def refresh(self, session):
-        now = time.time()
+        if session is not None:
+            await self.calibrate(session)
+        now = self.now()
         state = shorts.status(self.path)
         opened = {p['symbol']: p.get('opened', p['submitted']) for p in state['positions'] if p['stage'] != 'closed'} if state else {}
         self.pending_ends = {p['symbol']: p['closed'] for p in state['positions'] if p['stage'] == 'funding'} if state else {}
@@ -302,7 +332,7 @@ class Collector:
             # Process each fresh book immediately rather than aging it while other symbols load.
             active_markets = {key: value for key, value in self.observed.items()
                               if key in opened or key in candidates}
-            shorts.tick(active_markets, time.time(), self.path, allow_entries=not catalog_error)
+            shorts.tick(active_markets, self.now(), self.path, allow_entries=not catalog_error)
             return result
         results = await asyncio.gather(*(observe(sym)
                                         for sym in dict.fromkeys([*opened, *candidates])), return_exceptions=True)
@@ -315,5 +345,5 @@ class Collector:
                 errors.extend(result[0] + ': ' + error for error in result[1].get('data_errors', []))
         shorts.record_error('; '.join(errors), self.path)
         if not markets:
-            shorts.tick({}, time.time(), self.path, allow_entries=False)
+            shorts.tick({}, self.now(), self.path, allow_entries=False)
         return markets

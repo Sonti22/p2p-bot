@@ -179,3 +179,7 @@ P2P-объявления блокируют исполнение. `/paper banks`
 [HTX](https://huobiapi.github.io/docs/spot/v1/en/#get-market-depth),
 [KuCoin: стакан](https://www.kucoin.com/docs-new/rest/spot-trading/market-data/get-part-orderbook),
 [KuCoin: правила пары](https://www.kucoin.com/docs-new/rest/spot-trading/market-data/get-symbol).
+
+Проверка накопленных данных и гипотез: `/shorts research`, `/paper research [fast|base|stress]`.
+Методика и ограничения — [docs/STRATEGY_RESEARCH.md](docs/STRATEGY_RESEARCH.md).
+Автоматический подбор параметров и переключение рабочих правил пока не включены.
