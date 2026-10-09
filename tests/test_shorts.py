@@ -379,3 +379,46 @@ def test_metadata_outage_does_not_disable_open_position_exit(db,monkeypatch):
     arun(c.refresh(None))
     assert position(db)['stage']=='exit' and position(db)['gap']
     assert 'Каталог' in S.status(db)['last_error']
+
+
+def test_seconds_samples_require_new_warmup_after_gap(db):
+    c=M.Collector(db)
+    c.watched={'ALTUSDT'}
+    ticks={'ALTUSDT':{'markPrice':'100'}}
+    for at in range(62):
+        c.add_samples(ticks,NOW+at,NOW+at+.1)
+    m=market(NOW+61)
+    m['mark_samples']=c.samples['ALTUSDT']
+    assert S.protection(m,NOW+61) is None
+    c.add_samples(ticks,NOW+66,NOW+66+.1)
+    assert len(c.samples['ALTUSDT'])==1
+    m=market(NOW+66)
+    m['mark_samples']=c.samples['ALTUSDT']
+    assert S.protection(m,NOW+66) is not None
+
+
+@pytest.mark.parametrize('ts,now',[(NOW,NOW+4),(NOW+2,NOW),(NOW,NOW)])
+def test_seconds_samples_reject_stale_future_or_reordered_ticks(db,ts,now):
+    c=M.Collector(db)
+    c.watched={'ALTUSDT'}
+    c.samples={'ALTUSDT':[[NOW,'100']]}
+    c.add_samples({'ALTUSDT':{'markPrice':'101'}},ts,now)
+    assert len(c.samples.get('ALTUSDT',[]))<=1
+
+
+def test_seconds_sampler_failure_clears_window_and_close_cancels_task(db,monkeypatch):
+    import asyncio
+    c=M.Collector(db)
+    c.watched={'ALTUSDT'}
+    c.samples={'ALTUSDT':[[NOW,'100']]}
+    async def fail(*args,**kwargs):
+        c.watched.clear()
+        raise ValueError('public endpoint unavailable')
+    monkeypatch.setattr(M,'get',fail)
+    async def run():
+        c.sample_task=asyncio.create_task(c.sample_loop(None))
+        await asyncio.sleep(.01)
+        assert not c.samples
+        await c.close()
+        assert c.sample_task is None
+    arun(run())

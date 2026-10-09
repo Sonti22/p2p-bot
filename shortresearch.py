@@ -81,7 +81,7 @@ def evaluate(path=None, minimum_days=90):
             closed = [p for p in s['positions'] if p['stage'] == 'closed' and p.get('opened')]
             pnl = [shorts.dec(p['pnl']) for p in closed]
             result['variants'][variant] = {'trades': len(closed), 'realized': s['realized'],
-                 'equity': s['equity'], 'drawdown': s['drawdown'], 'worst_trade': str(min(pnl, default=0)),
+                 'equity': s['equity'], 'drawdown': s['drawdown'], 'worst_result': str(min(pnl, default=0)),
                  'stress_losses': sum(bool(p.get('stress')) for p in closed),
                  'trades_by_signal': {p['symbol']+':'+str(p['signal_ts']):p['pnl'] for p in closed},
                  'rejections': s['rejections'], 'invalid_universe_observations': invalid,

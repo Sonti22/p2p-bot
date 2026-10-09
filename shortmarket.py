@@ -74,6 +74,8 @@ class Collector:
         self.last_observed = 0
         self.observed = {}
         self.pending_ends = {}
+        self.watched = set()
+        self.sample_task = None
         if os.path.exists(path or shorts.DB_PATH):
             with shorts.connect(path) as con:
                 row = con.execute('SELECT ts,state FROM catalog ORDER BY ts DESC LIMIT 1').fetchone()
@@ -84,6 +86,39 @@ class Collector:
                     for group in raw.get('fee_groups', {}).get('list', []):
                         for symbol in group['symbols']:
                             self.groups[symbol] = group['groupName']
+
+    def add_samples(self, tickers, ts, now):
+        """Only observed prices; any outage/reordering invalidates the warm-up window."""
+        if not 0 <= now-ts <= 2:
+            self.samples.clear()
+            return
+        for sym in self.watched:
+            ticker = tickers.get(sym)
+            if not ticker or shorts.dec(ticker.get('markPrice', '0')) <= 0:
+                self.samples.pop(sym, None)
+                continue
+            samples = self.samples.setdefault(sym, [])
+            if samples and (ts <= samples[-1][0] or ts-samples[-1][0] > 3):
+                samples.clear()
+            samples.append([ts, ticker['markPrice']])
+            samples[:] = [x for x in samples if ts-x[0] <= 120]
+
+    async def sample_loop(self, session):
+        while self.watched:
+            started = time.monotonic()
+            try:
+                # One public request for all contracts, not one per watched coin.
+                result, ts = await get(session, 'tickers', category='linear')
+                self.add_samples({t['symbol']: t for t in result['list']}, ts, time.time())
+            except Exception:
+                self.samples.clear()
+            await asyncio.sleep(max(.1, 1-(time.monotonic()-started)))
+
+    async def close(self):
+        if self.sample_task is not None:
+            self.sample_task.cancel()
+            await asyncio.gather(self.sample_task, return_exceptions=True)
+            self.sample_task = None
 
     async def universe(self, session, now):
         if now-self.catalog_ts >= 600 or not self.instruments:
@@ -195,9 +230,11 @@ class Collector:
             book, server_ts = await get(session, 'orderbook', category='linear', symbol=sym, limit=200)
             if abs(time.time()-server_ts) > 2:
                 raise ValueError('часы сервера/локальные отличаются больше 2с')
-            samples = self.samples.setdefault(sym, [])
-            samples.append([ticker_ts, ticker['markPrice']])
-            samples[:] = [x for x in samples if ticker_ts-x[0] <= 120]
+            samples = self.samples.get(sym, [])
+            if not samples or time.time()-samples[-1][0] > 3:
+                samples = []
+            if opened and not samples:
+                errors.append('Разрыв секундных наблюдений mark: защита за 60с не проверена')
             lot, price = inst['lotSizeFilter'], inst['priceFilter']
             leverage = inst['leverageFilter']
             if not shorts.dec(leverage['minLeverage']) <= 2 <= shorts.dec(leverage['maxLeverage']):
@@ -255,6 +292,10 @@ class Collector:
                       if not catalog_error and shorts.eligible(inst, self.tickers.get(sym, {}), now)]
         candidates.sort(key=lambda sym: shorts.dec(self.tickers[sym]['price24hPcnt']), reverse=True)
         candidates = candidates[:20]
+        self.watched = set(opened) | set(candidates)
+        self.samples = {key: value for key, value in self.samples.items() if key in self.watched}
+        if session is not None and self.watched and (self.sample_task is None or self.sample_task.done()):
+            self.sample_task = asyncio.create_task(self.sample_loop(session))
         async def observe(sym):
             result = await self.market(session, sym, sym in candidates, opened.get(sym))
             self.observed[sym] = result[1]
