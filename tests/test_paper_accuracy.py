@@ -263,3 +263,8 @@ def test_virtually_exhausted_sbp_limit_puts_fee_into_plan_and_volume(monkeypatch
     no_fee = p2p.deal_for_amount(deal, bot.cfg, sn, 10000)
     assert c["pay_kind"] == "sbp" and c["planned_pct"] < no_fee[0] - 0.4
     assert c["sell_qty"] < no_fee[2].avail
+
+
+# These regressions explicitly exercise the preserved historical engine.
+import pytest as _compat_pytest
+pytestmark = _compat_pytest.mark.usefixtures("legacy_paper_engine")

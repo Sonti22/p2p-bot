@@ -404,7 +404,8 @@ def test_finish_cycle_error_rolls_back_result_and_balance(tmp_path, monkeypatch)
 def test_stats_empty_db(tmp_path):
     db = str(tmp_path / "paper.db")
     st = paper.stats(path=db)
-    assert st["day"] == {"total": 0, "done": 0, "failed": 0, "failed_by_reason": {}, "avg_diff": None}
+    assert st["day"] == {"total": 0, "done": 0, "failed": 0, "failed_by_reason": {}, "avg_diff": None,
+                         "profit_rub": 0.0, "turnover_rub": 0.0, "return_pct": None}
     assert st["week"]["total"] == 0 and st["all"]["total"] == 0
 
 
@@ -418,7 +419,8 @@ def test_stats_counts_done_and_failed(tmp_path):
     paper.finish_cycle(cid2, "failed_sell", realized_pct=0.0, note="цена ушла", path=db, ts=now)
     st = paper.stats(path=db, now=now)
     assert st["day"] == {"total": 2, "done": 1, "failed": 1,
-                         "failed_by_reason": {"failed_sell": 1}, "avg_diff": pytest.approx(0.5)}
+                         "failed_by_reason": {"failed_sell": 1}, "avg_diff": pytest.approx(0.5),
+                         "profit_rub": 250.0, "turnover_rub": 10000.0, "return_pct": 2.5}
     assert st["all"] == st["day"]   # оба круга сегодня же
 
 

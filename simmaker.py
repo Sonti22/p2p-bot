@@ -396,9 +396,9 @@ def report_view(cfg=None, path=DB_PATH):
     lines = ["🧪 <b>Бумажный мейкер</b> — симуляция своих объявлений, реальных объявлений и сделок нет", "",
              ("Статус: ✅ считается на каждом скане" if s["on"] else
               "Статус: ⏸ выключен — включить SIM_MAKER=1 в .env на ПК"),
-             f"Настройки: {esc(', '.join(s['venues']))} · {esc(', '.join(s['assets']))} · "
-             f"{', '.join(SIDE_LABELS[x] for x in s['sides']) or 'стороны не заданы'} · лот {p2p._money(s['amount'])} ₽ · "
-             f"до {s['max_lots']} лот. · коридор ±{s['band']:g}% от ориентира · доля потока {s['capture']:.0%}",
+             f"Настройки: {esc(', '.join(s['venues']))}\n{esc(', '.join(s['assets']))}\n"
+             f"{', '.join(SIDE_LABELS[x] for x in s['sides']) or 'стороны не заданы'}\nлот {p2p._money(s['amount'])} ₽\n"
+             f"до {s['max_lots']} лот.\nкоридор ±{s['band']:g}% от ориентира\nдоля потока {s['capture']:.0%}",
              "⚠️ Исполнения — <b>слабый прокси</b>: убыль объёма у конкурентов с ценой не хуже нашей между сканами. "
              "Это не сделки: объём правят, объявления снимают, тейкер выбирает и по банку, и по репутации.", ""]
     rows = stats(path)
@@ -414,16 +414,16 @@ def report_view(cfg=None, path=DB_PATH):
             if ad:
                 now.append(f"{SIDE_LABELS[side]} {p2p._price(ad['price'])} ₽ (место {ad['place']} из {ad['total']}"
                            f"{', у границы коридора' if ad.get('clamped') else ''})")
-        lines.append(f"Сейчас: {'; '.join(now) or 'объявлений нет'} · позиция {_qty(r['pos'], a)}")
+        lines.append(f"Сейчас: {'; '.join(now) or 'объявлений нет'}\nпозиция {_qty(r['pos'], a)}")
         per_day = f"{r['fills_per_day']:.1f}/день" if r["fills_per_day"] is not None else "мало данных"
         lines.append(f"Исполнений (прокси): {r['fills']} ({per_day}), из них по пропавшим объявлениям {r['fills_gone']}")
         if r["rounds"]:
-            lines.append(f"Кругов: {r['rounds']} · спред брутто ср. {r['spread_gross']:.2f}% · "
-                         f"нетто после комиссии {r['spread_net']:.2f}% · держали позицию медиана {r['hold_min']:.0f} мин")
+            lines.append(f"Кругов: {r['rounds']}\nспред брутто ср. {r['spread_gross']:.2f}%\n"
+                         f"нетто после комиссии {r['spread_net']:.2f}%\nдержали позицию медиана {r['hold_min']:.0f} мин")
         else:
             lines.append("Кругов покупка+продажа пока нет")
-        lines.append(f"P&L: круги {_rub(r['realized'])} (комиссии всего {_rub(-r['fees'])}) · позиция по ориентиру "
-                     f"{_rub(r['unreal'] - r['open_fees'])} · итого <b>{_rub(r['total'])}</b>")
+        lines.append(f"P&L: круги {_rub(r['realized'])} (комиссии всего {_rub(-r['fees'])})\nпозиция по ориентиру "
+                     f"{_rub(r['unreal'] - r['open_fees'])}\nитого <b>{_rub(r['total'])}</b>")
         if not r["fee_known"]:
             lines.append(f"Комиссия мейкера {esc(r['ex'])} неизвестна — считаю 0")
         queue = []
@@ -434,12 +434,12 @@ def report_view(cfg=None, path=DB_PATH):
         if r["wait_min"] is not None:
             queue.append(f"ожидание до исполнения медиана {r['wait_min']:.0f} мин")
         if queue:
-            lines.append("Очередь: " + "; ".join(queue))
+            lines.append("Очередь:\n• " + "\n• ".join(queue))
         pauses = [f"{SIDE_LABELS.get(side, side)} — " + ", ".join(f"{PAUSE_LABELS.get(k, k)} {n}" for k, n in p.items())
                   for side, p in r["paused"].items() if p]
         if pauses:
-            lines.append("Без объявления (сканов): " + "; ".join(pauses))
-        lines.append(f"Риск позиции: худшая оценка запаса {_rub(r['worst_inv'])} · макс. просадка итога "
+            lines.append("Без объявления (сканов):\n• " + "\n• ".join(pauses))
+        lines.append(f"Риск позиции: худшая оценка запаса {_rub(r['worst_inv'])}\nмакс. просадка итога "
                      f"{_rub(-r['max_dd'])}")
         lines.append(f"Порог «бумага → кнопка»: ≥ {GATE_DAYS} дней в плюсе после комиссии — сейчас "
                      f"{r['days']:.1f} дн., итог {_rub(r['total'])}")

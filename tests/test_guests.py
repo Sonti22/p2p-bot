@@ -32,8 +32,8 @@ def test_stranger_gets_id_and_owner_is_told_once(monkeypatch):
 
 
 def test_chat_that_wrote_before_owner_was_bound_still_reaches_owner(monkeypatch):
-    """TG_CHAT_ID пуст, первой пишет группа: ей один раз «владелец — только личный чат». Потом владелец привязывается
-    из лички, и та же группа пишет снова — это обычный чужой чат: ей id и /allow, владельцу — как дать доступ. Раньше
+    """TG_CHAT_ID пуст: ни группа, ни личный чат не назначают владельца. После локальной настройки
+    та же группа — обычный чужой чат: ей id и /allow, владельцу — как дать доступ. Раньше
     отметка «уже ответили» до привязки лежала в том же наборе, что у ask_access, и оба сообщения молча пропадали."""
     monkeypatch.setattr(B, "save_env", lambda k, v, path=None: None)
     bot = Stub(p2p.Config())
@@ -41,8 +41,9 @@ def test_chat_that_wrote_before_owner_was_bound_still_reaches_owner(monkeypatch)
     for _ in range(2):
         arun(bot.on_update(msg(-1001, "/start", ctype="supergroup", id=7)))
     assert [p["text"] for p in sent(bot)] == [B.FIRST_CHAT_PRIVATE] and bot.chat_id == ""
-    arun(bot.on_update(msg(555, "/start")))                  # владелец — из личного чата
-    assert bot.chat_id == "555"
+    arun(bot.on_update(msg(555, "/start")))
+    assert bot.chat_id == ""                              # первое сообщение не назначает владельца
+    bot.chat_id = "555"                                  # локальная настройка владельца
     before = len(sent(bot))
     arun(bot.on_update(msg(-1001, "привет", ctype="supergroup", id=7, username="vasya")))
     new = sent(bot)[before:]

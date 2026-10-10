@@ -213,3 +213,8 @@ def test_cmd_paper_cycles_days_clamp_and_garbage(monkeypatch, tmp_path):
     assert caption("cycles 9999") == "Круги бумаги: 1 шт. за 365 дн."
     assert caption("cycles abc") == "Круги бумаги: 1 шт. за 30 дн."
     assert caption("cycles -5") == "Круги бумаги: 1 шт. за 30 дн."
+
+
+# These regressions explicitly exercise the preserved historical engine.
+import pytest as _compat_pytest
+pytestmark = _compat_pytest.mark.usefixtures("legacy_paper_engine")

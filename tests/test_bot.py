@@ -3363,3 +3363,8 @@ def test_other_sender_in_owner_chat_still_refused_and_logged(caplog):
         arun(bot.on_update({"message": {"chat": {"id": 1, "type": "private"}, "from": {"id": 99, "is_bot": False},
                                         "text": "/settings", "message_id": 7}}))
     assert "отказ" in caplog.text
+
+
+# These regressions explicitly exercise the preserved historical engine.
+import pytest as _compat_pytest
+pytestmark = _compat_pytest.mark.usefixtures("legacy_paper_engine")

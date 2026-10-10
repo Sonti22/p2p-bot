@@ -115,7 +115,7 @@ def encrypt_saved_keys():
 
 
 def _keys_file():
-    return jsonstore.read_dict(KEYS_PATH)
+    return jsonstore.read_dict(KEYS_PATH, strict=True)
 
 
 def _write_keys_file(data):
@@ -132,11 +132,21 @@ def keys(exchange):
     """(api_key, api_secret) для биржи или None, если ключей нет или ключ выключен пометкой disabled
     (файл имеет приоритет над .env)."""
     ex = exchange.lower()
-    saved = _keys_file().get(ex, {})
+    try:
+        saved = _keys_file().get(ex, {})
+    except (OSError, ValueError, UnicodeError):
+        return None
+    if not isinstance(saved, dict):
+        return None
     if saved.get("disabled"):   # ключ удалён в боте — не подхватываем его и из .env
         return None
-    key = unprotect(saved.get("key")) or os.getenv(f"{exchange.upper()}_API_KEY")
-    secret = unprotect(saved.get("secret")) or os.getenv(f"{exchange.upper()}_API_SECRET")
+    if "key" in saved or "secret" in saved:
+        if not all(isinstance(saved.get(k), str) for k in ("key", "secret")):
+            return None
+        key, secret = unprotect(saved["key"]), unprotect(saved["secret"])
+    else:
+        key = os.getenv(f"{exchange.upper()}_API_KEY")
+        secret = os.getenv(f"{exchange.upper()}_API_SECRET")
     return (key, secret) if key and secret else None
 
 
@@ -156,10 +166,18 @@ def save_key(exchange, key, secret, passphrase=None):
 def passphrase(exchange):
     """Passphrase ключа биржи (сейчас только KuCoin): data/keys.json, иначе {EXCHANGE}_API_PASSPHRASE в .env."""
     ex = exchange.lower()
-    saved = _keys_file().get(ex, {})
+    try:
+        saved = _keys_file().get(ex, {})
+    except (OSError, ValueError, UnicodeError):
+        return None
+    if not isinstance(saved, dict):
+        return None
     if saved.get("disabled"):
         return None
-    return unprotect(saved.get("passphrase")) or os.getenv(f"{exchange.upper()}_API_PASSPHRASE")
+    if "key" in saved or "secret" in saved or "passphrase" in saved:
+        value = saved.get("passphrase")
+        return unprotect(value) if isinstance(value, str) else None
+    return os.getenv(f"{exchange.upper()}_API_PASSPHRASE")
 
 
 def delete_key(exchange):
@@ -234,7 +252,10 @@ def mexc_signed_params(api_secret, params=None, recv_window="5000", timestamp=No
 
 
 async def _get_json(s, url, headers):
-    async with s.get(url, headers=headers) as r:
+    async with s.get(url, headers=headers, allow_redirects=False) as r:
+        if 300 <= getattr(r, "status", 200) < 400:
+            raise aiohttp.ClientResponseError(r.request_info, r.history, status=r.status,
+                                             message="редирект запрещён")
         r.raise_for_status()
         return await r.json(content_type=None)
 

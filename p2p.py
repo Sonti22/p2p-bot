@@ -441,6 +441,14 @@ class Ad:
 # отправляет (ValueError до отправки, как accounts.bybit_post). Список запинен в tests/test_trading_surface.py
 # (защищённый файл): новая площадка или адрес — только после проверки владельцем.
 JSON_ALLOWED = frozenset({
+    ("GET", "api.bybit.com", "/v5/market/orderbook"),
+    ("GET", "api.bybit.com", "/v5/market/instruments-info"),
+    ("GET", "api.mexc.com", "/api/v3/depth"),
+    ("GET", "api.mexc.com", "/api/v3/exchangeInfo"),
+    ("GET", "api.htx.com", "/market/depth"),
+    ("GET", "api.htx.com", "/v1/common/symbols"),
+    ("GET", "api.kucoin.com", "/api/v1/market/orderbook/level2_100"),
+    ("GET", "api.kucoin.com", "/api/v2/symbols/"),
     ("POST", "api2.bybit.com", "/fiat/otc/configuration/queryAllPaymentList"),
     ("POST", "api2.bybit.com", "/fiat/otc/item/online"),
     ("GET", "www.htx.com", "/-/x/otc/v1/data/trade-market"),
@@ -526,6 +534,12 @@ def _parse_ads(venue, side, asset, items, make):
 _bybit_pay = {}
 
 
+def _public_ad_id(item):
+    """Preserve the response's ad ID; never substitute a merchant or snapshot ID."""
+    value = item.get('id')
+    return str(value).strip() if isinstance(value, (str, int)) and not isinstance(value, bool) else ''
+
+
 async def bybit(s, cfg, side, asset, page=1):
     if not _bybit_pay:
         j = await _json(s, "POST", "https://api2.bybit.com/fiat/otc/configuration/queryAllPaymentList", {})
@@ -539,7 +553,7 @@ async def bybit(s, cfg, side, asset, page=1):
     def make(i):
         return Ad("Bybit", side, float(i["price"]), float(i["minAmount"]), float(i["maxAmount"]), float(i["lastQuantity"]),
                    [_bybit_pay.get(p, p) for p in i["payments"]], i["nickName"], int(i["recentOrderNum"]),
-                   float(i["recentExecuteRate"]), asset=asset, terms=i.get("remark") or "")
+                   float(i["recentExecuteRate"]), asset=asset, terms=i.get("remark") or "", ad_id=_public_ad_id(i))
     return _parse_ads("bybit", side, asset, items, make)
 
 
@@ -557,7 +571,7 @@ async def htx(s, cfg, side, asset, page=1):
     def make(i):
         return Ad("HTX", side, float(i["price"]), float(i["minTradeLimit"]), float(i["maxTradeLimit"]), float(i["tradeCount"]),
                    [p["name"] for p in i["payMethods"]], i["userName"], int(i["tradeMonthTimes"]),
-                   float(i["orderCompleteRate"] or 0), asset=asset)
+                   float(i["orderCompleteRate"] or 0), asset=asset, ad_id=_public_ad_id(i))
     return _parse_ads("htx", side, asset, items, make)
 
 
@@ -578,7 +592,7 @@ async def kucoin(s, cfg, side, asset, page=1):
         return Ad("KuCoin", side, float(i["floatPrice"]), float(i["limitMinQuote"]), float(i["limitMaxQuote"]),
                    float(i["currencyBalanceQuantity"]), [_kucoin_pay(p) for p in i["adPayTypes"]], i["nickName"],
                    int(i.get("dealOrderNum") or 0), float((i.get("dealOrderRate") or "0").rstrip("%")), asset=asset,
-                   terms=i.get("remarks") or "")
+                   terms=i.get("remarks") or "", ad_id=_public_ad_id(i))
     return _parse_ads("kucoin", side, asset, items, make)
 
 
@@ -608,7 +622,7 @@ async def mexc(s, cfg, side, asset, page=1):
         return Ad("MEXC", side, float(i["price"]), float(i["minTradeLimit"]), float(i["maxTradeLimit"]),
                   float(i["availableQuantity"]), [_mexc_pay.get(p, f"pm{p}") for p in str(i["payMethod"]).split(",")],
                   (i.get("merchant") or {}).get("nickName", "?"), int(st.get("doneLastMonthCount") or 0),
-                  float(st.get("completeRate") or 0) * 100, asset=asset, terms=i.get("tradeTerms") or "")
+                  float(st.get("completeRate") or 0) * 100, asset=asset, terms=i.get("tradeTerms") or "", ad_id=_public_ad_id(i))
     return _parse_ads("mexc", side, asset, items, make)
 
 
@@ -681,6 +695,8 @@ BC_URL = "http://api.bestchange.ru/info.zip"
 # без ответа за 10 с — путь закрыт (VPN-выход бывает в бане у BestChange: пакет уходит, ответа нет вообще)
 BC_TIMEOUT = aiohttp.ClientTimeout(total=60, sock_connect=6, sock_read=10)
 BC_MAX_TRIES = 5
+BC_MAX_ARCHIVE = 32 * 1024 * 1024
+BC_MAX_UNPACKED = 256 * 1024 * 1024
 
 
 def _bc_parse(data):
@@ -688,7 +704,12 @@ def _bc_parse(data):
     _bc_stats['skipped'], лог при изменении числа); если битых строк bm_rates.dat больше, чем разобранных
     объявлений — это смена формата выгрузки, а не случайная строка, и разбор падает (кэш и бэкофф площадки не
     трогаются, как при любом другом сбое выгрузки)."""
+    if len(data) > BC_MAX_ARCHIVE:
+        raise ValueError("BestChange: archive size limit exceeded")
     z = zipfile.ZipFile(io.BytesIO(data))
+    if sum(item.file_size for item in z.infolist()) > BC_MAX_UNPACKED:
+        z.close()
+        raise ValueError("BestChange: unpacked size limit exceeded")
     skipped = 0
     cy = {}
     for line in z.read("bm_cy.dat").decode("cp1251", errors="replace").splitlines():
@@ -768,7 +789,12 @@ async def _bc_download(s, local=None):
     try:
         async with sess.get(BC_URL, headers=HEADERS, timeout=BC_TIMEOUT) as r:
             r.raise_for_status()
-            return await r.read()
+            data = bytearray()
+            async for chunk in r.content.iter_chunked(65536):
+                data.extend(chunk)
+                if len(data) > BC_MAX_ARCHIVE:
+                    raise ValueError("BestChange: archive size limit exceeded")
+            return bytes(data)
     finally:
         if own:
             await sess.close()

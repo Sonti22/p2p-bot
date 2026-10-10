@@ -39,15 +39,15 @@ PINS = {
         "_dpapi": "e05c4989f06bb3225abce35ae8fca035f0149e4b285b0f0ea2472183c148ca7d",
         "_cryptomus_err": "4e69147c388598e0f03113d51f48e926a7a01d6fa4439d4e851e00d3982db3bf",
         "_json_no_redirect": "cce7ba856bee23dd5e1fa262ddcc67f386bc736f5bcd2952a9c612dd28de1b13",
-        "_keys_file": "f2562b36bc299ad07fbb421381d0cb00911e58066a7dca2b6ae75a0861d46f93",
+        "_keys_file": "93061fcffcf8e03f71deec60186e9885a40edc55567c70818034632414b28260",
         "_scrub": "3146a0186a5c4e8da7816f3b707295e02ff572db3321f2177eaeec11c9d0108f",
         "api_error_text": "81d9084f8708a800e2d4dd8520502c27c2aaff9050e15fa0c68768a4823dd2ac",
         "cryptomus_sign": "2d1e3c3bab112ce82a952ac496c0d90375a8134f5411a4e0ec792183ddeb8d15",
-        "keys": "023f663c307679982718475f03ec298304566c0961452453738e034535fb25c9",
+        "keys": "c36ce4752ae3385f511065f81ad32403492f4836153fb8638e8155b5493c8561",
         "unprotect": "80e72cb3c549e601b1f4386028baceb430f2161fb007b6d06fad99e3f95e163e",
     },
     "jsonstore": {
-        "read_dict": "5a8483b471a9d1a2a28086bfb5be90a1f2ffabd41f069b256d8712fa6c2db609",
+        "read_dict": "582ea5a4f3bf56cf1d461b85e2eaddcf63bc308af5a83e4d181dfb45fa560bdb",
     },
     "p2p": {   # чтение .env при старте бота: от него зависит, что PAYOUTS=0 от launcher дойдёт до процесса
         "ENV_PATH": "b798b14e84cc4dc7fb9a2a071f5738cb7ad4e90e60e2c599be38012c46f27391",
@@ -55,7 +55,7 @@ PINS = {
         "load_env": "fd47832c89bca7a4b7076c3c7aa28e5b08ed6a92e4820ecd4230b3a3afbcf600",
     },
     "bot": {
-        "Bot._owner_gate": "f056f786e69e0fd8762c11855920d8f82e7dbad3ec82835487cf5543c09cd636",
+        "Bot._owner_gate": "f194997811c2a04720a113b2242279174834a961f323eae872e7b4901334875b",
         "Bot.cmd_payout": "2ae4aa84ef8550ce13d865bfbca73263f1e3367186ea874cb029687389490403",
         "Bot.is_guest": "6ec5bae4210f98d830738dd39b2a4af415903dc282cec6b7491d6afc5236ddff",
         "Bot.on_guest_callback": "b07a402c731d1cd1caece87305842e5dd9a77760512a5ace172923d5bf47330d",

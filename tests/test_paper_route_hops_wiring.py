@@ -53,3 +53,8 @@ def test_hops_belong_to_the_picked_deal_not_the_first_one(monkeypatch):
     assert (c["buy_ex"], c["sell_ex"]) == ("HTX", "KuCoin")      # выбрана вторая, не первая по списку
     hops = paper.cycle_hops(c)["hops"]
     assert [(h["frm"], h["to"], h["asset"]) for h in hops] == [("HTX", "KuCoin", "USDT")]
+
+
+# These regressions explicitly exercise the preserved historical engine.
+import pytest as _compat_pytest
+pytestmark = _compat_pytest.mark.usefixtures("legacy_paper_engine")

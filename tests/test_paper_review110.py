@@ -229,3 +229,8 @@ def test_reset_is_listed_in_paper_help():
     assert "/paper reset" in bot.paper_view()
     assert "reset" in next(c["description"] for c in B.COMMANDS if c["command"] == "paper")
     assert "reset" not in B.GUEST_DENIED and "/paper" not in B.GUEST_WELCOME
+
+
+# These regressions explicitly exercise the preserved historical engine.
+import pytest as _compat_pytest
+pytestmark = _compat_pytest.mark.usefixtures("legacy_paper_engine")

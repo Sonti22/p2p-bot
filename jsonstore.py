@@ -11,18 +11,24 @@ import tempfile
 logger = logging.getLogger(__name__)
 
 
-def read_dict(path):
+def read_dict(path, strict=False):
     """JSON-словарь из файла; нет файла, битый JSON или не словарь на верхнем уровне (например,
-    список) — пустой словарь, во втором и третьем случае ещё и предупреждение в лог."""
+    список) — пустой словарь, во втором и третьем случае ещё и предупреждение в лог.
+    strict=True — ошибки чтения и структуры пробрасываются: повреждённое хранилище секретов не пустое.
+    Отсутствующий файл и в строгом режиме — пустой словарь."""
     try:
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
     except FileNotFoundError:
         return {}
     except (OSError, json.JSONDecodeError) as e:
+        if strict:
+            raise
         logger.warning("%s: битый JSON (%s), считаем пустым", path, e)
         return {}
     if not isinstance(data, dict):
+        if strict:
+            raise ValueError("JSON должен содержать словарь")
         logger.warning("%s: верхний уровень %s вместо словаря, считаем пустым", path, type(data).__name__)
         return {}
     return data

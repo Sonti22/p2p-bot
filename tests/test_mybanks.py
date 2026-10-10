@@ -34,7 +34,8 @@ def test_default_view_lists_owner_banks_and_tariffs(monkeypatch, tmp_path):
     assert not buttons["ownbank:Ozon Bank"].startswith("✅")
     assert buttons["ownbank:*"].startswith("✅")
     assert buttons["sbplim:T-Bank:100000"].startswith("✅") and buttons["sbplim:VTB:300000"].startswith("✅")
-    assert "Т-Банк — бесплатно по СБП 100 000 ₽" in text and "ВТБ — бесплатно по СБП 300 000 ₽" in text
+    assert "<b>Т-Банк</b>\nБесплатно по СБП: 100 000 ₽" in text
+    assert "\n\n<b>ВТБ</b>\nБесплатно по СБП: 300 000 ₽" in text
 
 
 def test_toggle_banks_and_star(monkeypatch, tmp_path):
@@ -102,3 +103,8 @@ def test_paper_card_says_how_owner_pays(monkeypatch, tmp_path):
         arun(bot.notify(snap))
         card = [t for t in texts(bot) if "Сухой прогон" in t][-1]
         assert f"оплата: {expect}" in card, card
+
+
+# Paper assertions in this module exercise the preserved historical engine.
+import pytest as _compat_pytest
+pytestmark = _compat_pytest.mark.usefixtures("legacy_paper_engine")

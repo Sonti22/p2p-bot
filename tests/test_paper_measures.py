@@ -262,3 +262,8 @@ def test_bot_buy_check_recorded_on_advance_and_fail(monkeypatch):
     early = paper.start_cycle(10000, buy, sell, "r", 2.0, ts=time.time())
     arun(bot.process_paper_cycles(_snap([_deal()])))
     assert paper.get_cycle(early)["buy_check_avail"] is None               # рано — проверки не было
+
+
+# These regressions explicitly exercise the preserved historical engine.
+import pytest as _compat_pytest
+pytestmark = _compat_pytest.mark.usefixtures("legacy_paper_engine")

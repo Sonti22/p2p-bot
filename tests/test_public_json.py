@@ -2,12 +2,15 @@
 
 Адреса здесь склеиваются из частей (SCHEME + хост): это данные теста, а не новые домены для guard."""
 import urllib.parse
+import time
 
 import pytest
 
 import netstatus
 import p2p
+import spotbook
 from helpers import arun
+from test_spotbook import responses
 
 REAL_JSON = p2p._json   # настоящий _json — до фикстуры offline, которая его подменяет
 SCHEME = "https" + "://"
@@ -52,7 +55,21 @@ def test_every_public_request_of_the_bot_is_allowed_and_every_entry_is_used(offl
     """Все настоящие вызовы _json (площадки, курс Rapira, спот, сети монет netstatus) проходят список, и каждая
     запись списка кем-то используется — лишнего в нём нет."""
     monkeypatch.setattr(p2p, "_json", REAL_JSON)
-    s = _Session(offline)
+    answers = {}
+    for venue in p2p.SPOT_VENUES:
+        depth, instrument = responses(venue)
+        stamp = int(time.time() * 1000)
+        if venue == "Bybit":
+            depth["result"]["ts"] = stamp
+        elif venue == "HTX":
+            depth["ts"] = stamp
+        elif venue == "KuCoin":
+            depth["data"]["time"] = stamp
+        depth_url, instrument_url = spotbook.urls(venue, "ETH")
+        answers[depth_url], answers[instrument_url] = depth, instrument
+    async def answer(session, method, url, body):
+        return answers[url] if url in answers else await offline(session, method, url, body)
+    s = _Session(answer)
     cfg = p2p.Config()
 
     async def go():
@@ -63,6 +80,8 @@ def test_every_public_request_of_the_bot_is_allowed_and_every_entry_is_used(offl
                 assert await fetch(s, cfg, side, "USDT") is not None
         await p2p.rapira_mid(s)
         await p2p.spot_prices(s, ["USDT", "BTC"])
+        books, errors = await spotbook.load(s, [(venue, "ETH") for venue in p2p.SPOT_VENUES])
+        assert len(books) == len(p2p.SPOT_VENUES) and not errors
         return await netstatus.refresh(s, ["USDT", "TON"], ["htx", "kucoin"], p2p._json)
 
     errors = arun(go())

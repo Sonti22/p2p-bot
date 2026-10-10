@@ -34,18 +34,22 @@ def cb(data, message_id=1):
     return {"id": "cbid", "data": data, "message": {"message_id": message_id, "chat": {"id": "1"}}}
 
 
-def test_first_message_starts_onboarding_not_plain_welcome(tmp_path, monkeypatch):
+def test_setup_starts_onboarding_only_for_locally_configured_owner(tmp_path, monkeypatch):
     import functools
     env = tmp_path / ".env"
     env.write_text("", encoding="utf-8")
     monkeypatch.setattr(B, "save_env", functools.partial(B.save_env, path=str(env)))
     bot = Stub(p2p.Config(), chat_id="")
-    arun(bot.on_update(msg_update()))
+    arun(bot.on_update(msg_update(text="/start setup")))
+    assert bot.chat_id == "" and bot.onboarding is None
+    assert env.read_text(encoding="utf-8") == ""
+    bot.chat_id = "1"                              # владелец настроен на ПК
+    arun(bot.on_update(msg_update(text="/start setup")))
     assert bot.chat_id == "1"
     assert bot.onboarding == {"step": "amount", "banks": set()}
     sent = texts(bot)
     assert sent and "Шаг 1/3" in sent[-1]
-    assert "TG_CHAT_ID=1" in env.read_text(encoding="utf-8")
+    assert env.read_text(encoding="utf-8") == ""
 
 
 def test_second_start_skips_onboarding():

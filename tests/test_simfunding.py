@@ -294,7 +294,7 @@ def test_view_shows_last_tick_age(tmp_path):
     SF.tick(now=NOW, path=db)
     assert "последний тик 0 мин назад" in SF.view(db, now=NOW + 20)
     text = SF.view(db, now=NOW + 7 * 60 + 30)
-    assert "данных 0.0 дн. · последний тик 7 мин назад" in text
+    assert "данных 0.0 дн.\nпоследний тик 7 мин назад" in text
     assert "последний тик 0 мин назад" in SF.view(db, now=NOW - 5)   # часы сбились назад — не отрицательное число
 
 

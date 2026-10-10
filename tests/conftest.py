@@ -459,3 +459,9 @@ def _restore_environ():
     yield
     os.environ.clear()
     os.environ.update(saved)
+
+
+@pytest.fixture
+def legacy_paper_engine(monkeypatch):
+    """Historical paper regressions remain executable; new portfolio tests use ledger."""
+    monkeypatch.setenv("PAPER_ENGINE", "legacy")

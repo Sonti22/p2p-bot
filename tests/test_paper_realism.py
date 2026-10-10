@@ -114,7 +114,8 @@ def test_sell_stage_records_fact_price_and_note(monkeypatch):
     assert c["result"] == "done" and c["sell_fact"] == 89.0 and 0 < c["realized_pct"] < 2.0
     assert "вместо 90" in c["note"]
     msg = [t for t in texts(bot) if "завершён" in t][0]
-    assert "факт" in msg and "вместо 90" in msg
+    assert "теоретический результат" in msg and "вместо 90" in msg
+    assert "выручка 10086.67 ₽" in msg and "+86.67 ₽" in msg
 
 
 def test_report_shows_results_by_label(monkeypatch):
@@ -146,3 +147,8 @@ def test_ladder_button_answers_callback_once(monkeypatch):
     bot = Stub(p2p.Config())
     arun(bot.on_callback({"id": "1", "data": "paper_ladder:20000", "message": {"message_id": 9}}))
     assert [m for m, _ in bot.out].count("answerCallbackQuery") == 1
+
+
+# These regressions explicitly exercise the preserved historical engine.
+import pytest as _compat_pytest
+pytestmark = _compat_pytest.mark.usefixtures("legacy_paper_engine")

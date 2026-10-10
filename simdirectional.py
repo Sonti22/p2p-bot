@@ -334,9 +334,9 @@ def view(path=DB_PATH, now=None):
     cfg = settings()
     books, opened, hold, books_x1 = stats(path)
     lines = ["📈 <b>Направленная стратегия — бумага</b> (ордеров нет)",
-             f"Статус: {'🟢 включена' if cfg['on'] else '⚪ выключена'} · EMA{FAST}/{SLOW} 1ч Bybit · стоп ATR{ATR_N}"
-             f"×{cfg['atr_mult']:g} · риск {cfg['risk']:g} USDT на сделку, до {cfg['max_notional']:g} USDT · "
-             f"комиссии тейкера ×{cfg['fee_mult']:g} (как в бэктесте) · {', '.join(cfg['assets'])}", ""]
+             f"Статус: {'🟢 включена' if cfg['on'] else '⚪ выключена'}\nEMA{FAST}/{SLOW} 1ч Bybit\nстоп ATR{ATR_N}"
+             f"×{cfg['atr_mult']:g}\nриск {cfg['risk']:g} USDT на сделку, до {cfg['max_notional']:g} USDT\n"
+             f"комиссии тейкера ×{cfg['fee_mult']:g} (как в бэктесте)\n{', '.join(cfg['assets'])}", ""]
     for p in opened:
         q = perp.quote_for(VENUE, p["asset"], now)
         upnl = ""
@@ -347,7 +347,7 @@ def view(path=DB_PATH, now=None):
                      f"{p['px_open']:g}, стоп {p['stop']:g}{upnl}")
     if opened:
         lines.append("")
-    lines.append(_fmt_book("Стратегия", books["ema"]))
+    lines.extend(["<b>Результаты стратегии</b>", _fmt_book("Стратегия", books["ema"]), ""])
     lines.append(_fmt_book("Случайные входы", books["random"]))
     e, r = books["ema"], books["random"]
     if e["trades"] and r["trades"]:

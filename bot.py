@@ -39,7 +39,16 @@ import simmaker
 import hedge_plans
 import signal_funnel
 import simperp
+import sqlite3
+import portfolio
+import spotbook
 import snapshots
+import health_http
+import shorts
+import reality
+import shortmarket
+import shortlab
+import shortlogic
 import trades
 import trading.wiring
 from cards import deal_card, history_card, history_compare_card, portfolio_card, top_chart
@@ -48,7 +57,7 @@ from p2p import ALL_EXCHANGES, AMOUNT_MAX, AMOUNT_MIN, DEFAULT_ASSETS, ENV_PATH,
     deal_for_amount, deal_fresh, fmt_ad, fmt_breakeven, fmt_deal, fmt_top, load_env, maker_neighbors, maker_place, maker_quote, \
     maker_round_fee, parse_amount, parse_min_profit, profit_breakdown, reliability, reliability_index, route_hops, scan, \
     score, setup_logging, spot_url, traps_log, venue_url, ScanSpeed, deal_stale
-from p2p import depth_for_deal, depth_settings, terms_log, terms_summary
+from p2p import depth_for_deal, depth_settings, terms_log, terms_summary, rapira_mid
 
 logger = logging.getLogger(__name__)
 
@@ -72,11 +81,17 @@ def save_topics(topics, path=None):
     jsonstore.write_dict(path or TOPICS_PATH, topics)
 
 
-MENU = {"keyboard": [[{"text": "🔥 Лучшая сейчас"}, {"text": "📊 Топ связок"}],
+MENU = {"keyboard": [[{"text": "🧪 Виртуальный баланс"}, {"text": "📈 Сценарии"}],
+                     [{"text": "📉 Шорты альтов"}],
+                     [{"text": "🏦 Банки и лимиты"}, {"text": "📒 Журнал CSV"}],
+                     [{"text": "🔥 Лучшая сейчас"}, {"text": "📊 Топ связок"}],
                      [{"text": "⚙️ Настройки"}, {"text": "🛠 Разработка"}],
                      [{"text": "❓ Как работать"}, {"text": "🛡 Безопасность"}]],
         "resize_keyboard": True, "is_persistent": True}
-BUTTONS = {"🔥 Лучшая сейчас": "/best", "📊 Топ связок": "/top", "⚙️ Настройки": "/settings",
+BUTTONS = {"🧪 Виртуальный баланс": "/paper", "📈 Сценарии": "/paper scenarios",
+           "📉 Шорты альтов": "/shorts",
+           "🏦 Банки и лимиты": "/paper banks", "📒 Журнал CSV": "/paper scenario-report",
+           "🔥 Лучшая сейчас": "/best", "📊 Топ связок": "/top", "⚙️ Настройки": "/settings",
            "🛠 Разработка": "/dev", "❓ Как работать": "/help", "🛡 Безопасность": "/safety"}
 
 # Гости (TG_GUESTS в .env): получают сигналы и рыночные команды; настройки, ключи, журнал, алерты — только
@@ -101,8 +116,9 @@ OWNER_ONLY_PRIVATE = ("🔒 Команды владельца (настройк�
                       "Сейчас TG_CHAT_ID в .env — группа или канал: впиши туда id своего личного чата с ботом (он "
                       "равен твоему Telegram user id) и перезапусти бота.")
 OWNER_ONLY_TOAST = "Кнопки владельца — только в личном чате владельца с ботом"
-FIRST_CHAT_PRIVATE = "🔒 Владельцем бота становится только личный чат: напиши мне /start в личные сообщения."
+FIRST_CHAT_PRIVATE = "🔒 Владелец ещё не настроен: укажи свой Telegram user ID в TG_CHAT_ID в .env на ПК и перезапусти бота."
 COMMANDS = [{"command": "best", "description": "Лучшая связка сейчас"},
+            {"command": "shorts", "description": "Виртуальные шорты альтов: баланс, позиции, риск и журнал"},
             {"command": "top", "description": "Топ связок графиком"},
             {"command": "history", "description": "История спредов: время суток, дни недели, BestChange"},
             {"command": "backtest", "description": "Бэктест маршрута по истории спредов (7/30 дней)"},
@@ -219,6 +235,7 @@ HELP_SECTIONS = {
               "/paper report — отчёт по площадкам и парам + CSV\n/paper cycles [дней] — круги в CSV\n"
               "/paper reset — обнулить (с подтверждением)\n"
               "/funding — бумажный арбитраж фандинга\n/futures — бумажная стратегия EMA 20/100\n"
+              "/shorts — виртуальные шорты альтов: баланс, позиции, риск и CSV\n"
               "/maker paper — бумажный мейкер\n/calibration — поправка факт − план (CALIBRATION=1)"),
     "settings": ("⚙️ Настройки", "<b>Настройки и служебное</b>\n"
                  "/settings — порог, сумма, фильтры, мои биржи и банки, тихие часы, пауза, пресеты (всё в .env)\n"
@@ -1367,11 +1384,12 @@ def mybanks_view():
     остальных банках (перевод мерчанту в его банк — внутри банка) и бесплатный лимит СБП каждого по тарифу."""
     listed, star = trades.own_banks()
     lines = ["🏦 <b>Мои банки и лимиты СБП</b>", "",
-             "Есть у мерчанта твой банк — перевод внутри банка, лимит СБП не тратится. Мерчант принимает только СБП "
+             "Есть у мерчанта твой банк — перевод внутри банка, лимит СБП не тратится.\n\nМерчант принимает только СБП "
              "или чужой банк — бот считает оплату по СБП с первого твоего банка, у которого бесплатный лимит за "
              "месяц ещё не исчерпан.", ""]
     for b in listed:
-        lines.append(f"• {trades.BANK_NAMES.get(b, b)} — бесплатно по СБП {_limit_text(trades.free_limit(b))} в месяц")
+        lines.extend([f"<b>{html.escape(trades.BANK_NAMES.get(b, b))}</b>",
+                      f"Бесплатно по СБП: {_limit_text(trades.free_limit(b))} в месяц", ""])
     lines.append(f"• {'✅' if star else '➖'} карты и в любом другом банке")
     kb = [[{"text": ("✅ " if b in listed else "") + trades.BANK_NAMES.get(b, b), "callback_data": f"ownbank:{b}"}
            for b in MY_BANKS[i:i + 3]] for i in range(0, len(MY_BANKS), 3)]
@@ -2268,9 +2286,14 @@ class Bot:
                             f"{s['avg_fact']:+.2f}%, расхождение расчёт→факт {s['avg_diff']:+.2f} п.п.")
                 if s.get("plan_facts"):
                     line += f"; «как расчёт»/±0.5 у {s['plan_facts']} — не факт, в сравнение не идут"
-                lines.append(line)
+                heading = f"{label}: {s['count']} сделок"
+                lines.extend([line.replace(heading, f"<b>{heading}</b>", 1)
+                              .replace(", оборот", "\nОборот")
+                              .replace(", средний профит", "\nСредний профит")
+                              .replace("; факт", "\nфакт")
+                              .replace("; «как расчёт»", "\n«как расчёт»"), ""])
             else:
-                lines.append(f"{label}: сделок нет")
+                lines.extend([f"<b>{label}</b>", "Сделок нет", ""])
         lines += spread_lines(trades.plan_fact_spread(trades.period_start("month")))
         lines += direction_lines(trades.by_direction(trades.period_start("month")))
         banks = trades.month_banks()
@@ -2300,53 +2323,19 @@ class Bot:
         return sigreport.render(sigreport.build(days=days))
 
     def paper_view(self):
-        """Текст «/paper»: настройки, открытые виртуальные круги, статистика за день/неделю/всё время
-        (исполнилось/сорвалось и почему, средний факт vs план) и виртуальный баланс с изменением с начала."""
+        import scenarios
+        if scenarios.enabled():
+            return '\n'.join(scenarios.report('base') + [
+                '/paper scenarios — сравнение · /paper verified — строгий портфель',
+                '/paper scenario-report [fast|base|stress] — журнал CSV'])
+        if os.getenv("PAPER_ENGINE", "ledger") == "legacy":
+            return self._legacy_paper_view()
+        """Сводка нового виртуального портфеля; прежняя история доступна отдельно."""
         s = paper.settings()
-        lines = ["🧪 <b>Сухой прогон</b>", "",
-                 f"Статус: {'🟢 включён' if s['on'] else '⚪ выключен'}, сумма круга {_money(s['amount'])} ₽", ""]
-        open_ = paper.open_cycles()
-        if not open_:
-            lines.append("Открытых кругов нет.")
-        else:
-            now = time.time()
-            for c in open_:
-                mins = (now - c["ts_stage"]) / 60
-                stage = PAPER_STAGE_LABELS.get(c["stage"], c["stage"])
-                lines.append(f"🔄 {c['buy_ex']}→{c['sell_ex']} ({c['buy_asset']}→{c['sell_asset']}): "
-                            f"стадия «{stage}» {mins:.0f} мин, план {c['planned_pct']:+.2f}%")
-        lines.append("")
-        st = paper.stats()
-        for key, label in (("day", "За сегодня"), ("week", "За неделю"), ("all", "За всё время")):
-            p = st[key]
-            if not p["total"]:
-                lines.append(f"{label}: кругов не было")
-                continue
-            line = f"{label}: {p['total']} кругов, исполнилось {p['done']}"
-            if p["failed"]:
-                reasons = ", ".join(f"{paper.FAIL_LABELS.get(r, r)} {n}" for r, n in p["failed_by_reason"].items())
-                line += f", сорвалось {p['failed']} ({reasons})"
-            if p["avg_diff"] is not None:
-                line += f", факт vs план {p['avg_diff']:+.2f} п.п."
-            lines.append(line)
-        balance = paper.get_balance()
-        if balance is not None:
-            change = paper.balance_change()
-            change_str = f"{change:+,.0f}".replace(",", " ")
-            lines.append("")
-            lines.append(f"Виртуальный баланс: {_money(balance)} ₽ (изменение с начала: {change_str} ₽)")
-        banks = paper.banks_this_month()
-        if banks:
-            lines.append("")
-            lines.append("Лимит СБП за месяц (виртуальный оборот):")
-            for bank, total in sorted(banks.items(), key=lambda kv: -kv[1]):
-                limit = trades.free_limit(bank)
-                mark = "⚠️ " if total >= limit else ""
-                lines.append(f"{mark}{trades.BANK_NAMES.get(bank, bank)}: {_money(total)} ₽ / {_limit_text(limit)}")
-        lines.append("")
-        lines.append("Кнопки ниже; то же командами: /paper on, /paper off, /paper amount 20000, /paper report. "
-                     "/paper reset — начать статистику с нуля (старая база — в архив)")
-        return "\n".join(lines)
+        return "\n".join(portfolio.report_lines() + [
+            f"Статус: {'включён' if s['on'] else 'выключен'} · сумма круга {s['amount']:.2f} ₽",
+            "/paper report — журнал CSV; /paper reset — новый портфель с архивом",
+            "Прежняя история сохранена отдельно в paper.db."] + portfolio.bank_report())
 
     def paper_markup(self):
         """Кнопки под сводкой «/paper»: включить/выключить, сумма круга, отчёт. Ссылка «/paper» в тексте
@@ -2356,7 +2345,21 @@ class Bot:
                   else {"text": "▶️ Включить", "callback_data": "paper_set:on"})
         amounts = [{"text": ("✓ " if s["amount"] == a else "") + f"{_money(a)} ₽", "callback_data": f"paper_amt:{a}"}
                    for a in PAPER_AMOUNTS]
-        return {"inline_keyboard": [[toggle], amounts,
+        import scenarios
+        navigation = []
+        if scenarios.enabled() and os.getenv("PAPER_ENGINE", "ledger") != "legacy":
+            navigation = [
+                [{"text": label, "callback_data": "paper_view:" + name}
+                 for name, label in (("fast", "⚡ Быстрый"), ("base", "📊 Базовый"), ("stress", "⏳ Стрессовый"))],
+                [{"text": "📈 Сравнение", "callback_data": "paper_nav:scenarios"},
+                 {"text": "🏦 Банки и лимиты", "callback_data": "paper_nav:banks"}],
+                [{"text": "📋 Тарифы", "callback_data": "paper_nav:catalog"},
+                 {"text": "🔒 Строгий портфель", "callback_data": "paper_nav:verified"}],
+                [{"text": "📚 Проверка маршрутов", "callback_data": "paper_nav:research"}],
+                [{"text": "🛡 Реальность и ограничения", "callback_data": "paper_nav:risks"}],
+                [{"text": label + " CSV", "callback_data": "paper_csv:" + name}
+                 for name, label in (("fast", "⚡"), ("base", "📊"), ("stress", "⏳"))]]
+        return {"inline_keyboard": navigation + [[toggle], amounts,
                                     [{"text": "📊 Отчёт + CSV", "callback_data": "paper_report"},
                                      {"text": "🔄 Обновить", "callback_data": "paper"}]]}
 
@@ -2447,6 +2450,8 @@ class Bot:
         return lines
 
     async def cmd_paper(self, arg):
+        if os.getenv("PAPER_ENGINE", "ledger") == "legacy":
+            return await self._legacy_cmd_paper(arg)
         """/paper — сводка сухого прогона; /paper on|off — включить/выключить; /paper amount 20000 —
         сумма виртуального круга (баланс не сбрасывает, действует для новых кругов); /paper report —
         отчёт по площадкам и парам + CSV-файл (data/paper_report.csv); /paper cycles [дней] — построчная
@@ -2454,7 +2459,69 @@ class Bot:
         обнулить (paper_reset:yes → paper.reset, база в архив)."""
         sub, _, rest = arg.strip().partition(" ")
         sub = sub.lower()
-        if sub == "on":
+        if sub == 'risks':
+            import executionfacts
+            await self.send(executionfacts.report(), markup=self.paper_markup())
+        elif sub == "research":
+            import strategyreview
+            name = rest.strip() or 'base'
+            if name not in ('fast','base','stress'):
+                await self.send('Варианты: fast, base, stress.')
+                return
+            await self.send(strategyreview.p2p_report(name), markup=self.paper_markup())
+        elif sub == "verified":
+            await self.send('\n'.join(portfolio.report_lines() + portfolio.bank_report()), markup=self.paper_markup())
+        elif sub == "scenarios":
+            import scenarios
+            for name in scenarios.VARIANTS:
+                await self.send('\n'.join(scenarios.report(name)), markup=self.paper_markup())
+        elif sub == "scenario-report":
+            import scenarios
+            name = rest.strip() or 'base'
+            if name not in scenarios.VARIANTS:
+                await self.send('Варианты: fast, base, stress.')
+                return
+            with scenarios.context(name):
+                output = os.path.join(scenarios.ROOT, 'paper_scenario_' + name + '.csv')
+                portfolio.export(output, path=scenarios.path(name))
+            await self.send_document(output, caption='Сценарный журнал: ' + name)
+        elif sub == "catalog":
+            import bankcatalog
+            await self.send("\n".join(bankcatalog.report_lines()), markup=self.paper_markup())
+        elif sub == "bankfee":
+            import bankcatalog
+            parts = rest.split()
+            if len(parts) not in (3, 4) or (len(parts) == 4 and parts[3] != "own"):
+                await self.send("/paper bankfee продукт сумма уже_переведено_за_месяц [own]. "
+                                "Продукты: /paper catalog. own — только между своими счетами.")
+                return
+            try:
+                quote = bankcatalog.estimate(parts[0], parts[1], parts[2],
+                                             own_account=len(parts) == 4)
+                await self.send("Сценарная комиссия: " + quote['fee'] + " ₽. "
+                                "Это не чистая прибыль: обслуживание, расходы биржи, "
+                                "финансирование и персональные ограничения здесь не вычтены. "
+                                "Расчёт не открывает виртуальную сделку и не подтверждает разрешение банка.")
+            except ValueError as exc:
+                await self.send("Расчёт отклонён: " + html.escape(str(exc)))
+        elif sub == "banks":
+            import scenarios
+            await self.send('\n'.join(scenarios.account_lines() if scenarios.enabled() else portfolio.bank_report()), markup=self.paper_markup())
+        elif sub == "transfer":
+            parts = rest.split()
+            if len(parts) != 4:
+                await self.send("Формат: /paper transfer счёт_откуда счёт_куда сумма секунды_зачисления. "
+                                "Только виртуальные рубли; условия обоих счетов должны быть подтверждены.")
+                return
+            try:
+                amount = parse_amount(parts[2])
+                if amount is None:
+                    raise ValueError("Некорректная сумма")
+                tid = portfolio.own_transfer(parts[0], parts[1], amount, int(parts[3]))
+                await self.send(f"Виртуальный перевод #{tid}: деньги в пути до проверки зачисления.")
+            except (ValueError, KeyError, OSError, sqlite3.Error) as exc:
+                await self.send("Виртуальный перевод отклонён: " + html.escape(str(exc)))
+        elif sub == "on":
             save_env("PAPER", "1")
             await self.send("🧪 Сухой прогон включён.")
         elif sub == "off":
@@ -2468,24 +2535,23 @@ class Bot:
                 return
             save_env("PAPER_AMOUNT", f"{amount:.0f}")
             await self.send(f"🧪 Сумма круга сухого прогона: {_money(amount)} ₽.")
-        elif sub == "report":
-            rows = paper.report_rows()
-            await self.send(self.paper_report_view(rows))
-            if rows:
-                path = paper.write_report_csv(rows)
-                await self.send_document(path, "Отчёт сухого прогона (CSV)")
-        elif sub == "cycles":
-            days = int(rest) if rest.strip().isdigit() else 30
-            days = min(365, max(1, days))
-            rows = paper.export_cycles(time.time() - days * 86400)
-            if not rows:
-                await self.send("за период кругов нет")
+        elif sub in ("report", "cycles"):
+            await self.send(self.paper_view())
+            import scenarios
+            if scenarios.enabled():
+                path = portfolio.export(os.path.join(scenarios.ROOT, 'paper_scenario_base.csv'), path=scenarios.path('base'))
             else:
-                path = paper.write_cycles_csv(rows)
-                await self.send_document(path, f"Круги бумаги: {len(rows)} шт. за {days} дн.")
+                path = portfolio.export(portfolio.EXPORT_PATH)
+            await self.send_document(path, "Журнал виртуального портфеля (CSV)")
         elif sub == "reset":
+            import scenarios
+            if scenarios.enabled():
+                r = await self.send('Архивировать и начать заново три стандартных сценария по 50 000 ₽? '
+                                    'Строгий портфель сохранится.', markup=PAPER_RESET_MARKUP)
+                self.paper_reset_ask = (r.get('result') or {}).get('message_id')
+                return
             r = await self.send("🧪 Обнулить сухой прогон? Все круги (и открытые) уйдут в архив "
-                            "data/paper-archive-…db — он не удаляется; статистика, баланс и лестница начнутся с нуля. "
+                            "data/paper-portfolio-archive-…db — он не удаляется; капитал станет 50 000 ₽. "
                             "Вкл/выкл и сумма круга не меняются.", markup=PAPER_RESET_MARKUP)
             # «Да» принимается только с этого сообщения и один раз: двойное нажатие до того, как кнопки пропали,
             # иначе затирало итог обнуления текстом «обнулять нечего»
@@ -2494,17 +2560,22 @@ class Bot:
             await self.send(self.paper_view(), markup=self.paper_markup())
 
     def paper_reset(self):
-        """Кнопка «🗑 Да, обнулить»: paper.reset и текст ответа — что ушло в архив."""
+        import scenarios
+        if scenarios.enabled():
+            try:
+                archives = scenarios.reset_all()
+                return f'Три сценария начаты заново; архивов: {len(archives)}. Строгий портфель сохранён.'
+            except (OSError, ValueError, sqlite3.Error) as exc:
+                return 'Сброс сценариев не завершён: ' + html.escape(str(exc))
+        if os.getenv("PAPER_ENGINE", "ledger") == "legacy":
+            return self._legacy_paper_reset()
+        """Архивировать новый портфель и начать с 50 000 рублей."""
         try:
-            res = paper.reset()
-        except OSError as e:   # файл базы занят/нет прав — база на месте, говорим как есть
-            return f"⚠️ Не получилось обнулить сухой прогон: {html.escape(str(e))}"
-        if res is None:
-            return "🧪 Обнулять нечего — кругов сухого прогона ещё не было."
-        change = f"{res['change']:+,.0f}".replace(",", " ")
-        return (f"🗑 Сухой прогон обнулён. В архиве data/{html.escape(os.path.basename(res['archive']))}: "
-                f"кругов {res['cycles']}, итог завершённых {change} ₽. Статистика, баланс и лестница — с нуля; "
-                f"вкл/выкл и сумма круга прежние.")
+            archive = portfolio.reset()
+        except (OSError, ValueError, sqlite3.Error) as e:
+            return f"Не удалось сбросить портфель: {html.escape(str(e))}"
+        return (f"Портфель обнулён до 50 000 ₽. Архив: {html.escape(os.path.basename(archive))}."
+                if archive else "Новый портфель ещё не запускался.")
 
     async def cmd_export(self, arg):
         """/export [month|year] — журнал сделок за календарный месяц (по умолчанию) или год до сегодня по МСК:
@@ -2658,9 +2729,9 @@ class Bot:
         else:
             status = f"▶️ сканирую каждые {c.interval} с"
         text = (f"⚙️ <b>Настройки</b>\n\nПорог сигнала: <b>{c.min_profit:g}%</b> (1-я строка кнопок)\n"
-                f"Сумма круга: <b>{_money(c.amount)} ₽</b> (2-я строка)\nСтатус: {status}\n"
+                f"Сумма круга: <b>{_money(c.amount)} ₽</b> (2-я строка)\n\n<b>Работа бота</b>\nСтатус: {status}\n"
                 f"Тихие часы: {'✅ вкл' if self.quiet_on else '➖ выкл'} ({self.quiet_hours} МСК)\n\n"
-                f"Монеты: {', '.join(c.assets)}\nПлощадки: {', '.join(c.exchanges)}")
+                f"<b>Рынки и фильтры</b>\nМонеты: {', '.join(c.assets)}\nПлощадки: {', '.join(c.exchanges)}")
         if c.include_pay:
             text += f"\nБанки: {', '.join(c.include_pay)}"
         if c.same_venue_only:
@@ -2935,6 +3006,7 @@ class Bot:
                 t0 = time.time()
                 snap = self.last = await self.fresh_scan()
                 self.last_scan_ts, self.last_scan_duration = time.time(), time.time() - t0
+                health_http.update_scan_status(self.last_scan_duration, snap.errors)
                 self.scan_errors = 0
                 self.speed.add(self.last, self.last_scan_duration)
                 await self.scan_step("track_liveness", self.track_liveness, self.last)
@@ -3143,6 +3215,126 @@ class Bot:
             except Exception as e:
                 logger.error("perp_loop error: %s", e)
             await asyncio.sleep(PERP_LOOP_TICK)
+
+    async def shorts_loop(self):
+        collector = shortmarket.Collector()
+        lab = shortlab.Worker()
+        self.short_collector, self.short_lab = collector, lab
+        try:
+            await self._shorts_watch_loop(collector, lab)
+        finally:
+            await collector.close()
+            await lab.close()
+
+    async def _shorts_watch_loop(self, collector, lab):
+        last_notice = 0
+        if os.getenv('ALT_SHORTS', '0') == '1':
+            with shorts.connect() as con:
+                last_notice = con.execute('SELECT COALESCE(MAX(id),0) FROM events').fetchone()[0]
+        while True:
+            state = None
+            try:
+                if os.getenv('ALT_SHORTS', '0') == '1':
+                    state = shorts.status()
+                    if state is None and self.last is not None and 0 <= time.time()-self.last.ts <= 60:
+                        shorts.initialize(self.last.ref, self.last.ref_src)
+                    elif state is None:
+                        rate = await rapira_mid(self.s)
+                        shorts.initialize(rate, 'Rapira USDT/RUB · наблюдение при запуске')
+                    if shorts.status() is not None:
+                        roundtrip = reality.status() if os.getenv('REALITY_CYCLES', '0') == '1' else None
+                        collector.external_path = roundtrip['strategy'] if roundtrip and roundtrip['stage'] == 'trade' and roundtrip['venue_available'] else None
+                        collector.external_entries = bool(roundtrip and roundtrip['stage'] == 'trade'
+                                                          and not roundtrip['paused'] and float(roundtrip['service_debt']) == 0
+                                                          and collector.now() < roundtrip['due'])
+                        markets = await collector.refresh(self.s)
+                        if os.getenv('REALITY_CYCLES', '0') == '1':
+                            reality.tick(self.last, markets, now=collector.now())
+                        lab.submit(markets, collector.diagnostics_snapshot(), collector.now())
+                        with shorts.connect() as con:
+                            row = con.execute("SELECT MAX(id) FROM events").fetchone()
+                            high = row[0] or 0
+                            events = con.execute("SELECT kind FROM events WHERE id>? AND kind IN ('entry_fill','exit_fill','stress_loss','drawdown_halt')", (last_notice,)).fetchall()
+                        last_notice = high
+                        if events:
+                            await self.send(shorts.report('positions'), markup=self.shorts_markup(), topic='journal')
+            except Exception as exc:
+                logger.warning('shorts_loop: %s', type(exc).__name__)
+                shorts.record_error('Ошибка получения данных: ' + type(exc).__name__)
+            current = shorts.status() if os.getenv('ALT_SHORTS', '0') == '1' else None
+            await asyncio.sleep(1 if current and any(p['stage'] != 'closed' for p in current['positions']) else 15)
+
+    def shorts_markup(self):
+        return {'inline_keyboard': [
+            [{'text': '💰 Баланс', 'callback_data': 'shorts:balance'},
+             {'text': '🔎 Кандидаты', 'callback_data': 'shorts:candidates'}],
+            [{'text': '📉 Позиции', 'callback_data': 'shorts:positions'},
+             {'text': '📊 Результаты', 'callback_data': 'shorts:results'}],
+            [{'text': '🛡 Риск', 'callback_data': 'shorts:risk'},
+             {'text': '📒 CSV', 'callback_data': 'shorts:export'}],
+            [{'text': '📚 Данные и обучение', 'callback_data': 'shorts:research'}],
+            [{'text': '🔄 Рубли → шорты → рубли', 'callback_data': 'shorts:cycle'},
+             {'text': '📒 Полный цикл CSV', 'callback_data': 'shorts:cycleexport'}],
+            [{'text': '🧠 Обучение', 'callback_data': 'shorts:learning'},
+             {'text': '⚡ Качество данных', 'callback_data': 'shorts:feed'}],
+            [{'text': '🔎 Решения', 'callback_data': 'shorts:decisions'},
+             {'text': '📖 Логика', 'callback_data': 'shorts:knowledge'}],
+            [{'text': '📒 Журнал решений CSV', 'callback_data': 'shorts:labexport'}],
+            [{'text': '⏸ Пауза входов', 'callback_data': 'shorts:pause'},
+             {'text': '▶️ Возобновить', 'callback_data': 'shorts:resume'}]]}
+
+    async def cmd_shorts(self, arg):
+        section = arg.strip().lower()
+        if section in ('pause', 'resume'):
+            shorts.control(section)
+            if reality.status() is not None:
+                reality.control(section)
+            section = ''
+        if section == 'cycle':
+            await self.send(reality.report(), markup=self.shorts_markup())
+        elif section == 'cycleexport':
+            if reality.status() is None:
+                await self.send('Полный рублёвый цикл ещё не активирован.', markup=self.shorts_markup())
+            else:
+                destination = os.path.join(reality.ROOT, 'rub_roundtrip.csv')
+                reality.export(destination)
+                await self.send_document(destination, caption='Полный рублёвый цикл и дочерний USDT-журнал · до налогов')
+        elif section == 'export':
+            destination = os.path.join(os.path.dirname(shorts.DB_PATH), 'alt_shorts.csv')
+            shorts.export(destination)
+            await self.send_document(destination, caption='Журнал виртуальных шортов альтов')
+        elif section == 'research':
+            import strategyreview
+            await self.send(strategyreview.shorts_report(), markup=self.shorts_markup())
+        elif section == 'knowledge':
+            await self.send(shortlogic.guide(), markup=self.shorts_markup())
+        elif section in ('learning', 'decisions', 'feed'):
+            text = await asyncio.to_thread(shortlab.report, section)
+            chunk = ''
+            for block in text.split('\n\n'):
+                if chunk and len(chunk) + len(block) + 2 > 3800:
+                    await self.send(chunk, markup=self.shorts_markup())
+                    chunk = ''
+                chunk += ('\n\n' if chunk else '') + block
+            if chunk:
+                await self.send(chunk, markup=self.shorts_markup())
+        elif section == 'labexport':
+            destination = os.path.join(os.path.dirname(shortlab.DB_PATH), 'short_decisions.csv')
+            await asyncio.to_thread(shortlab.export, destination)
+            await self.send_document(destination, caption='Причины входов и отказов · виртуальные шорты')
+        elif section in ('', 'balance', 'candidates', 'positions', 'results', 'risk'):
+            text = shorts.report('' if section == 'balance' else section)
+            # Blocks have balanced HTML tags. Split only between blocks for long watchlists.
+            chunk = ''
+            for block in text.split('\n\n'):
+                if chunk and len(chunk) + len(block) + 2 > 3800:
+                    await self.send(chunk, markup=self.shorts_markup())
+                    chunk = ''
+                chunk += ('\n\n' if chunk else '') + block
+            if chunk:
+                await self.send(chunk, markup=self.shorts_markup())
+        else:
+            await self.send('/shorts balance|candidates|positions|results|risk|export|pause|resume|research|learning|decisions|feed|knowledge|labexport')
 
     def sim_tick(self):
         """Бумажные симуляции на свежих котировках перпов; сбой одной не мешает другой и опросу."""
@@ -3388,6 +3580,14 @@ class Bot:
         сутки не завершилось ни одного круга."""
         if not paper.settings()["on"]:
             return []
+        import scenarios
+        if scenarios.enabled():
+            lines = ['🧪 Стандартные сценарии (альтернативы одного капитала):']
+            for name in scenarios.VARIANTS:
+                s = portfolio.summary(scenarios.path(name))
+                lines.append(f"{scenarios.LABELS[name]}: продажи {float(s['realized']):+.2f} ₽; "
+                             f"после расходов {float(s.get('net_realized', s['realized'])):+.2f} ₽.")
+            return lines
         now = time.time() if now is None else now
         try:
             p = paper.summary_since(now - 86400)
@@ -3582,27 +3782,25 @@ class Bot:
         return f"⏱ держится {minutes} мин · "
 
     async def maybe_start_paper_cycle(self, deals, snap):
-        """Сухой прогон (paper.py): при свободном слоте виртуально «берём» лучшую по p2p.score (на сумме
-        PAPER_AMOUNT) связку из тех, о которых владелец получает сигнал (выше порога и держится LIVE_SCANS
-        сканов), если стакана хватает на PAPER_AMOUNT (deal_for_amount/_stack) и она не «🪤 ловушка»
-        (PAPER_TRAPS=1 — брать и их, notify тогда отдаёт их сюда и при SIGNAL_TRAPS=0). Пишем
-        круг с меткой надёжности в data/paper.db со стадией buy. Карточка — только владельцу, гостям про
-        сухой прогон ничего не идёт."""
+        import scenarios
+        if scenarios.enabled():
+            return await self.start_scenario_cycles(deals, snap)
+        if os.getenv("PAPER_ENGINE", "ledger") == "legacy":
+            return await self._legacy_maybe_start_paper_cycle(deals, snap)
+        """Резервировать капитал по подтверждённому сигналу и неизменному маршруту."""
         settings = paper.settings()
-        if not settings["on"] or not self.chat_id or not deals:
+        if not settings["on"] or not self.chat_id or not deals or self.cfg.fiat != "RUB":
             return
-        if len(paper.open_cycles()) >= settings["max_open"]:
+        if len(portfolio.runs(active=True)) >= settings["max_open"]:
             return
         # лимит СБП исчерпан по-настоящему (trades) или по виртуальному обороту прогона — комиссия 0.5% в плане
         own = trades.own_banks()[0]
-        over = frozenset(snap.over_banks) | {b for b in own if paper.bank_month_total(b) >= trades.free_limit(b)}
+        over = frozenset(snap.over_banks) | {b for b in own if portfolio.bank_month_total(b) >= trades.free_limit(b)}
         psnap = dataclasses.replace(snap, over_banks=over)
         picked = None   # лучшая по p2p.score уже на сумме прогона, а не первая в списке (тот отсортирован на AMOUNT)
         for deal in deals:
             if not self.is_confirmed(deal) or deal_stale(deal):
                 continue   # сигнала о ней ещё не было (выброс одного скана) или данные площадки устарели — не берём
-            if not paper.simple_route(deal):
-                continue   # через спот/межмонетные — пока нет, условия возврата в ROADMAP (межмонетные, часть 2)
             d = deal_for_amount(deal, self.cfg, psnap, settings["amount"])
             if d is None or d[0] < self.cfg.min_profit:
                 continue   # на сумму сухого прогона глубины не хватает или прибыль ниже порога
@@ -3616,7 +3814,6 @@ class Bot:
             return
         rank, d, label, reasons = picked
         profit, b, s, route = d
-        paper.init_balance(settings["amount"])
         # выход маршрута в монете продажи по итоговому стеку s (его parts: переводов на каждый обменник) — без
         # запаса на курс и с комиссией СБП, если лимит исчерпан; по нему же план без запаса — с ним сравнивается факт
         route_cfg = dataclasses.replace(self.cfg, amount=settings["amount"])
@@ -3624,7 +3821,6 @@ class Bot:
         raw = (qty * s.price / settings["amount"] - 1) * 100 if qty else profit
         # площадки конвертации и сеть/комиссия каждого хопа на момент старта: стадия transfer проверяет именно эти
         # переводы, sell считает выход по их комиссиям, время перевода круга — по их сетям (paper.start_cycle);
-        # межмонетные связки фильтр paper.simple_route пока не пускает (снятие — шаг владельца)
         hops = route_hops(b, s, route_cfg, psnap.spot, over)
         # для разбора (этап 1 «измерения»): индекс и причины надёжности, серия «живости», запас глубины и id снимка
         # скана — снимок пишется после сигналов, но id (время начала скана) известен уже сейчас
@@ -3634,124 +3830,116 @@ class Bot:
                     "snapshot_id": snapshots.scan_id(snap)}
         if measures["snapshot_id"] is not None:   # снимок этого скана запишется, даже если он не SNAPSHOT_EVERY-й
             self.snapshot_keep.add(measures["snapshot_id"])
-        # бумажный хедж (simperp): шорт перпа на монету круга; HEDGE_PLAN=1 — в плане стоимость хеджа вместо запаса.
-        # Монета круга — выход маршрута, а без него купленное (не s.avail — это весь объём объявления продажи).
-        # for_cycle не бросает исключений: сбой хеджа не мешает ни кругу, ни сигналам после него
-        hedge, hedge_note, profit, hedge_line = simperp.for_cycle(
-            b.asset, qty or settings["amount"] / b.price, settings["amount"], psnap.ref, b.price, raw, profit,
-            risk=self.cfg.risk_buffer.get(b.asset, 0.0))
-        # over — тот же, что в плане и qty: банк оплаты и комиссия СБП в круге совпадут с планом
-        cycle = paper.get_cycle(paper.start_cycle(settings["amount"], b, s, route, profit, label=label,
-                                                  sell_qty=qty or s.avail, pay_fee=self.cfg.pay_fee, over=over,
-                                                  planned_raw=raw, hops=hops, **measures)) or {}
-        try:
-            simperp.open_hedge(cycle.get("id"), hedge, hedge_note)
-        except Exception as e:
-            logger.error("simperp: %s", e)
-        pay = trades.pay_label(cycle.get("pay_kind", ""), cycle.get("bank", ""), b.pays)
-        qty = settings["amount"] / b.price
-        text = (f"🧪 <b>Сухой прогон</b>: купил бы {_money(qty)} {b.asset} у {html.escape(b.nick)} "
-                f"по {_price(b.price)} ₽, оплата: {html.escape(pay)} · план {profit:.2f}% · {label}"
-                f" · оценка {rank:+.2f}")
+        if not hops:
+            return
+        kind, bank = trades.pay_plan(b.pays, over=over)
+        pay_fee = max(self.cfg.pay_fee, trades.SBP_OVER_FEE) if kind == "sbp" and bank in over else self.cfg.pay_fee
+        cycle = portfolio.start(settings["amount"], b, s, hops, raw, pay_fee=pay_fee,
+                                max_open=settings["max_open"], bank=bank, pay_kind=kind, measures=measures,
+                                spot_fees={v: p2p._spot_fee(self.cfg, v) for v in hops.get("venues", [])})
+        if cycle is None:
+            return
+        text = (f"🧪 Зарезервировано {settings['amount']:.2f} ₽ для круга #{cycle['id']}: "
+                f"{html.escape(b.ex)} {b.asset} → {html.escape(s.ex)} {s.asset}. "
+                f"План {profit:+.2f}%; покупка ещё не исполнена. "
+                f"Оплата: {html.escape(trades.pay_label(kind, bank, b.pays))}.")
         if reasons:
             text += "\n" + "\n".join(f"• {html.escape(r)}" for r in reasons)
-        if hedge_line:
-            text += "\n" + html.escape(hedge_line)
         await self.send(text, topic="signals")
 
     async def process_paper_cycles(self, snap):
-        """Сухой прогон: стадии открытых виртуальных кругов по свежему снимку/справочникам, без сети.
-        buy — через PAPER_PAY_MINUTES покупка по свежему стакану (мерчанты круга, не хватило — другие по цене;
-        цена хуже плана больше PAPER_BUY_SLIP_MAX — срыв; у обменника — только по свежей котировке BestChange),
-        цена покупки пишется в круг; transfer — через время перевода по сетям круга переводы маршрута ещё возможны
-        (fees/netstatus), неизвестный статус сети — риск в круге; sell — продаём лучшим объявлениям стакана на весь
-        объём, прибыль — по фактическим ценам покупки и продажи (может быть ниже плана и в минус). Срыв
-        (failed_buy/failed_transfer/failed_sell): стакана покупки не хватило или цена ушла, перевод закрыт,
-        покупателей на весь объём нет. Всё состояние круга — в data/paper.db: перезапуск бота круг продолжает."""
+        if os.getenv("PAPER_ENGINE", "ledger") == "legacy":
+            return await self._legacy_process_paper_cycles(snap)
+        """Один шаг виртуального маршрута по свежим данным; состояние и журнал атомарны."""
         if not self.chat_id:
             return
+        import scenarios
+        pairs = set(portfolio.needed_books())
+        if scenarios.enabled():
+            for name in scenarios.VARIANTS:
+                scenarios.maintain(name, self.cfg)
+                pairs.update(portfolio.needed_books(path=scenarios.path(name)))
+        books, errors = await spotbook.load(self.s, pairs) if pairs else ({}, {})
+        for (venue, asset), error in errors.items():
+            logger.warning("paper spot depth unavailable: %s/%s (%s)", venue, asset, error)
+        for notice in portfolio.tick(snap, self.cfg, books=books):
+            await self.send("🧪 " + html.escape(notice), topic="signals")
+        if scenarios.enabled():
+            for name in scenarios.VARIANTS:
+                with scenarios.context(name, self.cfg):
+                    for notice in portfolio.tick(snap, self.cfg, path=scenarios.path(name), books=books):
+                        await self.send('🧪 ' + scenarios.LABELS[name] + ': ' + html.escape(notice), topic='signals')
+
+    async def start_scenario_cycles(self, deals, snap):
+        import scenarios
         settings = paper.settings()
-        for cycle in paper.open_cycles():
-            if cycle["stage"] == "buy":
-                action, note = paper.check_buy_stage(cycle, snap, settings["pay_minutes"],
-                                                     stale_minutes=settings["stale_minutes"])
-                if action == "wait":
+        if not settings['on'] or not self.chat_id or not deals or self.cfg.fiat != 'RUB':
+            return
+        # Scenario counters are independent of the user's real bank turnover.
+        for name in scenarios.VARIANTS:
+            scenarios.maintain(name, self.cfg)
+            psnap = scenarios.market_snapshot(name, snap, self.cfg)
+            with scenarios.context(name, self.cfg):
+                if len(portfolio.runs(path=scenarios.path(name), active=True)) >= settings['max_open']:
                     continue
-                paper.set_buy_check(cycle["id"], *paper.buy_observed(cycle, snap))   # цена и объём на проверке
-                if action == "fail":
-                    if not paper.finish_cycle(cycle["id"], "failed_buy", 0.0, note):
-                        continue   # круга уже нет (/paper reset посреди обработки)
-                    await self.send(f"🧪 Сухой прогон: круг #{cycle['id']} сорвался на покупке — {note}",
-                                    topic="signals")
-                else:
-                    # цена покупки по свежему стакану (проскальзывание, другие мерчанты) — для факта на продаже
-                    paper.set_buy_fill(cycle["id"], paper.buy_fill(cycle, snap))
-                    paper.set_stage(cycle["id"], "transfer")
-            elif cycle["stage"] == "transfer":
-                action, note = paper.check_transfer_stage(cycle, self.cfg, settings["transfer_minutes"])
-                if action == "wait":
+                balance = portfolio.summary(scenarios.path(name))
+                budget = min(float(balance['cash']), settings['amount'])
+                if budget <= 0:
                     continue
-                if action == "fail":
-                    if not paper.finish_cycle(cycle["id"], "failed_transfer", 0.0, note):
+                picked = None
+                for deal in deals:
+                    if not self.is_confirmed(deal) or deal_stale(deal):
                         continue
-                    await self.send(f"🧪 Сухой прогон: круг #{cycle['id']} сорвался на переводе — {note}",
-                                    topic="signals")
-                else:
-                    paper.add_risks(cycle["id"], paper.transfer_risks(cycle, self.cfg))   # неизвестный статус сети — риск
-                    paper.set_stage(cycle["id"], "sell")
-            elif cycle["stage"] == "sell":
-                action, note, price = paper.check_sell_stage(cycle, snap, cfg=self.cfg,
-                                                              stale_minutes=settings["stale_minutes"])
-                if action == "wait":
+                    preview = deal_for_amount(deal, dataclasses.replace(self.cfg, pay_fee=0), psnap, budget)
+                    if preview is None:
+                        continue
+                    estimate = scenarios.prepare(name, preview[1], preview[2], budget, self.cfg)
+                    if estimate is None:
+                        continue
+                    principal = float(estimate['principal'])
+                    cfg = dataclasses.replace(self.cfg, amount=principal, pay_fee=0)
+                    d = deal_for_amount(deal, cfg, psnap, principal)
+                    if d is None:
+                        continue
+                    net = ((principal * (1 + d[0] / 100) - float(estimate['incoming_fee'])) / budget - 1) * 100
+                    label, reasons = reliability(d, cfg, psnap)
+                    if net < self.cfg.min_profit or (label == TRAP and not settings['traps']):
+                        continue
+                    if picked is None or net > picked[0]:
+                        picked = net, d, estimate, cfg
+                if picked is None:
+                    scenarios.blocked(name, 'Нет подтверждённого сигнала с доступной глубиной, каналом оплаты '
+                                      'и чистой прибыльностью выше порога; неизвестные условия не подтверждены.')
                     continue
-                if action == "fail":
-                    if not paper.finish_cycle(cycle["id"], "failed_sell", 0.0, note):
-                        continue
-                    await self.send(f"🧪 Сухой прогон: круг #{cycle['id']} сорвался на продаже — {note}",
-                                    topic="signals")
-                else:
-                    # тот же пересчёт по свежему snap.spot, что уже решил check_sell_stage — межмонетные/спот
-                    # связки видят движение курса между стартом круга и продажей, а не число со старта
-                    qty = paper.recompute_sell_qty(cycle, self.cfg, snap.spot)
-                    rp = paper.realized_pct(cycle, price, qty)
-                    if not paper.finish_cycle(cycle["id"], "done", rp, note, sell_fact=price):
-                        continue
-                    # план без запаса на курс — с ним сравнивает и /paper (у старых кругов его нет — план с запасом)
-                    plan = cycle.get("planned_raw")
-                    plan = cycle["planned_pct"] if plan is None else plan
-                    await self.send(f"🧪 Сухой прогон: круг #{cycle['id']} завершён — план "
-                                    f"{plan:.2f}%, факт {rp:.2f}%"
-                                    + (f" ({note})" if note else ""), topic="signals")
+                net, d, estimate, cfg = picked
+                _, buy, sell, route = d
+                if scenarios.prepare(name, buy, sell, budget, self.cfg, fund=True) is None:
+                    continue
+                hops = route_hops(buy, sell, cfg, psnap.spot, frozenset())
+                if not hops:
+                    continue
+                cycle = portfolio.start(budget, buy, sell, hops, net, pay_fee=0,
+                                        path=scenarios.path(name), max_open=settings['max_open'],
+                                        measures={'scenario_quote': estimate, 'snapshot_ts': snap.ts},
+                                        spot_fees={v: p2p._spot_fee(cfg, v) for v in hops.get('venues', [])})
+                if cycle:
+                    await self.send(f"🧪 {scenarios.LABELS[name]}: круг #{cycle['id']}, резерв {budget:.2f} ₽; "
+                                    f"сценарный план {net:+.2f}%. Личный допуск сделки предполагается.", topic='signals')
 
     def paper_hedge_tick(self, snap):
+        if os.getenv("PAPER_ENGINE", "ledger") == "legacy":
+            return self._legacy_paper_hedge_tick(snap)
         """Бумажный хедж (simperp): фандинг по расчётам и откуп шорта у завершённых кругов — сбой не мешает скану."""
-        try:
-            simperp.tick(snap.ref)
-        except Exception as e:
-            logger.error("simperp: %s", e)
+        return
 
     async def check_paper_ladder(self):
+        if os.getenv("PAPER_ENGINE", "ledger") == "legacy":
+            return await self._legacy_check_paper_ladder()
         """Лестница суммы сухого прогона (paper.ladder_suggestion): сам PAPER_AMOUNT не меняет —
         шлёт владельцу сообщение с кнопкой подтверждения, не чаще раза в LADDER_ALERT_COOLDOWN."""
         if not self.chat_id or not paper.settings()["on"]:
             return
-        suggestion = paper.ladder_suggestion()
-        if not suggestion:
-            return
-        now = time.time()
-        if now - self.paper_ladder_alerted_ts < LADDER_ALERT_COOLDOWN:
-            return
-        self.paper_ladder_alerted_ts = now
-        amount = suggestion["amount"]
-        if suggestion["action"] == "up":
-            text = ("🧪 Сухой прогон стабилен (≥20 кругов, срывов мало, факт не хуже плана) — "
-                    f"можно попробовать сумму круга {_money(amount)} ₽.")
-        else:
-            text = (f"🧪 Сухой прогон: за неделю много срывов — может, вернуться на "
-                    f"{_money(amount)} ₽ за круг?")
-        kb = {"inline_keyboard": [[{"text": f"Перейти на {_money(amount)} ₽",
-                                    "callback_data": f"paper_ladder:{amount:.0f}"}]]}
-        await self.send(text, markup=kb, topic="signals")
+        return  # New portfolio needs its own calibrated sizing history.
 
     async def notify(self, snap):
         now = time.time()
@@ -3961,10 +4149,9 @@ class Bot:
         и покупки, и продажи."""
         since = time.time() - 86400  # не старше суток — дальше сопоставлять по времени уже нет смысла
         for trade in trades.unmatched(since=since):
-            fact = trades.match_fact(trade, hist_by_ex)
+            fact = trades.set_auto_fact(trade, hist_by_ex)
             if fact is None:
                 continue
-            trades.set_fact(trade["id"], fact, source=trades.FACT_AUTO)
             was = " вместо «как расчёт»" if trade.get("fact_source") in trades.PLAN_SOURCES else ""
             await self.send(f"✅ автосопоставление сделки #{trade['id']}: факт {fact:+.2f}% чистыми{was} "
                             f"(расчёт был {trade['profit']:+.2f}%)", topic="journal")
@@ -4014,8 +4201,8 @@ class Bot:
         "owner" — владелец в своём личном чате: chat.type == "private" и from.id == chat.id == TG_CHAT_ID (у личного
         чата id равен id пользователя; у кнопки from — тот, кто нажал, chat — где сообщение с кнопкой): ему всё, в том
         числе настройки, ключи, выплаты и их подтверждение; "refuse" — чат TG_CHAT_ID, но не личный (группа,
-        супергруппа, канал) или пишет/нажал не владелец: команды и кнопки владельца — отказ; "bind" — TG_CHAT_ID пуст и
-        пишет человек в личном чате с ботом: этот чат станет чатом владельца (группа или канал — никогда);
+        супергруппа, канал) или пишет/нажал не владелец: команды и кнопки владельца — отказ;
+        TG_CHAT_ID задаётся на ПК: при пустом ID никто не получает права владельца или гостя;
         "guest" — гость из /allow: только GUEST_CMDS/GUEST_CALLBACKS; None — чужой.
         Защищённая функция (пин в tests/test_payout_pins.py): от неё зависит, кто может нажимать кнопки выплат."""
         u = u if isinstance(u, dict) else {}
@@ -4026,8 +4213,8 @@ class Bot:
         private = bool(cid) and chat.get("type") == "private" and str(sender.get("id", "")) == cid
         if self.chat_id and cid == self.chat_id:
             return "owner" if private else "refuse"
-        if not self.chat_id and private and m is u:
-            return "bind"
+        if not self.chat_id:
+            return None
         if cid and self.is_guest(cid):
             return "guest"
         return None
@@ -4053,18 +4240,10 @@ class Bot:
             return
         self.cur_thread = msg.get("message_thread_id")
         who = self._owner_gate(msg)
-        if who == "bind":
-            # первый, кто написал боту в личку, становится владельцем и получателем сигналов
-            self.chat_id = chat
-            save_env("TG_CHAT_ID", chat)
-            logger.info("chat_id сохранён в .env: %s", chat)
-            await self.setup_topics()
-            await self.start_onboarding()
-            return
         if not self.chat_id:
             if chat not in self.unbound_asked:   # группа, канал или чужой отправитель: владельцем не делаем, раз
                 self.unbound_asked.add(chat)
-                logger.warning("TG_CHAT_ID пуст: чат %s (%s) не личный — владельцем не назначен, жду /start в личке",
+                logger.warning("TG_CHAT_ID пуст: чат %s (%s) не назначен владельцем, настрой ID на ПК",
                                chat, msg.get("chat", {}).get("type"))
                 await self.send(FIRST_CHAT_PRIVATE, chat_id=chat)
             return
@@ -4305,6 +4484,8 @@ class Bot:
             await self.open_help(cq, data[5:])
         elif data == "paper":
             await self.send(self.paper_view(), markup=self.paper_markup())
+        elif data in {'shorts:' + action for action in ('balance', 'candidates', 'positions', 'results', 'risk', 'export', 'pause', 'resume', 'research', 'learning', 'feed', 'decisions', 'knowledge', 'labexport')}:
+            await self.cmd_shorts(data.split(':', 1)[1])
         elif data.startswith(("paper_set:", "paper_amt:")):
             key, value = data.split(":", 1)
             if key == "paper_set" and value in ("on", "off"):
@@ -4313,6 +4494,14 @@ class Bot:
                 save_env("PAPER_AMOUNT", value)
             await self.call("editMessageText", chat_id=self.chat_id, message_id=cq["message"]["message_id"],
                             text=self.paper_view(), parse_mode="HTML", reply_markup=self.paper_markup())
+        elif data in {"paper_nav:" + sub for sub in ("scenarios", "banks", "catalog", "verified", "research")}:
+            await self.cmd_paper(data.split(":", 1)[1])
+        elif data in {"paper_view:" + name for name in ("fast", "base", "stress")}:
+            import scenarios
+            if scenarios.enabled() and os.getenv("PAPER_ENGINE", "ledger") != "legacy":
+                await self.send("\n".join(scenarios.report(data.split(":", 1)[1])), markup=self.paper_markup())
+        elif data in {"paper_csv:" + name for name in ("fast", "base", "stress")}:
+            await self.cmd_paper("scenario-report " + data.split(":", 1)[1])
         elif data == "paper_report":
             await self.cmd_paper("report")
         elif data.startswith("paper_reset:"):
@@ -4470,7 +4659,10 @@ class Bot:
         elif cmd == "/guests":
             await self.cmd_guests()
         elif cmd == "/start":
-            await self.welcome()
+            if arg.strip().lower() == "setup" and REPLY_CHAT.get() is None:
+                await self.start_onboarding()
+            else:
+                await self.welcome()
         elif cmd == "/best":
             await self.show_best()
         elif cmd == "/top":
@@ -4499,6 +4691,8 @@ class Bot:
             await self.send(simfunding.view())
         elif cmd == "/futures":   # и «/futures paper» — пока есть только бумага
             await self.send(simdirectional.view())
+        elif cmd == "/shorts":
+            await self.cmd_shorts(arg)
         elif cmd == "/fav":
             text, kb = self.favorites_view()
             await self.send(text, markup=kb)
@@ -4777,15 +4971,312 @@ class Bot:
                 logger.warning("%s: %s", method, accounts.api_error_text(e))   # без URL с токеном бота
 
 
+    def _legacy_paper_view(self):
+        """Текст «/paper»: настройки, открытые виртуальные круги, статистика за день/неделю/всё время
+        (исполнилось/сорвалось и почему, средний факт vs план) и виртуальный баланс с изменением с начала."""
+        s = paper.settings()
+        lines = ["🧪 <b>Сухой прогон</b>", "",
+                 f"Статус: {'🟢 включён' if s['on'] else '⚪ выключен'}, сумма круга {_money(s['amount'])} ₽", ""]
+        open_ = paper.open_cycles()
+        if not open_:
+            lines.append("Открытых кругов нет.")
+        else:
+            now = time.time()
+            for c in open_:
+                mins = (now - c["ts_stage"]) / 60
+                stage = PAPER_STAGE_LABELS.get(c["stage"], c["stage"])
+                lines.append(f"🔄 {c['buy_ex']}→{c['sell_ex']} ({c['buy_asset']}→{c['sell_asset']}): "
+                            f"стадия «{stage}» {mins:.0f} мин, план {c['planned_pct']:+.2f}%")
+        lines.append("")
+        st = paper.stats()
+        for key, label in (("day", "За сегодня"), ("week", "За неделю"), ("all", "За всё время")):
+            p = st[key]
+            if not p["total"]:
+                lines.append(f"{label}: кругов не было")
+                continue
+            line = f"{label}: {p['total']} кругов, исполнилось {p['done']}"
+            if p["failed"]:
+                reasons = ", ".join(f"{paper.FAIL_LABELS.get(r, r)} {n}" for r, n in p["failed_by_reason"].items())
+                line += f", сорвалось {p['failed']} ({reasons})"
+            if p["avg_diff"] is not None:
+                line += f", факт vs план {p['avg_diff']:+.2f} п.п."
+            lines.append(line)
+        balance = paper.get_balance()
+        # Итоговые суммы по периодам видны рядом со статистикой кругов.
+        for key, label in (("day", "Сегодня"), ("week", "Неделя"), ("all", "Всё время")):
+            p = st[key]
+            if p["done"]:
+                lines.append(f"{label}: теоретическая прибыль {p['profit_rub']:+.2f} ₽ "
+                             f"({p['return_pct']:+.2f}% от оборота {_money(p['turnover_rub'])} ₽)")
+        lines.append("Это виртуальный результат по котировкам; сорванные круги не считаются продажей, "
+                     "стоимость оставшейся монеты в итог прибыли не включена.")
+        if balance is not None:
+            change = paper.balance_change()
+            change_str = f"{change:+,.0f}".replace(",", " ")
+            lines.append("")
+            lines.append(f"Виртуальный баланс: {_money(balance)} ₽ (изменение с начала: {change_str} ₽)")
+        banks = paper.banks_this_month()
+        if banks:
+            lines.append("")
+            lines.append("Лимит СБП за месяц (виртуальный оборот):")
+            for bank, total in sorted(banks.items(), key=lambda kv: -kv[1]):
+                limit = trades.free_limit(bank)
+                mark = "⚠️ " if total >= limit else ""
+                lines.append(f"{mark}{trades.BANK_NAMES.get(bank, bank)}: {_money(total)} ₽ / {_limit_text(limit)}")
+        lines.append("")
+        lines.append("Кнопки ниже; то же командами: /paper on, /paper off, /paper amount 20000, /paper report. "
+                     "/paper reset — начать статистику с нуля (старая база — в архив)")
+        return "\n".join(lines)
+
+    async def _legacy_maybe_start_paper_cycle(self, deals, snap):
+        """Сухой прогон (paper.py): при свободном слоте виртуально «берём» лучшую по p2p.score (на сумме
+        PAPER_AMOUNT) связку из тех, о которых владелец получает сигнал (выше порога и держится LIVE_SCANS
+        сканов), если стакана хватает на PAPER_AMOUNT (deal_for_amount/_stack) и она не «🪤 ловушка»
+        (PAPER_TRAPS=1 — брать и их, notify тогда отдаёт их сюда и при SIGNAL_TRAPS=0). Пишем
+        круг с меткой надёжности в data/paper.db со стадией buy. Карточка — только владельцу, гостям про
+        сухой прогон ничего не идёт."""
+        settings = paper.settings()
+        if not settings["on"] or not self.chat_id or not deals:
+            return
+        if len(paper.open_cycles()) >= settings["max_open"]:
+            return
+        # лимит СБП исчерпан по-настоящему (trades) или по виртуальному обороту прогона — комиссия 0.5% в плане
+        own = trades.own_banks()[0]
+        over = frozenset(snap.over_banks) | {b for b in own if paper.bank_month_total(b) >= trades.free_limit(b)}
+        psnap = dataclasses.replace(snap, over_banks=over)
+        picked = None   # лучшая по p2p.score уже на сумме прогона, а не первая в списке (тот отсортирован на AMOUNT)
+        for deal in deals:
+            if not self.is_confirmed(deal) or deal_stale(deal):
+                continue   # сигнала о ней ещё не было (выброс одного скана) или данные площадки устарели — не берём
+            if not paper.simple_route(deal):
+                continue   # через спот/межмонетные — пока нет, условия возврата в ROADMAP (межмонетные, часть 2)
+            d = deal_for_amount(deal, self.cfg, psnap, settings["amount"])
+            if d is None or d[0] < self.cfg.min_profit:
+                continue   # на сумму сухого прогона глубины не хватает или прибыль ниже порога
+            label, reasons = reliability(d, self.cfg, snap)
+            if label == TRAP and not settings["traps"]:
+                continue
+            rank = score(d, self.cfg, snap)
+            if picked is None or rank > picked[0]:
+                picked = (rank, d, label, reasons)
+        if picked is None:
+            return
+        rank, d, label, reasons = picked
+        profit, b, s, route = d
+        paper.init_balance(settings["amount"])
+        # выход маршрута в монете продажи по итоговому стеку s (его parts: переводов на каждый обменник) — без
+        # запаса на курс и с комиссией СБП, если лимит исчерпан; по нему же план без запаса — с ним сравнивается факт
+        route_cfg = dataclasses.replace(self.cfg, amount=settings["amount"])
+        qty = _route_qty(b, s, route_cfg, psnap.spot, over, disable=frozenset({"risk"}))
+        raw = (qty * s.price / settings["amount"] - 1) * 100 if qty else profit
+        # площадки конвертации и сеть/комиссия каждого хопа на момент старта: стадия transfer проверяет именно эти
+        # переводы, sell считает выход по их комиссиям, время перевода круга — по их сетям (paper.start_cycle);
+        # межмонетные связки фильтр paper.simple_route пока не пускает (снятие — шаг владельца)
+        hops = route_hops(b, s, route_cfg, psnap.spot, over)
+        # для разбора (этап 1 «измерения»): индекс и причины надёжности, серия «живости», запас глубины и id снимка
+        # скана — снимок пишется после сигналов, но id (время начала скана) известен уже сейчас
+        measures = {"index": reliability_index(d, self.cfg, snap), "reasons": reasons,
+                    "streak": self.live.get(self._deal_key(d), {}).get("streak", 0),
+                    "depth": paper.depth_margin(psnap, b, s, settings["amount"], qty or s.avail),
+                    "snapshot_id": snapshots.scan_id(snap)}
+        if measures["snapshot_id"] is not None:   # снимок этого скана запишется, даже если он не SNAPSHOT_EVERY-й
+            self.snapshot_keep.add(measures["snapshot_id"])
+        # бумажный хедж (simperp): шорт перпа на монету круга; HEDGE_PLAN=1 — в плане стоимость хеджа вместо запаса.
+        # Монета круга — выход маршрута, а без него купленное (не s.avail — это весь объём объявления продажи).
+        # for_cycle не бросает исключений: сбой хеджа не мешает ни кругу, ни сигналам после него
+        hedge, hedge_note, profit, hedge_line = simperp.for_cycle(
+            b.asset, qty or settings["amount"] / b.price, settings["amount"], psnap.ref, b.price, raw, profit,
+            risk=self.cfg.risk_buffer.get(b.asset, 0.0))
+        # over — тот же, что в плане и qty: банк оплаты и комиссия СБП в круге совпадут с планом
+        cycle = paper.get_cycle(paper.start_cycle(settings["amount"], b, s, route, profit, label=label,
+                                                  sell_qty=qty or s.avail, pay_fee=self.cfg.pay_fee, over=over,
+                                                  planned_raw=raw, hops=hops, **measures)) or {}
+        try:
+            simperp.open_hedge(cycle.get("id"), hedge, hedge_note)
+        except Exception as e:
+            logger.error("simperp: %s", e)
+        pay = trades.pay_label(cycle.get("pay_kind", ""), cycle.get("bank", ""), b.pays)
+        qty = settings["amount"] / b.price
+        text = (f"🧪 <b>Сухой прогон</b>: купил бы {_money(qty)} {b.asset} у {html.escape(b.nick)} "
+                f"по {_price(b.price)} ₽, оплата: {html.escape(pay)} · план {profit:.2f}% · {label}"
+                f" · оценка {rank:+.2f}")
+        if reasons:
+            text += "\n" + "\n".join(f"• {html.escape(r)}" for r in reasons)
+        if hedge_line:
+            text += "\n" + html.escape(hedge_line)
+        await self.send(text, topic="signals")
+
+    async def _legacy_process_paper_cycles(self, snap):
+        """Сухой прогон: стадии открытых виртуальных кругов по свежему снимку/справочникам, без сети.
+        buy — через PAPER_PAY_MINUTES покупка по свежему стакану (мерчанты круга, не хватило — другие по цене;
+        цена хуже плана больше PAPER_BUY_SLIP_MAX — срыв; у обменника — только по свежей котировке BestChange),
+        цена покупки пишется в круг; transfer — через время перевода по сетям круга переводы маршрута ещё возможны
+        (fees/netstatus), неизвестный статус сети — риск в круге; sell — продаём лучшим объявлениям стакана на весь
+        объём, прибыль — по фактическим ценам покупки и продажи (может быть ниже плана и в минус). Срыв
+        (failed_buy/failed_transfer/failed_sell): стакана покупки не хватило или цена ушла, перевод закрыт,
+        покупателей на весь объём нет. Всё состояние круга — в data/paper.db: перезапуск бота круг продолжает."""
+        if not self.chat_id:
+            return
+        settings = paper.settings()
+        for cycle in paper.open_cycles():
+            if cycle["stage"] == "buy":
+                action, note = paper.check_buy_stage(cycle, snap, settings["pay_minutes"],
+                                                     stale_minutes=settings["stale_minutes"])
+                if action == "wait":
+                    continue
+                paper.set_buy_check(cycle["id"], *paper.buy_observed(cycle, snap))   # цена и объём на проверке
+                if action == "fail":
+                    if not paper.finish_cycle(cycle["id"], "failed_buy", 0.0, note):
+                        continue   # круга уже нет (/paper reset посреди обработки)
+                    await self.send(f"🧪 Сухой прогон: круг #{cycle['id']} сорвался на покупке — {note}",
+                                    topic="signals")
+                else:
+                    # цена покупки по свежему стакану (проскальзывание, другие мерчанты) — для факта на продаже
+                    paper.set_buy_fill(cycle["id"], paper.buy_fill(cycle, snap))
+                    paper.set_stage(cycle["id"], "transfer")
+            elif cycle["stage"] == "transfer":
+                action, note = paper.check_transfer_stage(cycle, self.cfg, settings["transfer_minutes"])
+                if action == "wait":
+                    continue
+                if action == "fail":
+                    if not paper.finish_cycle(cycle["id"], "failed_transfer", 0.0, note):
+                        continue
+                    await self.send(f"🧪 Сухой прогон: круг #{cycle['id']} сорвался на переводе — {note}",
+                                    topic="signals")
+                else:
+                    paper.add_risks(cycle["id"], paper.transfer_risks(cycle, self.cfg))   # неизвестный статус сети — риск
+                    paper.set_stage(cycle["id"], "sell")
+            elif cycle["stage"] == "sell":
+                action, note, price = paper.check_sell_stage(cycle, snap, cfg=self.cfg,
+                                                              stale_minutes=settings["stale_minutes"])
+                if action == "wait":
+                    continue
+                if action == "fail":
+                    if not paper.finish_cycle(cycle["id"], "failed_sell", 0.0, note):
+                        continue
+                    await self.send(f"🧪 Сухой прогон: круг #{cycle['id']} сорвался на продаже — {note}",
+                                    topic="signals")
+                else:
+                    # тот же пересчёт по свежему snap.spot, что уже решил check_sell_stage — межмонетные/спот
+                    # связки видят движение курса между стартом круга и продажей, а не число со старта
+                    qty = paper.recompute_sell_qty(cycle, self.cfg, snap.spot)
+                    rp = paper.realized_pct(cycle, price, qty)
+                    if not paper.finish_cycle(cycle["id"], "done", rp, note, sell_fact=price):
+                        continue
+                    # план без запаса на курс — с ним сравнивает и /paper (у старых кругов его нет — план с запасом)
+                    plan = cycle.get("planned_raw")
+                    plan = cycle["planned_pct"] if plan is None else plan
+                    await self.send(f"🧪 Сухой прогон: круг #{cycle['id']} завершён — план "
+                                    f"{plan:.2f}%, теоретический результат {rp:+.2f}% "
+                                    f"({cycle['amount'] * rp / 100:+.2f} ₽), "
+                                    f"выручка {cycle['amount'] * (1 + rp / 100):.2f} ₽ "
+                                    f"при вложении {cycle['amount']:.2f} ₽"
+                                    + (f" ({note})" if note else ""), topic="signals")
+
+    def _legacy_paper_hedge_tick(self, snap):
+        """Бумажный хедж (simperp): фандинг по расчётам и откуп шорта у завершённых кругов — сбой не мешает скану."""
+        try:
+            simperp.tick(snap.ref)
+        except Exception as e:
+            logger.error("simperp: %s", e)
+
+    async def _legacy_check_paper_ladder(self):
+        """Лестница суммы сухого прогона (paper.ladder_suggestion): сам PAPER_AMOUNT не меняет —
+        шлёт владельцу сообщение с кнопкой подтверждения, не чаще раза в LADDER_ALERT_COOLDOWN."""
+        if not self.chat_id or not paper.settings()["on"]:
+            return
+        suggestion = paper.ladder_suggestion()
+        if not suggestion:
+            return
+        now = time.time()
+        if now - self.paper_ladder_alerted_ts < LADDER_ALERT_COOLDOWN:
+            return
+        self.paper_ladder_alerted_ts = now
+        amount = suggestion["amount"]
+        if suggestion["action"] == "up":
+            text = ("🧪 Сухой прогон стабилен (≥20 кругов, срывов мало, факт не хуже плана) — "
+                    f"можно попробовать сумму круга {_money(amount)} ₽.")
+        else:
+            text = (f"🧪 Сухой прогон: за неделю много срывов — может, вернуться на "
+                    f"{_money(amount)} ₽ за круг?")
+        kb = {"inline_keyboard": [[{"text": f"Перейти на {_money(amount)} ₽",
+                                    "callback_data": f"paper_ladder:{amount:.0f}"}]]}
+        await self.send(text, markup=kb, topic="signals")
+
+    def _legacy_paper_reset(self):
+        """Кнопка «🗑 Да, обнулить»: paper.reset и текст ответа — что ушло в архив."""
+        try:
+            res = paper.reset()
+        except OSError as e:   # файл базы занят/нет прав — база на месте, говорим как есть
+            return f"⚠️ Не получилось обнулить сухой прогон: {html.escape(str(e))}"
+        if res is None:
+            return "🧪 Обнулять нечего — кругов сухого прогона ещё не было."
+        change = f"{res['change']:+,.0f}".replace(",", " ")
+        return (f"🗑 Сухой прогон обнулён. В архиве data/{html.escape(os.path.basename(res['archive']))}: "
+                f"кругов {res['cycles']}, итог завершённых {change} ₽. Статистика, баланс и лестница — с нуля; "
+                f"вкл/выкл и сумма круга прежние.")
+
+    async def _legacy_cmd_paper(self, arg):
+        """/paper — сводка сухого прогона; /paper on|off — включить/выключить; /paper amount 20000 —
+        сумма виртуального круга (баланс не сбрасывает, действует для новых кругов); /paper report —
+        отчёт по площадкам и парам + CSV-файл (data/paper_report.csv); /paper cycles [дней] — построчная
+        выгрузка кругов в CSV (по умолчанию 30 дн., 1..365); /paper reset — спросить кнопками и
+        обнулить (paper_reset:yes → paper.reset, база в архив)."""
+        sub, _, rest = arg.strip().partition(" ")
+        sub = sub.lower()
+        if sub == "on":
+            save_env("PAPER", "1")
+            await self.send("🧪 Сухой прогон включён.")
+        elif sub == "off":
+            save_env("PAPER", "0")
+            await self.send("🧪 Сухой прогон выключен.")
+        elif sub == "amount":
+            amount = parse_amount(rest)
+            if amount is None:
+                await self.send(f"Не понял сумму. Пример: /paper amount 20000 "
+                                f"(от {_money(AMOUNT_MIN)} до {_money(AMOUNT_MAX)} ₽).")
+                return
+            save_env("PAPER_AMOUNT", f"{amount:.0f}")
+            await self.send(f"🧪 Сумма круга сухого прогона: {_money(amount)} ₽.")
+        elif sub == "report":
+            rows = paper.report_rows()
+            await self.send(self.paper_report_view(rows))
+            if rows:
+                path = paper.write_report_csv(rows)
+                await self.send_document(path, "Отчёт сухого прогона (CSV)")
+        elif sub == "cycles":
+            days = int(rest) if rest.strip().isdigit() else 30
+            days = min(365, max(1, days))
+            rows = paper.export_cycles(time.time() - days * 86400)
+            if not rows:
+                await self.send("за период кругов нет")
+            else:
+                path = paper.write_cycles_csv(rows)
+                await self.send_document(path, f"Круги бумаги: {len(rows)} шт. за {days} дн.")
+        elif sub == "reset":
+            r = await self.send("🧪 Обнулить сухой прогон? Все круги (и открытые) уйдут в архив "
+                            "data/paper-archive-…db — он не удаляется; статистика, баланс и лестница начнутся с нуля. "
+                            "Вкл/выкл и сумма круга не меняются.", markup=PAPER_RESET_MARKUP)
+            # «Да» принимается только с этого сообщения и один раз: двойное нажатие до того, как кнопки пропали,
+            # иначе затирало итог обнуления текстом «обнулять нечего»
+            self.paper_reset_ask = (r.get("result") or {}).get("message_id")
+        else:
+            await self.send(self.paper_view(), markup=self.paper_markup())
+
+
 async def main():
     setup_logging()
     load_env()
+    health_http.start_metrics()
     payouts.switch_from_file(ENV_PATH)   # выключатель выплат — только из .env: PAYOUTS=1 извне его не перебьёт
     trading.switch.switch_from_file(ENV_PATH)   # торговля: TRADING и TRADING_MODE — только из .env, извне не поднять
     trading.gates.flags_from_file(ENV_PATH)     # флаг владельца TRADING_SHORT_PAPER — тоже только из файла .env
     token = os.getenv("TG_TOKEN", "").strip()
     if not token:
         raise SystemExit("TG_TOKEN не задан: создай бота у @BotFather и пропиши токен в .env")
+    owner_id = os.getenv("TG_CHAT_ID", "").strip()
+    if not owner_id.isdigit() or int(owner_id) <= 0:
+        raise SystemExit("TG_CHAT_ID должен содержать Telegram user ID владельца, заданный в .env на ПК")
     cfg = Config.from_env()
     try:   # ключи от прошлой версии лежат открыто — шифруем (DPAPI); сбой не мешает запуску
         if accounts.encrypt_saved_keys():
@@ -4800,12 +5291,19 @@ async def main():
             await bot.setup_topics()
             await bot.check_key_safety()
         bot.perp_task = asyncio.ensure_future(bot.perp_loop())   # публичные данные перпов — своим циклом (perp.py)
+        bot.shorts_task = asyncio.ensure_future(bot.shorts_loop())
         # торговое ядро: старт (ключи у бирж, предупреждения — одно сообщение) и сверка — своей задачей, скан не ждёт
         bot.trading_task = asyncio.ensure_future(trading.wiring.run(bot))
         bot.watchdog_task = asyncio.ensure_future(bot.watchdog_loop())   # «скан стоит» — своей задачей
         logger.info("Бот запущен: каждые %ss, порог %g%%, биржи %s", cfg.interval, cfg.min_profit,
                     ', '.join(cfg.exchanges))
-        await asyncio.gather(bot.scan_loop(), bot.command_loop(), bot.accounts_loop(), bot.payouts_loop())
+        health_port = int(os.getenv("HEALTH_CHECK_PORT", "0"))
+        health_runner = await health_http.init_app(health_port) if health_port else None
+        try:
+            await asyncio.gather(bot.scan_loop(), bot.command_loop(), bot.accounts_loop(), bot.payouts_loop())
+        finally:
+            if health_runner is not None:
+                await health_runner.cleanup()
 
 
 if __name__ == "__main__":

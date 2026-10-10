@@ -408,6 +408,14 @@ ALLOWED_SENDERS = {
 # p2p._json шлёт только это (метод, хост, путь; путь с «/» на конце — префикс + монета). Расширить — только владелец:
 # сначала сюда (защищённый файл), потом в p2p.JSON_ALLOWED.
 JSON_ALLOWED_PIN = frozenset({
+    ("GET", "api.bybit.com", "/v5/market/orderbook"),
+    ("GET", "api.bybit.com", "/v5/market/instruments-info"),
+    ("GET", "api.mexc.com", "/api/v3/depth"),
+    ("GET", "api.mexc.com", "/api/v3/exchangeInfo"),
+    ("GET", "api.htx.com", "/market/depth"),
+    ("GET", "api.htx.com", "/v1/common/symbols"),
+    ("GET", "api.kucoin.com", "/api/v1/market/orderbook/level2_100"),
+    ("GET", "api.kucoin.com", "/api/v2/symbols/"),
     ("POST", "api2.bybit.com", "/fiat/otc/configuration/queryAllPaymentList"),
     ("POST", "api2.bybit.com", "/fiat/otc/item/online"),
     ("GET", "www.htx.com", "/-/x/otc/v1/data/trade-market"),
@@ -1399,10 +1407,12 @@ def test_aiohttp_and_urllib_are_blocked(network_attempts):
     network_attempts.clear()
 
 
-def test_foreign_loopback_port_is_blocked(network_attempts):
+def test_foreign_loopback_port_is_blocked(network_attempts, monkeypatch):
     """На 127.0.0.1 чужой порт — это, например, прокси VPN владельца: через него запрос ушёл бы наружу. Соединяться по
     loopback можно только с портами, которые открыл сам процесс тестов."""
     foreign = 10808   # не эфемерный порт: процесс тестов его сам не открывает
+    # Проверяем транспорт через заданный прокси независимо от proxy bypass Windows и его DNS-вызовов.
+    monkeypatch.setattr(urllib.request, "proxy_bypass", lambda host: False)
     with pytest.raises(ConnectionRefusedError, match="сеть в тестах заблокирована"):
         socket.create_connection((LOOPBACK, foreign), timeout=1)
     via_proxy = urllib.request.build_opener(urllib.request.ProxyHandler({"http": f"http://{LOOPBACK}:{foreign}"}))
