@@ -154,6 +154,9 @@ def usage(con, profile, direction, method, now, period, exclude_run=None, reserv
 
 
 def quote(con, profile, method, direction, amount, now, run_id=None):
+    import settlement
+    if not settlement.available(con, profile['id'], profile['scope']):
+        raise Blocked('Счёт ограничен; срок проверки не означает снятие ограничения')
     if SCENARIO.get() is not None:
         from scenarios import quote
         return quote(con, profile, method, direction, amount, now, run_id)
@@ -268,6 +271,10 @@ def select(con, data, pays, direction, amount, now, run_id=None, venue=None):
 def initialize(con, data, now):
     """One-time attribution of existing free RUB; never add a second capital deposit."""
     schema(con)
+    import settlement
+    settlement.schema(con)
+    for profile in data['accounts']:
+        con.execute('INSERT OR REPLACE INTO account_scopes VALUES (?,?)', (profile['id'],profile['scope']))
     if con.execute('SELECT 1 FROM bank_accounts LIMIT 1').fetchone():
         for profile in data['accounts']:
             if not con.execute('SELECT 1 FROM bank_accounts WHERE id=?', (profile['id'],)).fetchone():

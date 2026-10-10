@@ -28,6 +28,7 @@ FILES = ("trades.db", "blacklist.db", "alerts.db", "history.db", "paper.db", "pa
 FILES += ("alt_shorts.db", "paper_scenario_fast.db", "paper_scenario_base.db", "paper_scenario_stress.db")
 FILES += ("sim_maker.db", "sim_funding.db", "sim_directional.db")
 FILES += ("short_lab.db", "short_learning_model.json")
+FILES += ("rub_roundtrips.db", "rub_roundtrips_shorts_v2.db")
 KEEP_DEFAULT = 7
 EVERY = 86400                     # сек — не чаще раза в сутки
 MSK = timezone(timedelta(hours=3))

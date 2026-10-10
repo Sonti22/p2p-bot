@@ -113,6 +113,9 @@ def _usage(con, profile, direction, method, now, period):
 
 
 def quote(con, profile, method, direction, amount, now, run_id=None):
+    import settlement
+    if not settlement.available(con, profile['id'], profile['scope']):
+        raise bm.Blocked('Счёт ограничен; средства недоступны')
     validate_profile(profile, now)
     if method not in profile['methods'] or direction not in ('in', 'out'):
         raise bm.Blocked('Нет проверенной модели канала платежа')

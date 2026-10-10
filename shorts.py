@@ -62,7 +62,7 @@ def event(con, now, kind, details):
     con.execute('INSERT INTO events(ts,kind,details) VALUES(?,?,?)', (now, kind, dump(details)))
 
 
-def initialize(rate, source, now=None, path=None):
+def initialize(rate, source, now=None, path=None, capital=None, funding_model='allocation-stress-v1'):
     now = time.time() if now is None else now
     rate = dec(rate)
     if rate <= 0 or not source:
@@ -70,9 +70,12 @@ def initialize(rate, source, now=None, path=None):
     with connect(path, True) as con:
         if con.execute('SELECT 1 FROM meta').fetchone():
             return False
-        capital = D(50000) / rate
+        capital = D(50000) / rate if capital is None else dec(capital)
+        if capital <= 0 or funding_model not in ('allocation-stress-v1', 'exchange-wallet-v2'):
+            raise ValueError('некорректный капитал или модель финансирования')
         state = {'initial': str(capital), 'cash': str(capital), 'realized': '0', 'fees': '0',
-                 'funding': '0', 'rub_rate': str(rate), 'rate_source': str(source), 'start': now,
+                 'funding': '0', 'funding_debt': '0', 'funding_model': funding_model,
+                 'rub_rate': str(rate), 'rate_source': str(source), 'start': now,
                  'peak': str(capital), 'equity': str(capital), 'drawdown': '0', 'paused': False,
                  'halt': False, 'day': int(now // 86400), 'day_start': str(capital), 'day_pnl': '0',
                  'version': VERSION, 'policy': POLICY, 'last_error': '', 'rejections': {}, 'watch': []}
@@ -101,7 +104,7 @@ def save_position(con, p):
 
 def verify(con, state):
     held = sum((dec(p['held']) for p in positions(con, True)), D(0))
-    actual = dec(state['cash']) + held
+    actual = dec(state['cash']) + held - dec(state.get('funding_debt', '0'))
     expected = dec(state['initial']) + dec(state['realized'])
     if abs(actual - expected) > D('0.000000000000000000001') or dec(state['cash']) < 0 or held < 0:
         raise ArithmeticError('нарушение сохранения капитала шортов')
@@ -419,7 +422,7 @@ def tick(markets, now=None, path=None, allow_entries=True, filters=True, random_
             save_position(con, p)
         opened = positions(con, True)
         unreal = sum((dec(p.get('unrealized', '0')) for p in opened), D(0))
-        equity = dec(state['cash']) + sum((dec(p['held']) for p in opened), D(0)) + unreal
+        equity = dec(state['cash']) + sum((dec(p['held']) for p in opened), D(0)) + unreal - dec(state.get('funding_debt', '0'))
         state['equity'] = str(equity)
         state['peak'] = str(max(dec(state['peak']), equity))
         dd = 1 - equity / dec(state['peak'])
@@ -429,7 +432,7 @@ def tick(markets, now=None, path=None, allow_entries=True, filters=True, random_
                 event(con, now, 'drawdown_halt', {'drawdown': str(dd)})
             state['halt'] = True
         daily = (dec(state['day_start']) - equity) / dec(state['day_start']) >= D('.02')
-        unresolved = any(p.get('funding_unverified') for p in positions(con))
+        unresolved = any(p.get('funding_unverified') for p in positions(con)) or dec(state.get('funding_debt', '0')) > 0
         if allow_entries and not state['paused'] and not state['halt'] and not daily and not unresolved:
             candidates = sorted(markets.items(), key=lambda item: dec(item[1].get('growth', '0')), reverse=True)
             for sym, m in candidates:
@@ -513,15 +516,37 @@ def _funding(con, state, p, m, now):
             if fill['position'] == p['id']:
                 qty -= dec(fill['qty'])
         payment = qty * dec(f['mark']) * dec(f['rate'])
-        if dec(p['held']) + payment < 0:
-            payment = -dec(p['held'])
-        p['held'] = str(dec(p['held']) + payment)
-        p['reserve'] = str(dec(p['reserve']) + payment)
+        if state.get('funding_model') == 'exchange-wallet-v2':
+            if payment >= 0:
+                state['cash'] = str(dec(state['cash']) + payment)
+            else:
+                owed = -payment
+                from_cash = min(dec(state['cash']), owed)
+                state['cash'] = str(dec(state['cash']) - from_cash)
+                from_position = min(dec(p['held']), owed - from_cash)
+                p['held'] = str(dec(p['held']) - from_position)
+                from_reserve = min(max(D(0), dec(p['reserve'])), from_position)
+                p['reserve'] = str(dec(p['reserve']) - from_reserve)
+                p['margin'] = str(max(D(0), dec(p['margin']) - (from_position - from_reserve)))
+                unpaid = owed - from_cash - from_position
+                if unpaid:
+                    state['funding_debt'] = str(dec(state.get('funding_debt', '0')) + unpaid)
+                    state['halt'] = True
+                    p['gap'] = True
+                    event(con, now, 'funding_deficit', {'position': p['id'], 'amount': str(unpaid),
+                                                     'exchange_outcome_verified': False})
+        else:
+            if dec(p['held']) + payment < 0:
+                payment = -dec(p['held'])
+            p['held'] = str(dec(p['held']) + payment)
+            p['reserve'] = str(dec(p['reserve']) + payment)
         p['funding'] = str(dec(p['funding']) + payment)
         p['pnl'] = str(dec(p['pnl']) + payment)
         p['funding_to'] = f['ts']
         _realize(state, payment, funding=payment)
-        event(con, now, 'funding', {'position': p['id'], 'settled': f['ts'], 'amount': str(payment), 'mark_model': 'minute-open'})
+        event(con, now, 'funding', {'position': p['id'], 'settled': f['ts'], 'amount': str(payment),
+                                  'mark_model': 'minute-open',
+                                  'wallet_model': state.get('funding_model', 'allocation-stress-v1')})
     p['funding_unverified'] = not complete
     if not complete:
         state['funding_unverified'] = True
@@ -566,6 +591,14 @@ def report(section='', path=None):
         return '📉 <b>Шорты альтов · виртуально</b>\n\nОжидаю активацию и свежий стартовый курс RUB/USDT.'
     lines = ['📉 <b>Шорты альтов · Bybit · виртуально</b>', '',
              'Режим: ' + ('⏸ Входы остановлены' if state['paused'] or state['halt'] or state.get('daily_blocked') else '▶️ Автономный прогон'), '']
+    lines += ['Модель funding: ' + html.escape(state.get('funding_model', 'allocation-stress-v1')),
+              ('Funding сначала расходует свободный кошелёк, затем средства позиции.'
+               if state.get('funding_model') == 'exchange-wallet-v2' else
+               'История v1 ограничивает расходы позицией; это стрессовая модель, не правило биржи.'),
+              f"Неурегулированное обязательство funding: {dec(state.get('funding_debt', '0')):.4f} USDT",
+              'Результат до налогов. Покупка и продажа USDT: /shorts cycle.', '']
+    if state.get('funding_model') == 'exchange-wallet-v2':
+        lines += ['Funding может расходовать свободный кошелёк; лимит выделения на входе не ограничивает все списания биржи.', '']
     uncertain = any(p.get('funding_unverified') or p.get('gap') or p.get('stress') for p in state['positions'])
     if uncertain:
         lines.extend(['⚠️ Есть непроверенные промежутки, расходы или стрессовые исходы. Итог сценарный, не подтверждённый биржей.', ''])

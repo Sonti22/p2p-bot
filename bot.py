@@ -45,6 +45,7 @@ import spotbook
 import snapshots
 import health_http
 import shorts
+import reality
 import shortmarket
 import shortlab
 import shortlogic
@@ -2355,6 +2356,7 @@ class Bot:
                 [{"text": "📋 Тарифы", "callback_data": "paper_nav:catalog"},
                  {"text": "🔒 Строгий портфель", "callback_data": "paper_nav:verified"}],
                 [{"text": "📚 Проверка маршрутов", "callback_data": "paper_nav:research"}],
+                [{"text": "🛡 Реальность и ограничения", "callback_data": "paper_nav:risks"}],
                 [{"text": label + " CSV", "callback_data": "paper_csv:" + name}
                  for name, label in (("fast", "⚡"), ("base", "📊"), ("stress", "⏳"))]]
         return {"inline_keyboard": navigation + [[toggle], amounts,
@@ -2457,7 +2459,10 @@ class Bot:
         обнулить (paper_reset:yes → paper.reset, база в архив)."""
         sub, _, rest = arg.strip().partition(" ")
         sub = sub.lower()
-        if sub == "research":
+        if sub == 'risks':
+            import executionfacts
+            await self.send(executionfacts.report(), markup=self.paper_markup())
+        elif sub == "research":
             import strategyreview
             name = rest.strip() or 'base'
             if name not in ('fast','base','stress'):
@@ -3237,7 +3242,14 @@ class Bot:
                         rate = await rapira_mid(self.s)
                         shorts.initialize(rate, 'Rapira USDT/RUB · наблюдение при запуске')
                     if shorts.status() is not None:
+                        roundtrip = reality.status() if os.getenv('REALITY_CYCLES', '0') == '1' else None
+                        collector.external_path = roundtrip['strategy'] if roundtrip and roundtrip['stage'] == 'trade' and roundtrip['venue_available'] else None
+                        collector.external_entries = bool(roundtrip and roundtrip['stage'] == 'trade'
+                                                          and not roundtrip['paused'] and float(roundtrip['service_debt']) == 0
+                                                          and collector.now() < roundtrip['due'])
                         markets = await collector.refresh(self.s)
+                        if os.getenv('REALITY_CYCLES', '0') == '1':
+                            reality.tick(self.last, markets, now=collector.now())
                         lab.submit(markets, collector.diagnostics_snapshot(), collector.now())
                         with shorts.connect() as con:
                             row = con.execute("SELECT MAX(id) FROM events").fetchone()
@@ -3261,6 +3273,8 @@ class Bot:
             [{'text': '🛡 Риск', 'callback_data': 'shorts:risk'},
              {'text': '📒 CSV', 'callback_data': 'shorts:export'}],
             [{'text': '📚 Данные и обучение', 'callback_data': 'shorts:research'}],
+            [{'text': '🔄 Рубли → шорты → рубли', 'callback_data': 'shorts:cycle'},
+             {'text': '📒 Полный цикл CSV', 'callback_data': 'shorts:cycleexport'}],
             [{'text': '🧠 Обучение', 'callback_data': 'shorts:learning'},
              {'text': '⚡ Качество данных', 'callback_data': 'shorts:feed'}],
             [{'text': '🔎 Решения', 'callback_data': 'shorts:decisions'},
@@ -3273,8 +3287,19 @@ class Bot:
         section = arg.strip().lower()
         if section in ('pause', 'resume'):
             shorts.control(section)
+            if reality.status() is not None:
+                reality.control(section)
             section = ''
-        if section == 'export':
+        if section == 'cycle':
+            await self.send(reality.report(), markup=self.shorts_markup())
+        elif section == 'cycleexport':
+            if reality.status() is None:
+                await self.send('Полный рублёвый цикл ещё не активирован.', markup=self.shorts_markup())
+            else:
+                destination = os.path.join(reality.ROOT, 'rub_roundtrip.csv')
+                reality.export(destination)
+                await self.send_document(destination, caption='Полный рублёвый цикл и дочерний USDT-журнал · до налогов')
+        elif section == 'export':
             destination = os.path.join(os.path.dirname(shorts.DB_PATH), 'alt_shorts.csv')
             shorts.export(destination)
             await self.send_document(destination, caption='Журнал виртуальных шортов альтов')

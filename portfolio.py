@@ -16,6 +16,7 @@ import paper
 import spotbook
 import bankmodel
 import execution_review
+import settlement
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "data", "paper_portfolio.db")
 EXPORT_PATH = os.path.join(os.path.dirname(__file__), "data", "paper_portfolio.csv")
@@ -136,6 +137,9 @@ def start(amount, buy, sell, hops, planned_pct, pay_fee=0, path=DB_PATH, now=Non
                "measures": measures or {},
                "note": "", "assumptions": [], "in_transit": False, "dust": []}
         run["settings"]["bank_model"] = "strict" if bank_profile else "legacy"
+        if os.getenv('PAPER_REALITY', '0') == '1' and bankmodel.SCENARIO.get() is not None:
+            run['settlement_version'] = 'receipts-v2'
+            run['receipts'] = []
         if bankmodel.SCENARIO.get() is not None:
             scenario = bankmodel.SCENARIO.get()
             run['settings']['pay_minutes'] = execution_review.check(bank_profile, buy, now)['payment_seconds'] / 60
@@ -258,6 +262,7 @@ def tick(snap, cfg, path=DB_PATH, now=None, books=None):
                 ctx.prec = 40
                 _sell_dust(con, run, snap, now)
                 if not was_terminal:
+                    settlement.settle(con, run, now, _cash, _event)
                     _step(con, run, snap, cfg, now, books or {})
             _save(con, run)
             if state != json.dumps(run, ensure_ascii=False):
@@ -503,15 +508,24 @@ def _step(con, r, snap, cfg, now, books):
                 bankmodel.payment(con, bank_quote, now, r["id"])
             cost = dec(r["cost"]) * qty / remaining
             r["cost"] = str(dec(r["cost"]) - cost)
-            r["realized"] = str(dec(r["realized"]) + proceeds - cost)
-            r["proceeds"] = str(dec(r["proceeds"]) + proceeds)
             remaining -= qty
-            _cash(con, proceeds, bank_quote["account"] if bank_quote else None, now)
-            _event(con, r["id"], "sell", {"qty": str(qty), "rub": str(proceeds), "cost": str(cost),
-                                          "price": str(price), "quote_ts": ad.fetched_ts, "bank_quote": bank_quote}, now)
+            details = {"qty": str(qty), "rub": str(proceeds), "cost": str(cost),
+                       "price": str(price), "quote_ts": ad.fetched_ts, "bank_quote": bank_quote,
+                       "account": bank_quote['account'] if bank_quote else None}
+            if r.get('settlement_version') == 'receipts-v2':
+                details.update(due=now + st['pay_minutes'] * 60, status='scenario_credit',
+                               reference=f"paper:{r['id']}:{len(r['receipts'])}:{now}",
+                               personal_eligibility='assumed_not_verified')
+                r['receipts'].append(details)
+                _event(con, r['id'], 'sell_reserved', details, now)
+            else:
+                r["realized"] = str(dec(r["realized"]) + proceeds - cost)
+                r["proceeds"] = str(dec(r["proceeds"]) + proceeds)
+                _cash(con, proceeds, details['account'], now)
+                _event(con, r["id"], "sell", details, now)
         r["qty"] = str(remaining)
         if remaining == 0:
-            r["stage"] = "done"
+            r["stage"] = "receipt" if r.get('receipts') else "done"
         else:
             r["note"] = "Остаток сохранён; ждём доступную продажу"
 
@@ -536,13 +550,16 @@ def summary(path=DB_PATH):
         periods = {}
         for name, since in (("day", paper._day_start(now)), ("week", now - 7 * 86400)):
             periods[name] = str(sum((dec(d["rub"]) - dec(d["cost"]) for raw, in
-                                    con.execute("SELECT details FROM events WHERE kind='sell' AND ts>=?", (since,))
+                                    con.execute("SELECT details FROM events WHERE kind IN ('sell','bank_receipt') AND ts>=?", (since,))
                                     for d in [json.loads(raw)]), ZERO))
         expenses = sum((dec(v) for v, in con.execute("SELECT amount FROM bank_expenses")), ZERO)
         transit = sum((dec(v) for v, in con.execute("SELECT amount FROM bank_transfers WHERE state='pending'")), ZERO)
         strict_profit = sum((dec(r["realized"]) for r in values
                              if r["settings"].get("bank_model") == "strict" and not r.get("origin_model")), ZERO)
-        return {"bank_expenses": str(expenses), "bank_in_transit": str(transit),
+        restricted = settlement.restricted_cash(con)
+        return {"restricted": str(restricted), "available_cash": str(dec(row[1])-restricted),
+                "pending_receipts": str(sum((settlement.pending(r) for r in values), ZERO)),
+                "bank_expenses": str(expenses), "bank_in_transit": str(transit),
                 "strict_realized": str(strict_profit),
                 "net_realized": str(sum((dec(r["realized"]) for r in values), ZERO) - expenses),
                 "initial": row[0] if row else "50000.00", "cash": row[1] if row else "50000.00",
@@ -558,10 +575,13 @@ def summary(path=DB_PATH):
 def report_lines(path=DB_PATH):
     s = summary(path)
     lines = ["🧪 <b>Виртуальный портфель</b>", "", "<b>Деньги</b>", f"Начальный капитал: {dec(s['initial']):.2f} ₽",
-             f"Свободно: {dec(s['cash']):.2f} ₽",
+             f"Свободно: {dec(s.get('available_cash', s['cash'])):.2f} ₽",
              f"Резерв: {dec(s['reserved']):.2f} ₽", "", "<b>Результат продаж</b>",
              f"Прибыль исполненных продаж: {dec(s['realized']):+.2f} ₽",
              "Открытые позиции оцениваются отдельно; неизвестная цена не равна нулю."]
+    lines += [f"Ограниченные деньги: {dec(s.get('restricted', '0')):.2f} ₽",
+              f"Себестоимость ожидаемых зачислений: {dec(s.get('pending_receipts', '0')):.2f} ₽",
+              'Результат до налогов. Сценарное зачисление не подтверждено банком.']
     if "bank_expenses" in s:
         lines.append(f"Расходы счетов/собственных переводов: {dec(s['bank_expenses']):.2f} ₽\n"
                      f"Результат после расходов: {dec(s['net_realized']):+.2f} ₽")
@@ -588,7 +608,7 @@ def report_lines(path=DB_PATH):
         if r["stage"] in ("done", "cancelled"):
             continue
         stages = {'buy': 'Покупка', 'route': 'Обмен / перевод', 'sell': 'Продажа',
-                  'escrow': 'Разблокировка криптовалюты'}
+                  'escrow': 'Разблокировка криптовалюты', 'receipt': 'Ожидание рублёвого зачисления'}
         lines.extend(['', f"<b>Круг #{r['id']}</b>",
                       'Этап: ' + html.escape(stages.get(r['stage'], r['stage'])),
                       'Площадка: ' + html.escape(r['venue']),
@@ -615,6 +635,9 @@ def _mark(con, snap, now):
         "SELECT 1 FROM bank_transfers WHERE state='pending' LIMIT 1").fetchone() else None
     for state, in con.execute("SELECT state FROM runs"):
         r = json.loads(state)
+        if r.get('receipts'):
+            reason = 'bank_receipt_not_confirmed'
+            total += settlement.pending(r)
         total += dec(r["reserved"])
         strict = strict or r["settings"].get("bank_model") == "strict"
         for position in r.get("dust", []) + ([r] if dec(r["qty"]) else []):
@@ -679,7 +702,7 @@ def _verify(con):
         for name in ("reserved", "qty", "cost"):
             if dec(r[name]) < 0:
                 raise ValueError(f"Negative {name} in run {r['id']}")
-        balance += dec(r["reserved"]) + dec(r["cost"]) - dec(r["realized"])
+        balance += dec(r["reserved"]) + dec(r["cost"]) + settlement.pending(r) - dec(r["realized"])
         for dust in r.get("dust", []):
             if dec(dust["qty"]) < 0 or dec(dust["cost"]) < 0:
                 raise ValueError("Negative rounding remainder")

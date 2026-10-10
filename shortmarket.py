@@ -297,9 +297,10 @@ class Collector:
                 for symbol in group['symbols']:
                     mapping[symbol] = group['groupName']
             observed = self.now()
-            shorts.record_catalog({'instruments': instruments, 'fee_groups': groups,
+            self.catalog_record = {'instruments': instruments, 'fee_groups': groups,
                                    'source': 'Bybit public V5', 'observed': observed,
-                                   'catalog_server_ts': ts, 'fee_group_server_ts': group_ts}, observed, self.path)
+                                   'catalog_server_ts': ts, 'fee_group_server_ts': group_ts}
+            shorts.record_catalog(self.catalog_record, observed, self.path)
             self.instruments, self.groups, self.catalog_ts = instruments, mapping, observed
         if now-self.ticker_ts >= 15 or not self.tickers:
             result, ts = await self.request(session, 'tickers', category='linear')
@@ -517,6 +518,10 @@ class Collector:
     async def _refresh(self, session):
         state = shorts.status(self.path)
         active = [p for p in state['positions'] if p['stage'] != 'closed'] if state else []
+        external_path = getattr(self, 'external_path', None)
+        if external_path:
+            external = shorts.status(external_path)
+            active += [p for p in external['positions'] if p['stage'] != 'closed'] if external else []
         opened = {p['symbol']: p.get('opened', p['submitted']) for p in active}
         self._opened_terms = {p['symbol']: p.get('terms', {}) for p in active}
         self.pending_ends = {p['symbol']: p['closed'] for p in active if p['stage'] == 'funding'}
@@ -552,6 +557,9 @@ class Collector:
             active_markets = {key: value for key, value in self.observed.items()
                               if key in self.watched}
             shorts.tick(active_markets, decision_at, self.path, allow_entries=entries)
+            if external_path:
+                shorts.tick(active_markets, decision_at, external_path,
+                            allow_entries=entries and getattr(self, 'external_entries', False))
             return result
 
         def collect(symbols, results):
@@ -575,6 +583,8 @@ class Collector:
             catalog_error = 'Каталог/тикеры: ' + type(exc).__name__
             errors.append(catalog_error)
         self._ensure_refresh_active()
+        if external_path and getattr(self, 'catalog_record', None):
+            shorts.record_catalog(self.catalog_record, self.catalog_ts, external_path)
         candidates = [sym for sym, inst in self.instruments.items()
                       if not catalog_error and not clock_error
                       and shorts.eligible(inst, self.tickers.get(sym, {}), self.now())]

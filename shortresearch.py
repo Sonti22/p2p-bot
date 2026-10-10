@@ -120,7 +120,9 @@ def _replay(con, original, start, end, directory, include_end=False):
     os.makedirs(directory)
     dbs = {name: os.path.join(directory, name + '.db') for name in VARIANTS}
     for db in dbs.values():
-        shorts.initialize(original['rub_rate'], original['rate_source'], start, db)
+        shorts.initialize(original['rub_rate'], original['rate_source'], start, db,
+                          capital=original['initial'],
+                          funding_model=original.get('funding_model', 'allocation-stress-v1'))
     catalogs = iter(con.execute('SELECT ts,state FROM catalog ORDER BY ts'))
     next_catalog, known = next(catalogs, None), None
     comparison = '<=' if include_end else '<'
